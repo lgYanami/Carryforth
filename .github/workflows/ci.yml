@@ -23,6 +23,7 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      semantic: ${{ steps.filter.outputs.semantic }}
       project-view: ${{ steps.filter.outputs.project-view }}
       project-document: ${{ steps.filter.outputs.project-document }}
       desktop: ${{ steps.filter.outputs.desktop }}
@@ -67,6 +68,30 @@ jobs:
               - 'deploy/local/**'
               - 'deploy/compose/**'
               - 'Justfile'
+            semantic:
+              - 'crates/buzz-semantic/**'
+              - 'crates/buzz-db/src/semantic.rs'
+              - 'crates/buzz-db/src/migration.rs'
+              - 'crates/buzz-relay/src/semantic_runtime.rs'
+              - 'crates/buzz-relay/src/config.rs'
+              - 'crates/buzz-relay/src/main.rs'
+              - 'crates/buzz-relay/src/router.rs'
+              - 'crates/buzz-admin/src/semantic.rs'
+              - 'migrations/**'
+              - 'schema/**'
+              - 'scripts/test-semantic-*.sh'
+              - 'deploy/postgres/**'
+              - 'deploy/local/**'
+              - 'deploy/compose/**'
+              - 'docker-compose.yml'
+              - 'docker-compose.harness.yml'
+              - '.env.example'
+              - 'docs/lora/stage/semantic/**'
+              - 'docs/semantic-pgvector-operations.md'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Justfile'
+              - '.github/workflows/ci.yml'
             project-view:
               - 'crates/buzz-project-view/**'
               - 'crates/buzz-core/src/kind.rs'
@@ -1056,6 +1081,23 @@ jobs:
           PROJECT_CONTEXT_E2E_PROFILE: ci
           PROJECT_CONTEXT_E2E_NO_BUILD: "1"
         run: just project-context-test-e2e-stage5
+
+  semantic-foundation-integration:
+    name: Project Context Semantic Foundation
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: [changes]
+    if: needs.changes.outputs.semantic == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Pinned pgvector and semantic activation contracts
+        run: just semantic-test
 
   project-view-pre-feature-rollback:
     name: Project View Pre-feature Database Boundary

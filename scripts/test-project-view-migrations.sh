@@ -39,6 +39,12 @@ trap cleanup EXIT
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
   -c "CREATE DATABASE ${database_name}" >/dev/null
+docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
+  -c "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null
+docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null
 
 database_url="postgres://buzz:buzz_dev@localhost:5432/${database_name}"
 export BUZZ_TEST_DATABASE_URL="${database_url}"
@@ -79,6 +85,10 @@ docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 51 AND success" \
   | grep -qx ok
 docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+  psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 -qtA \
+  -c "SELECT CASE WHEN count(*) = 1 THEN 'ok' ELSE 'bad' END FROM _sqlx_migrations WHERE version = 57 AND success" \
+  | grep -qx ok
+docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
   psql -U buzz -d "${database_name}" -v ON_ERROR_STOP=1 \
   -c "SELECT id, host FROM communities LIMIT 0" >/dev/null
 
@@ -101,8 +111,8 @@ project_protocol_drift="$(
   jq '[
     .groups[].steps[]?
     | select(
-        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge"; "i"))
-        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge"; "i"))
+        ((.path // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge|semantic"; "i"))
+        or ((.sql // "") | test("project_view|project_role|project_work_commitments|project_runtime|project_document|project_context_edge|semantic"; "i"))
       )
   ]' "${plan_file}"
 )"

@@ -3021,7 +3021,7 @@ fn state_metadata_from_row(
     })
 }
 
-fn current_document_from_row(
+pub(crate) fn current_document_from_row(
     document_id: Uuid,
     row: &sqlx::postgres::PgRow,
 ) -> ProjectDocumentWriteResult<CurrentDocument> {

@@ -1,7 +1,7 @@
 //! Relay configuration from environment variables.
 
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use thiserror::Error;
 use tracing::warn;
 
@@ -42,6 +42,44 @@ pub struct JoinPolicyConfig {
     pub age_attestation_required: bool,
     /// Content-derived identifier binding receipts to the exact policy revision.
     pub version: String,
+}
+
+/// Capability-gated Project Context semantic worker configuration.
+#[derive(Clone)]
+pub struct SemanticWorkerConfig {
+    /// Process-wide worker switch. A Community gate is independently required.
+    pub enabled: bool,
+    /// Approved provider API key. Debug output always redacts this value.
+    pub api_key: Option<String>,
+    /// Provider base URL ending at the versioned API root.
+    pub base_url: Option<url::Url>,
+    /// Provider request model/deployment alias. The response must resolve to
+    /// the exact generation model contract.
+    pub request_model: Option<String>,
+    /// Hard timeout for one provider request.
+    pub request_timeout: Duration,
+    /// Minimum interval between provider requests in this process.
+    pub request_interval: Duration,
+    /// Durable claim lease duration.
+    pub claim_seconds: u16,
+    /// Attempts before a job becomes poison.
+    pub max_attempts: u32,
+}
+
+impl std::fmt::Debug for SemanticWorkerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticWorkerConfig")
+            .field("enabled", &self.enabled)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("request_model", &self.request_model)
+            .field("request_timeout", &self.request_timeout)
+            .field("request_interval", &self.request_interval)
+            .field("claim_seconds", &self.claim_seconds)
+            .field("max_attempts", &self.max_attempts)
+            .finish()
+    }
 }
 
 /// Relay runtime configuration, loaded from environment variables.
@@ -239,6 +277,9 @@ pub struct Config {
     pub runtime_supervision_batch_limit: u16,
     /// Duration of one multi-pod scheduler claim.
     pub runtime_supervision_claim_secs: u64,
+
+    /// Derived Project Context semantic worker/provider configuration.
+    pub semantic_worker: SemanticWorkerConfig,
 
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
@@ -814,6 +855,96 @@ impl Config {
                 "BUZZ_RUNTIME_UNRECOVERABLE requires a stable BUZZ_RELAY_PRIVATE_KEY".to_owned(),
             ));
         }
+        let semantic_worker_enabled = parse_bool("BUZZ_SEMANTIC_WORKER_ENABLED", false)?;
+        let semantic_api_key = std::env::var("BUZZ_SEMANTIC_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let semantic_base_url = std::env::var("BUZZ_SEMANTIC_BASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                let mut parsed = url::Url::parse(&value).map_err(|_| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_SEMANTIC_BASE_URL must be an absolute HTTPS URL".to_string(),
+                    )
+                })?;
+                if parsed.scheme() != "https"
+                    || parsed.host_str().is_none()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_SEMANTIC_BASE_URL must be an HTTPS origin/path without credentials, query, or fragment"
+                            .to_string(),
+                    ));
+                }
+                if !parsed.path().ends_with('/') {
+                    let path = format!("{}/", parsed.path());
+                    parsed.set_path(&path);
+                }
+                Ok(parsed)
+            })
+            .transpose()?;
+        let semantic_request_model = std::env::var("BUZZ_SEMANTIC_REQUEST_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let semantic_request_timeout_secs =
+            positive_u64_from_env("BUZZ_SEMANTIC_REQUEST_TIMEOUT_SECS", 30)?;
+        if !(1..=120).contains(&semantic_request_timeout_secs) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_REQUEST_TIMEOUT_SECS must be in 1..=120".to_string(),
+            ));
+        }
+        let semantic_request_interval_millis =
+            positive_u64_from_env("BUZZ_SEMANTIC_REQUEST_INTERVAL_MS", 1_000)?;
+        if !(100..=60_000).contains(&semantic_request_interval_millis) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_REQUEST_INTERVAL_MS must be in 100..=60000".to_string(),
+            ));
+        }
+        let semantic_claim_seconds = positive_u64_from_env("BUZZ_SEMANTIC_CLAIM_SECS", 60)?;
+        let semantic_claim_seconds = u16::try_from(semantic_claim_seconds)
+            .ok()
+            .filter(|value| (10..=300).contains(value))
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(
+                    "BUZZ_SEMANTIC_CLAIM_SECS must be in 10..=300".to_string(),
+                )
+            })?;
+        let semantic_max_attempts = positive_u64_from_env("BUZZ_SEMANTIC_MAX_ATTEMPTS", 8)?;
+        let semantic_max_attempts = u32::try_from(semantic_max_attempts)
+            .ok()
+            .filter(|value| (1..=100).contains(value))
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(
+                    "BUZZ_SEMANTIC_MAX_ATTEMPTS must be in 1..=100".to_string(),
+                )
+            })?;
+        if semantic_worker_enabled
+            && (semantic_api_key.is_none()
+                || semantic_base_url.is_none()
+                || semantic_request_model.is_none())
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_WORKER_ENABLED requires provider key, base URL, and request model"
+                    .to_string(),
+            ));
+        }
+        let semantic_worker = SemanticWorkerConfig {
+            enabled: semantic_worker_enabled,
+            api_key: semantic_api_key,
+            base_url: semantic_base_url,
+            request_model: semantic_request_model,
+            request_timeout: Duration::from_secs(semantic_request_timeout_secs),
+            request_interval: Duration::from_millis(semantic_request_interval_millis),
+            claim_seconds: semantic_claim_seconds,
+            max_attempts: semantic_max_attempts,
+        };
         let join_policy = if terms_markdown.is_none()
             && privacy_markdown.is_none()
             && !age_attestation_required
@@ -935,6 +1066,7 @@ impl Config {
             runtime_supervision_interval_secs,
             runtime_supervision_batch_limit,
             runtime_supervision_claim_secs,
+            semantic_worker,
             ephemeral_ttl_override,
             git_repo_path,
             git_pack_cache_path,

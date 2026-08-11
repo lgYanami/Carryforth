@@ -13,7 +13,7 @@
 # =============================================================================
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.5-pg17-bookworm@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
     environment:
       POSTGRES_USER: buzz
       POSTGRES_PASSWORD: buzz_dev
@@ -23,6 +23,7 @@ services:
       - "5471:5432"
     volumes:
       - harness-postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/initdb/001-pgvector.sql:/docker-entrypoint-initdb.d/001-pgvector.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U buzz"]
       interval: 5s

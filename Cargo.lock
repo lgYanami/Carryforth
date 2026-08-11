@@ -811,7 +811,9 @@ dependencies = [
  "buzz-pubsub",
  "buzz-sdk",
  "buzz-search",
+ "buzz-semantic",
  "buzz-workflow",
+ "chrono",
  "clap",
  "deadpool-redis",
  "hex",
@@ -927,9 +929,11 @@ dependencies = [
  "buzz-project-document",
  "buzz-project-view",
  "buzz-sdk",
+ "buzz-semantic",
  "chrono",
  "hex",
  "nostr",
+ "pgvector",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -1138,6 +1142,7 @@ dependencies = [
  "buzz-relay-mesh",
  "buzz-sdk",
  "buzz-search",
+ "buzz-semantic",
  "buzz-workflow",
  "bytes",
  "chrono",
@@ -1232,6 +1237,20 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-semantic"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "postcard",
+ "pulldown-cmark",
+ "serde",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
@@ -2193,7 +2212,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6206,6 +6225,15 @@ dependencies = [
  "fixedbitset 0.5.7",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "pgvector"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]

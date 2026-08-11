@@ -81,6 +81,38 @@ impl ProjectViewObjectDataV3 {
             Self::Resource(value) => value.summary.as_deref(),
         }
     }
+
+    /// Return the canonical human-readable title or name used by lightweight
+    /// source previews and semantic extraction.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        match self {
+            Self::ProjectProfile(value) => &value.name,
+            Self::Goal(value) => &value.title,
+            Self::Role(value) => &value.name,
+            Self::Plan(value) => &value.title,
+            Self::Stage(value) => &value.title,
+            Self::Requirement(value) => &value.title,
+            Self::Issue(value) => &value.title,
+            Self::Work(value) => &value.title,
+            Self::Resource(value) => &value.name,
+        }
+    }
+
+    /// Return source-native lifecycle status metadata when this object type
+    /// defines one. This value is for filtering and is not semantic text.
+    #[must_use]
+    pub fn source_status(&self) -> Option<&'static str> {
+        match self {
+            Self::Role(value) => Some(if value.active { "active" } else { "inactive" }),
+            Self::Plan(value) => Some(value.status.as_str()),
+            Self::Stage(value) => Some(value.status.as_str()),
+            Self::Requirement(value) => Some(value.status.as_str()),
+            Self::Issue(value) => Some(value.status.as_str()),
+            Self::Work(value) => Some(value.status.as_str()),
+            Self::ProjectProfile(_) | Self::Goal(_) | Self::Resource(_) => None,
+        }
+    }
 }
 
 /// One active canonical Project View v3 object.

@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 56);
+        assert_eq!(migrations.len(), 57);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1375,6 +1375,70 @@ mod tests {
                 "migration 0056 must not contain destructive statement {destructive}"
             );
         }
+
+        assert_eq!(migrations[56].version, 57);
+        let semantic_foundation = migrations[56].sql.as_str();
+        for required in [
+            "Project Context semantic schema requires installed pgvector",
+            "ADD COLUMN semantic_index_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE TABLE semantic_index_generations",
+            "CREATE TABLE semantic_sources",
+            "CREATE TABLE semantic_unit_sets",
+            "CREATE TABLE semantic_units",
+            "CREATE TABLE semantic_embeddings",
+            "embedding public.vector NOT NULL",
+            "CREATE TABLE semantic_source_generation_heads",
+            "CREATE TABLE semantic_index_jobs",
+            "CREATE TABLE semantic_rebuild_operations",
+            "CREATE TABLE semantic_provider_rate_gates",
+            "CREATE FUNCTION semantic_mark_source_changed",
+            "project_view_objects_semantic_capture",
+            "project_documents_semantic_capture",
+            "meeting_sessions_semantic_capture",
+            "channels_meeting_semantic_capture",
+        ] {
+            assert!(
+                semantic_foundation.contains(required),
+                "migration 0057 must contain {required}"
+            );
+        }
+        for forbidden in [
+            "CREATE EXTENSION",
+            "DROP EXTENSION",
+            "TRUNCATE",
+            "DELETE FROM project_view_objects",
+            "DELETE FROM project_documents",
+            "DELETE FROM meeting_sessions",
+        ] {
+            assert!(
+                !semantic_foundation.contains(forbidden),
+                "migration 0057 must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_schema_contains_semantic_foundation_storage() {
+        let schema = include_str!("../../../schema/schema.sql");
+        for required in [
+            "semantic_index_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE TABLE semantic_index_generations",
+            "CREATE TABLE semantic_sources",
+            "CREATE TABLE semantic_unit_sets",
+            "CREATE TABLE semantic_units",
+            "CREATE TABLE semantic_embeddings",
+            "embedding public.vector NOT NULL",
+            "CREATE TABLE semantic_source_generation_heads",
+            "CREATE TABLE semantic_index_jobs",
+            "CREATE TABLE semantic_rebuild_operations",
+            "CREATE TABLE semantic_provider_rate_gates",
+            "CREATE FUNCTION semantic_mark_source_changed",
+        ] {
+            assert!(
+                schema.contains(required),
+                "schema/schema.sql is missing semantic fragment {required}"
+            );
+        }
     }
 
     #[test]
@@ -1605,6 +1669,7 @@ mod tests {
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect direct-action migration scratch database");
+        install_test_vector(&pool).await;
 
         MIGRATOR
             .run_to(45, &pool)
@@ -1771,6 +1836,7 @@ mod tests {
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect schema scratch database");
+        install_test_vector(&pool).await;
 
         sqlx::raw_sql(include_str!("../../../schema/schema.sql"))
             .execute(&pool)
@@ -1977,10 +2043,18 @@ mod tests {
 
     async fn connect_test_pool() -> PgPool {
         let database_url = isolated_test_database_url();
-
-        PgPool::connect(&database_url)
+        let pool = PgPool::connect(&database_url)
             .await
-            .expect("connect to test DB")
+            .expect("connect to test DB");
+        install_test_vector(&pool).await;
+        pool
+    }
+
+    async fn install_test_vector(pool: &PgPool) {
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+            .execute(pool)
+            .await
+            .expect("semantic migration tests require the pgvector extension package");
     }
 
     fn isolated_test_database_url() -> String {
@@ -2017,6 +2091,10 @@ mod tests {
             is_disposable_test_database_name(&database_name),
             "refusing to reset public schema outside a disposable buzz_ test database: {database_name}"
         );
+        sqlx::query("DROP EXTENSION IF EXISTS vector CASCADE")
+            .execute(pool)
+            .await
+            .expect("drop test vector extension before public schema reset");
         sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
             .execute(pool)
             .await
@@ -2025,6 +2103,7 @@ mod tests {
             .execute(pool)
             .await
             .expect("create public schema");
+        install_test_vector(pool).await;
     }
 
     async fn applied_versions(pool: &PgPool) -> Vec<i64> {
@@ -2158,7 +2237,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade Meeting schema through V2 stage two");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
         let preserved: Vec<(uuid::Uuid, i32, String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT session_id, schema_version, floor_policy_version, moderator_pubkey \
              FROM meeting_sessions WHERE community_id = $1 ORDER BY session_id",
@@ -2240,6 +2319,7 @@ mod tests {
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect migration scratch database");
+        install_test_vector(&pool).await;
 
         MIGRATOR
             .run_to(24, &pool)
@@ -2264,7 +2344,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade scratch database through 0051");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
         let flags: Vec<(uuid::Uuid, bool, i16)> = sqlx::query_as(
             "SELECT id, project_view_enabled, project_view_schema_version \
              FROM communities ORDER BY id",
@@ -2458,6 +2538,7 @@ mod tests {
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect migration scratch database");
+        install_test_vector(&pool).await;
 
         MIGRATOR
             .run_to(31, &pool)
@@ -2474,7 +2555,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("upgrade scratch database through 0051");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
         let existing_enabled: bool =
             sqlx::query_scalar("SELECT project_document_enabled FROM communities WHERE id = $1")
                 .bind(existing_id)
@@ -2546,12 +2627,13 @@ mod tests {
         let second = PgPool::connect(&database_url)
             .await
             .expect("connect second migrator");
+        install_test_vector(&first).await;
 
         let (first_result, second_result) =
             tokio::join!(run_migrations(&first), run_migrations(&second));
         first_result.expect("first concurrent migrator succeeds");
         second_result.expect("second concurrent migrator succeeds");
-        assert_eq!(applied_versions(&first).await.last().copied(), Some(51));
+        assert_eq!(applied_versions(&first).await.last().copied(), Some(57));
         let project_view_migration_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM _sqlx_migrations \
              WHERE version BETWEEN 25 AND 36 AND success",
@@ -2639,7 +2721,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(51));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(57));
     }
 
     #[tokio::test]

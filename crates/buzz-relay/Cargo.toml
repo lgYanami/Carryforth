@@ -64,6 +64,7 @@ buzz-sdk = { workspace = true }
 buzz-project-context = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-project-document = { workspace = true }
+buzz-semantic = { workspace = true }
 buzz-workflow = { workspace = true, features = ["reqwest"] }
 buzz-media = { workspace = true }
 s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }

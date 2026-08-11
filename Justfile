@@ -377,6 +377,17 @@ project-view-test-db:
 test-migrations:
     ./scripts/test-project-view-migrations.sh
 
+# Verify the pinned PostgreSQL/pgvector runtime contract in an isolated container.
+semantic-pgvector-test:
+    ./scripts/test-semantic-pgvector.sh
+
+# Run the additive semantic schema, trigger, worker-fence, and activation tests.
+semantic-migration-test:
+    ./scripts/test-semantic-migrations.sh
+
+# Run all Project Context semantic-foundation quality gates.
+semantic-test: semantic-pgvector-test semantic-migration-test
+
 # Run the real Relay + real cf CLI Project View end-to-end test.
 project-view-test-e2e:
     ./scripts/test-project-view-e2e.sh
