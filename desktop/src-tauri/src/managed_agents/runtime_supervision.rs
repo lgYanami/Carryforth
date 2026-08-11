@@ -97,9 +97,9 @@ pub(crate) fn configure_runtime_supervision_for_spawn(
                 Ok(identity) => identity,
                 Err(error) => {
                     eprintln!(
-                        "buzz-desktop: Runtime supervisor identity unavailable for {}: {error}",
-                        runtime_key.runtime_id()
-                    );
+                    "carryforth-desktop: Runtime supervisor identity unavailable for {}: {error}",
+                    runtime_key.runtime_id()
+                );
                     RuntimeSupervisorSpawnIdentity::unavailable(
                         connection_relay_url,
                         "local_identity_unavailable",
@@ -437,7 +437,7 @@ fn persist_identity(
         if let Err(error) = std::fs::remove_file(&scope.key_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
-                    "buzz-desktop: Runtime supervisor keyring write succeeded but stale file cleanup failed: {error}"
+                    "carryforth-desktop: Runtime supervisor keyring write succeeded but stale file cleanup failed: {error}"
                 );
             }
         }

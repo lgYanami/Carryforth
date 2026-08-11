@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 150" role="img" aria-labelledby="title">
+  <title id="title">Carryforth</title>
+  <g fill="none" stroke="#20242B" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="8" y="18" width="114" height="114" rx="34" stroke-width="9"/>
+    <path d="m37 50 25 25-25 25m29-50 25 25-25 25" stroke-width="11"/>
+  </g>
+  <text x="150" y="101" fill="#20242B" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="76" font-weight="650" letter-spacing="-3">Carryforth</text>
+</svg>

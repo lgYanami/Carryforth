@@ -7,19 +7,17 @@ import {
   Check,
   ChevronDown,
   Cpu,
-  Download,
   FlaskConical,
   Keyboard,
   LayoutTemplate,
   MonitorCog,
   Moon,
   ShieldAlert,
-  Smartphone,
   Smile,
   Sun,
   SunMoon,
-  Ticket,
   UserRound,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -72,7 +70,6 @@ import { DoctorSettingsPanel } from "./DoctorSettingsPanel";
 import { ExperimentalFeaturesCard } from "./ExperimentalFeaturesCard";
 import { KeyboardShortcutsCard } from "./KeyboardShortcutsCard";
 import { MeshComputeSettingsCard } from "@/features/mesh-compute/ui/MeshComputeSettingsCard";
-import { MobilePairingCard } from "./MobilePairingCard";
 import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
@@ -80,7 +77,6 @@ import { ActiveAgentCommunitiesSettingsCard } from "./ActiveAgentCommunitiesSett
 import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
-import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 export type SettingsSection =
@@ -95,9 +91,7 @@ export type SettingsSection =
   | "community-members"
   | "moderation"
   | "custom-emoji"
-  | "local-archive"
-  | "mobile"
-  | "updates";
+  | "local-archive";
 
 export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
 
@@ -114,8 +108,6 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "moderation",
   "custom-emoji",
   "local-archive",
-  "mobile",
-  "updates",
 ];
 
 export function isSettingsSection(value: unknown): value is SettingsSection {
@@ -193,8 +185,8 @@ export const settingsSections: SettingsSectionDescriptor[] = [
   },
   {
     value: "community-members",
-    label: "Invites",
-    icon: Ticket,
+    label: "Members",
+    icon: Users,
   },
   {
     value: "moderation",
@@ -212,19 +204,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     label: "Local archive",
     icon: Archive,
   },
-  {
-    value: "mobile",
-    label: "Mobile",
-    icon: Smartphone,
-  },
-  {
-    value: "updates",
-    label: "Updates",
-    icon: Download,
-  },
 ];
 
 function formatThemeLabel(name: string): string {
+  if (name === "buzz") return "Carryforth";
+  if (name === "buzz-dark") return "Carryforth Dark";
   return name
     .split("-")
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
@@ -509,7 +493,7 @@ function ThemeSettingsCard() {
     >
       <SettingsSectionHeader
         title="Appearance"
-        description="Choose a theme for Buzz."
+        description="Choose a theme for Carryforth."
       />
 
       {/* Mode selector: System / Light / Dark */}
@@ -828,10 +812,6 @@ export function renderSettingsSection(
       return <CustomEmojiSettingsCard />;
     case "local-archive":
       return <LocalArchiveSettingsCard />;
-    case "mobile":
-      return <MobilePairingCard currentPubkey={props.currentPubkey} />;
-    case "updates":
-      return <UpdateChecker />;
     default: {
       const exhaustiveCheck: never = section;
       return exhaustiveCheck;

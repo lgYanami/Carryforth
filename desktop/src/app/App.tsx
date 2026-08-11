@@ -55,9 +55,7 @@ import {
 } from "@/shared/api/tauri";
 import { getProfile } from "@/shared/api/tauriProfiles";
 import { cn } from "@/shared/lib/cn";
-import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
-import { FlappingBee } from "@/shared/ui/buzz-logo/FlappingBee";
-import { FuzzyLogo } from "@/shared/ui/buzz-logo/FuzzyLogo";
+import { CarryforthMark } from "@/shared/ui/carryforth-logo/CarryforthMark";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 
 const LOADING_TEXT = "Setting up your community...";
@@ -121,12 +119,7 @@ function useBootSplashHold(): BootSplashPhase {
   return phase;
 }
 
-// Animated Buzz mark for the loading gates. The static BuzzMark renders in
-// normal flow and sizes the box — it's plain SVG (no JS/SMIL), so it paints on
-// the very first frame even before scripting starts, avoiding a blank flash on
-// hard reload. The animated FuzzyLogo is layered on top and takes over once it
-// begins playing.
-function BeeLoader({
+function CarryforthLoader({
   ariaLabel,
   className,
   tintClassName = "text-foreground",
@@ -137,22 +130,17 @@ function BeeLoader({
 }) {
   return (
     <div className={cn("relative", tintClassName, className)}>
-      <BuzzMark className="block h-auto w-full" />
-      <FuzzyLogo
+      <CarryforthMark
         ariaLabel={ariaLabel}
-        className="absolute inset-0 h-full! w-full! [&>svg]:h-full [&>svg]:w-full [&>svg]:max-w-full"
-        fuzz
-        loop
-        loopRestSeconds={0}
+        className="block h-auto w-full animate-pulse"
       />
     </div>
   );
 }
 
 // Cold boot gate: the theme-adaptive grainient background with a single
-// centered Buzz bee flying over it — the same static mark as before, now with
-// its wings flapping (ported from the Buzz website's wing-flap). Replaces the
-// old "Setting up your community" text, which stays as an sr-only caption.
+// centered Carryforth mark. The status caption remains available to assistive
+// technology while the local community is initialized.
 function AppLoadingGate() {
   return (
     <div
@@ -163,7 +151,7 @@ function AppLoadingGate() {
       <StartupWindowDragRegion />
       <ThemeGrainientBackground />
       <span className="sr-only">{LOADING_TEXT}</span>
-      <FlappingBee className="relative z-10 h-auto w-28" />
+      <CarryforthMark className="relative z-10 h-auto w-24 text-foreground" />
     </div>
   );
 }
@@ -187,7 +175,7 @@ function CommunitySwitchGate() {
       <StartupWindowDragRegion />
       <span className="sr-only">Switching community…</span>
       {showSpinner ? (
-        <BeeLoader
+        <CarryforthLoader
           ariaLabel="Switching community…"
           className="h-auto w-20"
           tintClassName="text-muted-foreground"

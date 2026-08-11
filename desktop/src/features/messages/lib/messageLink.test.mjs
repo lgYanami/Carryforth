@@ -16,7 +16,7 @@ const THREAD =
 
 test("buildMessageLink → parseMessageLink round-trips without thread", () => {
   const url = buildMessageLink({ channelId: CHANNEL, messageId: MESSAGE });
-  assert.equal(url, `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
+  assert.equal(url, `carryforth://message?channel=${CHANNEL}&id=${MESSAGE}`);
 
   const parsed = parseMessageLink(url);
   assert.equal(parsed.ok, true);
@@ -53,8 +53,8 @@ test("buildMessageLink treats null/empty thread as absent", () => {
     messageId: MESSAGE,
     threadRootId: "",
   });
-  assert.equal(a, `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
-  assert.equal(b, `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
+  assert.equal(a, `carryforth://message?channel=${CHANNEL}&id=${MESSAGE}`);
+  assert.equal(b, `carryforth://message?channel=${CHANNEL}&id=${MESSAGE}`);
 });
 
 test("buildMessageLink rejects missing required params", () => {
@@ -70,20 +70,20 @@ test("parseMessageLink rejects unsupported schemes", () => {
   assert.equal(r.ok === false && r.reason, "wrong-scheme");
 });
 
-test("parseMessageLink rejects buzz:// with wrong host", () => {
-  const r = parseMessageLink(`buzz://connect?relay=wss://example.com`);
+test("parseMessageLink rejects carryforth:// with wrong host", () => {
+  const r = parseMessageLink(`carryforth://connect?relay=wss://example.com`);
   assert.equal(r.ok, false);
   assert.equal(r.ok === false && r.reason, "wrong-host");
 });
 
 test("parseMessageLink rejects missing channel", () => {
-  const r = parseMessageLink(`buzz://message?id=${MESSAGE}`);
+  const r = parseMessageLink(`carryforth://message?id=${MESSAGE}`);
   assert.equal(r.ok, false);
   assert.equal(r.ok === false && r.reason, "missing-channel");
 });
 
 test("parseMessageLink rejects missing id", () => {
-  const r = parseMessageLink(`buzz://message?channel=${CHANNEL}`);
+  const r = parseMessageLink(`carryforth://message?channel=${CHANNEL}`);
   assert.equal(r.ok, false);
   assert.equal(r.ok === false && r.reason, "missing-id");
 });
@@ -94,26 +94,22 @@ test("parseMessageLink rejects malformed URL strings", () => {
   assert.equal(r.ok === false && r.reason, "invalid-url");
 });
 
-test("parseMessageLink accepts legacy buzz://message links", () => {
+test("parseMessageLink rejects retired buzz://message links", () => {
   const r = parseMessageLink(`buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
-  assert.equal(r.ok, true);
-  assert.deepEqual(r.ok && r.value, {
-    channelId: CHANNEL,
-    messageId: MESSAGE,
-    threadRootId: null,
-  });
+  assert.equal(r.ok, false);
+  assert.equal(r.ok === false && r.reason, "wrong-scheme");
 });
 
-test("isMessageLink matches buzz://message and legacy buzz://message", () => {
+test("isMessageLink only matches carryforth://message", () => {
   assert.equal(
-    isMessageLink(`buzz://message?channel=${CHANNEL}&id=${MESSAGE}`),
+    isMessageLink(`carryforth://message?channel=${CHANNEL}&id=${MESSAGE}`),
     true,
   );
   assert.equal(
     isMessageLink(`buzz://message?channel=${CHANNEL}&id=${MESSAGE}`),
-    true,
+    false,
   );
-  assert.equal(isMessageLink("buzz://connect?relay=wss://x"), false);
+  assert.equal(isMessageLink("carryforth://connect?relay=wss://x"), false);
   assert.equal(isMessageLink("buzz://connect?relay=wss://x"), false);
   assert.equal(isMessageLink("https://example.com"), false);
   assert.equal(isMessageLink(undefined), false);
@@ -121,7 +117,7 @@ test("isMessageLink matches buzz://message and legacy buzz://message", () => {
 });
 
 test("resolveMessageLinkRenderTarget distinguishes autolinks from labeled links", () => {
-  const href = `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`;
+  const href = `carryforth://message?channel=${CHANNEL}&id=${MESSAGE}`;
 
   assert.deepEqual(resolveMessageLinkRenderTarget({ href, label: href }), {
     kind: "pill",

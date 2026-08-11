@@ -484,7 +484,7 @@ impl ModelSlot {
         // is accessible on the current thread. Tauri's runtime is always available.
         tauri::async_runtime::spawn(async move {
             if let Err(e) = download_fn(http_client).await {
-                eprintln!("buzz-desktop: {name} download failed: {e}");
+                eprintln!("carryforth-desktop: {name} download failed: {e}");
                 slot.set_status(ModelStatus::Error(e));
             }
         });
@@ -664,7 +664,7 @@ impl ModelManager {
             .join(format!("{STT_MODEL_DIR_NAME}.tar.bz2"));
         let temp_dir = self.models_dir.join(format!("{STT_MODEL_DIR_NAME}.tmp"));
 
-        eprintln!("buzz-desktop: downloading STT model from {STT_DOWNLOAD_URL}");
+        eprintln!("carryforth-desktop: downloading STT model from {STT_DOWNLOAD_URL}");
         let response = fetch_url(&http_client, STT_DOWNLOAD_URL, "stt archive").await?;
 
         let slot = self.stt.clone();
@@ -684,7 +684,7 @@ impl ModelManager {
             },
         )
         .await?;
-        eprintln!("buzz-desktop: downloaded {bytes} bytes, wrote to disk");
+        eprintln!("carryforth-desktop: downloaded {bytes} bytes, wrote to disk");
 
         // Verify archive integrity before extraction.
         let hash = sha256_file(&archive_path).await?;
@@ -700,7 +700,7 @@ impl ModelManager {
         });
         fresh_temp_dir(&temp_dir).await?;
 
-        eprintln!("buzz-desktop: extracting STT archive…");
+        eprintln!("carryforth-desktop: extracting STT archive…");
         let (ap, td) = (archive_path.clone(), temp_dir.clone());
         tokio::task::spawn_blocking(move || extract_archive(&ap, &td))
             .await
@@ -745,7 +745,7 @@ impl ModelManager {
         cleanup_legacy_moonshine_dir(&self.models_dir).await;
 
         eprintln!(
-            "buzz-desktop: STT model ready at {}",
+            "carryforth-desktop: STT model ready at {}",
             self.stt.model_dir(&self.models_dir).display()
         );
         Ok(())
@@ -786,7 +786,7 @@ impl ModelManager {
         let total_files = downloads.len() as u32;
 
         for (i, (url, filename)) in downloads.iter().enumerate() {
-            eprintln!("buzz-desktop: downloading Pocket TTS {filename} from {url}");
+            eprintln!("carryforth-desktop: downloading Pocket TTS {filename} from {url}");
 
             let response = fetch_url(&http_client, url, filename)
                 .await
@@ -820,7 +820,7 @@ impl ModelManager {
             .inspect_err(|_| {
                 let _ = std::fs::remove_dir_all(&temp_dir);
             })?;
-            eprintln!("buzz-desktop: downloaded {bytes} bytes ({filename}), wrote to disk");
+            eprintln!("carryforth-desktop: downloaded {bytes} bytes ({filename}), wrote to disk");
 
             let expected = TTS_FILE_HASHES
                 .iter()
@@ -860,7 +860,7 @@ impl ModelManager {
         }
 
         eprintln!(
-            "buzz-desktop: Pocket TTS model ready at {}",
+            "carryforth-desktop: Pocket TTS model ready at {}",
             self.tts.model_dir(&self.models_dir).display()
         );
         Ok(())
@@ -907,11 +907,11 @@ async fn cleanup_legacy_moonshine_dir(models_dir: &Path) {
     }
     match tokio::fs::remove_dir_all(&legacy).await {
         Ok(()) => eprintln!(
-            "buzz-desktop: removed legacy STT model dir {}",
+            "carryforth-desktop: removed legacy STT model dir {}",
             legacy.display()
         ),
         Err(e) => eprintln!(
-            "buzz-desktop: could not remove legacy STT model dir {}: {e} \
+            "carryforth-desktop: could not remove legacy STT model dir {}: {e} \
              (harmless — remove manually to reclaim disk space)",
             legacy.display()
         ),

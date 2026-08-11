@@ -66,7 +66,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
         }
         let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
             eprintln!(
-                "buzz-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving snapshot empty — it will spawn from its record fields",
+                "carryforth-desktop: persona-snapshot backfill: agent {} links persona {persona_id} which no longer exists; leaving snapshot empty — it will spawn from its record fields",
                 record.pubkey
             );
             continue;
@@ -265,7 +265,7 @@ pub async fn restore_managed_agents_on_launch(
                         .await
                 {
                     eprintln!(
-                        "buzz-desktop: fleet profile reconciliation failed for agent {pubkey}: {error}"
+                        "carryforth-desktop: fleet profile reconciliation failed for agent {pubkey}: {error}"
                     );
                 }
             }

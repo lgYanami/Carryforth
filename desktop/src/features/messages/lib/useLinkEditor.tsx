@@ -244,7 +244,7 @@ export function useLinkEditor(richText: UseRichTextEditorResult) {
     closeCard();
   }, [cardState, openDialogFromInfo, closeCard]);
 
-  // Card URL click: route `buzz://message?…` deep-links in-app (matching the
+  // Card URL click: route `carryforth://message?…` deep-links in-app (matching the
   // rendered-message link path), everything else to the OS opener.
   const openCardUrl = React.useCallback(
     (event: React.MouseEvent<HTMLAnchorElement>) => {

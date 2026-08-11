@@ -41,11 +41,11 @@ pub(crate) fn reconcile_agents_to_events(app: &tauri::AppHandle, keys: &nostr::K
         Ok(0) => {}
         Ok(reconciled) => {
             eprintln!(
-                "buzz-desktop: agent-event-reconcile: {reconciled} agents reconciled to retention"
+                "carryforth-desktop: agent-event-reconcile: {reconciled} agents reconciled to retention"
             );
         }
         Err(e) => {
-            eprintln!("buzz-desktop: agent-event-reconcile: {e}");
+            eprintln!("carryforth-desktop: agent-event-reconcile: {e}");
         }
     }
 }

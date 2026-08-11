@@ -695,8 +695,8 @@ export function ProjectViewObjectDialog({
                 : `Edit ${projectViewObjectTypeLabel(objectType)}`}
             </DialogTitle>
             <DialogDescription>
-              This revision-checked change will be signed by your current Buzz
-              identity. Base revision: {baseRevision}.
+              This revision-checked change will be signed by your current
+              Carryforth identity. Base revision: {baseRevision}.
             </DialogDescription>
           </DialogHeader>
 

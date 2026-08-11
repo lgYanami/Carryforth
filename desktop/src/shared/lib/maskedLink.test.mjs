@@ -51,7 +51,7 @@ test("not masked when there is nothing useful to compare", () => {
 test("non-http schemes are never masked", () => {
   assert.equal(isMaskedLink("email me", "mailto:a@b.com"), false);
   assert.equal(
-    isMaskedLink("open thread", "buzz://message?channel=x&id=y"),
+    isMaskedLink("open thread", "carryforth://message?channel=x&id=y"),
     false,
   );
 });

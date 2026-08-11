@@ -202,7 +202,7 @@ pub fn validate_user_env_keys(env_vars: &BTreeMap<String, String>) -> Result<(),
     reserved.dedup();
     if !reserved.is_empty() {
         return Err(format!(
-            "the following env vars are reserved by Buzz and cannot be overridden: {}",
+            "the following env vars are reserved by Carryforth and cannot be overridden: {}",
             reserved.join(", ")
         ));
     }
@@ -262,7 +262,7 @@ pub(crate) fn merged_user_env(
     merged.retain(|k, v| {
         if is_reserved_env_key(k) {
             eprintln!(
-                "buzz-desktop: ignoring reserved env var `{k}` from persona/agent overrides"
+                "carryforth-desktop: ignoring reserved env var `{k}` from persona/agent overrides"
             );
             return false;
         }
@@ -272,7 +272,7 @@ pub(crate) fn merged_user_env(
             // smuggle a reserved key past us via `=`-in-key tricks. See
             // `is_well_formed_env_key` for the exploit.
             eprintln!(
-                "buzz-desktop: ignoring malformed env var key `{}` from persona/agent overrides",
+                "carryforth-desktop: ignoring malformed env var key `{}` from persona/agent overrides",
                 display_invalid_key(k)
             );
             return false;
@@ -282,13 +282,13 @@ pub(crate) fn merged_user_env(
             // have escaped the value validator; drop them here rather
             // than crash the spawn. We deliberately do NOT log the value.
             eprintln!(
-                "buzz-desktop: ignoring env var `{k}` with NUL byte in value"
+                "carryforth-desktop: ignoring env var `{k}` with NUL byte in value"
             );
             return false;
         }
         if v.len() > MAX_ENV_VALUE_BYTES {
             eprintln!(
-                "buzz-desktop: ignoring env var `{k}` with oversize value ({} bytes > {MAX_ENV_VALUE_BYTES})",
+                "carryforth-desktop: ignoring env var `{k}` with oversize value ({} bytes > {MAX_ENV_VALUE_BYTES})",
                 v.len()
             );
             return false;

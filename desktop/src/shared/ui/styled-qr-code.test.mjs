@@ -11,7 +11,7 @@ const TEST_PAIRING_URI =
 test("renders the Wallet-style QR geometry locally", () => {
   const html = renderToStaticMarkup(
     React.createElement(StyledQrCode, {
-      centerImageSrc: "/app-icon@2x.png",
+      centerImageSrc: "/carryforth.svg",
       title: "Mobile pairing QR code",
       value: TEST_PAIRING_URI,
     }),
@@ -24,7 +24,7 @@ test("renders the Wallet-style QR geometry locally", () => {
     (html.match(/<circle /g) ?? []).length > 100,
     "expected the QR payload to render as individual circular data cells",
   );
-  assert.match(html, /href="\/app-icon@2x\.png"/);
+  assert.match(html, /href="\/carryforth\.svg"/);
 });
 
 test("uses a deterministic lower-density matrix for the same payload", () => {

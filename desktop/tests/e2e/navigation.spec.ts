@@ -317,7 +317,7 @@ test("message links to visible root messages open the thread panel", async ({
   );
 
   const link =
-    "buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
+    "carryforth://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
   await page.getByTestId("message-input").fill(`Root link repro ${link}`);
   await page.getByTestId("send-message").click();
 
@@ -356,7 +356,7 @@ test("message links reopen a closed thread when the same messageId is already in
   await expect(threadPanel).not.toBeVisible();
 
   const link =
-    "buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
+    "carryforth://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
   await page
     .getByTestId("message-input")
     .fill(`Reopen same root link repro ${link}`);

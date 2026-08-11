@@ -65,7 +65,7 @@ pub(crate) async fn post_connect_setup(
     // Start TTS immediately. STT/transcript posting is opt-in and starts only
     // after the user explicitly enables transcription.
     if let Err(e) = maybe_start_tts_pipeline(state).await {
-        eprintln!("buzz-desktop: TTS pipeline failed to start: {e}");
+        eprintln!("carryforth-desktop: TTS pipeline failed to start: {e}");
     }
 
     Ok(())
@@ -301,7 +301,7 @@ pub(crate) fn spawn_transcription_task(
                 match events::build_message(channel_uuid, &t, None, &p_tags, &[], &[], &[]) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("buzz-desktop: STT build_message: {e}");
+                        eprintln!("carryforth-desktop: STT build_message: {e}");
                         continue;
                     }
                 };
@@ -313,7 +313,7 @@ pub(crate) fn spawn_transcription_task(
             let event = match builder.sign_with_keys(&keys) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("buzz-desktop: STT sign event: {e}");
+                    eprintln!("carryforth-desktop: STT sign event: {e}");
                     continue;
                 }
             };
@@ -327,7 +327,7 @@ pub(crate) fn spawn_transcription_task(
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("buzz-desktop: STT NIP-98 auth: {e}");
+                    eprintln!("carryforth-desktop: STT NIP-98 auth: {e}");
                     continue;
                 }
             };
@@ -348,10 +348,10 @@ pub(crate) fn spawn_transcription_task(
                     // Route through relay_error_message so a 429 arms the
                     // admission gate for subsequent relay sends.
                     let msg = crate::relay::relay_error_message(resp).await;
-                    eprintln!("buzz-desktop: STT kind:9 post failed: {msg}");
+                    eprintln!("carryforth-desktop: STT kind:9 post failed: {msg}");
                 }
                 Err(e) => {
-                    eprintln!("buzz-desktop: STT kind:9 post failed: {e}");
+                    eprintln!("carryforth-desktop: STT kind:9 post failed: {e}");
                 }
             }
         }

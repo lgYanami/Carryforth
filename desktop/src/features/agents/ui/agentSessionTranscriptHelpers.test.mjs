@@ -26,8 +26,8 @@ test("parsePromptText returns the empty/Prompt fallback for whitespace-only inpu
 
 test("parsePromptText wraps header-less free text in a single Prompt section", () => {
   // Free text with no `[header]` becomes one "Prompt" section. Since no
-  // section is a "Buzz event", there is no event content to surface, so
-  // userText is empty and the title falls through to "Buzz event".
+  // section is a "Carryforth event", there is no event content to surface, so
+  // userText is empty and the title falls through to "Carryforth event".
   const result = parsePromptText("just some free text");
   assert.deepEqual(
     result.sections.map((s) => s.title),
@@ -35,7 +35,7 @@ test("parsePromptText wraps header-less free text in a single Prompt section", (
   );
   assert.equal(result.sections[0].body, "just some free text");
   assert.equal(result.userText, "");
-  assert.equal(result.userTitle, "Buzz event");
+  assert.equal(result.userTitle, "Carryforth event");
   assert.equal(result.userPubkey, null);
   assert.equal(result.userEventId, null);
 });
@@ -45,7 +45,7 @@ test("parsePromptText extracts event id, content, hex pubkey, and a title-cased 
     "[System]",
     "system preamble here",
     "",
-    "[Buzz event: @mention]",
+    "[Carryforth event: @mention]",
     `Event ID: ${HEX_UPPER}`,
     "Channel: demo",
     `From: Wes (hex: ${HEX})`,
@@ -63,13 +63,13 @@ test("parsePromptText extracts event id, content, hex pubkey, and a title-cased 
   // Both headers become sections.
   assert.deepEqual(
     result.sections.map((s) => s.title),
-    ["System", "Buzz event: @mention"],
+    ["System", "Carryforth event: @mention"],
   );
 });
 
 test("parsePromptText preserves multiline event content in the user bubble text", () => {
   const text = [
-    "[Buzz event: @mention]",
+    "[Carryforth event: @mention]",
     "Event ID: event-1",
     "Channel: agents",
     `From: tho (hex: ${HEX})`,
@@ -101,7 +101,7 @@ test("parsePromptText preserves multiline event content in the user bubble text"
 
 test("parsePromptText lowercases the extracted hex pubkey", () => {
   const text = [
-    "[Buzz event: dm]",
+    "[Carryforth event: dm]",
     `From: Someone (hex: ${HEX_UPPER})`,
     "Content: hi",
   ].join("\n");
@@ -111,9 +111,11 @@ test("parsePromptText lowercases the extracted hex pubkey", () => {
 });
 
 test("parsePromptText yields a null pubkey when From has no hex", () => {
-  const text = ["[Buzz event: note]", "From: Someone", "Content: hi"].join(
-    "\n",
-  );
+  const text = [
+    "[Carryforth event: note]",
+    "From: Someone",
+    "Content: hi",
+  ].join("\n");
 
   const result = parsePromptText(text);
   assert.equal(result.userPubkey, null);
@@ -121,10 +123,10 @@ test("parsePromptText yields a null pubkey when From has no hex", () => {
   assert.equal(result.userTitle, "Note");
 });
 
-test("parsePromptText defaults the title to 'Buzz event' when no kind is present", () => {
-  const text = ["[Buzz event]", "Content: x"].join("\n");
+test("parsePromptText defaults the title to 'Carryforth event' when no kind is present", () => {
+  const text = ["[Carryforth event]", "Content: x"].join("\n");
   const result = parsePromptText(text);
-  assert.equal(result.userTitle, "Buzz event");
+  assert.equal(result.userTitle, "Carryforth event");
 });
 
 test("parsePromptText leading text before a header becomes a Prompt section", () => {

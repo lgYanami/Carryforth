@@ -1148,10 +1148,3 @@ export const setPreventSleepActive = (active: boolean) =>
 
 export const setAgentManagedProfiles = (enabled: boolean) =>
   invokeTauri("set_agent_managed_profiles", { enabled });
-
-/** Returns true on macOS, Windows, and Linux AppImage installs.
- *  Returns false on Linux non-AppImage packages (e.g. .deb) where
- *  Tauri's updater cannot swap the binary. */
-export function isAutoUpdateSupported(): Promise<boolean> {
-  return invokeTauri<boolean>("is_auto_update_supported");
-}

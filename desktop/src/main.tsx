@@ -3,7 +3,6 @@ import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
 import "@fontsource-variable/inter/wght.css";
 import "@/shared/styles/globals.css";
-import { UpdaterProvider } from "@/features/settings/hooks/UpdaterProvider";
 import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communities/legacyCommunityStorage";
 import { ensureLocalOnlyCommunityStorage } from "@/features/communities/communityStorage";
 import { purgeRemovedCommunityClientState } from "@/features/communities/localCommunityCleanup";
@@ -83,9 +82,7 @@ function renderApp() {
             <TooltipProvider delayDuration={300}>
               <EmojiBurstProvider>
                 <PoofBurstProvider>
-                  <UpdaterProvider>
-                    <App />
-                  </UpdaterProvider>
+                  <App />
                   <Toaster />
                 </PoofBurstProvider>
               </EmojiBurstProvider>

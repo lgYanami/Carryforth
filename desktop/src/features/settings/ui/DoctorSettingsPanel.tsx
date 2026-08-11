@@ -35,7 +35,7 @@ import { Spinner } from "@/shared/ui/spinner";
 import { Switch } from "@/shared/ui/switch";
 
 const RUNTIME_LOGO_URLS: Record<string, string> = {
-  "buzz-agent": "/app-icon@2x.png",
+  "buzz-agent": "/carryforth.svg",
   claude: "/runtime-icons/claude.png",
   codex: "/runtime-icons/codex.png",
   goose: "/runtime-icons/goose.svg",
@@ -453,7 +453,7 @@ function RuntimeRow({
           <AlertDialogHeader>
             <AlertDialogTitle>Update {runtime.label} adapter?</AlertDialogTitle>
             <AlertDialogDescription>
-              This replaces the machine-wide codex-acp adapter. Older Buzz
+              This replaces the machine-wide codex-acp adapter. Older Carryforth
               releases using the legacy adapter may lose community access until
               @zed-industries/codex-acp@0.16.0 is restored.
             </AlertDialogDescription>
@@ -554,7 +554,7 @@ export function DoctorSettingsPanel() {
       <SectionHeader
         className="items-center"
         title="Agent runtimes"
-        description="Choose which agent tools Buzz can use on this device."
+        description="Choose which agent tools Carryforth can use on this device."
         action={
           <Button
             disabled={isRefreshing}

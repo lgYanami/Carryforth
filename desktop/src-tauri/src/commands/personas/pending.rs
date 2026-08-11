@@ -66,7 +66,7 @@ pub(in crate::commands) fn retain_persona_pending(
         )
     })();
     if let Err(e) = result {
-        eprintln!("buzz-desktop: persona-retain: {e}");
+        eprintln!("carryforth-desktop: persona-retain: {e}");
     }
 }
 
@@ -129,6 +129,6 @@ pub(in crate::commands) fn tombstone_persona_pending(
         )
     })();
     if let Err(e) = result {
-        eprintln!("buzz-desktop: persona-tombstone: {e}");
+        eprintln!("carryforth-desktop: persona-tombstone: {e}");
     }
 }

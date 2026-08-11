@@ -139,7 +139,7 @@ export function AgentDefaultsEditor({
     () => sortPersonaRuntimes(runtimesQuery.data ?? []),
     [runtimesQuery.data],
   );
-  // An unset preferred runtime uses the same Buzz Agent-first fallback as
+  // An unset preferred runtime uses the same Built-in Agent-first fallback as
   // deployment. The rendered draft below carries that fallback forward so the
   // next user edit persists the visible harness instead of saving null.
   const selectedRuntime = React.useMemo(() => {

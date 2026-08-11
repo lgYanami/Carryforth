@@ -1426,7 +1426,7 @@ function createMarkdownComponents(
       );
     }
 
-    // Intercept `buzz://message?channel=…&id=…` links so a click navigates
+    // Intercept `carryforth://message?channel=…&id=…` links so a click navigates
     // in-app instead of opening the URL in the OS browser. http(s) links
     // continue to use the existing target="_blank" behavior.
     if (href) {
@@ -1776,7 +1776,7 @@ function createMarkdownComponents(
       const href = String(children ?? "");
       const parsed = parseMessageLink(href);
       if (!parsed.ok) {
-        // Malformed `buzz://message?…` — render the raw URL as plain text
+        // Malformed `carryforth://message?…` — render the raw URL as plain text
         // rather than a misleading clickable pill.
         return <span data-message-link="">{href}</span>;
       }

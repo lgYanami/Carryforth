@@ -25,7 +25,6 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
-import { UpdateIndicator } from "@/features/settings/UpdateIndicator";
 import type { Channel, UserProfileSummary } from "@/shared/api/types";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
@@ -449,7 +448,6 @@ export function InboxDetailPane({
 
               <TooltipProvider delayDuration={200}>
                 <div className="flex shrink-0 items-center gap-1">
-                  <UpdateIndicator />
                   {channel ? (
                     <ChannelMembersBar
                       channel={channel}

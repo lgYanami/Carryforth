@@ -14,6 +14,7 @@ import {
 } from "@/features/profile/hooks";
 import { NsecMaskedDisplay } from "@/features/onboarding/ui/NsecMaskedDisplay";
 import { getNsec } from "@/shared/api/tauriIdentity";
+import { PRODUCT_NAME } from "@/shared/constants/product";
 import { MaskedAvatarBadgeFrame } from "@/features/profile/ui/MaskedAvatarBadgeFrame";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import {
@@ -569,7 +570,7 @@ export function ProfileSettingsCard({
       <div>
         <SettingsSectionHeader
           title="Profile"
-          description="Update how your name, avatar, and bio appear across Buzz."
+          description={`Update how your name, avatar, and bio appear across ${PRODUCT_NAME}.`}
         />
 
         <div className="space-y-3">

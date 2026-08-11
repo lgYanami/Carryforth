@@ -865,7 +865,7 @@ async fn run_human_action_renewal(
             Ok(Some(head)) => head,
             Ok(None) => break,
             Err(error) => {
-                eprintln!("buzz-desktop: Human Meeting Action renewal read failed: {error}");
+                eprintln!("carryforth-desktop: Human Meeting Action renewal read failed: {error}");
                 delay = HUMAN_ACTION_RENEW_RETRY;
                 continue;
             }
@@ -880,7 +880,7 @@ async fn run_human_action_renewal(
             match prepare_human_action_renewal(&registration.binding, &head) {
                 Ok(event) => prepared = Some(event),
                 Err(error) => {
-                    eprintln!("buzz-desktop: Human Meeting Action renewal stopped: {error}");
+                    eprintln!("carryforth-desktop: Human Meeting Action renewal stopped: {error}");
                     break;
                 }
             }
@@ -915,14 +915,14 @@ async fn run_human_action_renewal(
                 }
                 Err(error) => {
                     eprintln!(
-                        "buzz-desktop: Human Meeting Action renewal receipt needs reconciliation: {error}"
+                        "carryforth-desktop: Human Meeting Action renewal receipt needs reconciliation: {error}"
                     );
                     delay = HUMAN_ACTION_RENEW_RETRY;
                 }
             },
             Err(error) => {
                 eprintln!(
-                    "buzz-desktop: Human Meeting Action renewal submit failed: {}",
+                    "carryforth-desktop: Human Meeting Action renewal submit failed: {}",
                     error.message
                 );
                 if definitive_renewal_error(&error) {

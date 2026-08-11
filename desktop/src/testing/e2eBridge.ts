@@ -208,34 +208,6 @@ type E2eConfig = {
   mock?: {
     /** Advertised HEAD for the first mock project without adding that branch. */
     projectHeadBranch?: string;
-    /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-    builderlabAuth?: {
-      email?: string;
-      name?: string;
-      expiresAt: string;
-    } | null;
-    /** Delay Builderlab login completion so cancellation/retry UI can be tested. */
-    builderlabLoginDelayMs?: number;
-    /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
-    builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
-    /** Structured error returned when onboarding tries to bind the local identity. */
-    builderlabBindError?: { code?: string; message?: string };
-    /** Communities owned by the mocked Builderlab account. */
-    builderlabCommunities?: Array<{
-      id?: string;
-      name?: string;
-      slug?: string;
-      normalized_host?: string;
-      archived_at?: string | null;
-    }>;
-    /** Override the community returned after hosted creation. */
-    builderlabCreatedCommunity?: {
-      id?: string;
-      name?: string;
-      slug?: string;
-      normalized_host?: string;
-      archived_at?: string | null;
-    };
     acpRuntimesCatalog?: RawAcpRuntimeCatalogEntry[];
     /** Catalog returned after a successful mocked install. */
     acpRuntimesCatalogAfterInstall?: RawAcpRuntimeCatalogEntry[];
@@ -325,15 +297,8 @@ type E2eConfig = {
     profileUpdateError?: string;
     profileUpdateErrors?: string[];
     searchProfiles?: MockSearchProfileSeed[];
-    updateAvailable?: boolean;
     updateChannelDelayMs?: number;
-    updateDownloadDelayMs?: number;
     restartDelayMs?: number;
-    updateVersion?: string;
-    /** When false, `is_auto_update_supported` returns false (simulates a
-     *  Linux .deb install where Tauri's updater cannot swap the binary).
-     *  Defaults to true for all existing tests. */
-    autoUpdateSupported?: boolean;
     /** Reject `plugin:opener|open_url` to exercise browser-return fallback UI. */
     openerError?: string;
     /** Delay binding signatures so specs can exercise request supersession. */
@@ -482,18 +447,6 @@ type E2eConfig = {
     // Event IDs that `get_event` should report as definitively not found.
     // Causes `useDraftRootStatus` to classify as `deleted`.
     deletedEventIds?: string[];
-    // Pending community deep links (buzz://join / buzz://connect / buzz://add-community) seeded into
-    // the mocked Rust-side queue. Mirrors the real queue's semantics:
-    // `take_pending_community_deep_link` peeks the head and
-    // `acknowledge_pending_community_deep_link` removes by id. Drives the
-    // pending-invite gate and deep-link drain path in tests.
-    pendingCommunityDeepLinks?: Array<{
-      id: string;
-      kind: "connect" | "join" | "add-community";
-      relayUrl: string;
-      code?: string | null;
-      name?: string | null;
-    }>;
     // When true, `get_identity` returns `lost: true` until `persist_current_identity`
     // or `import_identity` is called. Drives the identity-lost recovery UX in tests.
     identityLost?: boolean;
@@ -2095,7 +2048,7 @@ function buildMockConfigSurface(pubkey: string): {
   };
 
   // Mixed-provenance showcase — top-level rows carry different origins so the
-  // panel witnesses distinct provenance labels in one frame: "Set in Buzz",
+  // panel witnesses distinct provenance labels in one frame: "Set in Carryforth",
   // "Inherited from template", "From config file (...)" and
   // "From environment variable (...)".
   const multiOriginSurface = {
@@ -2157,7 +2110,7 @@ function buildMockConfigSurface(pubkey: string): {
   const buzzAgentSurface = {
     ...gooseSurface,
     runtimeId: "buzz-agent",
-    runtimeLabel: "Buzz Agent",
+    runtimeLabel: "Built-in Agent",
     advanced: [],
     extensions: [],
     sources: {
@@ -5478,25 +5431,6 @@ function resetMockUserStatuses() {
   mockUserStatuses.length = 0;
 }
 
-// Mocked Rust-side pending deep-link queue (see desktop/src-tauri/src/deep_link.rs).
-let mockPendingCommunityDeepLinks: Array<{
-  id: string;
-  kind: string;
-  relayUrl: string;
-  code: string | null;
-  name: string | null;
-}> = [];
-
-function resetMockPendingCommunityDeepLinks(config: E2eConfig | null) {
-  mockPendingCommunityDeepLinks = (
-    config?.mock?.pendingCommunityDeepLinks ?? []
-  ).map((pending) => ({
-    ...pending,
-    code: pending.code ?? null,
-    name: pending.name ?? null,
-  }));
-}
-
 function recordMockUserStatus(event: RelayEvent) {
   const dTag = event.tags.find((tag) => tag[0] === "d")?.[1];
   if (dTag) {
@@ -6418,7 +6352,7 @@ const MOCK_PROJECT_SEEDS = [
     dtag: "buzz",
     name: "buzz",
     description:
-      "Relay, desktop, and mobile clients for the Buzz community platform.",
+      "Relay and desktop clients for the Carryforth community platform.",
     owner: MOCK_IDENTITY_PUBKEY,
     contributors: [ALICE_PUBKEY, BOB_PUBKEY, CHARLIE_PUBKEY],
     activityLevel: 4,
@@ -7788,50 +7722,6 @@ async function handleSetChannelPurpose(
   });
 }
 
-type MockUpdaterChannel = {
-  onmessage?: (event: { event: "Finished" }) => void;
-};
-
-function notifyUpdaterFinished(payload: unknown) {
-  const channel = (payload as { onEvent?: MockUpdaterChannel } | null)?.onEvent;
-  channel?.onmessage?.({ event: "Finished" });
-}
-
-function handleUpdaterCheck(config: E2eConfig | undefined) {
-  if (!config?.mock?.updateAvailable) {
-    return null;
-  }
-
-  const version = config.mock.updateVersion ?? "0.3.18";
-
-  return {
-    rid: 42,
-    currentVersion: "0.3.17",
-    version,
-    date: "2026-06-12T00:00:00Z",
-    body: `Mock update ${version}`,
-    rawJson: null,
-  };
-}
-
-async function handleUpdaterDownload(
-  payload: unknown,
-  config: E2eConfig | undefined,
-) {
-  const delayMs = config?.mock?.updateDownloadDelayMs ?? 0;
-
-  if (delayMs > 0) {
-    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-  }
-
-  notifyUpdaterFinished(payload);
-  return 43;
-}
-
-function handleUpdaterInstall() {
-  return null;
-}
-
 async function handleRestart(config: E2eConfig | undefined) {
   const delayMs = config?.mock?.restartDelayMs ?? 0;
 
@@ -8613,15 +8503,15 @@ async function handleDiscoverAcpRuntimes(
     },
     {
       id: "buzz-agent",
-      label: "Buzz Agent",
+      label: "Built-in Agent",
       avatar_url: "",
       availability: "available",
       command: "buzz-agent",
       binary_path: "/usr/local/bin/buzz-agent",
       default_args: [],
       mcp_command: "buzz-dev-mcp",
-      install_hint: "Ships with the Buzz desktop app.",
-      install_instructions_url: "https://github.com/block/buzz",
+      install_hint: "Ships with the Carryforth desktop app.",
+      install_instructions_url: "",
       can_auto_install: false,
       requires_external_cli: false,
       underlying_cli_path: null,
@@ -9390,7 +9280,7 @@ async function handleStartManagedAgent(
         mockMeshState.models.some((model) => model.id === modelId));
     if (!hasLiveTarget) {
       throw new Error(
-        "Buzz shared compute cannot start because no live member is serving this model.",
+        "Carryforth shared compute cannot start because no live member is serving this model.",
       );
     }
   }
@@ -10806,7 +10696,6 @@ export function maybeInstallE2eTauriMocks() {
   resetMockMesh();
   resetMockUserStatuses();
   resetMockSaveSubscriptions(config);
-  resetMockPendingCommunityDeepLinks(config);
   mockMeetingFloorSubmissions.clear();
   mockMeetingHostSubmissions.clear();
   mockMeetingActionSubmissions.clear();
@@ -11213,62 +11102,6 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
     switch (command) {
-      case "get_builderlab_auth":
-        return activeConfig?.mock?.builderlabAuth ?? null;
-      case "start_builderlab_login": {
-        const delayMs = activeConfig?.mock?.builderlabLoginDelayMs ?? 0;
-        if (delayMs > 0)
-          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-        const nextAuth = activeConfig?.mock?.builderlabAuth ?? {
-          email: "owner@example.com",
-          expiresAt: "2099-01-01T00:00:00Z",
-        };
-        if (activeConfig?.mock) activeConfig.mock.builderlabAuth = nextAuth;
-        return nextAuth;
-      }
-      case "cancel_builderlab_login":
-        return null;
-      case "clear_builderlab_auth":
-        if (activeConfig?.mock) activeConfig.mock.builderlabAuth = null;
-        return null;
-      case "get_builderlab_nostr_identity":
-        return activeConfig?.mock?.builderlabIdentity
-          ? { identity: activeConfig.mock.builderlabIdentity }
-          : { error: { code: "missing_mapping", setup_needed: true } };
-      case "bind_builderlab_nostr_identity": {
-        if (activeConfig?.mock?.builderlabBindError)
-          return { error: activeConfig.mock.builderlabBindError };
-        const activeIdentity = identity ?? DEFAULT_MOCK_IDENTITY;
-        const nextIdentity = {
-          pubkey_hex: activeIdentity.pubkey,
-          npub: `npub1${activeIdentity.pubkey}`,
-        };
-        if (activeConfig?.mock)
-          activeConfig.mock.builderlabIdentity = nextIdentity;
-        return { identity: nextIdentity };
-      }
-      case "delete_builderlab_nostr_identity":
-        if (activeConfig?.mock) activeConfig.mock.builderlabIdentity = null;
-        return {};
-      case "list_builderlab_communities":
-        return {
-          communities: activeConfig?.mock?.builderlabCommunities ?? [],
-        };
-      case "check_builderlab_community_name":
-        return {
-          available: true,
-          normalized_host: `${(payload as { name?: string })?.name ?? "community"}.communities.buzz.xyz`,
-        };
-      case "create_builderlab_community": {
-        const name = (payload as { name?: string })?.name ?? "community";
-        return {
-          community: activeConfig?.mock?.builderlabCreatedCommunity ?? {
-            id: `hosted-${name}`,
-            name,
-            normalized_host: `${name}.communities.buzz.xyz`,
-          },
-        };
-      }
       case "mesh_installed_models":
         return mockMeshState.models;
       case "mesh_node_status":
@@ -11556,7 +11389,7 @@ export function maybeInstallE2eTauriMocks() {
               kind: "blob",
               size: 33120,
               preview_content:
-                "// Smart HTTP git transport\n// Handles upload-pack and receive-pack for Buzz git repos.\n",
+                "// Smart HTTP git transport\n// Handles upload-pack and receive-pack for Relay git repos.\n",
             },
           ],
         };
@@ -11933,20 +11766,6 @@ export function maybeInstallE2eTauriMocks() {
           activeWorkspaceId: null,
           onboardingCompletions: [],
         };
-      case "take_pending_community_deep_link":
-        // Mirrors the Rust queue: peek the head; acknowledge removes it.
-        return mockPendingCommunityDeepLinks[0] ?? null;
-      case "acknowledge_pending_community_deep_link": {
-        const { id } = payload as { id: string };
-        const index = mockPendingCommunityDeepLinks.findIndex(
-          (pending) => pending.id === id,
-        );
-        if (index === -1) {
-          return false;
-        }
-        mockPendingCommunityDeepLinks.splice(index, 1);
-        return true;
-      }
       case "get_relay_http_url":
         return getRelayHttpUrl(activeConfig);
       case "relay_requires_membership":
@@ -12563,7 +12382,7 @@ export function maybeInstallE2eTauriMocks() {
           }
           if (mockMeshState.models.length === 0) {
             throw new Error(
-              "no Buzz shared compute serving members are available",
+              "no Carryforth shared compute serving members are available",
             );
           }
         }
@@ -12980,16 +12799,6 @@ export function maybeInstallE2eTauriMocks() {
       case "plugin:window|set_badge_count":
       case "plugin:window|set_badge_label":
         return null;
-      case "plugin:updater|check":
-        return handleUpdaterCheck(activeConfig);
-      case "plugin:updater|download":
-        return handleUpdaterDownload(payload, activeConfig);
-      case "plugin:updater|install":
-        return handleUpdaterInstall();
-      case "is_auto_update_supported":
-        // Default true so all existing tests continue to use the auto-update
-        // path. Set mock.autoUpdateSupported: false to simulate a .deb install.
-        return activeConfig?.mock?.autoUpdateSupported !== false;
       case "relay_reconnect_hook":
         return null;
       case "relay_reconnect_hook_configured":

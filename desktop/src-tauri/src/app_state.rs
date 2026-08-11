@@ -143,12 +143,12 @@ fn identity_from_env() -> Option<Keys> {
         Ok(nsec) => match Keys::parse(nsec.trim()) {
             Ok(keys) => Some(keys),
             Err(error) => {
-                eprintln!("buzz-desktop: invalid BUZZ_PRIVATE_KEY: {error}");
+                eprintln!("carryforth-desktop: invalid BUZZ_PRIVATE_KEY: {error}");
                 None
             }
         },
         Err(std::env::VarError::NotUnicode(_)) => {
-            eprintln!("buzz-desktop: BUZZ_PRIVATE_KEY contains invalid UTF-8");
+            eprintln!("carryforth-desktop: BUZZ_PRIVATE_KEY contains invalid UTF-8");
             None
         }
         Err(std::env::VarError::NotPresent) => None,
@@ -182,7 +182,7 @@ pub fn build_app_state() -> AppState {
     let keys = match identity_from_env() {
         Some(keys) => {
             eprintln!(
-                "buzz-desktop: configured identity pubkey {}",
+                "carryforth-desktop: configured identity pubkey {}",
                 keys.public_key().to_hex()
             );
             keys
@@ -311,7 +311,7 @@ impl AppState {
                 .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err("identity is in recovery mode; event signing is disabled \
-                 until the identity is restored and Buzz is relaunched"
+                 until the identity is restored and Carryforth is relaunched"
                 .to_string());
         }
         self.keys
@@ -491,7 +491,7 @@ fn resolve_identity_with_store(
                 match Keys::parse(nsec.trim()) {
                     Ok(keyring_keys) => {
                         eprintln!(
-                            "buzz-desktop: persisted identity pubkey {}",
+                            "carryforth-desktop: persisted identity pubkey {}",
                             keyring_keys.public_key().to_hex()
                         );
                         // Check for a leftover identity.key. If it holds a
@@ -506,7 +506,7 @@ fn resolve_identity_with_store(
                                     if file_keys.public_key() != keyring_keys.public_key() =>
                                 {
                                     eprintln!(
-                                        "buzz-desktop: identity.key differs from keyring; \
+                                        "carryforth-desktop: identity.key differs from keyring; \
                                          adopting imported key {}",
                                         file_keys.public_key().to_hex()
                                     );
@@ -524,7 +524,7 @@ fn resolve_identity_with_store(
                                         data_dir,
                                     ) {
                                         eprintln!(
-                                            "buzz-desktop: keyring adoption of identity.key \
+                                            "carryforth-desktop: keyring adoption of identity.key \
                                              failed ({e}); using file key, will retry next boot"
                                         );
                                     }
@@ -537,7 +537,7 @@ fn resolve_identity_with_store(
                                 // cleanup so there is a diagnostic for the lost data.
                                 Err(e) => {
                                     eprintln!(
-                                        "buzz-desktop: leftover identity.key is corrupt ({e}); \
+                                        "carryforth-desktop: leftover identity.key is corrupt ({e}); \
                                          keyring is authoritative, removing"
                                     );
                                     ensure_marker_then_cleanup(data_dir, legacy_path);
@@ -562,7 +562,7 @@ fn resolve_identity_with_store(
                             if let Err(e) = write_migration_marker(&migration_marker_path(data_dir))
                             {
                                 eprintln!(
-                                    "buzz-desktop: keyring present but marker missing; \
+                                    "carryforth-desktop: keyring present but marker missing; \
                                      self-heal marker write failed ({e}), continuing"
                                 );
                             }
@@ -611,7 +611,7 @@ fn resolve_identity_with_store(
                 // than silently starting a fresh identity.
                 let ephemeral = Keys::generate();
                 eprintln!(
-                    "buzz-desktop: identity lost — keyring was empty despite migration marker; \
+                    "carryforth-desktop: identity lost — keyring was empty despite migration marker; \
                      using ephemeral key {}, awaiting user re-import",
                     ephemeral.public_key().to_hex()
                 );
@@ -638,7 +638,7 @@ fn resolve_identity_with_store(
             if !legacy_path.exists() && migration_marker_path(data_dir).exists() {
                 let ephemeral = Keys::generate();
                 eprintln!(
-                    "buzz-desktop: keyring unreachable but migration marker present; \
+                    "carryforth-desktop: keyring unreachable but migration marker present; \
                      booting keyring-locked recovery with ephemeral key {} — \
                      unlock the keyring and relaunch",
                     ephemeral.public_key().to_hex()
@@ -676,9 +676,11 @@ fn recover_from_keyring(
     data_dir: &std::path::Path,
     error: &str,
 ) -> Result<ResolvedIdentity, String> {
-    eprintln!("buzz-desktop: corrupt nsec in keyring ({error}), clearing and recovering from file");
+    eprintln!(
+        "carryforth-desktop: corrupt nsec in keyring ({error}), clearing and recovering from file"
+    );
     if let Err(e) = store.delete(IDENTITY_KEY_NAME) {
-        eprintln!("buzz-desktop: failed to clear corrupt keyring value: {e}");
+        eprintln!("carryforth-desktop: failed to clear corrupt keyring value: {e}");
     }
     if legacy_path.exists() {
         if let Some(keys) = migrate_identity_file(store, legacy_path, data_dir)? {
@@ -694,7 +696,7 @@ fn recover_from_keyring(
     if migration_marker_path(data_dir).exists() {
         let ephemeral = Keys::generate();
         eprintln!(
-            "buzz-desktop: identity lost — keyring had corrupt data and no valid identity.key \
+            "carryforth-desktop: identity lost — keyring had corrupt data and no valid identity.key \
              backup; prior identity (migration marker present) is unrecoverable; \
              using ephemeral key {}, awaiting user re-import",
             ephemeral.public_key().to_hex()
@@ -722,7 +724,7 @@ fn load_file_or_generate(
         match load_key_file(legacy_path) {
             Ok(keys) => {
                 eprintln!(
-                    "buzz-desktop: persisted identity pubkey {}",
+                    "carryforth-desktop: persisted identity pubkey {}",
                     keys.public_key().to_hex()
                 );
                 return Ok(keys);
@@ -733,7 +735,7 @@ fn load_file_or_generate(
     let keys = Keys::generate();
     save_key_file(legacy_path, &keys)?;
     eprintln!(
-        "buzz-desktop: generated and saved identity pubkey {}",
+        "carryforth-desktop: generated and saved identity pubkey {}",
         keys.public_key().to_hex()
     );
     Ok(keys)
@@ -750,7 +752,9 @@ fn migrate_identity_file(
     let keys = match load_key_file(legacy_path) {
         Ok(keys) => keys,
         Err(error) => {
-            eprintln!("buzz-desktop: corrupt identity.key during migration ({error}), skipping");
+            eprintln!(
+                "carryforth-desktop: corrupt identity.key during migration ({error}), skipping"
+            );
             return Ok(None);
         }
     };
@@ -779,15 +783,15 @@ fn migrate_identity_file(
     let marker_path = migration_marker_path(data_dir);
     if let Err(e) = write_migration_marker(&marker_path) {
         eprintln!(
-            "buzz-desktop: keyring import ok but failed to write migration marker ({e}); \
+            "carryforth-desktop: keyring import ok but failed to write migration marker ({e}); \
              keeping identity.key so the key is not stranded"
         );
         return Ok(Some(keys));
     }
     if let Err(e) = std::fs::remove_file(legacy_path) {
-        eprintln!("buzz-desktop: keyring import ok but failed to delete identity.key: {e}");
+        eprintln!("carryforth-desktop: keyring import ok but failed to delete identity.key: {e}");
     } else {
-        eprintln!("buzz-desktop: migrated identity key into OS keyring");
+        eprintln!("carryforth-desktop: migrated identity key into OS keyring");
     }
     Ok(Some(keys))
 }
@@ -834,7 +838,7 @@ fn persist_identity_to_keyring(
         if !legacy_path.exists() {
             if let Err(write_err) = save_key_file(legacy_path, keys) {
                 eprintln!(
-                    "buzz-desktop: keyring ok but marker write failed ({e}) and \
+                    "carryforth-desktop: keyring ok but marker write failed ({e}) and \
                      identity.key write also failed ({write_err}); key may be unrecoverable"
                 );
                 return Err(format!(
@@ -844,13 +848,13 @@ fn persist_identity_to_keyring(
                 ));
             } else {
                 eprintln!(
-                    "buzz-desktop: keyring ok but marker write failed ({e}); \
+                    "carryforth-desktop: keyring ok but marker write failed ({e}); \
                      wrote identity.key as fallback so the key is not stranded"
                 );
             }
         } else {
             eprintln!(
-                "buzz-desktop: keyring ok but marker write failed ({e}); \
+                "carryforth-desktop: keyring ok but marker write failed ({e}); \
                  keeping existing identity.key so the key is not stranded"
             );
         }
@@ -859,7 +863,9 @@ fn persist_identity_to_keyring(
 
     if legacy_path.exists() {
         if let Err(e) = std::fs::remove_file(legacy_path) {
-            eprintln!("buzz-desktop: keyring write ok but failed to delete identity.key: {e}");
+            eprintln!(
+                "carryforth-desktop: keyring write ok but failed to delete identity.key: {e}"
+            );
         }
     }
 
@@ -880,7 +886,7 @@ fn persist_imported_identity_impl(
         Ok(()) => Ok(()),
         Err(e) => {
             eprintln!(
-                "buzz-desktop: keyring write failed during import ({e}), \
+                "carryforth-desktop: keyring write failed during import ({e}), \
                  falling back to identity.key"
             );
             save_key_file(legacy_path, keys)
@@ -949,14 +955,14 @@ fn generate_and_persist(
         let marker_path = migration_marker_path(data_dir);
         if let Err(e) = write_migration_marker(&marker_path) {
             eprintln!(
-                "buzz-desktop: stored identity in keyring but failed to write migration marker \
+                "carryforth-desktop: stored identity in keyring but failed to write migration marker \
                  ({e}); saving identity.key fallback so the key is not stranded"
             );
             save_key_file(legacy_path, &keys)?;
         }
     }
     eprintln!(
-        "buzz-desktop: generated and saved identity pubkey {}",
+        "carryforth-desktop: generated and saved identity pubkey {}",
         keys.public_key().to_hex()
     );
     Ok(keys)
@@ -979,7 +985,9 @@ fn store_key_preferring_keyring(
     match store.store(IDENTITY_KEY_NAME, &nsec) {
         Ok(()) => Ok(PersistBackend::Keyring),
         Err(keyring_err) => {
-            eprintln!("buzz-desktop: keyring write failed ({keyring_err}), using file fallback");
+            eprintln!(
+                "carryforth-desktop: keyring write failed ({keyring_err}), using file fallback"
+            );
             save_key_file(legacy_path, keys)?;
             Ok(PersistBackend::File)
         }
@@ -998,7 +1006,7 @@ fn ensure_marker_then_cleanup(data_dir: &std::path::Path, legacy_path: &std::pat
         || write_migration_marker(&marker_path)
             .map_err(|e| {
                 eprintln!(
-                    "buzz-desktop: keyring present but marker missing; \
+                    "carryforth-desktop: keyring present but marker missing; \
                      failed to write marker ({e}), keeping identity.key"
                 );
             })
@@ -1016,8 +1024,10 @@ fn cleanup_leftover_identity_file(legacy_path: &std::path::Path) {
         return;
     }
     match std::fs::remove_file(legacy_path) {
-        Ok(()) => eprintln!("buzz-desktop: removed leftover identity.key (key is in keyring)"),
-        Err(e) => eprintln!("buzz-desktop: failed to remove leftover identity.key: {e}"),
+        Ok(()) => {
+            eprintln!("carryforth-desktop: removed leftover identity.key (key is in keyring)")
+        }
+        Err(e) => eprintln!("carryforth-desktop: failed to remove leftover identity.key: {e}"),
     }
 }
 
@@ -1032,7 +1042,7 @@ fn quarantine_corrupt_key(key_path: &std::path::Path, data_dir: &std::path::Path
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let bad_name = format!("identity.key.bad.{ts}");
-    eprintln!("buzz-desktop: corrupt identity.key ({error}), quarantining to {bad_name}");
+    eprintln!("carryforth-desktop: corrupt identity.key ({error}), quarantining to {bad_name}");
     let bad_path = data_dir.join(bad_name);
     if std::fs::rename(key_path, &bad_path).is_err() {
         let _ = std::fs::remove_file(key_path);

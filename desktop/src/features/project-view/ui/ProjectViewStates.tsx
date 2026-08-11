@@ -104,7 +104,7 @@ export function ProjectViewLoadingState() {
 export function ProjectViewUnsupportedState() {
   return (
     <ProjectViewState
-      description="This Relay does not advertise the Project View protocol. Existing Projects and other Buzz features are unaffected."
+      description="This Relay does not advertise the Project View protocol. Existing Projects and other Carryforth features are unaffected."
       icon={<CircleOff className="h-5 w-5" />}
       title="View is not supported by this Relay"
     />
@@ -162,7 +162,7 @@ export function ProjectViewIntegrityFailureState({
           {retrying ? "Checking again…" : "Verify again"}
         </Button>
       }
-      description="Buzz rejected the snapshot because its verified metadata and assembled objects do not describe one safe, consistent View. No partial project data is being shown."
+      description="The Relay rejected the snapshot because its verified metadata and assembled objects do not describe one safe, consistent View. No partial project data is being shown."
       diagnostic={diagnostic}
       icon={<ShieldX className="h-5 w-5" />}
       title="View integrity check failed"

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// Standalone Playwright screenshot helper for the Buzz desktop app.
+// Standalone Playwright screenshot helper for the Carryforth desktop app.
 //
 // Launches headless Chromium with the E2E mock bridge pre-injected (same
 // setup as installMockBridge in bridge.ts), navigates to a route, optionally
@@ -21,7 +21,6 @@
 //   --viewport <WxH>           Viewport dimensions (default: 1280x720)
 //   --outdir <path>            Output directory (default: test-results/screenshots)
 //   --messages <path>          JSON file with messages to inject before capture
-//   --update-ready             Mock an available update so the sidebar update card renders
 
 import { parseArgs } from "node:util";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -42,7 +41,6 @@ const { values: args } = parseArgs({
     outdir: { type: "string", default: "test-results/screenshots" },
     messages: { type: "string" },
     "local-storage": { type: "string", multiple: true, default: [] },
-    "update-ready": { type: "boolean", default: false },
   },
   strict: true,
 });
@@ -140,37 +138,31 @@ if (localStorageSeeds.length > 0) {
 }
 
 // Install E2E mock bridge config + MockNotification (mirrors installBridge in bridge.ts)
-await page.addInitScript(
-  ({ updateReady }) => {
-    class MockNotification extends EventTarget {
-      static permission = "granted";
-      static async requestPermission() {
-        return "granted";
-      }
-      body;
-      onclick = null;
-      title;
-      constructor(title, options) {
-        super();
-        this.title = title;
-        this.body = options?.body ?? null;
-      }
-      close() {}
+await page.addInitScript(() => {
+  class MockNotification extends EventTarget {
+    static permission = "granted";
+    static async requestPermission() {
+      return "granted";
     }
-    Object.defineProperty(window, "Notification", {
-      configurable: true,
-      value: MockNotification,
-      writable: true,
-    });
+    body;
+    onclick = null;
+    title;
+    constructor(title, options) {
+      super();
+      this.title = title;
+      this.body = options?.body ?? null;
+    }
+    close() {}
+  }
+  Object.defineProperty(window, "Notification", {
+    configurable: true,
+    value: MockNotification,
+    writable: true,
+  });
 
-    window.__BUZZ_E2E__ = {
-      mode: "mock",
-      ...(updateReady ? { mock: { updateAvailable: true } } : {}),
-    };
-    window.__BUZZ_E2E_APP_BADGE_COUNT__ = 0;
-  },
-  { updateReady: args["update-ready"] },
-);
+  window.__BUZZ_E2E__ = { mode: "mock" };
+  window.__BUZZ_E2E_APP_BADGE_COUNT__ = 0;
+});
 
 try {
   if (args.messages) {

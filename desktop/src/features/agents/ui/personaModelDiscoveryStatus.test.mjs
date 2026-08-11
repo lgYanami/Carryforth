@@ -25,9 +25,9 @@ test("model discovery status names missing OpenAI-compatible credentials", () =>
   assert.match(status?.message ?? "", /OpenAI models/);
 });
 
-test("Buzz shared compute names the empty state and next action", () => {
+test("Carryforth shared compute names the empty state and next action", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("no Buzz shared compute serving members are available"),
+    new Error("no Carryforth shared compute serving members are available"),
     "relay-mesh",
   );
 
@@ -36,27 +36,31 @@ test("Buzz shared compute names the empty state and next action", () => {
   assert.match(status?.message ?? "", /Settings > Compute/);
 });
 
-test("Buzz shared compute distinguishes relay lookup failures", () => {
+test("Carryforth shared compute distinguishes relay lookup failures", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("Buzz shared compute model discovery failed: relay offline"),
+    new Error(
+      "Carryforth shared compute model discovery failed: relay offline",
+    ),
     "relay-mesh",
   );
 
   assert.equal(status?.tone, "warning");
   assert.match(status?.message ?? "", /couldn't check shared compute/);
-  assert.match(status?.message ?? "", /relay connection/);
+  assert.match(status?.message ?? "", /relay connection/i);
 });
 
-test("Buzz shared compute names a missing relay member roster", () => {
+test("Carryforth shared compute names a missing relay member roster", () => {
   const status = formatModelDiscoveryErrorStatus(
-    new Error("Buzz shared compute is waiting for the current member roster"),
+    new Error(
+      "Carryforth shared compute is waiting for the current member roster",
+    ),
     "relay-mesh",
   );
 
   assert.equal(status?.tone, "warning");
-  assert.match(status?.message ?? "", /waiting for the relay's member roster/);
+  assert.match(status?.message ?? "", /waiting for the relay's member roster/i);
   assert.match(status?.message ?? "", /membership configuration/);
-  assert.doesNotMatch(status?.message ?? "", /relay connection/);
+  assert.doesNotMatch(status?.message ?? "", /relay connection/i);
 });
 
 test("model discovery status stays quiet for missing Databricks defaults", () => {

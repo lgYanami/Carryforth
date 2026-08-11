@@ -268,7 +268,7 @@ fn log_progress(
 ) {
     let now_ms = local_now_ms();
     eprintln!(
-        "buzz-desktop: Human Meeting Grant renewal meeting={} grant={} progress_seq={} outcome={} soft_remaining_ms={} hard_remaining_ms={}",
+        "carryforth-desktop: Human Meeting Grant renewal meeting={} grant={} progress_seq={} outcome={} soft_remaining_ms={} hard_remaining_ms={}",
         binding.meeting_id,
         binding.grant_id,
         progress_seq,
@@ -323,14 +323,14 @@ async fn run_human_grant_renewal(
             Ok(Some(head)) => head,
             Ok(None) => {
                 eprintln!(
-                    "buzz-desktop: Human Meeting Grant renewal stopped meeting={} grant={} reason=grant_not_active",
+                    "carryforth-desktop: Human Meeting Grant renewal stopped meeting={} grant={} reason=grant_not_active",
                     registration.binding.meeting_id, registration.binding.grant_id
                 );
                 break;
             }
             Err(error) => {
                 eprintln!(
-                    "buzz-desktop: Human Meeting Grant renewal read failed meeting={} grant={} error={error}",
+                    "carryforth-desktop: Human Meeting Grant renewal read failed meeting={} grant={} error={error}",
                     registration.binding.meeting_id, registration.binding.grant_id
                 );
                 delay = RENEW_RETRY_DELAY;
@@ -359,7 +359,7 @@ async fn run_human_grant_renewal(
                 Ok(event) => prepared = Some(event),
                 Err(error) => {
                     eprintln!(
-                        "buzz-desktop: Human Meeting Grant renewal stopped meeting={} grant={} reason=prepare_failed error={error}",
+                        "carryforth-desktop: Human Meeting Grant renewal stopped meeting={} grant={} reason=prepare_failed error={error}",
                         registration.binding.meeting_id, registration.binding.grant_id
                     );
                     break;
@@ -409,7 +409,7 @@ async fn run_human_grant_renewal(
                     }
                     Err(error) => {
                         eprintln!(
-                        "buzz-desktop: Human Meeting Grant renewal receipt needs reconciliation meeting={} grant={} progress_seq={} error={error}",
+                        "carryforth-desktop: Human Meeting Grant renewal receipt needs reconciliation meeting={} grant={} progress_seq={} error={error}",
                         registration.binding.meeting_id,
                         registration.binding.grant_id,
                         pending.progress_seq,
@@ -420,7 +420,7 @@ async fn run_human_grant_renewal(
             }
             Err(error) => {
                 eprintln!(
-                    "buzz-desktop: Human Meeting Grant renewal submit failed meeting={} grant={} progress_seq={} category={:?} error={}",
+                    "carryforth-desktop: Human Meeting Grant renewal submit failed meeting={} grant={} progress_seq={} category={:?} error={}",
                     registration.binding.meeting_id,
                     registration.binding.grant_id,
                     pending.progress_seq,

@@ -14,7 +14,6 @@ import type * as React from "react";
 import { toast } from "sonner";
 
 import type { ChannelType, ChannelVisibility } from "@/shared/api/types";
-import { UpdateIndicator } from "@/features/settings/UpdateIndicator";
 import { cn } from "@/shared/lib/cn";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { Button } from "@/shared/ui/button";
@@ -163,7 +162,6 @@ export function ChatHeader({
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <UpdateIndicator />
           {actions ? <div className="shrink-0">{actions}</div> : null}
         </div>
       </div>

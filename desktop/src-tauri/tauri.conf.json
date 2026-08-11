@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Buzz",
+  "productName": "Carryforth",
   "version": "0.4.25",
   "identifier": "xyz.block.buzz.app",
   "build": {
@@ -40,12 +40,9 @@
     }
   },
   "plugins": {
-    "updater": {
-      "endpoints": []
-    },
     "deep-link": {
       "desktop": {
-        "schemes": ["buzz"]
+        "schemes": ["carryforth"]
       }
     }
   },
@@ -70,7 +67,6 @@
       "infoPlist": "Info.plist",
       "entitlements": "Entitlements.plist",
       "dmg": {
-        "background": "icons/dmg-background.png",
         "windowSize": {
           "width": 660,
           "height": 532

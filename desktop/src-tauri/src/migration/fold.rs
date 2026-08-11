@@ -27,10 +27,10 @@ pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
         Ok(None) => {}
         Ok(Some(folded)) => {
             eprintln!(
-                "buzz-desktop: persona-store-fold: {folded} definitions folded into the unified store"
+                "carryforth-desktop: persona-store-fold: {folded} definitions folded into the unified store"
             );
         }
-        Err(e) => eprintln!("buzz-desktop: persona-store-fold: {e}"),
+        Err(e) => eprintln!("carryforth-desktop: persona-store-fold: {e}"),
     }
 }
 

@@ -201,18 +201,6 @@ type MockBridgeOptions = {
   projectDocumentReadError?: string;
   projectDocumentMutationError?: string;
   projectDocumentMutationResults?: ProjectDocumentMutationResult[];
-  /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-  builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
-  /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
-  builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
-  /** Communities owned by the mocked Builderlab account. */
-  builderlabCommunities?: Array<{
-    id?: string;
-    name?: string;
-    slug?: string;
-    normalized_host?: string;
-    archived_at?: string | null;
-  }>;
   acpRuntimesCatalog?: Record<string, unknown>[];
   /** Catalog returned after a successful mocked install. */
   acpRuntimesCatalogAfterInstall?: Record<string, unknown>[];
@@ -323,13 +311,7 @@ type MockBridgeOptions = {
   profileUpdateError?: string;
   profileUpdateErrors?: string[];
   searchProfiles?: MockSearchProfileSeed[];
-  updateAvailable?: boolean;
   updateChannelDelayMs?: number;
-  updateDownloadDelayMs?: number;
-  updateVersion?: string;
-  /** Set to false to simulate a Linux .deb install where auto-update is not
-   *  supported. Defaults to true. See e2eBridge mock.autoUpdateSupported. */
-  autoUpdateSupported?: boolean;
   /** Reject browser opener calls to exercise manual pairing fallback UI. */
   openerError?: string;
   /** Delay binding signatures so specs can exercise request supersession. */
@@ -445,18 +427,6 @@ type MockBridgeOptions = {
    * invoked. Drives the keyring-locked screen in tests.
    */
   identityLocked?: boolean;
-  /**
-   * Pending community deep links seeded into the mocked Rust-side queue.
-   * The frontend drains these on boot into onboarding or an editable Add
-   * Community prefill.
-   */
-  pendingCommunityDeepLinks?: Array<{
-    id: string;
-    kind: "connect" | "join" | "add-community";
-    relayUrl: string;
-    code?: string | null;
-    name?: string | null;
-  }>;
   /**
    * Global agent config returned by `get_global_agent_config`. Defaults to
    * an empty config (no provider, model, or env vars) if not specified.

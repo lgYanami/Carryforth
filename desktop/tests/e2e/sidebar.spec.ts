@@ -84,6 +84,19 @@ test("community menu exposes only local actions", async ({ page }) => {
   ).toHaveCount(0);
 });
 
+test("settings omit retired remote product surfaces", async ({ page }) => {
+  await page.goto("/");
+  await openSettings(page);
+
+  await expect(page.getByTestId("settings-nav-updates")).toHaveCount(0);
+  await expect(
+    page.getByText("Hosted communities", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText("Mobile pairing", { exact: true })).toHaveCount(
+    0,
+  );
+});
+
 test("hides Invites settings on open relays", async ({ page }) => {
   await page.goto("/");
   await openSettings(page);
@@ -336,206 +349,4 @@ test("resizes, persists, and snaps to the default sidebar width", async ({
   await expect
     .poll(() => storedSidebarWidth(page))
     .toBe(String(DEFAULT_SIDEBAR_WIDTH));
-});
-
-test("shows a sidebar update card when an update is ready", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await expect(page.getByTestId("app-sidebar")).toBeVisible();
-
-  await page.evaluate(() => {
-    const testWindow = window as Window & {
-      __BUZZ_E2E__?: { mock?: { updateAvailable?: boolean } };
-    };
-
-    testWindow.__BUZZ_E2E__ = {
-      ...(testWindow.__BUZZ_E2E__ ?? {}),
-      mock: {
-        ...(testWindow.__BUZZ_E2E__?.mock ?? {}),
-        restartDelayMs: 500,
-        updateAvailable: true,
-      },
-    };
-  });
-
-  await page.getByTestId("sidebar-profile-card").click();
-  await page.getByTestId("profile-popover-settings").click();
-  await page.getByTestId("settings-nav-updates").click();
-  await page.getByRole("button", { name: "Check for Updates" }).click();
-  await expect(page.getByTestId("settings-panel-updates")).toContainText(
-    "Update downloaded. Click to apply.",
-  );
-  await expect
-    .poll(() =>
-      page.evaluate(() => {
-        const commands =
-          (
-            window as Window & {
-              __BUZZ_E2E_COMMANDS__?: string[];
-            }
-          ).__BUZZ_E2E_COMMANDS__ ?? [];
-        return (
-          commands.includes("plugin:updater|install") ||
-          commands.includes("plugin:process|restart")
-        );
-      }),
-    )
-    .toBe(false);
-
-  await page.getByTestId("settings-back-to-app").click();
-
-  const updateCard = page.getByTestId("sidebar-update-card");
-  await expect(updateCard).toBeVisible();
-  await expect(updateCard).toContainText("Ready to update!");
-  await expect(updateCard).toContainText("Click to update");
-  await expect(page.getByTestId("sidebar-update-now")).toBeVisible();
-  await page.getByTestId("sidebar-update-now").click();
-  await expect(updateCard).toContainText("Updating");
-  await expect(page.getByTestId("sidebar-update-now")).toBeDisabled();
-
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as Window & {
-              __BUZZ_E2E_COMMANDS__?: string[];
-            }
-          ).__BUZZ_E2E_COMMANDS__ ?? [],
-      ),
-    )
-    .toEqual(
-      expect.arrayContaining([
-        "plugin:updater|download",
-        "plugin:updater|install",
-        "plugin:process|restart",
-      ]),
-    );
-
-  const commands = await page.evaluate(
-    () =>
-      (
-        window as Window & {
-          __BUZZ_E2E_COMMANDS__?: string[];
-        }
-      ).__BUZZ_E2E_COMMANDS__ ?? [],
-  );
-  expect(commands.indexOf("plugin:updater|download")).toBeLessThan(
-    commands.indexOf("plugin:updater|install"),
-  );
-  expect(commands.indexOf("plugin:updater|install")).toBeLessThan(
-    commands.indexOf("plugin:process|restart"),
-  );
-});
-
-// Regression test for the sidebar card not reflecting an install started from
-// another surface (follow-up to #1820). The header UpdateIndicator and the
-// sidebar compact card both render in the "ready" state; starting the install
-// from the header must flip the sidebar card's copy too, not just the header's.
-test("reflects an install started from the header update button on the sidebar card", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await expect(page.getByTestId("app-sidebar")).toBeVisible();
-
-  await page.evaluate(() => {
-    const testWindow = window as Window & {
-      __BUZZ_E2E__?: { mock?: { updateAvailable?: boolean } };
-    };
-
-    testWindow.__BUZZ_E2E__ = {
-      ...(testWindow.__BUZZ_E2E__ ?? {}),
-      mock: {
-        ...(testWindow.__BUZZ_E2E__?.mock ?? {}),
-        restartDelayMs: 500,
-        updateAvailable: true,
-      },
-    };
-  });
-
-  await page.getByTestId("sidebar-profile-card").click();
-  await page.getByTestId("profile-popover-settings").click();
-  await page.getByTestId("settings-nav-updates").click();
-  await page.getByRole("button", { name: "Check for Updates" }).click();
-  await expect(page.getByTestId("settings-panel-updates")).toContainText(
-    "Update downloaded. Click to apply.",
-  );
-  await page.getByTestId("settings-back-to-app").click();
-
-  await page.getByTestId("channel-general").click();
-
-  const updateCard = page.getByTestId("sidebar-update-card");
-  await expect(updateCard).toBeVisible();
-  await expect(updateCard).toContainText("Click to update");
-
-  await page
-    .getByTestId("chat-header")
-    .getByRole("button", { name: "Update now" })
-    .click();
-
-  await expect(updateCard).toContainText("Updating");
-  await expect(page.getByTestId("sidebar-update-now")).toBeDisabled();
-});
-
-// Regression test for the Linux .deb auto-update guard (PR #1535).
-// When auto-update is not supported (e.g. Linux .deb install), the update
-// check must surface a "manual-required" card with a GitHub link and
-// AppImage hint, and must NEVER invoke the in-app download or install commands.
-test("shows manual-required update card and never auto-downloads on non-AppImage installs", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await expect(page.getByTestId("app-sidebar")).toBeVisible();
-
-  // Override the bridge to report an update available AND auto-update not
-  // supported. The mock is mutated after page load so the window object is
-  // live (mirrors the ready-card test pattern).
-  await page.evaluate(() => {
-    const testWindow = window as Window & {
-      __BUZZ_E2E__?: {
-        mock?: { updateAvailable?: boolean; autoUpdateSupported?: boolean };
-      };
-    };
-    testWindow.__BUZZ_E2E__ = {
-      ...(testWindow.__BUZZ_E2E__ ?? {}),
-      mock: {
-        ...(testWindow.__BUZZ_E2E__?.mock ?? {}),
-        updateAvailable: true,
-        autoUpdateSupported: false,
-      },
-    };
-  });
-
-  await page.getByTestId("sidebar-profile-card").click();
-  await page.getByTestId("profile-popover-settings").click();
-  await page.getByTestId("settings-nav-updates").click();
-  await page.getByRole("button", { name: "Check for Updates" }).click();
-
-  // Settings panel shows the manual-required state, not "ready".
-  await expect(page.getByTestId("settings-panel-updates")).toContainText(
-    "In-app updates aren't supported on this Linux package",
-  );
-  await expect(page.getByTestId("settings-panel-updates")).toContainText(
-    "AppImage",
-  );
-
-  await page.getByTestId("settings-back-to-app").click();
-
-  // Sidebar card shows the manual update card.
-  const updateCard = page.getByTestId("sidebar-update-card-manual");
-  await expect(updateCard).toBeVisible();
-  await expect(updateCard).toContainText("AppImage");
-
-  // In-app download and install must NEVER have been called.
-  const commands = await page.evaluate(
-    () =>
-      (
-        window as Window & {
-          __BUZZ_E2E_COMMANDS__?: string[];
-        }
-      ).__BUZZ_E2E_COMMANDS__ ?? [],
-  );
-  expect(commands).not.toContain("plugin:updater|download");
-  expect(commands).not.toContain("plugin:updater|install");
 });

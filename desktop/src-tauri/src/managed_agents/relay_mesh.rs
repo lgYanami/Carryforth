@@ -6,7 +6,7 @@ pub const RELAY_MESH_API_KEY_PLACEHOLDER: &str = "buzz-mesh-local";
 pub const RELAY_MESH_PROVIDER_ID: &str = "relay-mesh";
 pub const RELAY_MESH_AUTO_MODEL_ID: &str = "auto";
 
-/// Translate the native Buzz shared compute provider into the OpenAI-compatible
+/// Translate the native Carryforth shared compute provider into the OpenAI-compatible
 /// transport understood by buzz-agent. These are derived runtime details, not
 /// user-owned agent configuration.
 #[cfg(feature = "mesh-llm")]

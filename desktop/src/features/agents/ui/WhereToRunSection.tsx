@@ -7,7 +7,7 @@ import { probeBackendProvider } from "@/shared/api/tauri";
 import { ProviderConfigFields } from "./ProviderConfigFields";
 import { emptyWhereToRunDraft, type WhereToRunDraft } from "./whereToRunIntent";
 
-/** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
+/** Optional remote-backend selector. Carryforth shared compute is an LLM provider, not a run destination. */
 export function WhereToRunSection({
   draft,
   isPending,

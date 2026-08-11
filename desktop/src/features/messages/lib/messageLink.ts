@@ -1,10 +1,12 @@
 /**
- * `buzz://message` link encoding for "Copy link" / deep-link-to-message.
+ * `carryforth://message` link encoding for "Copy link" / deep-link-to-message.
  *
- * Format: `buzz://message?channel=<uuid>&id=<eventId>[&thread=<rootId>]`
+ * Format: `carryforth://message?channel=<uuid>&id=<eventId>[&thread=<rootId>]`
  */
 
-const MESSAGE_LINK_SCHEME = "buzz:";
+import { MESSAGE_DEEP_LINK_SCHEME } from "@/shared/constants/product";
+
+const MESSAGE_LINK_SCHEME = `${MESSAGE_DEEP_LINK_SCHEME}:`;
 const MESSAGE_LINK_HOST = "message";
 
 export type MessageLinkInput = {
@@ -33,7 +35,7 @@ export type MessageLinkParseResult =
   | { ok: false; reason: string };
 
 /**
- * Build a `buzz://message` URL for a given channel + message.
+ * Build a `carryforth://message` URL for a given channel + message.
  *
  * Empty `threadRootId` is treated as "no thread" so callers can pass through
  * the result of `getThreadReference(tags).rootId` without extra null checks.
@@ -56,7 +58,7 @@ export function buildMessageLink(input: MessageLinkInput): string {
 }
 
 /**
- * Parse a `buzz://message?…` URL. Returns a discriminated result so callers can
+ * Parse a `carryforth://message?…` URL. Returns a discriminated result so callers can
  * render a fallback (e.g. a plain link) without throwing.
  */
 export function parseMessageLink(url: string): MessageLinkParseResult {
@@ -70,7 +72,7 @@ export function parseMessageLink(url: string): MessageLinkParseResult {
   if (parsed.protocol !== MESSAGE_LINK_SCHEME) {
     return { ok: false, reason: "wrong-scheme" };
   }
-  // `new URL("buzz://message?…")` puts "message" in `hostname`.
+  // `new URL("carryforth://message?…")` puts "message" in `hostname`.
   if (parsed.hostname !== MESSAGE_LINK_HOST) {
     return { ok: false, reason: "wrong-host" };
   }
@@ -100,7 +102,9 @@ export function parseMessageLink(url: string): MessageLinkParseResult {
  */
 export function isMessageLink(href: string | undefined | null): boolean {
   if (!href) return false;
-  return href.startsWith("buzz://message?") || href === "buzz://message";
+  return (
+    href.startsWith("carryforth://message?") || href === "carryforth://message"
+  );
 }
 
 type MessageLinkRenderInput = {
@@ -115,7 +119,7 @@ export type MessageLinkRenderTarget =
 
 /**
  * Centralizes how markdown-rendered anchors map to message-link UI. Both
- * CommonMark autolinks (`<buzz://message?...>`) and explicitly labeled links
+ * CommonMark autolinks (`<carryforth://message?...>`) and explicitly labeled links
  * arrive as anchors; autolinks have label === href and should render as pills,
  * while intentionally labeled links keep their label.
  */

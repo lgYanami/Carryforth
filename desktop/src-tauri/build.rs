@@ -5,15 +5,12 @@ include!("src/commands/reconnect_hook_config.rs");
 use base64::Engine as _;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_PUBLIC_KEY");
-    println!("cargo:rerun-if-env-changed=BUZZ_UPDATER_ENDPOINT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_BUZZ_AGENT_PROVIDER");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_BUZZ_AGENT_MODEL");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_ENV");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_RELAY_RECONNECT_CMD");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_OBSERVER_ARCHIVE_DEFAULT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT");
-    println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
 
     if let Ok(provider) = std::env::var("BUZZ_BUILD_BUZZ_AGENT_PROVIDER") {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_BUZZ_AGENT_PROVIDER={provider}");
@@ -77,19 +74,6 @@ fn main() {
     // leave this unset → default OFF.
     if std::env::var("BUZZ_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT").is_ok() {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT=1");
-    }
-
-    let updater_public_key = std::env::var("BUZZ_UPDATER_PUBLIC_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let updater_endpoint = std::env::var("BUZZ_UPDATER_ENDPOINT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    if updater_public_key.is_some() && updater_endpoint.is_some() {
-        println!("cargo:rustc-cfg=buzz_updater_enabled");
     }
 
     // Cargo test executables get no embedded Windows manifest (tauri_build

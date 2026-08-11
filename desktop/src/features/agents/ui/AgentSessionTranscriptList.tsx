@@ -23,7 +23,7 @@ import {
 } from "@/shared/ui/dialog";
 import { Toggle } from "@/shared/ui/toggle";
 import { AnimatedCount } from "@/shared/ui/AnimatedCount";
-import { FuzzyLogo } from "@/shared/ui/buzz-logo/FuzzyLogo";
+import { CarryforthMark } from "@/shared/ui/carryforth-logo/CarryforthMark";
 import type { PromptSection, TranscriptItem } from "./agentSessionTypes";
 import { TurnLivenessIndicator } from "./TurnLivenessIndicator";
 import { PromptSectionList as PromptContextSections } from "./PromptSectionAccordion";
@@ -208,11 +208,9 @@ export function AgentSessionTranscriptList({
       <div className={scrollContainerClassNames}>
         <div className="flex h-full min-h-40 flex-col items-center justify-center px-6 py-10 text-center">
           {isLoading ? (
-            <FuzzyLogo
+            <CarryforthMark
               ariaLabel="Waiting for ACP activity"
-              className="mx-auto text-muted-foreground"
-              fuzz={false}
-              loop
+              className="mx-auto h-10 w-10 animate-pulse text-muted-foreground"
             />
           ) : (
             <>

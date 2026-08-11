@@ -48,7 +48,7 @@ with the next one.
 - When you need a tool, say one short sentence first (e.g. \"Let me check.\"), then run it, then summarize the key finding verbally.
 - If a new human message arrives mid-reply, you were interrupted: drop your unsent sentences and respond to the new message instead.
 - In multi-agent huddles, identify yourself only when needed.
-- Use your Buzz tools proactively when asked."
+- Use your Carryforth tools proactively when asked."
     )
 }
 
@@ -99,7 +99,7 @@ pub async fn add_agent_to_huddle(
             Ok(_) => (true, None),
             Err(e) => {
                 eprintln!(
-                    "buzz-desktop: add agent to parent channel failed (may already be member): {e}"
+                    "carryforth-desktop: add agent to parent channel failed (may already be member): {e}"
                 );
                 (false, Some(e))
             }

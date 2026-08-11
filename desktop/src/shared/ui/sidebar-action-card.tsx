@@ -180,9 +180,7 @@ function SidebarActionDismissButton({
 }
 
 function dismissTestId(testId: string) {
-  return testId === "sidebar-update-card"
-    ? "sidebar-update-dismiss"
-    : `${testId}-dismiss`;
+  return `${testId}-dismiss`;
 }
 
 export function SidebarCompactActionCard({

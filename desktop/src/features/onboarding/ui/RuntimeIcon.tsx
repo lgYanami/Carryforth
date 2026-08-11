@@ -4,7 +4,7 @@ import { TerminalSquare } from "lucide-react";
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { useTheme } from "@/shared/theme/ThemeProvider";
-import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
+import { CarryforthMark } from "@/shared/ui/carryforth-logo/CarryforthMark";
 import chatgptLogoUrl from "../assets/harness-logos/chatgpt.png?inline";
 import claudeLogoUrl from "../assets/harness-logos/claude.png?inline";
 import gooseLogoUrl from "../assets/harness-logos/goose.png?inline";
@@ -15,14 +15,14 @@ const RUNTIME_LOGOS: Record<string, string> = {
   goose: gooseLogoUrl,
 };
 
-function isBuzzRuntime(runtime: AcpRuntimeCatalogEntry): boolean {
+function isBuiltInRuntime(runtime: AcpRuntimeCatalogEntry): boolean {
   return runtime.id.trim().toLowerCase() === "buzz-agent";
 }
 
 export function getRuntimeDisplayLabel(
   runtime: AcpRuntimeCatalogEntry,
 ): string {
-  return isBuzzRuntime(runtime) ? "Buzz" : runtime.label;
+  return isBuiltInRuntime(runtime) ? "Built-in Agent" : runtime.label;
 }
 
 function getRuntimeLogoUrl(runtime: AcpRuntimeCatalogEntry): string | null {
@@ -42,8 +42,8 @@ export function RuntimeIcon({
   const imageUrl = runtimeLogoUrl ?? runtime.avatarUrl;
   const shouldForceForegroundColor = !runtimeLogoUrl && runtime.id === "goose";
 
-  if (isBuzzRuntime(runtime)) {
-    return <BuzzMark className="h-7 w-10 text-foreground" />;
+  if (isBuiltInRuntime(runtime)) {
+    return <CarryforthMark className="h-7 w-10 text-foreground" />;
   }
 
   if (imageUrl && !imageFailed) {

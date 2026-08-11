@@ -324,7 +324,7 @@ function AgentDeleteConfirmDialog({
           </li>
           <li>
             {isProviderAgent
-              ? "Requests remote deletion; if it is online, Buzz first sends a shutdown command when possible. If the deployment cannot be reached through a channel, the remote process may keep running without local management."
+              ? "Requests runtime deletion; when possible, Carryforth first sends a shutdown command. If the process cannot be reached through a channel, it may keep running without local management."
               : "Stops any local agent process before deleting the record"}
           </li>
         </ul>

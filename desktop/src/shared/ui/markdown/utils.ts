@@ -166,7 +166,7 @@ export function isInsideHiddenSpoiler(element: Element): boolean {
 }
 
 /**
- * `urlTransform` for `<ReactMarkdown>` that preserves `buzz://message?…`
+ * `urlTransform` for `<ReactMarkdown>` that preserves `carryforth://message?…`
  * links. The default transform strips unknown schemes (returns `""`) before
  * the `a` component override can see them, which would break copy → paste →
  * click end-to-end. Everything else delegates to `defaultUrlTransform`.

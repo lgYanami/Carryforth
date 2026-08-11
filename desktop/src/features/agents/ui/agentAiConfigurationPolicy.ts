@@ -38,7 +38,7 @@ export function agentAiConfigurationPairForMode({
  * Whether a Customize (explicit) AI pair is complete enough to submit.
  *
  * `needsProviderSelection` reflects whether the provider picker is actually
- * shown to the user: Buzz Agent / Goose expose it (and runtime-less legacy /
+ * shown to the user: Built-in Agent / Goose expose it (and runtime-less legacy /
  * builtin definitions do too), so both provider and model are required, while
  * Codex / Claude drive their own provider and hide the field, so requiring a
  * provider there would gate Save on a value the user can never set (the

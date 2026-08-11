@@ -149,7 +149,7 @@ fn install_acp_runtime_blocking(runtime_id: &str) -> Result<InstallRuntimeResult
     // Phase 1: Install CLI if missing and commands are available.
     // Today every entry in `cli_install_commands` is a curl-pipe; npm-backed
     // adapter installs live in Phase 2 below where they are rewritten to a
-    // Buzz-private prefix before execution.
+    // Carryforth-private prefix before execution.
     if let Some(cli) = runtime.underlying_cli {
         if crate::managed_agents::resolve_command(cli).is_none() {
             for cmd in runtime.cli_install_commands_for_os() {
@@ -477,12 +477,12 @@ async fn restart_single_agent_after_install(
     let runtime_keys = match stop_result {
         Ok(Ok(runtime_keys)) => runtime_keys,
         Ok(Err(e)) => {
-            eprintln!("buzz-desktop: install_acp_runtime: skipping restart of {pubkey}: {e}");
+            eprintln!("carryforth-desktop: install_acp_runtime: skipping restart of {pubkey}: {e}");
             return InstallRestartOutcome::Skipped;
         }
         Err(e) => {
             eprintln!(
-                "buzz-desktop: install_acp_runtime: spawn_blocking failed for stop of {pubkey}: {e}"
+                "carryforth-desktop: install_acp_runtime: spawn_blocking failed for stop of {pubkey}: {e}"
             );
             return InstallRestartOutcome::Skipped;
         }
@@ -495,17 +495,17 @@ async fn restart_single_agent_after_install(
     {
         Ok(_) => {
             eprintln!(
-                "buzz-desktop: install_acp_runtime: restarted setup-mode agent {pubkey} after install"
+                "carryforth-desktop: install_acp_runtime: restarted setup-mode agent {pubkey} after install"
             );
             InstallRestartOutcome::Restarted
         }
         Err(e) => {
             eprintln!(
-                "buzz-desktop: install_acp_runtime: failed to start {pubkey} after install: {e}"
+                "carryforth-desktop: install_acp_runtime: failed to start {pubkey} after install: {e}"
             );
             if let Err(save_err) = persist_last_error_on_install(app, pubkey, &e) {
                 eprintln!(
-                    "buzz-desktop: install_acp_runtime: failed to persist last_error for {pubkey}: {save_err}"
+                    "carryforth-desktop: install_acp_runtime: failed to persist last_error for {pubkey}: {save_err}"
                 );
             }
             InstallRestartOutcome::FailedAfterStop

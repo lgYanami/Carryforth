@@ -67,7 +67,7 @@ export function ProjectViewV3SetupGuide({
                 <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
                   The owner reviews the complete bootstrap command, including
                   the Project Profile, initial Goal, governance Role, and
-                  Assignment, then signs and submits it with the Buzz CLI.
+                  Assignment, then signs and submits it with the Carryforth CLI.
                 </p>
                 <code className="mt-3 block overflow-x-auto rounded-lg border border-border/70 bg-background px-3 py-2 text-xs">
                   cf project-view init-v3 --command

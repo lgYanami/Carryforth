@@ -32,7 +32,7 @@ pub fn spawn_event_sync(app: tauri::AppHandle, owner_keys: nostr::Keys) {
         })
         .await
         {
-            eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
+            eprintln!("carryforth-desktop: event-sync: spawn_blocking failed: {e}");
         }
     });
 }
@@ -68,11 +68,11 @@ pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys) {
         Ok(0) => {}
         Ok(migrated) => {
             eprintln!(
-                "buzz-desktop: persona-event-migration: {migrated} personas migrated to retention"
+                "carryforth-desktop: persona-event-migration: {migrated} personas migrated to retention"
             );
         }
         Err(e) => {
-            eprintln!("buzz-desktop: persona-event-migration: {e}");
+            eprintln!("carryforth-desktop: persona-event-migration: {e}");
         }
     }
 }
@@ -212,10 +212,12 @@ pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys) {
     match migrate_teams_in_dir(&base_dir, keys) {
         Ok(0) => {}
         Ok(migrated) => {
-            eprintln!("buzz-desktop: team-event-migration: {migrated} teams migrated to retention");
+            eprintln!(
+                "carryforth-desktop: team-event-migration: {migrated} teams migrated to retention"
+            );
         }
         Err(e) => {
-            eprintln!("buzz-desktop: team-event-migration: {e}");
+            eprintln!("carryforth-desktop: team-event-migration: {e}");
         }
     }
 }

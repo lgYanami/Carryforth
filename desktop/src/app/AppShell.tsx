@@ -583,7 +583,7 @@ export function AppShell() {
       unreadChannelNotificationCount + unreadMeetingIds.size,
   });
 
-  // Dispatch `buzz://message` deep links into the router.
+  // Dispatch `carryforth://message` deep links into the router.
   useMessageDeepLinks();
 
   const handleOpenNewDm = React.useCallback(

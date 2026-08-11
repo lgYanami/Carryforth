@@ -250,9 +250,9 @@ export function MeetingActionFinalizationCard({
         >
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
           <span>
-            Buzz could not retain this action-recording window. The canonical
-            Meeting state is being rechecked and renewal will retry while this
-            exact window remains current.
+            Carryforth could not retain this action-recording window. The
+            canonical Meeting state is being rechecked and renewal will retry
+            while this exact window remains current.
           </span>
         </div>
       ) : null}

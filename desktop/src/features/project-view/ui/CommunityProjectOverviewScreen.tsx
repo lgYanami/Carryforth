@@ -827,7 +827,7 @@ export function CommunityProjectOverviewScreen({
                   Verify again
                 </Button>
               }
-              description="Buzz rejected the snapshot because its verified metadata and assembled objects do not describe one safe, consistent View. No partial project summary is being shown."
+              description="The Relay rejected the snapshot because its verified metadata and assembled objects do not describe one safe, consistent View. No partial project summary is being shown."
               diagnostic={fatalErrorMessage}
               icon={<AlertCircle className="h-5 w-5" />}
               testId="community-project-integrity-failure"

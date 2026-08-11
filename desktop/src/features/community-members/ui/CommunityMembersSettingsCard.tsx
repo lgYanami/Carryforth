@@ -29,7 +29,6 @@ import {
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
-import { CommunityInviteDialog } from "./CommunityInviteDialog";
 
 function formatDisplayName(member: RelayMember, displayName?: string | null) {
   const trimmedDisplayName = displayName?.trim();
@@ -308,7 +307,6 @@ export function CommunityMembersSettingsCard({
     },
   );
   const profiles = profilesQuery.data?.profiles;
-  const [inviteDialogOpen, setInviteDialogOpen] = React.useState(false);
   const [search, setSearch] = React.useState("");
 
   const filteredMembers = React.useMemo(() => {
@@ -334,7 +332,7 @@ export function CommunityMembersSettingsCard({
     return (
       <section className="min-w-0" data-testid="settings-community-members">
         <p className="text-sm text-muted-foreground">
-          Checking invite permissions…
+          Checking community permissions…
         </p>
       </section>
     );
@@ -356,25 +354,18 @@ export function CommunityMembersSettingsCard({
             >
               Manage Roles in View
             </Button>
-          ) : directMembershipAllowed ? (
-            <Button
-              data-testid="community-invite-dialog-trigger"
-              onClick={() => setInviteDialogOpen(true)}
-            >
-              Invite to community
-            </Button>
-          ) : (
+          ) : directMembershipAllowed ? undefined : (
             <Button disabled variant="outline">
               Checking View governance…
             </Button>
           )
         }
-        title="Invites"
+        title="Members"
         description={
           roleGoverned
             ? "Role levels and active tenures are governed in View; direct admin changes and member removal are disabled here."
             : directMembershipAllowed
-              ? "Manage members and community access."
+              ? "Review members with access to this local community."
               : "Membership changes are disabled until View governance can be verified."
         }
       />
@@ -449,13 +440,6 @@ export function CommunityMembersSettingsCard({
           )}
         </div>
       </div>
-
-      {directMembershipAllowed ? (
-        <CommunityInviteDialog
-          onOpenChange={setInviteDialogOpen}
-          open={inviteDialogOpen}
-        />
-      ) : null}
     </section>
   );
 }

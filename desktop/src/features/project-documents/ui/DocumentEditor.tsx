@@ -190,7 +190,8 @@ export function DocumentEditor({
                 {verifiedConflictLatest?.documentRevision ??
                   conflict.currentRevision ??
                   "loading"}
-                . Buzz did not overwrite or automatically rebase your content.
+                . Carryforth did not overwrite or automatically rebase your
+                content.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button

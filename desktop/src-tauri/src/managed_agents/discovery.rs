@@ -16,8 +16,7 @@ pub(crate) use runtime_metadata::KnownAcpRuntime;
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
 const CLAUDE_CODE_AVATAR_URL: &str = "https://anthropic.gallerycdn.vsassets.io/extensions/anthropic/claude-code/2.1.77/1773707456892/Microsoft.VisualStudio.Services.Icons.Default";
 const CODEX_AVATAR_URL: &str = "https://openai.gallerycdn.vsassets.io/extensions/openai/chatgpt/26.5313.41514/1773706730621/Microsoft.VisualStudio.Services.Icons.Default";
-const BUZZ_AGENT_AVATAR_URL: &str =
-    "https://raw.githubusercontent.com/block/buzz/refs/heads/main/crates/buzz-agent/buzz-agent.png";
+const BUILT_IN_AGENT_AVATAR_URL: &str = "/carryforth.svg";
 
 fn common_binary_paths() -> &'static [PathBuf] {
     static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
@@ -79,7 +78,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         adapter_install_commands: &[],
         cli_install_instructions_url: "https://goose-docs.ai/docs/getting-started/installation/",
         adapter_install_instructions_url: "",
-        cli_install_hint: "Buzz requires the Goose CLI; the desktop app alone is not enough.",
+        cli_install_hint: "Carryforth requires the Goose CLI; the desktop app alone is not enough.",
         adapter_install_hint: "",
         skill_dir: Some(".goose/skills"),
         supports_acp_model_switching: false,
@@ -111,7 +110,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         adapter_install_commands: &["npm install -g @agentclientprotocol/claude-agent-acp"],
         cli_install_instructions_url: "https://code.claude.com/docs/en/getting-started",
         adapter_install_instructions_url: "https://github.com/agentclientprotocol/claude-agent-acp",
-        cli_install_hint: "Buzz requires the Claude Code CLI; the desktop app alone is not enough.",
+        cli_install_hint: "Carryforth requires the Claude Code CLI; the desktop app alone is not enough.",
         adapter_install_hint: "Install the Claude Code ACP adapter via npm.",
         skill_dir: Some(".claude/skills"),
         supports_acp_model_switching: false,
@@ -143,7 +142,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         adapter_install_commands: &["npm install -g @agentclientprotocol/codex-acp"],
         cli_install_instructions_url: "https://developers.openai.com/codex/cli/",
         adapter_install_instructions_url: "https://github.com/agentclientprotocol/codex-acp",
-        cli_install_hint: "Buzz requires the Codex CLI; the desktop app alone is not enough.",
+        cli_install_hint: "Carryforth requires the Codex CLI; the desktop app alone is not enough.",
         adapter_install_hint: "Install the Codex ACP adapter via npm.",
         skill_dir: Some(".codex/skills"),
         supports_acp_model_switching: false,
@@ -164,19 +163,19 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     },
     KnownAcpRuntime {
         id: "buzz-agent",
-        label: "Buzz Agent",
+        label: "Built-in Agent",
         commands: &["buzz-agent"],
         aliases: &[],
-        avatar_url: BUZZ_AGENT_AVATAR_URL,
+        avatar_url: BUILT_IN_AGENT_AVATAR_URL,
         mcp_command: Some("buzz-dev-mcp"),
         mcp_hooks: true,
         underlying_cli: None,
         cli_install_commands: &[],
         cli_install_commands_windows: &[],
         adapter_install_commands: &[],
-        cli_install_instructions_url: "https://github.com/block/buzz",
-        adapter_install_instructions_url: "https://github.com/block/buzz",
-        cli_install_hint: "Ships with the Buzz desktop app.",
+        cli_install_instructions_url: "",
+        adapter_install_instructions_url: "",
+        cli_install_hint: "Ships with the Carryforth desktop app.",
         adapter_install_hint: "",
         skill_dir: None,
         supports_acp_model_switching: true,

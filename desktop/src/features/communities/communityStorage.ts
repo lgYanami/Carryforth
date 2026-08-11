@@ -340,7 +340,7 @@ export function deriveCommunityName(relayUrl: string): string {
     const parts = host.split(".");
     // Detect staging environments (e.g. buzz-oss.stage.blox.sqprod.co)
     if (parts.some((p) => p === "stage" || p === "staging")) {
-      return "Buzz (staging)";
+      return "Local Dev";
     }
     // Use the first subdomain segment or the domain itself
     if (parts.length >= 2) {

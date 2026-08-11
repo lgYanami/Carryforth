@@ -23,7 +23,7 @@ const CURATED_LARGE: &str = "gemma-4-26B-A4B-it-UD-Q4_K_M";
 const CURATED_LARGE_SIZE: &str = "17GB";
 const CURATED_LARGE_FILE: &str = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf";
 const CURATED_LARGE_DESCRIPTION: &str =
-    "Gemma 4 26B MoE (4B active) — Buzz default for 64GB+ machines";
+    "Gemma 4 26B MoE (4B active) — Carryforth default for 64GB+ machines";
 const CURATED_SMALL: &str = "Gemma-4-E4B-it-Q4_K_M";
 /// Rated-capacity boundary between the two curated tiers, in GB (marketing
 /// capacity — a "64GB" Mac rates as 64 even though usable AI memory is less).

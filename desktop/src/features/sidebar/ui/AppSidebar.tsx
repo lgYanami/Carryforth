@@ -50,9 +50,6 @@ import {
   useSidebarLoadingShape,
 } from "@/features/sidebar/ui/sidebarLoadingSkeleton";
 import { useDeferredModalOpen } from "@/shared/ui/deferredModalOpen";
-import { SidebarUpdateCard } from "@/features/settings/SidebarUpdateCard";
-import { useUpdaterContext } from "@/features/settings/hooks/UpdaterProvider";
-import { shouldShowSidebarUpdateCard } from "@/features/settings/sidebarUpdateCardVisibility";
 import type { Channel, ChannelVisibility } from "@/shared/api/types";
 import {
   Sidebar,
@@ -131,14 +128,8 @@ export function AppSidebar({
   onUnstarChannel,
 }: AppSidebarProps) {
   const activeWorkingByChannelId = useActiveWorkingChannelsById();
-  const { status: updateStatus } = useUpdaterContext();
-  const canShowSidebarUpdateCard = shouldShowSidebarUpdateCard(updateStatus);
   const { open: sidebarOpen, openMobile } = useSidebar();
   const isMobile = useIsMobile();
-  const [isSidebarUpdateCardDismissed, setIsSidebarUpdateCardDismissed] =
-    React.useState(false);
-  const showSidebarUpdateCard =
-    canShowSidebarUpdateCard && !isSidebarUpdateCardDismissed;
   const [dmActionsMenuOpen, setDmActionsMenuOpen] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   useSidebarScrollLock(scrollRef);
@@ -191,12 +182,6 @@ export function AppSidebar({
     },
     [openModalNextFrame],
   );
-
-  React.useEffect(() => {
-    if (!canShowSidebarUpdateCard) {
-      setIsSidebarUpdateCardDismissed(false);
-    }
-  }, [canShowSidebarUpdateCard]);
 
   // Allow the create-channel dialog to be opened from outside (e.g. the
   // ⌘⇧N global shortcut in AppShell), mirroring the controlled new-DM lift.
@@ -787,13 +772,6 @@ export function AppSidebar({
                 onDismiss={relayConnectionCard.onDismissRelayConnectionCard}
                 onReconnect={relayConnectionCard.onReconnectRelay}
               />
-            ) : null}
-            {showSidebarUpdateCard ? (
-              <div className="mb-2 group-data-[collapsible=icon]:hidden">
-                <SidebarUpdateCard
-                  onDismiss={() => setIsSidebarUpdateCardDismissed(true)}
-                />
-              </div>
             ) : null}
             <SidebarMenu>
               <SidebarMenuItem>

@@ -1,7 +1,6 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
 mod app_state;
 mod archive;
-mod builderlab;
 mod commands;
 mod deep_link;
 mod event_sync;
@@ -19,7 +18,6 @@ mod migration;
 mod model_tests;
 mod models;
 mod native_websocket;
-mod nostr_bind;
 pub mod nostr_convert;
 mod pending_writes;
 mod prevent_sleep;
@@ -32,12 +30,8 @@ mod shutdown;
 mod templates;
 mod util;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
-use builderlab::*;
 use commands::*;
-use deep_link::{
-    acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks,
-};
+use deep_link::handle_deep_link_url;
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
@@ -74,11 +68,11 @@ const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
 
 fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
     if let Err(error) = window.show() {
-        eprintln!("buzz-desktop: failed to reveal main window: {error}");
+        eprintln!("carryforth-desktop: failed to reveal main window: {error}");
         return;
     }
     if let Err(error) = window.set_focus() {
-        eprintln!("buzz-desktop: failed to focus main window: {error}");
+        eprintln!("carryforth-desktop: failed to focus main window: {error}");
     }
 }
 
@@ -88,7 +82,7 @@ fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
     // native backing only across the first visible frames so the previous app
     // cannot show through before WebKit has submitted its first surface.
     if let Err(error) = window.set_background_color(Some(tauri::window::Color(17, 21, 24, 255))) {
-        eprintln!("buzz-desktop: failed to set initial window backing: {error}");
+        eprintln!("carryforth-desktop: failed to set initial window backing: {error}");
     }
 }
 
@@ -96,7 +90,7 @@ fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
 async fn clear_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     if let Err(error) = window.set_background_color(None) {
-        eprintln!("buzz-desktop: failed to clear initial window backing: {error}");
+        eprintln!("carryforth-desktop: failed to clear initial window backing: {error}");
     }
 }
 
@@ -133,7 +127,7 @@ async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tau
         tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
 
-    eprintln!("buzz-desktop: initial window geometry did not settle before reveal timeout");
+    eprintln!("carryforth-desktop: initial window geometry did not settle before reveal timeout");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -174,7 +168,7 @@ pub fn run() {
             }
             // Forward any deep link URLs from the duplicate launch.
             for arg in &argv {
-                if arg.starts_with("buzz://") {
+                if arg.starts_with("carryforth://") {
                     handle_deep_link_url(app, arg);
                 }
             }
@@ -223,7 +217,7 @@ pub fn run() {
                             .is_err()
                             {
                                 eprintln!(
-                                    "buzz-desktop: initial render did not commit before reveal timeout"
+                                    "carryforth-desktop: initial render did not commit before reveal timeout"
                                 );
                             }
 
@@ -334,17 +328,6 @@ pub fn run() {
             .build()
     });
 
-    // Register the updater only in configured release builds; omit it locally.
-    #[cfg(buzz_updater_enabled)]
-    let builder = if cfg!(debug_assertions) {
-        builder
-    } else {
-        builder.plugin(tauri_plugin_updater::Builder::new().build())
-    };
-
-    #[cfg(not(buzz_updater_enabled))]
-    let builder = builder;
-
     let app = builder
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -355,9 +338,6 @@ pub fn run() {
         })
         .manage(build_app_state())
         .manage(ClipboardState::new())
-        .manage(PendingCommunityDeepLinks::default())
-        .manage(BuilderlabSession::default())
-        .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -404,7 +384,7 @@ pub fn run() {
             // memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
-                eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
+                eprintln!("carryforth-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
             }
 
@@ -426,7 +406,7 @@ pub fn run() {
             let owner_keys = match state.keys.lock() {
                 Ok(k) => k.clone(),
                 Err(e) => {
-                    eprintln!("buzz-desktop: fatal: owner keys lock poisoned: {e}");
+                    eprintln!("carryforth-desktop: fatal: owner keys lock poisoned: {e}");
                     std::process::exit(1);
                 }
             };
@@ -438,7 +418,7 @@ pub fn run() {
             // snapshot. Synchronous and best-effort — a failure here must not
             // block launch, but a missing persona is logged loudly inside.
             if let Err(e) = backfill_persona_snapshots(&app_handle) {
-                eprintln!("buzz-desktop: persona-snapshot backfill failed: {e}");
+                eprintln!("carryforth-desktop: persona-snapshot backfill failed: {e}");
             }
 
             // Store the AppHandle so huddle commands can emit `huddle-state-changed`
@@ -481,7 +461,7 @@ pub fn run() {
             // nest directory. Non-fatal: agents fall back to $HOME if nest
             // creation fails.
             if let Err(error) = ensure_nest() {
-                eprintln!("buzz-desktop: failed to create nest: {error}");
+                eprintln!("carryforth-desktop: failed to create nest: {error}");
             }
 
             // Resolve the REPOS symlink from the persisted repos_dir BEFORE
@@ -528,7 +508,7 @@ pub fn run() {
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(parent) = exe.parent() {
                     if let Err(error) = managed_agents::ensure_cli_symlink(parent, is_dev_nest) {
-                        eprintln!("buzz-desktop: failed to create CLI symlink: {error}");
+                        eprintln!("carryforth-desktop: failed to create CLI symlink: {error}");
                     }
                 }
             }
@@ -629,7 +609,9 @@ pub fn run() {
                     let Ok(db_path) = managed_agents::managed_agents_base_dir(&flush_handle)
                         .map(|d| d.join("retention.db"))
                     else {
-                        eprintln!("buzz-desktop: event-flush: cannot resolve retention db path");
+                        eprintln!(
+                            "carryforth-desktop: event-flush: cannot resolve retention db path"
+                        );
                         return;
                     };
                     loop {
@@ -638,7 +620,7 @@ pub fn run() {
                             managed_agents::persona_events::flush_pending_events(&db_path, &state)
                                 .await
                         {
-                            eprintln!("buzz-desktop: event-flush: {e}");
+                            eprintln!("carryforth-desktop: event-flush: {e}");
                         }
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
@@ -648,21 +630,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            take_pending_community_deep_link,
-            acknowledge_pending_community_deep_link,
-            start_builderlab_login,
-            cancel_builderlab_login,
-            get_builderlab_auth,
-            clear_builderlab_auth,
-            get_builderlab_nostr_identity,
-            bind_builderlab_nostr_identity,
-            delete_builderlab_nostr_identity,
-            list_builderlab_communities,
-            check_builderlab_community_name,
-            create_builderlab_community,
-            archive_builderlab_community,
-            unarchive_builderlab_community,
-            transfer_builderlab_community,
             title_bar_double_click,
             get_identity,
             get_nsec,
@@ -721,7 +688,6 @@ pub fn run() {
             connect_acp_runtime,
             discover_managed_agent_prereqs,
             sign_event,
-            sign_nostr_identity_binding,
             sign_out,
             decrypt_observer_event,
             build_observer_control_event,
@@ -925,7 +891,6 @@ pub fn run() {
             archive::read_archived_observer_events_for_channel,
             archive::index_observer_channel_id,
             archive::read_unindexed_observer_rows,
-            is_auto_update_supported,
             set_window_vibrancy,
         ])
         .build(tauri::generate_context!())

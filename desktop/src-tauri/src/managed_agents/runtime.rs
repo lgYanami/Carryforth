@@ -371,7 +371,7 @@ fn resolve_pgids_and_kill(candidate_pids: &[i32]) {
     });
     if pgids.is_empty() && candidate_groups > 0 {
         eprintln!(
-            "buzz-desktop: orphan sweep: skipped all {candidate_groups} candidate group(s) (live foreign group leader or candidate already exited); nothing signalled"
+            "carryforth-desktop: orphan sweep: skipped all {candidate_groups} candidate group(s) (live foreign group leader or candidate already exited); nothing signalled"
         );
     }
     let unique: Vec<i32> = pgids.into_iter().collect();
@@ -405,7 +405,7 @@ fn resolve_pgids_and_kill(candidate_pids: &[i32]) {
     });
     if pgids.is_empty() && candidate_groups > 0 {
         eprintln!(
-            "buzz-desktop: orphan sweep: skipped all {candidate_groups} candidate group(s) (live foreign group leader or candidate already exited); nothing signalled"
+            "carryforth-desktop: orphan sweep: skipped all {candidate_groups} candidate group(s) (live foreign group leader or candidate already exited); nothing signalled"
         );
     }
     let unique: Vec<i32> = pgids.into_iter().collect();
@@ -640,7 +640,7 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
 
     if !orphans.is_empty() {
         eprintln!(
-            "buzz-desktop: system sweep found {} orphaned agent process(es), cleaning up",
+            "carryforth-desktop: system sweep found {} orphaned agent process(es), cleaning up",
             orphans.len()
         );
         resolve_pgids_and_kill(&orphans);
@@ -699,7 +699,7 @@ pub(crate) fn sweep_system_agent_processes(instance_id: &str, skip_pids: &[u32])
 
     if !orphans.is_empty() {
         eprintln!(
-            "buzz-desktop: system sweep found {} orphaned agent process(es), cleaning up",
+            "carryforth-desktop: system sweep found {} orphaned agent process(es), cleaning up",
             orphans.len()
         );
         resolve_pgids_and_kill(&orphans);
@@ -729,7 +729,7 @@ pub(crate) fn sweep_system_agent_processes_with_grace(
         .collect();
     if !confirmed.is_empty() {
         eprintln!(
-            "buzz-desktop: periodic sweep confirmed {} orphaned agent process(es), cleaning up",
+            "carryforth-desktop: periodic sweep confirmed {} orphaned agent process(es), cleaning up",
             confirmed.len()
         );
         resolve_pgids_and_kill(&confirmed);
@@ -1140,7 +1140,7 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
             continue;
         }
         eprintln!(
-            "buzz-desktop: reaping {} orphaned agent(s) from dead instance '{instance_id}'",
+            "carryforth-desktop: reaping {} orphaned agent(s) from dead instance '{instance_id}'",
             agent_pids.len()
         );
         resolve_pgids_and_kill(agent_pids);
@@ -1199,7 +1199,7 @@ pub(crate) fn reap_dead_instance_agents(our_instance_id: &str, skip_pids: &[u32]
             continue;
         }
         eprintln!(
-            "buzz-desktop: reaping {} orphaned agent(s) from dead instance '{instance_id}'",
+            "carryforth-desktop: reaping {} orphaned agent(s) from dead instance '{instance_id}'",
             agent_pids.len()
         );
         resolve_pgids_and_kill(agent_pids);
@@ -1693,7 +1693,7 @@ pub fn spawn_agent_child(
             Some(path) => Some(path),
             None => {
                 eprintln!(
-                    "buzz-desktop: mcp_command {effective_mcp_command:?} not found, skipping"
+                    "carryforth-desktop: mcp_command {effective_mcp_command:?} not found, skipping"
                 );
                 None
             }
@@ -1839,7 +1839,7 @@ pub fn spawn_agent_child(
                     Ok(json) => Some(json),
                     Err(e) => {
                         eprintln!(
-                            "buzz-desktop: failed to serialize setup payload for {}: {e}",
+                            "carryforth-desktop: failed to serialize setup payload for {}: {e}",
                             record.name
                         );
                         None
@@ -1867,7 +1867,7 @@ pub fn spawn_agent_child(
         if let Some(json) = setup_payload_json {
             command.env("BUZZ_ACP_SETUP_PAYLOAD", json);
             eprintln!(
-                "buzz-desktop: agent {} not ready — spawning in setup-listener mode",
+                "carryforth-desktop: agent {} not ready — spawning in setup-listener mode",
                 record.name
             );
         }
@@ -1990,7 +1990,7 @@ pub fn spawn_agent_child(
         command.env("GIT_CONFIG_VALUE_1", "true");
     } else {
         eprintln!(
-            "buzz-desktop: git-credential-nostr not found — agent {} will not have automatic Buzz git auth",
+            "carryforth-desktop: git-credential-nostr not found — agent {} will not have automatic Relay git authentication",
             record.name,
         );
     }
@@ -2020,7 +2020,7 @@ pub fn spawn_agent_child(
     }
     configure_runtime_cli(&mut command, runtime_meta);
 
-    // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
+    // Carryforth shared compute is stored as a native provider; derive the OpenAI-compatible
     // transport at spawn time and scrub any unrelated ambient OpenAI key.
     #[cfg(feature = "mesh-llm")]
     if effective_provider == Some(super::RELAY_MESH_PROVIDER_ID) {

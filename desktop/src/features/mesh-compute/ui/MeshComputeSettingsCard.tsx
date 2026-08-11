@@ -296,7 +296,8 @@ export function MeshComputeSettingsCard() {
             />
             <p className="text-sm font-normal text-muted-foreground">
               Choose a suggested model below, or enter a model reference or
-              local file. Buzz downloads remote models when sharing starts.
+              local file. Carryforth downloads remote models when sharing
+              starts.
             </p>
             {catalog && catalog.entries.length > 0 ? (
               <CatalogPicker

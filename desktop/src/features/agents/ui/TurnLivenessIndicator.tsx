@@ -1,7 +1,7 @@
 import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/shared/lib/cn";
-import { FuzzyLogo } from "@/shared/ui/buzz-logo/FuzzyLogo";
+import { CarryforthMark } from "@/shared/ui/carryforth-logo/CarryforthMark";
 import { useTranscriptAnimationEnabled } from "./transcriptAnimationPreference";
 
 const MARKS = ["first", "second", "third"] as const;
@@ -10,7 +10,6 @@ const CYCLE_SECONDS = 1.8;
 
 export function TurnLivenessIndicator({
   className,
-  fuzz = false,
 }: {
   className?: string;
   /** Defaults to false — the indicator stays mounted for whole turns. */
@@ -28,12 +27,9 @@ export function TurnLivenessIndicator({
         data-testid="turn-liveness-indicator"
         role="status"
       >
-        <FuzzyLogo
+        <CarryforthMark
           ariaLabel="Agent turn in progress"
-          className="text-foreground"
-          fuzz={fuzz}
-          loop
-          loopRestSeconds={2}
+          className="h-6 w-6 text-foreground"
         />
       </div>
     );
@@ -61,12 +57,7 @@ export function TurnLivenessIndicator({
             times: [0, 0.3, 0.7, 1],
           }}
         >
-          <FuzzyLogo
-            ariaLabel=""
-            className="w-5! text-foreground"
-            fuzz={fuzz}
-            pulse={false}
-          />
+          <CarryforthMark className="h-5 w-5 text-foreground" />
         </motion.div>
       ))}
     </div>

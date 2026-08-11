@@ -399,8 +399,8 @@ export function MeetingFloorDock({
           className="mx-auto mb-3 max-w-3xl rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
           data-testid="meeting-grant-renewal-error"
         >
-          Buzz could not retain this speaking window. Your draft is preserved
-          while the authoritative Meeting state is checked.
+          Carryforth could not retain this speaking window. Your draft is
+          preserved while the authoritative Meeting state is checked.
         </div>
       ) : null}
 

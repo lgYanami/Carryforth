@@ -74,20 +74,20 @@ fn managed_node_unsupported_step() -> InstallStepResult {
         success: false,
         stdout: String::new(),
         stderr: format!(
-            "Buzz does not provide a managed Node.js runtime for {}-{} yet",
+            "Carryforth does not provide a managed Node.js runtime for {}-{} yet",
             std::env::consts::OS,
             std::env::consts::ARCH
         ),
         exit_code: None,
         hint: Some(
-            "Install Node.js from https://nodejs.org, restart Buzz, then click Install again."
+            "Install Node.js from https://nodejs.org, restart Carryforth, then click Install again."
                 .to_string(),
         ),
     }
 }
 
 fn managed_node_install_hint() -> String {
-    "Buzz could not install its private Node.js runtime. Check your network and app-data directory permissions, then click Install again.".to_string()
+    "Carryforth could not install its private Node.js runtime. Check your network and app-data directory permissions, then click Install again.".to_string()
 }
 
 fn managed_node_failed_step(stderr: String) -> InstallStepResult {
@@ -142,7 +142,8 @@ pub(super) fn ensure_managed_node_runtime_blocking() -> Result<(), Box<InstallSt
     };
     let Some(root) = crate::managed_agents::buzz_managed_node_root() else {
         return Err(Box::new(managed_node_failed_step(
-            "failed to resolve Buzz app-data directory for private Node.js runtime".to_string(),
+            "failed to resolve Carryforth app-data directory for private Node.js runtime"
+                .to_string(),
         )));
     };
 
@@ -464,9 +465,9 @@ fn verify_node_tree(dir: &std::path::Path) -> Result<(), String> {
 
 // ── managed npm adapter installs ──────────────────────────────────────────────
 
-/// Guidance text shown when the Buzz-private npm prefix is not available.
+/// Guidance text shown when the Carryforth-private npm prefix is not available.
 fn managed_npm_prefix_hint() -> String {
-    "Buzz could not create its private Node tools directory. Check app-data directory permissions, restart Buzz, then click Install again.".to_string()
+    "Carryforth could not create its private Node tools directory. Check app-data directory permissions, restart Carryforth, then click Install again.".to_string()
 }
 
 pub(super) fn managed_npm_command(command: &str) -> Result<Option<String>, Box<InstallStepResult>> {
@@ -480,7 +481,8 @@ pub(super) fn managed_npm_command(command: &str) -> Result<Option<String>, Box<I
             command: command.to_string(),
             success: false,
             stdout: String::new(),
-            stderr: "failed to resolve Buzz app-data directory for private npm prefix".to_string(),
+            stderr: "failed to resolve Carryforth app-data directory for private npm prefix"
+                .to_string(),
             exit_code: None,
             hint: Some(managed_npm_prefix_hint()),
         }));
@@ -492,7 +494,7 @@ pub(super) fn managed_npm_command(command: &str) -> Result<Option<String>, Box<I
             success: false,
             stdout: String::new(),
             stderr: format!(
-                "failed to create Buzz private npm prefix '{}': {error}",
+                "failed to create Carryforth private npm prefix '{}': {error}",
                 prefix.display()
             ),
             exit_code: None,
@@ -527,7 +529,7 @@ fn shell_quote(path: &std::path::Path) -> String {
 pub(super) fn npm_eacces_hint(stderr: &str, _command: &str) -> Option<String> {
     if stderr.contains("EACCES: permission denied") || stderr.contains("npm error EACCES") {
         Some(
-            "npm could not write to Buzz's private Node tools directory. Check app-data directory permissions, restart Buzz, then click Install again."
+            "npm could not write to Carryforth's private Node tools directory. Check app-data directory permissions, restart Carryforth, then click Install again."
                 .to_string(),
         )
     } else {
@@ -542,10 +544,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_npm_eacces_hint_guidance_mentions_buzz_private_dir() {
+    fn test_npm_eacces_hint_guidance_mentions_carryforth_private_dir() {
         let hint = npm_eacces_hint("EACCES: permission denied", "npm install -g foo").unwrap();
         assert!(
-            hint.contains("Buzz's private Node tools directory"),
+            hint.contains("Carryforth's private Node tools directory"),
             "hint: {hint}"
         );
     }

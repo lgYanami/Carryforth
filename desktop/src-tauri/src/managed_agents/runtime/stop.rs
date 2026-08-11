@@ -78,7 +78,7 @@ fn stop_managed_agent_pair(
             ),
         ) {
             eprintln!(
-                "buzz-desktop: failed to append stop marker for {} on {}: {error}",
+                "carryforth-desktop: failed to append stop marker for {} on {}: {error}",
                 record.pubkey, key.relay_url
             );
         }

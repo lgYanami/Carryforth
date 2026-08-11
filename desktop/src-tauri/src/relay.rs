@@ -11,86 +11,19 @@ use crate::app_state::AppState;
 
 mod managed_agent_profile;
 pub use managed_agent_profile::sync_managed_agent_capabilities;
-
-pub(crate) const LOCAL_RELAY_WS_URL: &str = "ws://localhost:3000";
-pub(crate) const LOCAL_ONLY_UNAVAILABLE: &str = "unavailable:desktop:local_only";
+mod workspace_target;
+pub(crate) use workspace_target::validate_workspace_relay_url;
+pub use workspace_target::{
+    effective_agent_relay_url, relay_api_base_url, relay_api_base_url_with_override,
+    relay_http_base_url, relay_ws_url, relay_ws_url_with_override,
+};
+#[cfg(test)]
+use workspace_target::{LOCAL_ONLY_UNAVAILABLE, LOCAL_RELAY_WS_URL};
 
 // A reached-but-malformed 2xx body is NOT a connectivity failure, so this
 // message must never carry the "relay unreachable:" prefix the frontend
 // classifier keys on. Extracted to a const so a test can pin that contract.
 const MALFORMED_RESPONSE_MESSAGE: &str = "relay returned malformed response: not valid JSON";
-
-/// Return the stable failure used by inherited hosted-community commands.
-///
-/// Carryforth Desktop has no remote-community mode or enabling switch. The
-/// inherited implementations remain compiled only so callers receive one
-/// explicit local-only error before any network or browser side effect.
-pub(crate) fn reject_remote_community_operation() -> Result<(), String> {
-    Err(LOCAL_ONLY_UNAVAILABLE.to_owned())
-}
-
-fn validate_workspace_relay_url_value(relay_url: &str) -> Result<String, String> {
-    if relay_url == LOCAL_RELAY_WS_URL {
-        Ok(relay_url.to_owned())
-    } else {
-        Err(LOCAL_ONLY_UNAVAILABLE.to_owned())
-    }
-}
-
-/// Validate a relay chosen by the Desktop workspace surface. Local-only
-/// binaries accept exactly the canonical local relay spelling; aliases,
-/// alternate ports, trailing slashes, and remote hosts are rejected.
-pub(crate) fn validate_workspace_relay_url(relay_url: &str) -> Result<String, String> {
-    validate_workspace_relay_url_value(relay_url)
-}
-
-pub fn relay_ws_url() -> String {
-    LOCAL_RELAY_WS_URL.to_owned()
-}
-
-/// Return the only Relay coordinate supported by Carryforth Desktop.
-pub fn relay_ws_url_with_override(_state: &AppState) -> String {
-    LOCAL_RELAY_WS_URL.to_owned()
-}
-
-/// Return the HTTP origin corresponding to the fixed local Relay.
-pub fn relay_api_base_url_with_override(_state: &AppState) -> String {
-    relay_http_base_url(LOCAL_RELAY_WS_URL)
-}
-
-/// Selects the relay a managed agent should use for a relay operation.
-///
-/// Always the active workspace relay. The legacy per-record `relay_url` pin is
-/// deliberately IGNORED (agents-everywhere, #2122): every agent is eligible on
-/// every community, and the pair the caller is acting on is identified by the
-/// workspace relay, never by a stored pin. The record field is still parsed
-/// and persisted untouched — old records need no migration and a rollback to a
-/// pin-honoring build reads the same file — so the parameter stays in the
-/// signature as documentation of what is being ignored at the one choke point
-/// all agent relay resolution flows through. Resolving at read-time also means
-/// a stale stored value can never leak into reconcile, spawn, or profile sync.
-/// Uniform for both Local and Provider backends.
-pub fn effective_agent_relay_url(_record_relay: &str, workspace_relay: &str) -> String {
-    workspace_relay.to_string()
-}
-
-pub fn relay_http_base_url(relay_url: &str) -> String {
-    let trimmed = relay_url.trim().trim_end_matches('/');
-
-    if let Some(suffix) = trimmed.strip_prefix("wss://") {
-        return format!("https://{}", suffix);
-    }
-
-    if let Some(suffix) = trimmed.strip_prefix("ws://") {
-        return format!("http://{}", suffix);
-    }
-
-    trimmed.to_string()
-}
-
-pub fn relay_api_base_url() -> String {
-    relay_http_base_url(LOCAL_RELAY_WS_URL)
-}
 
 // ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
 

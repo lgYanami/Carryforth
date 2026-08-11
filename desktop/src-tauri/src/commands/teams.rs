@@ -75,7 +75,7 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
         )
     })();
     if let Err(e) = result {
-        eprintln!("buzz-desktop: team-retain: {e}");
+        eprintln!("carryforth-desktop: team-retain: {e}");
     }
 }
 
@@ -129,7 +129,7 @@ fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
         )
     })();
     if let Err(e) = result {
-        eprintln!("buzz-desktop: team-tombstone: {e}");
+        eprintln!("carryforth-desktop: team-tombstone: {e}");
     }
 }
 

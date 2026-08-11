@@ -272,7 +272,7 @@ export function rewriteRelayUrl(url: string): string {
   // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
-  // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
+  // was typed with uppercase (for example, a legacy hosted Relay URL).
   if (cachedRelayOrigin) {
     const urlOrigin = canonicalOrigin(url);
     if (urlOrigin !== cachedRelayOrigin) {
