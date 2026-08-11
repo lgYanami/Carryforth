@@ -684,6 +684,28 @@ pub enum DocumentsCmd {
 /// Commands for Project Context Edge discovery and maintenance.
 #[derive(Subcommand)]
 pub enum ProjectContextCmd {
+    /// Retrieve a bounded semantic relevance forest without replaying the Provider request
+    ///
+    /// Output is `{result,read_commands}`. `result` is the verified signed
+    /// closed DTO; `read_commands` is an unsigned deterministic convenience
+    /// projection. `--format compact` changes whitespace only.
+    #[command(name = "semantic-query")]
+    SemanticQuery {
+        /// Natural-language problem that remains the dominant relevance signal.
+        #[arg(long)]
+        problem: String,
+        /// Optional explicit traversal root as TYPE:<uuid-v4>; repeat as needed.
+        #[arg(long = "initial-coordinate")]
+        initial_coordinates: Vec<String>,
+        /// Optional soft context lens as TYPE:<uuid-v4>; repeat as needed.
+        #[arg(long = "context-coordinate")]
+        context_coordinates: Vec<String>,
+        /// Lifecycle selection for automatic roots and continued targets.
+        #[arg(long, value_enum, default_value = "all-current")]
+        lifecycle: SemanticLifecycleArg,
+        #[command(flatten)]
+        budget: SemanticGraphBudgetArgs,
+    },
     /// Find the unique Edge with exactly this unordered coordinate set
     Exact {
         /// Typed coordinate token; repeat for every endpoint.
@@ -727,6 +749,58 @@ pub enum ProjectContextCmd {
         #[command(flatten)]
         attribution: ProjectContextAttributionArgs,
     },
+}
+
+/// Lifecycle selector for semantic graph traversal.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SemanticLifecycleArg {
+    /// Include every current eligible source, including terminal work.
+    #[value(name = "all-current")]
+    AllCurrent,
+    /// Exclude terminal current sources from automatic roots and targets.
+    #[value(name = "non-terminal")]
+    NonTerminal,
+    /// Restrict automatic roots and targets to terminal current sources.
+    #[value(name = "terminal-only")]
+    TerminalOnly,
+}
+
+/// Optional bounded work-profile overrides for semantic graph traversal.
+#[derive(Debug, Default, clap::Args)]
+pub struct SemanticGraphBudgetArgs {
+    /// Maximum recalled sources per independent query-vector branch.
+    #[arg(long)]
+    max_recall_per_channel: Option<u16>,
+    /// Maximum automatically selected semantic roots.
+    #[arg(long)]
+    max_semantic_roots: Option<u16>,
+    /// Maximum complete Hyperedge hops in one path.
+    #[arg(long)]
+    max_hops_per_path: Option<u8>,
+    /// Maximum successors retained per logical path state.
+    #[arg(long)]
+    beam_width: Option<u16>,
+    /// Maximum provenance-distinct Coordinate expansions.
+    #[arg(long)]
+    max_expanded_coordinates: Option<u16>,
+    /// Maximum globally unique incident Edges materialized.
+    #[arg(long)]
+    max_incident_edges_materialized: Option<u16>,
+    /// Maximum unique relation options materialized.
+    #[arg(long)]
+    max_relation_options_materialized: Option<u16>,
+    /// Maximum unique target options materialized.
+    #[arg(long)]
+    max_target_options_materialized: Option<u16>,
+    /// Maximum stopped paths retained.
+    #[arg(long)]
+    max_paths: Option<u16>,
+    /// Absolute server work deadline in milliseconds.
+    #[arg(long)]
+    max_wall_time_ms: Option<u32>,
+    /// Maximum serialized virtual Event-array bytes.
+    #[arg(long)]
+    max_response_bytes: Option<u32>,
 }
 
 /// Optional explicit managed-Agent attribution for a Context write.
@@ -3400,6 +3474,41 @@ mod tests {
             vec![
                 "cf",
                 "project-context",
+                "semantic-query",
+                "--problem",
+                "why does release fail?",
+                "--initial-coordinate",
+                "requirement:10000000-0000-4000-8000-000000000001",
+                "--context-coordinate",
+                "work:10000000-0000-4000-8000-000000000002",
+                "--lifecycle",
+                "non-terminal",
+                "--max-recall-per-channel",
+                "32",
+                "--max-semantic-roots",
+                "4",
+                "--max-hops-per-path",
+                "2",
+                "--beam-width",
+                "6",
+                "--max-expanded-coordinates",
+                "48",
+                "--max-incident-edges-materialized",
+                "72",
+                "--max-relation-options-materialized",
+                "96",
+                "--max-target-options-materialized",
+                "128",
+                "--max-paths",
+                "8",
+                "--max-wall-time-ms",
+                "9000",
+                "--max-response-bytes",
+                "65536",
+            ],
+            vec![
+                "cf",
+                "project-context",
                 "exact",
                 "--coordinate",
                 requirement_a,
@@ -4028,7 +4137,14 @@ mod tests {
         assert_eq!(names(&cmd, "resources"), vec!["guide"]);
         assert_eq!(
             names(&cmd, "project-context"),
-            vec!["attach", "contains-all", "detach", "exact", "incident"]
+            vec![
+                "attach",
+                "contains-all",
+                "detach",
+                "exact",
+                "incident",
+                "semantic-query",
+            ]
         );
         let project_view = cmd
             .get_subcommands()

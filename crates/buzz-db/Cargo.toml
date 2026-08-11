@@ -15,6 +15,7 @@ buzz-project-view = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-audit = { workspace = true }
 buzz-semantic = { workspace = true }
+buzz-semantic-query = { workspace = true }
 sqlx        = { workspace = true }
 pgvector    = { workspace = true }
 tokio       = { workspace = true }

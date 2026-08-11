@@ -106,7 +106,7 @@ impl EncodedSemanticUnit {
         &self.response_model
     }
 
-    /// Validated finite embedding values.
+    /// Validated finite, non-zero embedding values.
     pub fn embedding(&self) -> &EmbeddingVector {
         &self.embedding
     }
@@ -250,9 +250,18 @@ mod tests {
     }
 
     #[test]
-    fn encoded_output_rejects_wrong_dimension_non_finite_and_model_drift() {
+    fn encoded_output_rejects_wrong_dimension_non_finite_zero_and_model_drift() {
         let encoder = DeterministicFakeEncoder::new(2).expect("fake encoder");
         let unit = document_unit();
+        assert!(matches!(
+            super::EncodedSemanticUnit::new(
+                &unit,
+                encoder.contract().model.clone(),
+                vec![0.0, -0.0],
+                encoder.contract(),
+            ),
+            Err(crate::SemanticError::ZeroNormEmbedding)
+        ));
         assert!(matches!(
             super::EncodedSemanticUnit::new(
                 &unit,

@@ -12,6 +12,8 @@ buzz-core = { workspace = true }
 buzz-project-context = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-project-view = { workspace = true }
+buzz-semantic = { workspace = true }
+buzz-semantic-query = { workspace = true }
 nostr = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

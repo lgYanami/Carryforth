@@ -15,7 +15,7 @@ use buzz_core::kind::{
     AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
     KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META, KIND_PROJECT_DOCUMENT_HEAD,
     KIND_PROJECT_DOCUMENT_META, KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META,
-    KIND_PROJECT_VIEW_OBJECT,
+    KIND_PROJECT_VIEW_OBJECT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -159,6 +159,12 @@ pub async fn filter_fanout_by_access(
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
     let kind = event_kind_u32(&stored_event.event);
+    // Semantic graph results are response-local virtual Events. Do not rely
+    // solely on the Event-store constraint: a corrupt import or injected
+    // Redis payload must also fail closed at the final fan-out chokepoint.
+    if kind == KIND_SEMANTIC_GRAPH_QUERY_RESULT {
+        return Vec::new();
+    }
     let configured_projection_signer = super::project_view::configured_projection_signer(state);
     if !project_view_projection_passes_final_fanout_gate(
         &stored_event.event,

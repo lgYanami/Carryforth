@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
+#[cfg(test)]
+use buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT;
 use buzz_core::kind::{
     KIND_PROJECT_CONTEXT_COMMAND, KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META,
     KIND_PROJECT_DOCUMENT_HEAD, KIND_PROJECT_DOCUMENT_META,
@@ -25,6 +27,13 @@ use buzz_sdk::project_document::{
     document_head_coordinate, parse_document_head, parse_document_meta,
     verify_document_head_observation, VerifiedDocumentHead, VerifiedDocumentMeta,
 };
+use buzz_sdk::semantic_graph::{
+    parse_semantic_graph_query_result, SemanticGraphHttpRequestObservation,
+};
+use buzz_semantic_query::{
+    LifecycleFilter, RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
+    SemanticGraphQueryResult,
+};
 use chrono::{DateTime, Utc};
 use nostr::Event;
 use serde::Serialize;
@@ -35,9 +44,13 @@ use crate::client::{CarryforthClient, ProjectCommandDelivery};
 use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
+    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
 };
 use crate::error::CliError;
-use crate::{OutputFormat, ProjectContextAttributionArgs, ProjectContextCmd};
+use crate::{
+    OutputFormat, ProjectContextAttributionArgs, ProjectContextCmd, SemanticGraphBudgetArgs,
+    SemanticLifecycleArg,
+};
 
 const QUERY_PAGE_SIZE: u16 = 500;
 const QUERY_SNAPSHOT_ATTEMPTS: usize = 3;
@@ -179,6 +192,25 @@ struct EdgeSnapshot {
     edges: Vec<ProjectContextEdge>,
 }
 
+#[derive(Serialize)]
+struct SemanticGraphQueryCliOutput<'a> {
+    result: &'a SemanticGraphQueryResult,
+    read_commands: UnsignedSemanticReadCommands,
+}
+
+#[derive(Serialize)]
+struct UnsignedSemanticReadCommands {
+    signed: bool,
+    derivation: &'static str,
+    commands: Vec<SemanticReadCommand>,
+}
+
+#[derive(Serialize)]
+struct SemanticReadCommand {
+    coordinate: ProjectContextCoordinate,
+    command: String,
+}
+
 struct BindingPages {
     values: Vec<Value>,
     reached_empty_page: bool,
@@ -222,6 +254,24 @@ pub async fn dispatch(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     match command {
+        ProjectContextCmd::SemanticQuery {
+            problem,
+            initial_coordinates,
+            context_coordinates,
+            lifecycle,
+            budget,
+        } => {
+            run_semantic_query(
+                client,
+                problem,
+                initial_coordinates,
+                context_coordinates,
+                lifecycle,
+                budget,
+                format,
+            )
+            .await
+        }
         ProjectContextCmd::Exact { coordinates } => {
             let coordinates = canonicalize_edge_tokens(coordinates)?;
             run_query(client, ContextQuery::Exact(coordinates), format).await
@@ -265,6 +315,261 @@ pub async fn dispatch(
             .await
         }
     }
+}
+
+async fn run_semantic_query(
+    client: &CarryforthClient,
+    problem: String,
+    initial_coordinate_tokens: Vec<String>,
+    context_coordinate_tokens: Vec<String>,
+    lifecycle: SemanticLifecycleArg,
+    budget_args: SemanticGraphBudgetArgs,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let identity = require_semantic_identity(client).await?;
+    let project = read_verified_v3_snapshot(client, identity)
+        .await
+        .map_err(|error| {
+            integrity_error(format!(
+                "cannot resolve current Project identity for semantic query: {error}"
+            ))
+        })?;
+    let project_id = *project.meta().project_id.as_uuid();
+    let initial_coordinates = parse_semantic_coordinate_tokens(initial_coordinate_tokens)?;
+    let context_coordinates = parse_semantic_coordinate_tokens(context_coordinate_tokens)?;
+    let request = SemanticGraphQuery {
+        request_id: Uuid::new_v4(),
+        project_id,
+        problem,
+        initial_coordinates,
+        context_coordinates,
+        lifecycle_filter: match lifecycle {
+            SemanticLifecycleArg::AllCurrent => LifecycleFilter::AllCurrent,
+            SemanticLifecycleArg::NonTerminal => LifecycleFilter::NonTerminal,
+            SemanticLifecycleArg::TerminalOnly => LifecycleFilter::TerminalOnly,
+        },
+        budget: semantic_query_budget(budget_args),
+    }
+    .validate_and_canonicalize()
+    .map_err(|error| CliError::Usage(format!("invalid semantic graph query: {error}")))?;
+
+    let response = client
+        .semantic_query_once(&identity.relay_pubkey, request)
+        .await?;
+    let event = parse_single_semantic_result_event(&response.response_body)?;
+    let result = parse_semantic_graph_query_result(
+        &event,
+        &identity.relay_pubkey,
+        SemanticGraphHttpRequestObservation {
+            project_id: CommunityId::from_uuid(project_id),
+            authenticated_caller: client.public_key(),
+            request: &response.request,
+            nip98_auth_event_id: response.nip98_auth_event_id,
+            exact_authenticated_body: &response.exact_body,
+        },
+    )
+    .map_err(|error| integrity_error(format!("invalid semantic virtual result: {error}")))?;
+    let read_commands = UnsignedSemanticReadCommands {
+        signed: false,
+        derivation: "deterministic_from_verified_result_identities",
+        commands: semantic_read_commands(&result),
+    };
+    print_semantic_query_output(
+        &SemanticGraphQueryCliOutput {
+            result: &result,
+            read_commands,
+        },
+        format,
+    )
+}
+
+async fn require_semantic_identity(
+    client: &CarryforthClient,
+) -> Result<ProjectViewIdentity, CliError> {
+    let identity = read_identity(client).await?.ok_or_else(|| {
+        CliError::Other("unavailable:semantic_graph_query:project_view_v3_not_ready".to_owned())
+    })?;
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err(CliError::Other(
+            "unsupported:semantic_graph_query:project_view_v3_required".to_owned(),
+        ));
+    }
+    if !identity.semantic_query_http_enabled {
+        return Err(CliError::Other(format!(
+            "unsupported:semantic_graph_query:relay_does_not_advertise_{SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION}"
+        )));
+    }
+    Ok(identity)
+}
+
+fn parse_semantic_coordinate_tokens(
+    tokens: Vec<String>,
+) -> Result<Vec<ProjectContextCoordinate>, CliError> {
+    tokens
+        .iter()
+        .map(|token| parse_coordinate_token(token))
+        .collect()
+}
+
+fn semantic_query_budget(args: SemanticGraphBudgetArgs) -> SemanticGraphQueryBudget {
+    let mut budget = SemanticGraphQueryBudget::default();
+    if let Some(value) = args.max_recall_per_channel {
+        budget.max_recall_per_channel = value;
+    }
+    if let Some(value) = args.max_semantic_roots {
+        budget.max_semantic_roots = value;
+    }
+    if let Some(value) = args.max_hops_per_path {
+        budget.max_hops_per_path = value;
+    }
+    if let Some(value) = args.beam_width {
+        budget.beam_width = value;
+    }
+    if let Some(value) = args.max_expanded_coordinates {
+        budget.max_expanded_coordinates = value;
+    }
+    if let Some(value) = args.max_incident_edges_materialized {
+        budget.max_incident_edges_materialized = value;
+    }
+    if let Some(value) = args.max_relation_options_materialized {
+        budget.max_relation_options_materialized = value;
+    }
+    if let Some(value) = args.max_target_options_materialized {
+        budget.max_target_options_materialized = value;
+    }
+    if let Some(value) = args.max_paths {
+        budget.max_paths = value;
+    }
+    if let Some(value) = args.max_wall_time_ms {
+        budget.max_wall_time_ms = value;
+    }
+    if let Some(value) = args.max_response_bytes {
+        budget.max_response_bytes = value;
+    }
+    budget
+}
+
+fn parse_single_semantic_result_event(bytes: &[u8]) -> Result<Event, CliError> {
+    let values: Vec<Value> = serde_json::from_slice(bytes).map_err(|error| {
+        integrity_error(format!(
+            "semantic query response is not a JSON Event array: {error}"
+        ))
+    })?;
+    let [value] = values.as_slice() else {
+        return Err(integrity_error(
+            "semantic query response must contain exactly one virtual Event",
+        ));
+    };
+    let event: Event = serde_json::from_value(value.clone())
+        .map_err(|error| integrity_error(format!("invalid semantic result Event: {error}")))?;
+    let canonical = serde_json::to_value(&event)
+        .map_err(|error| integrity_error(format!("serialize semantic result Event: {error}")))?;
+    if canonical != *value {
+        return Err(integrity_error(
+            "semantic result Event contains unknown or noncanonical fields",
+        ));
+    }
+    Ok(event)
+}
+
+fn semantic_read_commands(result: &SemanticGraphQueryResult) -> Vec<SemanticReadCommand> {
+    let mut coordinates = BTreeSet::new();
+    for observation in &result.input_observations.accepted_initial_coordinates {
+        coordinates.insert(observation.coordinate.clone());
+    }
+    coordinates.extend(
+        result
+            .input_observations
+            .initial_not_in_graph
+            .iter()
+            .cloned(),
+    );
+    for observation in &result.input_observations.omitted_initial_coordinates {
+        coordinates.insert(observation.coordinate.clone());
+    }
+    for observation in &result.input_observations.accepted_context_coordinates {
+        coordinates.insert(observation.coordinate.clone());
+    }
+    for observation in &result.input_observations.omitted_context_coordinates {
+        coordinates.insert(observation.coordinate.clone());
+    }
+    for root in &result.roots {
+        for entrypoint in &root.structural_entrypoints {
+            match entrypoint {
+                RootStructuralEntrypoint::Coordinate { coordinate } => {
+                    coordinates.insert(coordinate.clone());
+                }
+                RootStructuralEntrypoint::ContextDocument { document_id, .. } => {
+                    coordinates.insert(ProjectContextCoordinate::Document {
+                        document_id: *document_id,
+                    });
+                }
+            }
+        }
+    }
+    for path in &result.paths {
+        coordinates.insert(path.terminal_coordinate.clone());
+        for hop in &path.hops {
+            if let Some(coordinate) = &hop.entered_from_coordinate {
+                coordinates.insert(coordinate.clone());
+            }
+            coordinates.extend(hop.edge.complete_coordinates.iter().cloned());
+            for binding in &hop.edge.current_context_document_bindings {
+                coordinates.insert(ProjectContextCoordinate::Document {
+                    document_id: binding.document_id,
+                });
+            }
+            coordinates.insert(ProjectContextCoordinate::Document {
+                document_id: hop.selected_relation_document.document_id,
+            });
+            coordinates.insert(hop.continued_to_coordinate.coordinate.clone());
+        }
+    }
+
+    semantic_read_commands_for_coordinates(coordinates)
+}
+
+fn semantic_read_commands_for_coordinates(
+    coordinates: BTreeSet<ProjectContextCoordinate>,
+) -> Vec<SemanticReadCommand> {
+    coordinates
+        .into_iter()
+        .map(|coordinate| SemanticReadCommand {
+            command: canonical_coordinate_read_command(&coordinate),
+            coordinate,
+        })
+        .collect()
+}
+
+fn canonical_coordinate_read_command(coordinate: &ProjectContextCoordinate) -> String {
+    match coordinate {
+        ProjectContextCoordinate::ProjectViewObject {
+            object_type,
+            object_id,
+        } => format!(
+            "cf project-view get-object {} {object_id}",
+            object_type.as_str()
+        ),
+        ProjectContextCoordinate::Document { document_id } => {
+            format!("cf documents get {document_id}")
+        }
+        ProjectContextCoordinate::Meeting { meeting_id } => {
+            format!("cf meetings show --meeting {meeting_id}")
+        }
+    }
+}
+
+fn print_semantic_query_output(
+    output: &SemanticGraphQueryCliOutput<'_>,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let serialized = match format {
+        OutputFormat::Json => serde_json::to_string_pretty(output),
+        OutputFormat::Compact => serde_json::to_string(output),
+    }
+    .map_err(|error| CliError::Other(format!("failed to serialize output: {error}")))?;
+    println!("{serialized}");
+    Ok(())
 }
 
 async fn run_query(
@@ -1591,6 +1896,7 @@ mod tests {
             context_edge_enabled: true,
             context_edge_migration_required: false,
             document_enabled: true,
+            semantic_query_http_enabled: false,
         }
     }
 
@@ -1637,6 +1943,99 @@ mod tests {
         assert!(parse_coordinate_token(&format!("unknown:{id}")).is_err());
         assert!(parse_coordinate_token("requirement:not-a-uuid").is_err());
         assert!(parse_coordinate_token(&format!("requirement:{}", Uuid::nil())).is_err());
+    }
+
+    #[test]
+    fn semantic_budget_overrides_are_closed_and_validated_by_the_query_contract() {
+        let budget = semantic_query_budget(SemanticGraphBudgetArgs {
+            max_semantic_roots: Some(4),
+            max_hops_per_path: Some(2),
+            max_response_bytes: Some(64 * 1024),
+            ..SemanticGraphBudgetArgs::default()
+        });
+        assert_eq!(budget.max_semantic_roots, 4);
+        assert_eq!(budget.max_hops_per_path, 2);
+        assert_eq!(budget.max_response_bytes, 64 * 1024);
+        assert!(budget.validate().is_ok());
+
+        let invalid = semantic_query_budget(SemanticGraphBudgetArgs {
+            max_hops_per_path: Some(0),
+            ..SemanticGraphBudgetArgs::default()
+        });
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn semantic_read_commands_are_canonical_deduplicated_and_sorted() {
+        let object_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let meeting_id = Uuid::new_v4();
+        let object = ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Requirement,
+            object_id,
+        };
+        let document = ProjectContextCoordinate::Document { document_id };
+        let meeting = ProjectContextCoordinate::Meeting { meeting_id };
+        let coordinates =
+            BTreeSet::from([meeting.clone(), document.clone(), object.clone(), document]);
+        let commands = semantic_read_commands_for_coordinates(coordinates);
+        let value = serde_json::to_value(commands).expect("serialize read commands");
+        assert_eq!(value.as_array().expect("command array").len(), 3);
+        assert_eq!(
+            value[0]["coordinate"],
+            serde_json::to_value(object).unwrap()
+        );
+        assert_eq!(
+            value[0]["command"],
+            format!("cf project-view get-object requirement {object_id}")
+        );
+        assert_eq!(
+            value[1]["command"],
+            format!("cf documents get {document_id}")
+        );
+        assert_eq!(
+            value[2]["command"],
+            format!("cf meetings show --meeting {meeting_id}")
+        );
+    }
+
+    #[test]
+    fn semantic_read_command_projection_is_explicitly_unsigned() {
+        let projection = UnsignedSemanticReadCommands {
+            signed: false,
+            derivation: "deterministic_from_verified_result_identities",
+            commands: Vec::new(),
+        };
+        let value = serde_json::to_value(projection).expect("serialize read command projection");
+        assert_eq!(value["signed"], false);
+        assert_eq!(
+            value["derivation"],
+            "deterministic_from_verified_result_identities"
+        );
+        assert_eq!(value["commands"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn semantic_response_parser_is_single_event_and_closed() {
+        let event = EventBuilder::new(Kind::Custom(KIND_SEMANTIC_GRAPH_QUERY_RESULT as u16), "{}")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign virtual fixture");
+        let exact = serde_json::to_vec(&[&event]).expect("serialize Event array");
+        assert_eq!(
+            parse_single_semantic_result_event(&exact).expect("parse exact Event"),
+            event
+        );
+        assert!(parse_single_semantic_result_event(b"[]").is_err());
+        let doubled = serde_json::to_vec(&[&event, &event]).expect("serialize two Events");
+        assert!(parse_single_semantic_result_event(&doubled).is_err());
+
+        let mut value = serde_json::to_value(&event).expect("Event value");
+        value
+            .as_object_mut()
+            .expect("Event object")
+            .insert("semantic_extra".to_owned(), Value::Bool(true));
+        let unknown = serde_json::to_vec(&[value]).expect("serialize unknown Event field");
+        assert!(parse_single_semantic_result_event(&unknown).is_err());
     }
 
     #[test]

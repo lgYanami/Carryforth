@@ -52,6 +52,17 @@ pub async fn handle_count(
         }
     };
 
+    if filters
+        .iter()
+        .any(super::req::filter_explicitly_requests_semantic_graph_result)
+    {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "unsupported:semantic_graph_query:count",
+        ));
+        return;
+    }
+
     let project_context_can_match = filters
         .iter()
         .any(super::community_private::filter_can_match_project_context);

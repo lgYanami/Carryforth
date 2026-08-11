@@ -24,6 +24,7 @@ members = [
     "crates/buzz-project-document",
     "crates/buzz-project-view",
     "crates/buzz-semantic",
+    "crates/buzz-semantic-query",
     "crates/buzz-persona",
     "crates/git-credential-nostr",
     "crates/git-sign-nostr",
@@ -141,6 +142,7 @@ buzz-project-context = { path = "crates/buzz-project-context" }
 buzz-project-document = { path = "crates/buzz-project-document" }
 buzz-project-view = { path = "crates/buzz-project-view" }
 buzz-semantic = { path = "crates/buzz-semantic" }
+buzz-semantic-query = { path = "crates/buzz-semantic-query" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
 

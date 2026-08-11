@@ -464,6 +464,15 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    if state.config.semantic_worker.enabled || state.config.semantic_graph_query_http_available {
+        let provider = state
+            .semantic_provider()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if provider.is_none() {
+            anyhow::bail!("semantic worker/query runtime requires a configured semantic Provider");
+        }
+    }
+
     if state.config.runtime_unrecoverable_enabled {
         tokio::spawn(buzz_relay::runtime_supervision::run(Arc::clone(&state)));
     } else {
@@ -474,15 +483,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if state.config.semantic_worker.enabled {
-        if !state.db.semantic_schema_ready().await? {
+        if !state.db.semantic_schema_ready().await?
+            || !state.db.semantic_graph_query_schema_ready().await?
+        {
             anyhow::bail!(
-                "BUZZ_SEMANTIC_WORKER_ENABLED requires the pgvector semantic schema; \
+                "BUZZ_SEMANTIC_WORKER_ENABLED requires the pgvector semantic/query schema; \
                  run buzz-admin semantic preflight and migrations first"
             );
         }
         tokio::spawn(buzz_relay::semantic_runtime::run(Arc::clone(&state)));
     } else {
         info!("Project Context semantic worker disabled");
+    }
+    if state.config.semantic_graph_query_http_available
+        && !state.db.semantic_graph_query_schema_ready().await?
+    {
+        anyhow::bail!(
+            "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE requires migration 0058 query schema"
+        );
     }
 
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the

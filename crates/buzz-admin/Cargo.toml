@@ -18,6 +18,7 @@ buzz-project-context = { workspace = true }
 buzz-project-view = { workspace = true }
 buzz-project-document = { workspace = true }
 buzz-semantic = { workspace = true }
+buzz-semantic-query = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-auth = { workspace = true }
 buzz-pubsub = { workspace = true }

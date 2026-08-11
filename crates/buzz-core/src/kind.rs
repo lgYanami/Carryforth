@@ -473,6 +473,11 @@ pub const KIND_PROJECT_DOCUMENT_META: u32 = 40907;
 pub const KIND_PROJECT_CONTEXT_EDGE_BINDING: u32 = 40908;
 /// NIP-PCE: relay-signed current Project Context catalog metadata head.
 pub const KIND_PROJECT_CONTEXT_META: u32 = 40909;
+/// Relay-signed semantic Project Context graph query result.
+///
+/// This is a response-only virtual Event. It is never accepted from clients,
+/// persisted, indexed, queried through ordinary Nostr filters, or fanned out.
+pub const KIND_SEMANTIC_GRAPH_QUERY_RESULT: u32 = 40912;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -718,6 +723,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PROJECT_DOCUMENT_META,
     KIND_PROJECT_CONTEXT_EDGE_BINDING,
     KIND_PROJECT_CONTEXT_META,
+    KIND_SEMANTIC_GRAPH_QUERY_RESULT,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -885,6 +891,15 @@ pub const fn is_project_context_protocol_kind(kind: u32) -> bool {
     is_project_context_projection_kind(kind) || is_project_context_command_kind(kind)
 }
 
+/// Returns `true` only for the response-only semantic graph virtual result.
+///
+/// This classifier is deliberately separate from Project Context protocol
+/// kinds: the result is an authenticated query response, not canonical graph
+/// state and not a persistable projection.
+pub const fn is_semantic_graph_virtual_result_kind(kind: u32) -> bool {
+    kind == KIND_SEMANTIC_GRAPH_QUERY_RESULT
+}
+
 /// Returns `true` for Community-global protocols with member-only reads.
 ///
 /// This classifier is the protocol registry boundary. Relay read paths still
@@ -967,6 +982,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_PROJECT_DOCUMENT_META
             | KIND_PROJECT_CONTEXT_EDGE_BINDING
             | KIND_PROJECT_CONTEXT_META
+            | KIND_SEMANTIC_GRAPH_QUERY_RESULT
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -1064,6 +1080,14 @@ const _: () = assert!(is_project_context_protocol_kind(KIND_PROJECT_CONTEXT_META
 const _: () = assert!(is_project_context_protocol_kind(
     KIND_PROJECT_CONTEXT_COMMAND
 ));
+const _: () = assert!(is_semantic_graph_virtual_result_kind(
+    KIND_SEMANTIC_GRAPH_QUERY_RESULT
+));
+const _: () = assert!(!is_project_context_protocol_kind(
+    KIND_SEMANTIC_GRAPH_QUERY_RESULT
+));
+const _: () = assert!(!is_command_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+const _: () = assert!(is_relay_only_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -1260,6 +1284,38 @@ mod tests {
             KIND_PROJECT_CONTEXT_COMMAND
         ));
         assert!(!is_project_context_protocol_kind(KIND_TEXT_NOTE));
+    }
+
+    #[test]
+    fn semantic_graph_result_has_a_closed_response_only_classification() {
+        assert!(is_semantic_graph_virtual_result_kind(
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT
+        ));
+        for &kind in ALL_KINDS {
+            if kind != KIND_SEMANTIC_GRAPH_QUERY_RESULT {
+                assert!(
+                    !is_semantic_graph_virtual_result_kind(kind),
+                    "ordinary kind {kind} was classified as a semantic virtual result"
+                );
+            }
+        }
+        assert!(is_relay_only_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+        assert!(!is_command_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+        assert!(!is_project_context_projection_kind(
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT
+        ));
+        assert!(!is_project_context_protocol_kind(
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT
+        ));
+        assert!(!is_community_private_protocol_kind(
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT
+        ));
+        assert!(!has_indexed_d_tag(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+        assert!(!is_ephemeral(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+        assert!(!is_replaceable(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+        assert!(!is_parameterized_replaceable(
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT
+        ));
     }
 
     #[test]

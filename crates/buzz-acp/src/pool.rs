@@ -5366,6 +5366,9 @@ mod tests {
         assert!(composed.starts_with("[Project Space]\n"));
         assert!(composed.contains("versioned Project Documents"));
         assert!(composed.contains("referenced directly from Project View"));
+        assert!(composed.contains("cf project-context semantic-query --problem"));
+        assert!(composed.contains("candidate paths, not canonical facts"));
+        assert!(composed.contains("current canonical full content"));
         assert!(composed.contains("explicitly write the change back through Carryforth"));
         assert!(composed.ends_with("\n\nhello channel"));
     }
@@ -5557,6 +5560,11 @@ mod tests {
         assert!(framed.contains("`cf project-context exact`"));
         assert!(framed.contains("`cf project-context incident`"));
         assert!(framed.contains("`cf project-context contains-all`"));
+        assert!(framed.contains("`cf project-context semantic-query --problem \"<problem>\"`"));
+        assert!(framed.contains("verified Role, Work, or other situational Coordinates"));
+        assert!(framed.contains("not ACLs, authorization, or hard filters"));
+        assert!(framed.contains("candidate paths, not canonical facts"));
+        assert!(framed.contains("current canonical full content"));
         assert!(framed.contains("does not automatically produce a Gap"));
         assert!(framed.contains("materially changes"));
     }
@@ -5653,6 +5661,9 @@ mod tests {
         );
         assert!(prompt.contains("referenced directly from Project View"));
         assert!(prompt.contains("read only the needed body on demand"));
+        assert!(prompt.contains("cf project-context semantic-query --problem"));
+        assert!(prompt.contains("do not run semantic query automatically on every Turn"));
+        assert!(prompt.contains("Do not automatically persist a retrieval result"));
         assert!(prompt.contains("explicitly write the change back through Carryforth"));
     }
 

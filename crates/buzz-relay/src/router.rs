@@ -444,9 +444,15 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .unwrap_or(false)
             },
             async {
+                let graph_query_runtime_ready =
+                    crate::semantic_fleet::all_enabled_semantic_graph_http_fleets_ready(&state)
+                        .await;
                 state
                     .db
-                    .semantic_deployment_ready(state.config.semantic_worker.enabled)
+                    .semantic_deployment_ready(
+                        state.config.semantic_worker.enabled,
+                        graph_query_runtime_ready,
+                    )
                     .await
                     .unwrap_or(false)
             },
@@ -512,10 +518,23 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
 /// Status endpoint — service name, version, uptime.
 async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let semantic_query_runtime_digest = buzz_semantic_query::semantic_graph_http_runtime_digest()
+        .ok()
+        .map(buzz_semantic::Digest32::to_hex);
+    let semantic_query_handler_ready =
+        crate::semantic_fleet::semantic_graph_http_local_handler_ready(&state);
     Json(json!({
         "service": "buzz-relay",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime_secs,
+        "semantic_graph_query_http": {
+            "runtime_digest": semantic_query_runtime_digest,
+            "parser_ready": true,
+            "handler_ready": semantic_query_handler_ready,
+            "deployment_master": state.config.semantic_graph_query_http_available,
+            "deployment_id": state.config.semantic_graph_query_deployment_id,
+            "instance_id": state.config.semantic_graph_query_instance_id,
+        },
     }))
 }
 

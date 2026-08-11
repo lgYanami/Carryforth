@@ -46,8 +46,25 @@ TEST_PORT="$(docker inspect \
 
 cd "$REPO_ROOT"
 . ./bin/activate-hermit
+BUZZ_TEST_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
+  cargo test -p buzz-db semantic_query_upgrade_is_additive_and_index_disable_is_atomic \
+    -- --ignored --nocapture
 BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
   cargo test -p buzz-db semantic_pipeline_activates_only_a_complete_fenced_set -- --nocapture
+
+# Upgraded databases intentionally retain the zero-vector constraint as NOT
+# VALID until historical rows have been repaired. Verify the exact live
+# expression directly before excluding this one validation-state-only path
+# from desired-schema drift below.
+docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
+  -U "$TEST_USER" -d "$TEST_DATABASE" -qtA \
+  -c "SELECT CASE WHEN NOT convalidated
+          AND position('vector_norm(embedding)' IN pg_get_constraintdef(oid)) > 0
+          AND position('l2_norm' IN pg_get_constraintdef(oid)) = 0
+        THEN 'ok' ELSE 'bad' END
+      FROM pg_constraint
+      WHERE conrelid='semantic_embeddings'::regclass
+        AND conname='semantic_embeddings_nonzero_cosine'" | grep -qx ok
 
 PGHOST=127.0.0.1 \
 PGPORT="$TEST_PORT" \
@@ -70,6 +87,10 @@ semantic_drift="$(
     | select(
         ((.path // "") | test("semantic"; "i"))
         or ((.sql // "") | test("semantic"; "i"))
+      )
+    | select(
+        (.path // "") !=
+          "public.semantic_embeddings.semantic_embeddings_nonzero_cosine"
       )
   ]' "$PLAN_FILE"
 )"
@@ -104,6 +125,26 @@ docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
         to_regclass('semantic_index_generations') IS NOT NULL
         AND to_regclass('semantic_rebuild_operations') IS NOT NULL
         AND to_regclass('semantic_provider_rate_gates') IS NOT NULL
+        AND to_regclass('semantic_query_provider_admission') IS NOT NULL
+        AND to_regclass('semantic_graph_http_fleet_attestations') IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM pg_attribute
+          WHERE attrelid = 'communities'::regclass
+            AND attname = 'semantic_graph_query_enabled'
+            AND NOT attisdropped
+        )
+        AND EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'events'::regclass
+            AND conname = 'events_kind_not_semantic_graph_query_result'
+            AND convalidated
+        )
+        AND EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'semantic_embeddings'::regclass
+            AND conname = 'semantic_embeddings_nonzero_cosine'
+            AND convalidated
+        )
         AND to_regtype('vector') IS NOT NULL
       THEN 'ok' ELSE 'bad' END" | grep -qx ok
 

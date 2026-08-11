@@ -17,7 +17,7 @@ use buzz_semantic::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use pgvector::Vector;
-use sqlx::Row;
+use sqlx::{PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{Db, DbError, Result};
@@ -205,6 +205,117 @@ pub struct SemanticRuntimeMetrics {
     pub oldest_due_seconds: f64,
 }
 
+/// Closed provider workload lanes sharing one physical Community/provider gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticProviderWorkload {
+    /// Latency-bounded graph-query encoding.
+    InteractiveQuery,
+    /// Durable overview indexing and generation rebuilds.
+    BackgroundIndex,
+}
+
+/// Outcome of one deadline-aware distributed provider admission attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticProviderReservation {
+    /// Exactly one physical slot was consumed; wait this long before transport.
+    Reserved {
+        /// Delay remaining before the reserved transport slot starts.
+        wait: std::time::Duration,
+    },
+    /// No usable slot existed before the deadline; no gate row was changed.
+    Busy,
+}
+
+/// Single-use proof that a background overview input was current at the
+/// provider-egress linearization point.
+///
+/// The permit deliberately cannot be cloned. It carries no source content and
+/// is useful only to make the worker's final database fence explicit before
+/// handing the already-built input to the configured provider.
+#[derive(Debug)]
+#[must_use = "a semantic worker egress permit must be consumed at provider handoff"]
+pub struct SemanticWorkerEgressPermit {
+    _private: (),
+}
+
+/// Closed result of the background worker's final provider-egress fence.
+#[derive(Debug)]
+#[must_use = "semantic provider egress is allowed only by the permitted outcome"]
+pub enum SemanticWorkerEgressConfirmation {
+    /// Every Community, generation, claim, and exact source-currentness fence
+    /// passed in one writer transaction.
+    Permitted(SemanticWorkerEgressPermit),
+    /// At least one fence no longer matched; no source text may leave the
+    /// process for this claim.
+    Unavailable,
+}
+
+/// Content-free database prerequisites for enabling semantic graph queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticGraphQueryReadiness {
+    /// All additive query schema objects and constraints exist.
+    pub schema_ready: bool,
+    /// Foundation indexing is enabled for the Community.
+    pub index_enabled: bool,
+    /// The query egress gate is currently enabled.
+    pub query_enabled: bool,
+    /// The canonical Project Context graph gate is enabled.
+    pub project_context_enabled: bool,
+    /// Published active generation, if any.
+    pub active_generation_id: Option<Uuid>,
+    /// The active pointer resolves to a generation in `active` lifecycle.
+    pub active_generation_ready: bool,
+    /// Current heads without one exact, model-matching, non-zero overview.
+    pub non_queryable_current_heads: u64,
+    /// Persisted rows using the response-only virtual kind.
+    pub persisted_virtual_events: u64,
+}
+
+/// Closed, content-free outcome of repairing historical zero query vectors.
+///
+/// The repair is scoped to the Community's currently published active
+/// generation. It removes only exact current heads whose overview embedding
+/// has zero cosine norm and schedules the same source epoch for rebuilding;
+/// it never advances or rewrites canonical source currentness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticQueryVectorRepairReport {
+    /// Tenant boundary selected by the operator.
+    pub community_id: CommunityId,
+    /// Active generation inspected and repaired under the generation fence.
+    pub active_generation_id: Uuid,
+    /// Every head inspected in the active generation.
+    pub current_heads_scanned: u64,
+    /// Heads with an exact, model-matching, non-zero overview embedding.
+    pub queryable_current_heads: u64,
+    /// Exact current heads invalidated because their overview vector was zero.
+    pub zero_vector_current_heads: u64,
+    /// Heads that failed a non-zero-queryability fence for another reason.
+    pub other_nonqueryable_current_heads: u64,
+    /// Historical zero overview embedding rows observed behind repaired heads.
+    pub zero_vector_embeddings: u64,
+    /// Zero-vector heads removed from query-current eligibility.
+    pub heads_invalidated: u64,
+    /// Missing source-generation jobs created for the exact current epoch.
+    pub jobs_created: u64,
+    /// Existing source-generation jobs reset to immediately pending.
+    pub jobs_requeued: u64,
+}
+
+impl SemanticGraphQueryReadiness {
+    /// Whether database-owned enable prerequisites currently pass.
+    ///
+    /// Deployment-master, fleet-attestation, provider compatibility, signer,
+    /// and Project Context projection checks remain Relay/operator fences.
+    pub const fn database_ready(&self) -> bool {
+        self.schema_ready
+            && self.index_enabled
+            && self.project_context_enabled
+            && self.active_generation_ready
+            && self.non_queryable_current_heads == 0
+            && self.persisted_virtual_events == 0
+    }
+}
+
 impl SemanticGenerationCoverage {
     /// Whether this generation is complete enough to become ready or active.
     pub const fn complete(&self) -> bool {
@@ -306,6 +417,127 @@ impl SemanticPgvectorPreflight {
         }
         failures
     }
+}
+
+/// Reserve one provider slot inside a caller-owned transaction.
+///
+/// This is the single physical/lane capacity-admission implementation used by
+/// both the background worker and graph queries. It is never an egress
+/// authorization or currentness proof. `Busy` performs no durable write;
+/// callers must end the transaction to release its advisory and row locks. A
+/// successful reservation remains consumed when the caller commits, even if a
+/// later final egress fence rejects the request or the network call fails.
+pub(crate) async fn reserve_semantic_provider_slot_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    provider: &str,
+    workload: SemanticProviderWorkload,
+    interval: std::time::Duration,
+    latest_start_at: DateTime<Utc>,
+) -> Result<SemanticProviderReservation> {
+    if provider.trim().is_empty() || provider.trim() != provider || provider.len() > 255 {
+        return Err(DbError::InvalidData(
+            "semantic provider rate-gate identity is invalid".to_string(),
+        ));
+    }
+    if interval < std::time::Duration::from_millis(100)
+        || interval > std::time::Duration::from_secs(60)
+    {
+        return Err(DbError::InvalidData(
+            "semantic provider interval must be between 100ms and 60s".to_string(),
+        ));
+    }
+    let interval_chrono = ChronoDuration::from_std(interval)
+        .map_err(|_| DbError::InvalidData("semantic provider interval is invalid".to_string()))?;
+    let lane_interval = interval.checked_mul(2).ok_or_else(|| {
+        DbError::InvalidData("semantic provider lane interval overflow".to_string())
+    })?;
+    let lane_interval_chrono = ChronoDuration::from_std(lane_interval).map_err(|_| {
+        DbError::InvalidData("semantic provider lane interval is invalid".to_string())
+    })?;
+    let workload = semantic_provider_workload_db(workload);
+
+    // This closes the absent-row race before the physical/lane rows exist;
+    // established rows are additionally selected FOR UPDATE below.
+    let lock_identity = format!(
+        "buzz.semantic-provider:{}:{provider}",
+        community_id.as_uuid()
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(lock_identity)
+        .execute(&mut **tx)
+        .await?;
+
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    if latest_start_at > now + ChronoDuration::minutes(5) {
+        return Err(DbError::InvalidData(
+            "semantic provider reservation horizon exceeds five minutes".to_string(),
+        ));
+    }
+    let physical_next: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT next_request_at FROM semantic_provider_rate_gates \
+         WHERE community_id=$1 AND provider=$2 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(provider)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let lane_next: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT next_admission_at FROM semantic_query_provider_admission \
+         WHERE community_id=$1 AND provider=$2 AND workload=$3 FOR UPDATE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(provider)
+    .bind(workload)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let physical_gate_idle = physical_next.is_none_or(|next| next <= now);
+    let scheduled_at = physical_next.map_or(now, |next| next.max(now));
+    if scheduled_at > latest_start_at
+        || (!physical_gate_idle && lane_next.is_some_and(|next| next > scheduled_at))
+    {
+        return Ok(SemanticProviderReservation::Busy);
+    }
+
+    let next_request_at = scheduled_at + interval_chrono;
+    let next_admission_at = scheduled_at + lane_interval_chrono;
+    sqlx::query(
+        "INSERT INTO semantic_provider_rate_gates (\
+             community_id,provider,next_request_at,updated_at) \
+         VALUES ($1,$2,$3,$4) \
+         ON CONFLICT (community_id,provider) DO UPDATE SET \
+             next_request_at=EXCLUDED.next_request_at, \
+             updated_at=EXCLUDED.updated_at",
+    )
+    .bind(community_id.as_uuid())
+    .bind(provider)
+    .bind(next_request_at)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO semantic_query_provider_admission (\
+             community_id,provider,workload,next_admission_at,updated_at) \
+         VALUES ($1,$2,$3,$4,$5) \
+         ON CONFLICT (community_id,provider,workload) DO UPDATE SET \
+             next_admission_at=EXCLUDED.next_admission_at, \
+             updated_at=EXCLUDED.updated_at",
+    )
+    .bind(community_id.as_uuid())
+    .bind(provider)
+    .bind(workload)
+    .bind(next_admission_at)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    let wait_millis = (scheduled_at - now).num_milliseconds().max(0);
+    Ok(SemanticProviderReservation::Reserved {
+        wait: std::time::Duration::from_millis(u64::try_from(wait_millis).unwrap_or(u64::MAX)),
+    })
 }
 
 impl Db {
@@ -410,11 +642,456 @@ impl Db {
         Ok(ready)
     }
 
+    /// Check the additive graph-query schema without trusting the migration
+    /// ledger. An upgraded database may retain the historical-vector
+    /// constraint as `NOT VALID`; current-head readiness is checked separately.
+    pub async fn semantic_graph_query_schema_ready(&self) -> Result<bool> {
+        let ready: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+                             WHERE attrelid='communities'::regclass \
+                               AND attname='semantic_graph_query_enabled' \
+                               AND NOT attisdropped) \
+                 AND to_regclass('semantic_query_provider_admission') IS NOT NULL \
+                 AND to_regclass('semantic_graph_http_fleet_attestations') IS NOT NULL \
+                 AND EXISTS (SELECT 1 FROM pg_constraint \
+                             WHERE conrelid=to_regclass('communities') \
+                               AND conname='communities_semantic_graph_query_requires_index') \
+                 AND EXISTS (SELECT 1 FROM pg_constraint \
+                             WHERE conrelid=to_regclass('events') \
+                               AND conname='events_kind_not_semantic_graph_query_result' \
+                               AND convalidated) \
+                 AND EXISTS (SELECT 1 FROM pg_constraint \
+                             WHERE conrelid=to_regclass('semantic_embeddings') \
+                               AND conname='semantic_embeddings_nonzero_cosine')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !ready {
+            return Ok(false);
+        }
+        self.semantic_schema_ready().await
+    }
+
+    /// Inspect content-free database prerequisites for the Community query
+    /// gate. This does not replace Relay runtime/fleet/provider readiness.
+    pub async fn semantic_graph_query_readiness(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<SemanticGraphQueryReadiness> {
+        let schema_ready = self.semantic_graph_query_schema_ready().await?;
+        if !schema_ready {
+            return Ok(SemanticGraphQueryReadiness {
+                schema_ready: false,
+                index_enabled: false,
+                query_enabled: false,
+                project_context_enabled: false,
+                active_generation_id: None,
+                active_generation_ready: false,
+                non_queryable_current_heads: 0,
+                persisted_virtual_events: 0,
+            });
+        }
+
+        let row = sqlx::query(
+            "SELECT community.semantic_index_enabled, \
+                    community.semantic_graph_query_enabled, \
+                    community.project_context_edge_enabled, \
+                    community.semantic_active_generation_id, \
+                    EXISTS (SELECT 1 FROM semantic_index_generations generation \
+                            WHERE generation.community_id=community.id \
+                              AND generation.generation_id=\
+                                  community.semantic_active_generation_id \
+                              AND generation.lifecycle='active') \
+                        AS active_generation_ready, \
+                    (SELECT count(*) FROM semantic_source_generation_heads head \
+                     JOIN semantic_index_generations generation \
+                       ON generation.community_id=head.community_id \
+                      AND generation.generation_id=head.generation_id \
+                     WHERE head.community_id=community.id \
+                       AND head.generation_id=community.semantic_active_generation_id \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM semantic_unit_sets unit_set \
+                           JOIN semantic_units unit \
+                             ON unit.community_id=unit_set.community_id \
+                            AND unit.unit_set_id=unit_set.unit_set_id \
+                            AND unit.unit_kind='overview' \
+                           JOIN semantic_embeddings embedding \
+                             ON embedding.community_id=unit.community_id \
+                            AND embedding.unit_set_id=unit.unit_set_id \
+                            AND embedding.unit_key=unit.unit_key \
+                            AND embedding.generation_id=generation.generation_id \
+                           WHERE unit_set.community_id=head.community_id \
+                             AND unit_set.unit_set_id=head.unit_set_id \
+                             AND unit_set.state='active' \
+                             AND unit_set.extractor_version=generation.extractor_version \
+                             AND embedding.dimensions=generation.dimensions \
+                             AND embedding.model_contract_digest=\
+                                 generation.model_contract_digest \
+                             AND embedding.response_model=generation.model \
+                             AND vector_norm(embedding.embedding)>0 \
+                       )) AS non_queryable_current_heads, \
+                    (SELECT count(*) FROM events WHERE kind=40912) \
+                        AS persisted_virtual_events \
+             FROM communities community WHERE community.id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound("semantic Community".to_string()))?;
+
+        Ok(SemanticGraphQueryReadiness {
+            schema_ready,
+            index_enabled: row.try_get("semantic_index_enabled")?,
+            query_enabled: row.try_get("semantic_graph_query_enabled")?,
+            project_context_enabled: row.try_get("project_context_edge_enabled")?,
+            active_generation_id: row.try_get("semantic_active_generation_id")?,
+            active_generation_ready: row.try_get("active_generation_ready")?,
+            non_queryable_current_heads: nonnegative_u64(
+                row.try_get("non_queryable_current_heads")?,
+                "non_queryable_current_heads",
+            )?,
+            persisted_virtual_events: nonnegative_u64(
+                row.try_get("persisted_virtual_events")?,
+                "persisted_virtual_events",
+            )?,
+        })
+    }
+
+    /// Invalidate active-generation heads backed by historical zero overview
+    /// vectors and immediately schedule their exact source epochs for rebuild.
+    ///
+    /// The complete scan, head invalidation, and job coalescing commit in one
+    /// transaction. The Community active-generation pointer is fenced for the
+    /// duration, source rows are locked before their jobs and heads (the same
+    /// order used by worker activation), and neither the canonical source basis
+    /// nor its invalidation epoch is changed. Rollback-ready and other
+    /// generations are never selected.
+    pub async fn repair_active_semantic_query_vectors(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<SemanticQueryVectorRepairReport> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!("buzz_semantic_generation:{community_id}"))
+            .execute(&mut *tx)
+            .await?;
+
+        let community = sqlx::query(
+            "SELECT semantic_active_generation_id FROM communities \
+             WHERE id=$1 FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("semantic Community".to_string()))?;
+        let active_generation_id: Uuid = community
+            .try_get::<Option<Uuid>, _>("semantic_active_generation_id")?
+            .ok_or_else(|| {
+                DbError::InvalidData(
+                    "semantic query-vector repair requires an active generation".to_string(),
+                )
+            })?;
+        let generation_is_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM semantic_index_generations \
+             WHERE community_id=$1 AND generation_id=$2 AND lifecycle='active' \
+             FOR UPDATE)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !generation_is_active {
+            return Err(DbError::InvalidData(
+                "semantic active generation pointer is not query-current".to_string(),
+            ));
+        }
+
+        // Preserve worker activation's source -> job -> head lock order. This
+        // also makes a concurrently completing non-zero rebuild win before it
+        // can be mistaken for a historical zero head.
+        sqlx::query(
+            "SELECT source.source_id \
+             FROM semantic_sources source \
+             JOIN semantic_source_generation_heads head \
+               ON head.community_id=source.community_id \
+              AND head.source_family=source.source_family \
+              AND head.source_subtype=source.source_subtype \
+              AND head.source_id=source.source_id \
+             WHERE head.community_id=$1 AND head.generation_id=$2 \
+             ORDER BY source.source_family,source.source_subtype,source.source_id \
+             FOR UPDATE OF source",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "SELECT job.source_id \
+             FROM semantic_index_jobs job \
+             JOIN semantic_source_generation_heads head \
+               ON head.community_id=job.community_id \
+              AND head.generation_id=job.generation_id \
+              AND head.source_family=job.source_family \
+              AND head.source_subtype=job.source_subtype \
+              AND head.source_id=job.source_id \
+             WHERE job.community_id=$1 AND job.generation_id=$2 \
+             ORDER BY job.source_family,job.source_subtype,job.source_id \
+             FOR UPDATE OF job",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query(
+            "SELECT source_id FROM semantic_source_generation_heads \
+             WHERE community_id=$1 AND generation_id=$2 \
+             ORDER BY source_family,source_subtype,source_id FOR UPDATE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let classification = sqlx::query(
+            "WITH classified AS ( \
+                 SELECT head.source_family,head.source_subtype,head.source_id, \
+                        COALESCE(bool_or(candidate.cosine_norm=0),FALSE) AS has_zero, \
+                        COALESCE(bool_or(candidate.cosine_norm>0),FALSE) AS has_nonzero, \
+                        count(candidate.cosine_norm) FILTER ( \
+                            WHERE candidate.cosine_norm=0 \
+                        ) AS zero_embeddings \
+                 FROM semantic_source_generation_heads head \
+                 LEFT JOIN LATERAL ( \
+                     SELECT vector_norm(embedding.embedding) AS cosine_norm \
+                     FROM semantic_index_generations generation \
+                     JOIN semantic_sources source \
+                       ON source.community_id=head.community_id \
+                      AND source.source_family=head.source_family \
+                      AND source.source_subtype=head.source_subtype \
+                      AND source.source_id=head.source_id \
+                      AND source.invalidation_epoch=head.source_invalidation_epoch \
+                      AND source.snapshot_digest=head.source_snapshot_digest \
+                      AND source.eligibility='eligible' \
+                     JOIN semantic_unit_sets unit_set \
+                       ON unit_set.community_id=head.community_id \
+                      AND unit_set.unit_set_id=head.unit_set_id \
+                      AND unit_set.source_invalidation_epoch=\
+                          head.source_invalidation_epoch \
+                      AND unit_set.source_snapshot_digest=head.source_snapshot_digest \
+                      AND unit_set.state='active' \
+                      AND unit_set.extractor_version=generation.extractor_version \
+                     JOIN semantic_units unit \
+                       ON unit.community_id=unit_set.community_id \
+                      AND unit.unit_set_id=unit_set.unit_set_id \
+                      AND unit.unit_kind='overview' AND unit.unit_key='overview' \
+                     JOIN semantic_embeddings embedding \
+                       ON embedding.community_id=unit.community_id \
+                      AND embedding.unit_set_id=unit.unit_set_id \
+                      AND embedding.unit_key=unit.unit_key \
+                      AND embedding.generation_id=generation.generation_id \
+                      AND embedding.dimensions=generation.dimensions \
+                      AND embedding.model_contract_digest=\
+                          generation.model_contract_digest \
+                      AND embedding.response_model=generation.model \
+                     WHERE generation.community_id=head.community_id \
+                       AND generation.generation_id=head.generation_id \
+                       AND generation.lifecycle='active' \
+                 ) candidate ON TRUE \
+                 WHERE head.community_id=$1 AND head.generation_id=$2 \
+                 GROUP BY head.source_family,head.source_subtype,head.source_id \
+             ) \
+             SELECT count(*) AS scanned, \
+                    count(*) FILTER (WHERE NOT has_zero AND has_nonzero) AS queryable, \
+                    count(*) FILTER (WHERE has_zero) AS zero_heads, \
+                    count(*) FILTER (WHERE NOT has_zero AND NOT has_nonzero) AS other, \
+                    COALESCE(sum(zero_embeddings),0)::bigint AS zero_embeddings \
+             FROM classified",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let current_heads_scanned = nonnegative_u64(
+            classification.try_get("scanned")?,
+            "repair current_heads_scanned",
+        )?;
+        let queryable_current_heads = nonnegative_u64(
+            classification.try_get("queryable")?,
+            "repair queryable_current_heads",
+        )?;
+        let zero_vector_current_heads = nonnegative_u64(
+            classification.try_get("zero_heads")?,
+            "repair zero_vector_current_heads",
+        )?;
+        let other_nonqueryable_current_heads = nonnegative_u64(
+            classification.try_get("other")?,
+            "repair other_nonqueryable_current_heads",
+        )?;
+        let zero_vector_embeddings = nonnegative_u64(
+            classification.try_get("zero_embeddings")?,
+            "repair zero_vector_embeddings",
+        )?;
+        if current_heads_scanned
+            != queryable_current_heads
+                .saturating_add(zero_vector_current_heads)
+                .saturating_add(other_nonqueryable_current_heads)
+        {
+            return Err(DbError::InvalidData(
+                "semantic query-vector repair classification is not closed".to_string(),
+            ));
+        }
+
+        let existing_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM semantic_index_jobs job \
+             JOIN semantic_source_generation_heads head \
+               ON head.community_id=job.community_id \
+              AND head.generation_id=job.generation_id \
+              AND head.source_family=job.source_family \
+              AND head.source_subtype=job.source_subtype \
+              AND head.source_id=job.source_id \
+             JOIN semantic_index_generations generation \
+               ON generation.community_id=head.community_id \
+              AND generation.generation_id=head.generation_id \
+              AND generation.lifecycle='active' \
+             JOIN semantic_sources source \
+               ON source.community_id=head.community_id \
+              AND source.source_family=head.source_family \
+              AND source.source_subtype=head.source_subtype \
+              AND source.source_id=head.source_id \
+              AND source.invalidation_epoch=head.source_invalidation_epoch \
+              AND source.snapshot_digest=head.source_snapshot_digest \
+              AND source.eligibility='eligible' \
+             JOIN semantic_unit_sets unit_set \
+               ON unit_set.community_id=head.community_id \
+              AND unit_set.unit_set_id=head.unit_set_id \
+              AND unit_set.source_invalidation_epoch=head.source_invalidation_epoch \
+              AND unit_set.source_snapshot_digest=head.source_snapshot_digest \
+              AND unit_set.state='active' \
+              AND unit_set.extractor_version=generation.extractor_version \
+             JOIN semantic_units unit \
+               ON unit.community_id=unit_set.community_id \
+              AND unit.unit_set_id=unit_set.unit_set_id \
+              AND unit.unit_kind='overview' AND unit.unit_key='overview' \
+             JOIN semantic_embeddings embedding \
+               ON embedding.community_id=unit.community_id \
+              AND embedding.unit_set_id=unit.unit_set_id \
+              AND embedding.unit_key=unit.unit_key \
+              AND embedding.generation_id=generation.generation_id \
+              AND embedding.dimensions=generation.dimensions \
+              AND embedding.model_contract_digest=generation.model_contract_digest \
+              AND embedding.response_model=generation.model \
+             WHERE head.community_id=$1 AND head.generation_id=$2 \
+               AND vector_norm(embedding.embedding)=0",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let jobs_requeued = nonnegative_u64(existing_jobs, "repair existing_jobs")?;
+
+        let repaired = sqlx::query(
+            "WITH victims AS ( \
+                 DELETE FROM semantic_source_generation_heads head \
+                 USING semantic_index_generations generation, \
+                       semantic_sources source, semantic_unit_sets unit_set, \
+                       semantic_units unit, semantic_embeddings embedding \
+                 WHERE head.community_id=$1 AND head.generation_id=$2 \
+                   AND generation.community_id=head.community_id \
+                   AND generation.generation_id=head.generation_id \
+                   AND generation.lifecycle='active' \
+                   AND source.community_id=head.community_id \
+                   AND source.source_family=head.source_family \
+                   AND source.source_subtype=head.source_subtype \
+                   AND source.source_id=head.source_id \
+                   AND source.invalidation_epoch=head.source_invalidation_epoch \
+                   AND source.snapshot_digest=head.source_snapshot_digest \
+                   AND source.eligibility='eligible' \
+                   AND unit_set.community_id=head.community_id \
+                   AND unit_set.unit_set_id=head.unit_set_id \
+                   AND unit_set.source_invalidation_epoch=head.source_invalidation_epoch \
+                   AND unit_set.source_snapshot_digest=head.source_snapshot_digest \
+                   AND unit_set.state='active' \
+                   AND unit_set.extractor_version=generation.extractor_version \
+                   AND unit.community_id=unit_set.community_id \
+                   AND unit.unit_set_id=unit_set.unit_set_id \
+                   AND unit.unit_kind='overview' AND unit.unit_key='overview' \
+                   AND embedding.community_id=unit.community_id \
+                   AND embedding.unit_set_id=unit.unit_set_id \
+                   AND embedding.unit_key=unit.unit_key \
+                   AND embedding.generation_id=generation.generation_id \
+                   AND embedding.dimensions=generation.dimensions \
+                   AND embedding.model_contract_digest=generation.model_contract_digest \
+                   AND embedding.response_model=generation.model \
+                   AND vector_norm(embedding.embedding)=0 \
+                 RETURNING head.community_id,head.generation_id,head.source_family, \
+                           head.source_subtype,head.source_id, \
+                           head.source_invalidation_epoch \
+             ), scheduled AS ( \
+                 INSERT INTO semantic_index_jobs ( \
+                     community_id,generation_id,source_family,source_subtype,source_id, \
+                     desired_invalidation_epoch,state,attempts,next_attempt_at, \
+                     created_at,updated_at \
+                 ) \
+                 SELECT community_id,generation_id,source_family,source_subtype,source_id, \
+                        source_invalidation_epoch,'pending',0,clock_timestamp(), \
+                        clock_timestamp(),clock_timestamp() \
+                 FROM victims \
+                 ON CONFLICT ( \
+                     community_id,generation_id,source_family,source_subtype,source_id \
+                 ) DO UPDATE SET \
+                     desired_invalidation_epoch=EXCLUDED.desired_invalidation_epoch, \
+                     state='pending',attempts=0,next_attempt_at=clock_timestamp(), \
+                     claim_id=NULL,lease_until=NULL,claimed_at=NULL,completed_at=NULL, \
+                     error_code=NULL,error_detail=NULL,updated_at=clock_timestamp() \
+                 RETURNING source_id \
+             ) \
+             SELECT (SELECT count(*) FROM victims) AS invalidated, \
+                    (SELECT count(*) FROM scheduled) AS scheduled",
+        )
+        .bind(community_id.as_uuid())
+        .bind(active_generation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let heads_invalidated =
+            nonnegative_u64(repaired.try_get("invalidated")?, "repair heads_invalidated")?;
+        let jobs_scheduled =
+            nonnegative_u64(repaired.try_get("scheduled")?, "repair jobs_scheduled")?;
+        if heads_invalidated != zero_vector_current_heads || jobs_scheduled != heads_invalidated {
+            return Err(DbError::InvalidData(
+                "semantic query-vector repair lost its transactional victim set".to_string(),
+            ));
+        }
+        let jobs_created = jobs_scheduled.checked_sub(jobs_requeued).ok_or_else(|| {
+            DbError::InvalidData(
+                "semantic query-vector repair job accounting is invalid".to_string(),
+            )
+        })?;
+
+        tx.commit().await?;
+        Ok(SemanticQueryVectorRepairReport {
+            community_id,
+            active_generation_id,
+            current_heads_scanned,
+            queryable_current_heads,
+            zero_vector_current_heads,
+            other_nonqueryable_current_heads,
+            zero_vector_embeddings,
+            heads_invalidated,
+            jobs_created,
+            jobs_requeued,
+        })
+    }
+
     /// Deployment readiness for capability-gated semantic indexing.
     /// Pre-migration and all-disabled deployments remain ready. Enabled
     /// Communities require the derived schema and a running provider worker;
     /// any published active pointer must resolve to an active generation.
-    pub async fn semantic_deployment_ready(&self, worker_ready: bool) -> Result<bool> {
+    pub async fn semantic_deployment_ready(
+        &self,
+        worker_ready: bool,
+        graph_query_runtime_ready: bool,
+    ) -> Result<bool> {
         let column_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_attribute \
              WHERE attrelid='communities'::regclass \
@@ -434,7 +1111,10 @@ impl Db {
         if !any_enabled {
             return Ok(true);
         }
-        if !worker_ready || !self.semantic_schema_ready().await? {
+        if !worker_ready
+            || !self.semantic_schema_ready().await?
+            || !self.semantic_graph_query_schema_ready().await?
+        {
             return Ok(false);
         }
         let invalid_pointer: bool = sqlx::query_scalar(
@@ -448,7 +1128,27 @@ impl Db {
         )
         .fetch_one(&self.pool)
         .await?;
-        Ok(!invalid_pointer)
+        if invalid_pointer {
+            return Ok(false);
+        }
+        let query_column_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+             WHERE attrelid='communities'::regclass \
+               AND attname='semantic_graph_query_enabled' AND NOT attisdropped)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !query_column_exists {
+            return Ok(true);
+        }
+        let any_query_enabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM communities \
+             WHERE semantic_graph_query_enabled AND archived_at IS NULL)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(!any_query_enabled
+            || (graph_query_runtime_ready && self.semantic_graph_query_schema_ready().await?))
     }
 
     /// Create one immutable, capability-off model generation.
@@ -527,10 +1227,46 @@ impl Db {
         community_id: CommunityId,
         enabled: bool,
     ) -> Result<()> {
-        let affected =
-            sqlx::query("UPDATE communities SET semantic_index_enabled = $2 WHERE id = $1")
+        let mut tx = self.pool.begin().await?;
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM communities WHERE id=$1 FOR UPDATE")
                 .bind(community_id.as_uuid())
-                .bind(enabled)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            tx.rollback().await?;
+            return Err(DbError::NotFound("semantic Community".to_string()));
+        }
+        if !enabled {
+            // 0058 makes query imply index. Close egress first in the same
+            // row-locked transaction so no committed state can violate it.
+            sqlx::query("UPDATE communities SET semantic_graph_query_enabled=FALSE WHERE id=$1")
+                .bind(community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
+        let affected = sqlx::query("UPDATE communities SET semantic_index_enabled=$2 WHERE id=$1")
+            .bind(community_id.as_uuid())
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if affected != 1 {
+            tx.rollback().await?;
+            return Err(DbError::NotFound("semantic Community".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disable the Community graph-query egress gate.
+    ///
+    /// Enabling deliberately has no symmetric setter: callers must use the
+    /// fleet-fenced atomic operation in `semantic_fleet`.
+    pub async fn disable_semantic_graph_query(&self, community_id: CommunityId) -> Result<()> {
+        let affected =
+            sqlx::query("UPDATE communities SET semantic_graph_query_enabled=FALSE WHERE id=$1")
+                .bind(community_id.as_uuid())
                 .execute(&self.pool)
                 .await?
                 .rows_affected();
@@ -555,6 +1291,26 @@ impl Db {
         .ok_or_else(|| DbError::NotFound("semantic Community".to_string()))?;
         Ok((
             row.try_get("semantic_index_enabled")?,
+            row.try_get("semantic_active_generation_id")?,
+        ))
+    }
+
+    /// Return both semantic gates and the active generation pointer.
+    pub async fn semantic_community_query_state(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<(bool, bool, Option<Uuid>)> {
+        let row = sqlx::query(
+            "SELECT semantic_index_enabled, semantic_graph_query_enabled, \
+                    semantic_active_generation_id FROM communities WHERE id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound("semantic Community".to_string()))?;
+        Ok((
+            row.try_get("semantic_index_enabled")?,
+            row.try_get("semantic_graph_query_enabled")?,
             row.try_get("semantic_active_generation_id")?,
         ))
     }
@@ -600,46 +1356,181 @@ impl Db {
         })
     }
 
-    /// Reserve the next Community/provider request time in the writer DB so
-    /// horizontally scaled workers share one conservative rate gate.
-    pub async fn reserve_semantic_provider_slot(
+    /// Try to reserve exactly one deadline-usable provider slot.
+    ///
+    /// Both workload lanes share the existing physical gate. A lane may only
+    /// consume the next physical slot when its cadence permits, so it cannot
+    /// jump over and erase a slot reserved for the other workload. Expired,
+    /// physically idle capacity may be borrowed without creating future queue
+    /// debt. `Busy` rolls back without changing either gate table.
+    pub async fn try_reserve_semantic_provider_slot_until(
         &self,
         community_id: CommunityId,
         provider: &str,
+        workload: SemanticProviderWorkload,
         interval: std::time::Duration,
-    ) -> Result<std::time::Duration> {
-        if provider.trim().is_empty() || provider.len() > 255 {
-            return Err(DbError::InvalidData(
-                "semantic provider rate-gate identity is invalid".to_string(),
-            ));
-        }
-        if interval < std::time::Duration::from_millis(100)
-            || interval > std::time::Duration::from_secs(60)
-        {
-            return Err(DbError::InvalidData(
-                "semantic provider interval must be between 100ms and 60s".to_string(),
-            ));
-        }
-        let row = sqlx::query(
-            "INSERT INTO semantic_provider_rate_gates (\
-                 community_id,provider,next_request_at,updated_at) \
-             VALUES ($1,$2,clock_timestamp()+make_interval(secs=>$3),clock_timestamp()) \
-             ON CONFLICT (community_id,provider) DO UPDATE SET \
-                 next_request_at=GREATEST(semantic_provider_rate_gates.next_request_at, \
-                                          clock_timestamp())+make_interval(secs=>$3), \
-                 updated_at=clock_timestamp() \
-             RETURNING next_request_at-make_interval(secs=>$3) AS scheduled_at",
+        latest_start_at: DateTime<Utc>,
+    ) -> Result<SemanticProviderReservation> {
+        let mut tx = self.pool.begin().await?;
+        let reservation = reserve_semantic_provider_slot_in_tx(
+            &mut tx,
+            community_id,
+            provider,
+            workload,
+            interval,
+            latest_start_at,
         )
-        .bind(community_id.as_uuid())
-        .bind(provider)
-        .bind(interval.as_secs_f64())
-        .fetch_one(&self.pool)
         .await?;
-        let scheduled_at: DateTime<Utc> = row.try_get("scheduled_at")?;
-        let wait_millis = (scheduled_at - Utc::now()).num_milliseconds().max(0);
-        Ok(std::time::Duration::from_millis(
-            u64::try_from(wait_millis).unwrap_or(u64::MAX),
-        ))
+        match reservation {
+            SemanticProviderReservation::Reserved { .. } => tx.commit().await?,
+            SemanticProviderReservation::Busy => tx.rollback().await?,
+        }
+        Ok(reservation)
+    }
+
+    /// Revalidate one background claim immediately before external provider
+    /// handoff.
+    ///
+    /// Provider-slot reservation is capacity admission only. This separate,
+    /// short writer `REPEATABLE READ` transaction is the authorization and
+    /// currentness linearization point after any reservation wait. It locks in
+    /// canonical-trigger order (`semantic_sources` before jobs) and fails
+    /// closed if the Community, generation contract/lifecycle, exact claim
+    /// lease, or exact source basis/snapshot changed.
+    pub async fn confirm_semantic_worker_egress(
+        &self,
+        lease: &SemanticJobLease,
+        observation: &CanonicalSemanticSourceObservation,
+    ) -> Result<SemanticWorkerEgressConfirmation> {
+        validate_semantic_worker_egress_expectation(lease, observation)?;
+        let (family, subtype) = semantic_source_db_key(lease.source.kind);
+        let basis = serde_json::to_value(&observation.basis)?;
+        let epoch = u64_to_i64(
+            lease.desired_invalidation_epoch,
+            "semantic worker egress invalidation_epoch",
+        )?;
+        let dimensions = i32::try_from(lease.model_contract.dimensions).map_err(|_| {
+            DbError::InvalidData(
+                "semantic worker egress dimensions exceed PostgreSQL int".to_string(),
+            )
+        })?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+
+        let current: Result<bool> = async {
+            let community_enabled = sqlx::query_scalar::<_, bool>(
+                "SELECT semantic_index_enabled FROM communities WHERE id=$1 FOR SHARE",
+            )
+            .bind(lease.source.community_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if community_enabled != Some(true) {
+                return Ok(false);
+            }
+
+            let generation_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM semantic_index_generations generation \
+                 WHERE generation.community_id=$1 AND generation.generation_id=$2 \
+                   AND generation.lifecycle IN ('building','ready','active','rollback_ready') \
+                   AND generation.extractor_version=$3 \
+                   AND generation.input_contract_version=$4 \
+                   AND generation.provider=$5 AND generation.model=$6 \
+                   AND generation.dimensions=$7 AND generation.distance_metric=$8 \
+                   AND generation.normalization=$9 AND generation.provider_boundary=$10 \
+                   AND generation.model_contract_digest=$11 \
+                 FOR SHARE OF generation)",
+            )
+            .bind(lease.source.community_id)
+            .bind(lease.generation_id)
+            .bind(&lease.extractor_version)
+            .bind(&lease.model_contract.input_contract_version)
+            .bind(&lease.model_contract.provider)
+            .bind(&lease.model_contract.model)
+            .bind(dimensions)
+            .bind(distance_metric_db(lease.model_contract.distance_metric))
+            .bind(normalization_db(lease.model_contract.normalization))
+            .bind(provider_boundary_db(
+                &lease.model_contract.provider_boundary,
+            ))
+            .bind(lease.model_contract_digest.as_bytes().as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !generation_current {
+                return Ok(false);
+            }
+
+            // Canonical-source triggers take this row before coalescing the
+            // job. Keeping the same order avoids a source/job lock inversion.
+            let source_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM semantic_sources source \
+                 WHERE source.community_id=$1 AND source.source_family=$2 \
+                   AND source.source_subtype=$3 AND source.source_id=$4 \
+                   AND source.eligibility='eligible' AND source.invalidation_epoch=$5 \
+                   AND source.source_basis=$6 AND source.snapshot_digest=$7 \
+                 FOR SHARE OF source)",
+            )
+            .bind(lease.source.community_id)
+            .bind(family)
+            .bind(subtype)
+            .bind(lease.source.source_id)
+            .bind(epoch)
+            .bind(basis)
+            .bind(observation.snapshot_digest.as_bytes().as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !source_current {
+                return Ok(false);
+            }
+
+            let claim_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM semantic_index_jobs job \
+                 WHERE job.community_id=$1 AND job.generation_id=$2 \
+                   AND job.source_family=$3 AND job.source_subtype=$4 AND job.source_id=$5 \
+                   AND job.desired_invalidation_epoch=$6 AND job.state='claimed' \
+                   AND job.claim_id=$7 AND job.lease_until=$8 \
+                   AND job.lease_until >= clock_timestamp() \
+                 FOR SHARE OF job)",
+            )
+            .bind(lease.source.community_id)
+            .bind(lease.generation_id)
+            .bind(family)
+            .bind(subtype)
+            .bind(lease.source.source_id)
+            .bind(epoch)
+            .bind(lease.claim_id)
+            .bind(lease.lease_until)
+            .fetch_one(&mut *tx)
+            .await?;
+            Ok(claim_current)
+        }
+        .await;
+
+        match current {
+            Ok(true) => {
+                tx.commit().await?;
+                Ok(SemanticWorkerEgressConfirmation::Permitted(
+                    SemanticWorkerEgressPermit { _private: () },
+                ))
+            }
+            Ok(false) => {
+                tx.rollback().await?;
+                Ok(SemanticWorkerEgressConfirmation::Unavailable)
+            }
+            Err(error) if semantic_worker_egress_serialization_failure(&error) => {
+                // A writer that committed after this REPEATABLE READ snapshot
+                // cannot leave us holding an old row version: PostgreSQL
+                // raises 40001 at the conflicting row lock. Treat that normal
+                // writer-first race as the same closed no-egress outcome.
+                tx.rollback().await?;
+                Ok(SemanticWorkerEgressConfirmation::Unavailable)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
     }
 
     /// Start a durable canonical-source rebuild. Reusing an operation UUID is
@@ -1109,12 +2000,19 @@ impl Db {
         let row = sqlx::query(
             "SELECT embedding.embedding, embedding.response_model \
              FROM semantic_embeddings embedding \
+             JOIN semantic_index_generations generation \
+               ON generation.community_id=embedding.community_id \
+              AND generation.generation_id=embedding.generation_id \
              JOIN semantic_units unit \
                ON unit.community_id=embedding.community_id \
               AND unit.unit_set_id=embedding.unit_set_id \
               AND unit.unit_key=embedding.unit_key \
              WHERE embedding.community_id=$1 AND embedding.generation_id=$2 \
                AND embedding.model_contract_digest=$3 \
+               AND embedding.dimensions=generation.dimensions \
+               AND embedding.model_contract_digest=generation.model_contract_digest \
+               AND embedding.response_model=generation.model \
+               AND vector_norm(embedding.embedding)>0 \
                AND unit.semantic_text_digest=$4 \
              ORDER BY embedding.indexed_at DESC LIMIT 1",
         )
@@ -1246,7 +2144,12 @@ impl Db {
                 "INSERT INTO semantic_embeddings (\
                      community_id, unit_set_id, unit_key, generation_id, dimensions, \
                      model_contract_digest, response_model, embedding) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+                 ON CONFLICT (community_id,unit_set_id,unit_key,generation_id) \
+                 DO UPDATE SET response_model=EXCLUDED.response_model, \
+                               embedding=EXCLUDED.embedding, \
+                               indexed_at=clock_timestamp() \
+                 WHERE vector_norm(semantic_embeddings.embedding)=0",
             )
             .bind(lease.source.community_id)
             .bind(unit_set_id)
@@ -1757,18 +2660,8 @@ impl Db {
         &self,
         identity: &SemanticSourceIdentity,
     ) -> Result<CanonicalSemanticSourceObservation> {
-        identity
-            .validate()
-            .map_err(|error| semantic_contract_error("source_identity", error))?;
-        match identity.kind {
-            SemanticSourceKind::ProjectView(subtype) => {
-                self.observe_project_view_source(identity, subtype).await
-            }
-            SemanticSourceKind::ProjectDocument => {
-                self.observe_project_document_source(identity).await
-            }
-            SemanticSourceKind::Meeting => self.observe_meeting_source(identity).await,
-        }
+        let mut connection = self.pool.acquire().await?;
+        observe_semantic_source_in_connection(&mut connection, identity).await
     }
 
     /// Scan one canonical source family using a stable subtype/id keyset.
@@ -1875,14 +2768,40 @@ impl Db {
             next_cursor,
         })
     }
+}
 
-    async fn observe_project_view_source(
-        &self,
-        identity: &SemanticSourceIdentity,
-        requested_subtype: ProjectViewSemanticType,
-    ) -> Result<CanonicalSemanticSourceObservation> {
-        let row = sqlx::query(
-            "SELECT object.object_id, object.object_type, object.schema_version, \
+/// Reconstruct one canonical source through its source-owned tables and typed
+/// parser using the caller's existing database snapshot.
+///
+/// Semantic query code uses this adapter to avoid reading projections, caches,
+/// or a second transaction while hydrating current exact hits.
+pub(crate) async fn observe_semantic_source_in_connection(
+    connection: &mut PgConnection,
+    identity: &SemanticSourceIdentity,
+) -> Result<CanonicalSemanticSourceObservation> {
+    identity
+        .validate()
+        .map_err(|error| semantic_contract_error("source_identity", error))?;
+    match identity.kind {
+        SemanticSourceKind::ProjectView(subtype) => {
+            observe_project_view_source_in_connection(connection, identity, subtype).await
+        }
+        SemanticSourceKind::ProjectDocument => {
+            observe_project_document_source_in_connection(connection, identity).await
+        }
+        SemanticSourceKind::Meeting => {
+            observe_meeting_source_in_connection(connection, identity).await
+        }
+    }
+}
+
+async fn observe_project_view_source_in_connection(
+    connection: &mut PgConnection,
+    identity: &SemanticSourceIdentity,
+    requested_subtype: ProjectViewSemanticType,
+) -> Result<CanonicalSemanticSourceObservation> {
+    let row = sqlx::query(
+        "SELECT object.object_id, object.object_type, object.schema_version, \
                     object.object_revision, object.project_revision, object.body, \
                     object.under_goal_id, object.under_plan_id, \
                     object.planned_in_stage_id, object.about_object_id, \
@@ -1895,84 +2814,83 @@ impl Db {
              FROM project_view_objects object \
              JOIN communities community ON community.id = object.community_id \
              WHERE object.community_id = $1 AND object.object_id = $2",
-        )
-        .bind(identity.community_id)
-        .bind(identity.source_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| DbError::NotFound("semantic Project View source".to_string()))?;
+    )
+    .bind(identity.community_id)
+    .bind(identity.source_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| DbError::NotFound("semantic Project View source".to_string()))?;
 
-        let object_type: String = row.try_get("object_type")?;
-        if project_view_semantic_type(&object_type)? != requested_subtype {
-            return Err(DbError::NotFound(
-                "semantic Project View source".to_string(),
-            ));
-        }
-        let schema_version: i16 = row.try_get("schema_version")?;
-        let object_revision = positive_u64(row.try_get("object_revision")?, "object_revision")?;
-        let source_change_id =
-            digest_from_bytes(row.try_get("source_change_id")?, "source_change_id")?;
-        let basis = SemanticSourceBasis::ProjectView(ProjectViewSourceBasis {
-            schema_version: u16::try_from(schema_version).map_err(|_| {
-                DbError::InvalidData("semantic Project View schema version is invalid".to_string())
-            })?,
-            object_revision,
-            source_change_id,
-        });
-        let deleted_at = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")?;
-        let capability_ready: bool = row.try_get::<bool, _>("project_view_enabled")?
-            && row.try_get::<i16, _>("project_view_schema_version")? == 3;
+    let object_type: String = row.try_get("object_type")?;
+    if project_view_semantic_type(&object_type)? != requested_subtype {
+        return Err(DbError::NotFound(
+            "semantic Project View source".to_string(),
+        ));
+    }
+    let schema_version: i16 = row.try_get("schema_version")?;
+    let object_revision = positive_u64(row.try_get("object_revision")?, "object_revision")?;
+    let source_change_id = digest_from_bytes(row.try_get("source_change_id")?, "source_change_id")?;
+    let basis = SemanticSourceBasis::ProjectView(ProjectViewSourceBasis {
+        schema_version: u16::try_from(schema_version).map_err(|_| {
+            DbError::InvalidData("semantic Project View schema version is invalid".to_string())
+        })?,
+        object_revision,
+        source_change_id,
+    });
+    let deleted_at = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")?;
+    let capability_ready: bool = row.try_get::<bool, _>("project_view_enabled")?
+        && row.try_get::<i16, _>("project_view_schema_version")? == 3;
 
-        if schema_version != 3 || !capability_ready || deleted_at.is_some() {
-            let (reason, lifecycle) = if deleted_at.is_some() {
-                (
-                    IneligibilityReason::Tombstone,
-                    SemanticLifecycleClass::Tombstone,
-                )
-            } else {
-                (
-                    IneligibilityReason::SourceCapabilityUnavailable,
-                    SemanticLifecycleClass::Active,
-                )
-            };
-            return semantic_observation(
-                identity.clone(),
-                basis,
-                SemanticEligibility::Ineligible(reason),
-                lifecycle,
-                None,
-                String::new(),
-                None,
-            );
-        }
-
-        let entry = crate::project_view_v3::v3_entry_from_row(row).map_err(|error| {
-            DbError::InvalidData(format!("invalid semantic Project View source: {error}"))
-        })?;
-        let ProjectViewEntryV3::Active(object) = entry else {
-            return Err(DbError::InvalidData(
-                "active semantic Project View row reconstructed as tombstone".to_string(),
-            ));
+    if schema_version != 3 || !capability_ready || deleted_at.is_some() {
+        let (reason, lifecycle) = if deleted_at.is_some() {
+            (
+                IneligibilityReason::Tombstone,
+                SemanticLifecycleClass::Tombstone,
+            )
+        } else {
+            (
+                IneligibilityReason::SourceCapabilityUnavailable,
+                SemanticLifecycleClass::Active,
+            )
         };
-        let status = object.data.source_status().map(str::to_string);
-        let lifecycle = project_view_lifecycle(&object.data);
-        semantic_observation(
+        return semantic_observation(
             identity.clone(),
             basis,
-            SemanticEligibility::Eligible,
+            SemanticEligibility::Ineligible(reason),
             lifecycle,
-            status,
-            object.data.title().to_string(),
-            object.data.summary().map(str::to_string),
-        )
+            None,
+            String::new(),
+            None,
+        );
     }
 
-    async fn observe_project_document_source(
-        &self,
-        identity: &SemanticSourceIdentity,
-    ) -> Result<CanonicalSemanticSourceObservation> {
-        let row = sqlx::query(
-            "SELECT document.current_revision, document.state, document.created_at, \
+    let entry = crate::project_view_v3::v3_entry_from_row(row).map_err(|error| {
+        DbError::InvalidData(format!("invalid semantic Project View source: {error}"))
+    })?;
+    let ProjectViewEntryV3::Active(object) = entry else {
+        return Err(DbError::InvalidData(
+            "active semantic Project View row reconstructed as tombstone".to_string(),
+        ));
+    };
+    let status = object.data.source_status().map(str::to_string);
+    let lifecycle = project_view_lifecycle(&object.data);
+    semantic_observation(
+        identity.clone(),
+        basis,
+        SemanticEligibility::Eligible,
+        lifecycle,
+        status,
+        object.data.title().to_string(),
+        object.data.summary().map(str::to_string),
+    )
+}
+
+async fn observe_project_document_source_in_connection(
+    connection: &mut PgConnection,
+    identity: &SemanticSourceIdentity,
+) -> Result<CanonicalSemanticSourceObservation> {
+    let row = sqlx::query(
+        "SELECT document.current_revision, document.state, document.created_at, \
                     document.created_by, document.updated_at, document.updated_by, \
                     document.current_source_change_id, revision.title, revision.summary, \
                     revision.content_markdown, revision.actor_pubkey, revision.canonical_at, \
@@ -1984,63 +2902,63 @@ impl Db {
               AND revision.document_revision = document.current_revision \
              JOIN communities community ON community.id = document.community_id \
              WHERE document.community_id = $1 AND document.document_id = $2",
-        )
-        .bind(identity.community_id)
-        .bind(identity.source_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| DbError::NotFound("semantic Project Document source".to_string()))?;
-        let current_revision = positive_u64(row.try_get("current_revision")?, "document_revision")?;
-        let source_change_id = digest_from_bytes(
-            row.try_get("current_source_change_id")?,
-            "current_source_change_id",
-        )?;
-        let capability_ready: bool = row.try_get("project_document_enabled")?;
-        let current = crate::project_document::current_document_from_row(identity.source_id, &row)
-            .map_err(|error| {
-                DbError::InvalidData(format!("invalid semantic Document source: {error}"))
-            })?;
-        let basis = SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
-            document_revision: current_revision,
-            source_change_id,
-        });
-        match current.revision() {
-            DocumentRevision::Active { snapshot, .. } if capability_ready => semantic_observation(
-                identity.clone(),
-                basis,
-                SemanticEligibility::Eligible,
-                SemanticLifecycleClass::Active,
-                Some(DocumentState::Active.as_str().to_string()),
-                snapshot.title.clone(),
-                snapshot.summary.clone(),
-            ),
-            DocumentRevision::Active { .. } => semantic_observation(
-                identity.clone(),
-                basis,
-                SemanticEligibility::Ineligible(IneligibilityReason::SourceCapabilityUnavailable),
-                SemanticLifecycleClass::Active,
-                Some(DocumentState::Active.as_str().to_string()),
-                String::new(),
-                None,
-            ),
-            DocumentRevision::Deleted { .. } => semantic_observation(
-                identity.clone(),
-                basis,
-                SemanticEligibility::Ineligible(IneligibilityReason::Tombstone),
-                SemanticLifecycleClass::Tombstone,
-                Some(DocumentState::Deleted.as_str().to_string()),
-                String::new(),
-                None,
-            ),
-        }
+    )
+    .bind(identity.community_id)
+    .bind(identity.source_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| DbError::NotFound("semantic Project Document source".to_string()))?;
+    let current_revision = positive_u64(row.try_get("current_revision")?, "document_revision")?;
+    let source_change_id = digest_from_bytes(
+        row.try_get("current_source_change_id")?,
+        "current_source_change_id",
+    )?;
+    let capability_ready: bool = row.try_get("project_document_enabled")?;
+    let current = crate::project_document::current_document_from_row(identity.source_id, &row)
+        .map_err(|error| {
+            DbError::InvalidData(format!("invalid semantic Document source: {error}"))
+        })?;
+    let basis = SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
+        document_revision: current_revision,
+        source_change_id,
+    });
+    match current.revision() {
+        DocumentRevision::Active { snapshot, .. } if capability_ready => semantic_observation(
+            identity.clone(),
+            basis,
+            SemanticEligibility::Eligible,
+            SemanticLifecycleClass::Active,
+            Some(DocumentState::Active.as_str().to_string()),
+            snapshot.title.clone(),
+            snapshot.summary.clone(),
+        ),
+        DocumentRevision::Active { .. } => semantic_observation(
+            identity.clone(),
+            basis,
+            SemanticEligibility::Ineligible(IneligibilityReason::SourceCapabilityUnavailable),
+            SemanticLifecycleClass::Active,
+            Some(DocumentState::Active.as_str().to_string()),
+            String::new(),
+            None,
+        ),
+        DocumentRevision::Deleted { .. } => semantic_observation(
+            identity.clone(),
+            basis,
+            SemanticEligibility::Ineligible(IneligibilityReason::Tombstone),
+            SemanticLifecycleClass::Tombstone,
+            Some(DocumentState::Deleted.as_str().to_string()),
+            String::new(),
+            None,
+        ),
     }
+}
 
-    async fn observe_meeting_source(
-        &self,
-        identity: &SemanticSourceIdentity,
-    ) -> Result<CanonicalSemanticSourceObservation> {
-        let row = sqlx::query(
-            "SELECT session.create_event_id, session.end_event_id, session.status, \
+async fn observe_meeting_source_in_connection(
+    connection: &mut PgConnection,
+    identity: &SemanticSourceIdentity,
+) -> Result<CanonicalSemanticSourceObservation> {
+    let row = sqlx::query(
+        "SELECT session.create_event_id, session.end_event_id, session.status, \
                     session.summary, channel.name, channel.deleted_at, \
                     runtime.runtime_phase \
              FROM meeting_sessions session \
@@ -2051,55 +2969,53 @@ impl Db {
                ON runtime.community_id = session.community_id \
               AND runtime.session_id = session.session_id \
              WHERE session.community_id = $1 AND session.session_id = $2",
-        )
-        .bind(identity.community_id)
-        .bind(identity.source_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| DbError::NotFound("semantic Meeting source".to_string()))?;
-        let create_event_id =
-            digest_from_bytes(row.try_get("create_event_id")?, "create_event_id")?;
-        let end_event_id = row
-            .try_get::<Option<Vec<u8>>, _>("end_event_id")?
-            .map(|value| digest_from_bytes(value, "end_event_id"))
-            .transpose()?;
-        let basis = SemanticSourceBasis::Meeting(MeetingSourceBasis {
-            create_event_id,
-            end_event_id,
-        });
-        let status: String = row.try_get("status")?;
-        let runtime_phase: Option<String> = row.try_get("runtime_phase")?;
-        let lifecycle = if status == "ended" {
-            SemanticLifecycleClass::Terminal
-        } else if runtime_phase.as_deref() == Some("finalizing_actions") {
-            SemanticLifecycleClass::Finalizing
-        } else {
-            SemanticLifecycleClass::Active
-        };
-        if row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")?
-            .is_some()
-        {
-            return semantic_observation(
-                identity.clone(),
-                basis,
-                SemanticEligibility::Ineligible(IneligibilityReason::Deleted),
-                SemanticLifecycleClass::Deleted,
-                Some(status),
-                String::new(),
-                None,
-            );
-        }
-        semantic_observation(
+    )
+    .bind(identity.community_id)
+    .bind(identity.source_id)
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or_else(|| DbError::NotFound("semantic Meeting source".to_string()))?;
+    let create_event_id = digest_from_bytes(row.try_get("create_event_id")?, "create_event_id")?;
+    let end_event_id = row
+        .try_get::<Option<Vec<u8>>, _>("end_event_id")?
+        .map(|value| digest_from_bytes(value, "end_event_id"))
+        .transpose()?;
+    let basis = SemanticSourceBasis::Meeting(MeetingSourceBasis {
+        create_event_id,
+        end_event_id,
+    });
+    let status: String = row.try_get("status")?;
+    let runtime_phase: Option<String> = row.try_get("runtime_phase")?;
+    let lifecycle = if status == "ended" {
+        SemanticLifecycleClass::Terminal
+    } else if runtime_phase.as_deref() == Some("finalizing_actions") {
+        SemanticLifecycleClass::Finalizing
+    } else {
+        SemanticLifecycleClass::Active
+    };
+    if row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")?
+        .is_some()
+    {
+        return semantic_observation(
             identity.clone(),
             basis,
-            SemanticEligibility::Eligible,
-            lifecycle,
+            SemanticEligibility::Ineligible(IneligibilityReason::Deleted),
+            SemanticLifecycleClass::Deleted,
             Some(status),
-            row.try_get("name")?,
-            row.try_get("summary")?,
-        )
+            String::new(),
+            None,
+        );
     }
+    semantic_observation(
+        identity.clone(),
+        basis,
+        SemanticEligibility::Eligible,
+        lifecycle,
+        Some(status),
+        row.try_get("name")?,
+        row.try_get("summary")?,
+    )
 }
 
 fn semantic_observation(
@@ -2258,7 +3174,9 @@ async fn enqueue_semantic_jobs_tx(
     Ok(())
 }
 
-fn semantic_generation_from_row(row: &sqlx::postgres::PgRow) -> Result<SemanticGenerationRecord> {
+pub(crate) fn semantic_generation_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<SemanticGenerationRecord> {
     let dimensions: i32 = row.try_get("dimensions")?;
     let provider: String = row.try_get("provider")?;
     let boundary: String = row.try_get("provider_boundary")?;
@@ -2357,6 +3275,56 @@ fn semantic_job_lease_from_row(row: &sqlx::postgres::PgRow) -> Result<SemanticJo
         model_contract,
         model_contract_digest,
     })
+}
+
+fn validate_semantic_worker_egress_expectation(
+    lease: &SemanticJobLease,
+    observation: &CanonicalSemanticSourceObservation,
+) -> Result<()> {
+    if observation.identity != lease.source
+        || !matches!(observation.eligibility, SemanticEligibility::Eligible)
+    {
+        return Err(DbError::InvalidData(
+            "semantic worker egress source expectation is invalid".to_string(),
+        ));
+    }
+    lease
+        .model_contract
+        .validate()
+        .map_err(|error| semantic_contract_error("worker_egress_model_contract", error))?;
+    if lease
+        .model_contract
+        .digest()
+        .map_err(|error| semantic_contract_error("worker_egress_model_contract", error))?
+        != lease.model_contract_digest
+    {
+        return Err(DbError::InvalidData(
+            "semantic worker egress model contract digest mismatch".to_string(),
+        ));
+    }
+    let verified = CanonicalSemanticSourceObservation::new(
+        observation.identity.clone(),
+        observation.basis.clone(),
+        observation.eligibility,
+        observation.filter.clone(),
+        observation.title.clone(),
+        observation.summary.clone(),
+    )
+    .map_err(|error| semantic_contract_error("worker_egress_source_observation", error))?;
+    if verified.snapshot_digest != observation.snapshot_digest {
+        return Err(DbError::InvalidData(
+            "semantic worker egress source snapshot digest mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn semantic_worker_egress_serialization_failure(error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Sqlx(sqlx::Error::Database(database_error))
+            if database_error.code().as_deref() == Some("40001")
+    )
 }
 
 fn validate_semantic_activation(
@@ -2501,7 +3469,17 @@ fn semantic_rebuild_from_row(row: &sqlx::postgres::PgRow) -> Result<SemanticRebu
     })
 }
 
-fn semantic_source_kind_from_db(family: &str, subtype: &str) -> Result<SemanticSourceKind> {
+const fn semantic_provider_workload_db(workload: SemanticProviderWorkload) -> &'static str {
+    match workload {
+        SemanticProviderWorkload::InteractiveQuery => "interactive_query",
+        SemanticProviderWorkload::BackgroundIndex => "background_index",
+    }
+}
+
+pub(crate) fn semantic_source_kind_from_db(
+    family: &str,
+    subtype: &str,
+) -> Result<SemanticSourceKind> {
     match family {
         "project_view" => Ok(SemanticSourceKind::ProjectView(project_view_semantic_type(
             subtype,
@@ -2647,10 +3625,23 @@ mod tests {
 
     use super::{
         vector_version_supported, CreateSemanticGeneration, SemanticActivationOutcome,
-        SemanticClaimObservationOutcome, SemanticPgvectorPreflight, SemanticRebuildScope,
-        SemanticRebuildState, SemanticScanFamily,
+        SemanticClaimObservationOutcome, SemanticPgvectorPreflight, SemanticProviderReservation,
+        SemanticProviderWorkload, SemanticRebuildScope, SemanticRebuildState, SemanticScanFamily,
+        SemanticWorkerEgressConfirmation,
     };
     use crate::{Db, DbConfig};
+
+    fn assert_concurrent_worker_egress_rejected(
+        result: crate::Result<SemanticWorkerEgressConfirmation>,
+    ) {
+        match result {
+            Ok(SemanticWorkerEgressConfirmation::Unavailable) => {}
+            Ok(SemanticWorkerEgressConfirmation::Permitted(_)) => {
+                panic!("concurrent committed mutation must not receive an egress permit")
+            }
+            Err(error) => panic!("unexpected final egress fence error: {error}"),
+        }
+    }
 
     fn ready_report() -> SemanticPgvectorPreflight {
         SemanticPgvectorPreflight {
@@ -2732,24 +3723,174 @@ mod tests {
         db.set_semantic_community_enabled(community_id, true)
             .await
             .expect("enable");
+        sqlx::query("UPDATE communities SET semantic_graph_query_enabled=TRUE WHERE id=$1")
+            .bind(community_id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("seed query gate for atomic Foundation disable");
+        db.set_semantic_community_enabled(community_id, false)
+            .await
+            .expect("Foundation disable closes query in the same transaction");
+        assert_eq!(
+            db.semantic_community_query_state(community_id)
+                .await
+                .expect("read both semantic gates"),
+            (false, false, None)
+        );
+        db.set_semantic_community_enabled(community_id, true)
+            .await
+            .expect("re-enable Foundation for pipeline test");
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(1);
         let first_slot = db
-            .reserve_semantic_provider_slot(
+            .try_reserve_semantic_provider_slot_until(
                 community_id,
                 "deterministic_fake",
+                SemanticProviderWorkload::BackgroundIndex,
                 std::time::Duration::from_millis(100),
+                deadline,
             )
             .await
             .expect("first distributed provider slot");
-        let second_slot = db
-            .reserve_semantic_provider_slot(
+        let physical_before_busy: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT next_request_at FROM semantic_provider_rate_gates \
+             WHERE community_id=$1 AND provider='deterministic_fake'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("physical gate before busy reservation");
+        assert_eq!(
+            db.try_reserve_semantic_provider_slot_until(
                 community_id,
                 "deterministic_fake",
+                SemanticProviderWorkload::BackgroundIndex,
                 std::time::Duration::from_millis(100),
+                deadline,
+            )
+            .await
+            .expect("busy background slot does not fail"),
+            SemanticProviderReservation::Busy
+        );
+        let physical_after_busy: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT next_request_at FROM semantic_provider_rate_gates \
+             WHERE community_id=$1 AND provider='deterministic_fake'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("physical gate after busy reservation");
+        assert_eq!(physical_before_busy, physical_after_busy);
+        let second_slot = db
+            .try_reserve_semantic_provider_slot_until(
+                community_id,
+                "deterministic_fake",
+                SemanticProviderWorkload::InteractiveQuery,
+                std::time::Duration::from_millis(100),
+                deadline,
             )
             .await
             .expect("second distributed provider slot");
-        assert!(first_slot < std::time::Duration::from_millis(50));
-        assert!(second_slot >= std::time::Duration::from_millis(50));
+        let SemanticProviderReservation::Reserved { wait: first_wait } = first_slot else {
+            panic!("first background slot must be reserved");
+        };
+        let SemanticProviderReservation::Reserved { wait: second_wait } = second_slot else {
+            panic!("second interactive slot must be reserved");
+        };
+        let physical_after_second: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT next_request_at FROM semantic_provider_rate_gates \
+             WHERE community_id=$1 AND provider='deterministic_fake'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("physical gate after alternate workload reservation");
+        assert_eq!(
+            physical_after_second - physical_before_busy,
+            chrono::Duration::milliseconds(100)
+        );
+        assert!(second_wait >= first_wait);
+
+        let first_pod = db.clone();
+        let second_pod = db.clone();
+        let concurrent_deadline = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let (background, interactive) = tokio::join!(
+            first_pod.try_reserve_semantic_provider_slot_until(
+                community_id,
+                "deterministic_fake_concurrent",
+                SemanticProviderWorkload::BackgroundIndex,
+                std::time::Duration::from_millis(100),
+                concurrent_deadline,
+            ),
+            second_pod.try_reserve_semantic_provider_slot_until(
+                community_id,
+                "deterministic_fake_concurrent",
+                SemanticProviderWorkload::InteractiveQuery,
+                std::time::Duration::from_millis(100),
+                concurrent_deadline,
+            )
+        );
+        let concurrent_waits = [background, interactive]
+            .into_iter()
+            .map(
+                |outcome| match outcome.expect("concurrent distributed reservation") {
+                    SemanticProviderReservation::Reserved { wait } => wait,
+                    SemanticProviderReservation::Busy => {
+                        panic!("both workload lanes must make bounded first-round progress")
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(concurrent_waits.len(), 2);
+        let concurrent_lanes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM semantic_query_provider_admission \
+             WHERE community_id=$1 AND provider='deterministic_fake_concurrent'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("both distributed workload lanes persisted");
+        assert_eq!(concurrent_lanes, 2);
+
+        let deadline_gate: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "INSERT INTO semantic_provider_rate_gates (\
+                 community_id,provider,next_request_at) \
+             VALUES ($1,'deterministic_fake_deadline',clock_timestamp()+interval '1 second') \
+             RETURNING next_request_at",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("seed a provider gate beyond the interactive deadline");
+        assert_eq!(
+            db.try_reserve_semantic_provider_slot_until(
+                community_id,
+                "deterministic_fake_deadline",
+                SemanticProviderWorkload::InteractiveQuery,
+                std::time::Duration::from_millis(100),
+                chrono::Utc::now() + chrono::Duration::milliseconds(50),
+            )
+            .await
+            .expect("deadline busy reservation"),
+            SemanticProviderReservation::Busy
+        );
+        let deadline_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT next_request_at FROM semantic_provider_rate_gates \
+             WHERE community_id=$1 AND provider='deterministic_fake_deadline'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("deadline busy leaves physical gate intact");
+        let deadline_lane_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM semantic_query_provider_admission \
+             WHERE community_id=$1 AND provider='deterministic_fake_deadline'",
+        )
+        .bind(community_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("deadline busy creates no admission state");
+        assert_eq!(deadline_after, deadline_gate);
+        assert_eq!(deadline_lane_rows, 0);
         let before_rebuild = db
             .semantic_generation_coverage(community_id, generation_id)
             .await
@@ -2811,6 +3952,133 @@ mod tests {
                 .expect("prepare"),
             SemanticClaimObservationOutcome::Ready
         );
+        assert!(matches!(
+            db.confirm_semantic_worker_egress(&lease, &observation)
+                .await
+                .expect("current worker egress fence"),
+            SemanticWorkerEgressConfirmation::Permitted(_)
+        ));
+        {
+            let mut disable_tx = db.pool.begin().await.expect("begin concurrent disable");
+            sqlx::query(
+                "UPDATE communities SET semantic_graph_query_enabled=FALSE, \
+                        semantic_index_enabled=FALSE WHERE id=$1",
+            )
+            .bind(community_id.as_uuid())
+            .execute(&mut *disable_tx)
+            .await
+            .expect("hold Community disable row lock");
+            let blocked_confirmation = db.confirm_semantic_worker_egress(&lease, &observation);
+            tokio::pin!(blocked_confirmation);
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    blocked_confirmation.as_mut(),
+                )
+                .await
+                .is_err(),
+                "final fence must wait behind the in-flight Community writer",
+            );
+            disable_tx
+                .commit()
+                .await
+                .expect("commit concurrent Foundation disable");
+            let disabled_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                blocked_confirmation.as_mut(),
+            )
+            .await
+            .expect("disabled final fence must complete");
+            assert_concurrent_worker_egress_rejected(disabled_result);
+        }
+        db.set_semantic_community_enabled(community_id, true)
+            .await
+            .expect("re-enable Foundation after egress fence test");
+        assert!(matches!(
+            db.confirm_semantic_worker_egress(&lease, &observation)
+                .await
+                .expect("re-enabled worker egress fence"),
+            SemanticWorkerEgressConfirmation::Permitted(_)
+        ));
+
+        let changed_observation = CanonicalSemanticSourceObservation::new(
+            observation.identity.clone(),
+            observation.basis.clone(),
+            observation.eligibility,
+            observation.filter.clone(),
+            observation.title.clone(),
+            Some("A summary changed during the reserved provider wait".to_string()),
+        )
+        .expect("changed observation");
+        {
+            let mut source_writer_tx = db.pool.begin().await.expect("begin source mutation");
+            sqlx::query("SELECT semantic_mark_source_changed($1,$2,$3,$4,$5,$6,$7,$8)")
+                .bind(community_id.as_uuid())
+                .bind("project_document")
+                .bind("document")
+                .bind(observation.identity.source_id)
+                .bind(true)
+                .bind("active")
+                .bind("active")
+                .bind(Option::<&str>::None)
+                .execute(&mut *source_writer_tx)
+                .await
+                .expect("hold canonical-trigger source lock");
+            let blocked_confirmation = db.confirm_semantic_worker_egress(&lease, &observation);
+            tokio::pin!(blocked_confirmation);
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    blocked_confirmation.as_mut(),
+                )
+                .await
+                .is_err(),
+                "final fence must wait behind the in-flight canonical source trigger",
+            );
+            source_writer_tx
+                .commit()
+                .await
+                .expect("commit canonical source trigger");
+            let stale_result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                blocked_confirmation.as_mut(),
+            )
+            .await
+            .expect("stale final fence must complete");
+            assert_concurrent_worker_egress_rejected(stale_result);
+        }
+        db.reconcile_semantic_observation(&changed_observation)
+            .await
+            .expect("canonical summary invalidation");
+        assert!(matches!(
+            db.confirm_semantic_worker_egress(&lease, &observation)
+                .await
+                .expect("stale worker egress fence"),
+            SemanticWorkerEgressConfirmation::Unavailable
+        ));
+
+        // Restore the original fixture as a new epoch and prove only its new
+        // exact claim can cross the provider boundary.
+        db.reconcile_semantic_observation(&observation)
+            .await
+            .expect("restore source after stale egress test");
+        let lease = db
+            .claim_due_semantic_job(60)
+            .await
+            .expect("replacement claim query")
+            .expect("replacement claimed job");
+        assert_eq!(
+            db.prepare_semantic_claim_observation(&lease, &observation)
+                .await
+                .expect("prepare replacement claim"),
+            SemanticClaimObservationOutcome::Ready
+        );
+        assert!(matches!(
+            db.confirm_semantic_worker_egress(&lease, &observation)
+                .await
+                .expect("replacement worker egress fence"),
+            SemanticWorkerEgressConfirmation::Permitted(_)
+        ));
         let unit = extract_overview(&observation).expect("overview");
         let encoded = encoder
             .encode(&[SemanticEncoderInput::from_unit(&unit)])
