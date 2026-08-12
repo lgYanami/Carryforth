@@ -41,6 +41,8 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) project_context_edge_supported: bool,
     /// Whether semantic Project Context HTTP query readiness is advertised.
     pub(crate) semantic_query_http_available: bool,
+    /// Whether this NIP-11 dynamic capability observation was incomplete.
+    pub(crate) extensions_temporarily_unavailable: bool,
 }
 
 impl ProjectViewIdentity {

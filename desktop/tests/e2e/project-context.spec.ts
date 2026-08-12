@@ -2896,7 +2896,7 @@ const failureCases: Array<{
       retryable: true,
     },
     testId: "project-context-unavailable",
-    title: "Project Context is not available yet",
+    title: "Project Context is reconnecting",
   },
   {
     error: {
@@ -2974,7 +2974,6 @@ test("sequenced refresh failure keeps stale data and the next read recovers", as
     page.getByTestId("project-context-result-counts"),
   ).toHaveAttribute("data-edge-count", "1");
 
-  await page.getByTestId("project-context-refresh").click();
   await expect(page.getByText("Revision 9", { exact: true })).toBeVisible();
   await expect(
     page.getByTestId("project-context-result-counts"),

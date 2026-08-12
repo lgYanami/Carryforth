@@ -73,6 +73,9 @@ async fn query_project_context_semantic_inner(
         || !identity.runtime_ready
         || !identity.semantic_query_http_available
     {
+        if identity.extensions_temporarily_unavailable {
+            return Err(SemanticProjectContextQueryError::unavailable(None));
+        }
         return Err(SemanticProjectContextQueryError::unsupported());
     }
 

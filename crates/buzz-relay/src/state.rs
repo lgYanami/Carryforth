@@ -40,7 +40,6 @@ type SlidingWindowCounter = (u32, Instant);
 type ScopedRateLimiter = DashMap<ScopedPubkeyKey, SlidingWindowCounter>;
 type SemanticProviderCell =
     std::sync::OnceLock<Result<Option<VolcengineSemanticProvider>, SemanticProviderConfigError>>;
-const SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT: usize = 8;
 
 /// Per-connection entry in the connection manager.
 struct ConnEntry {
@@ -517,6 +516,9 @@ pub struct AppState {
     /// Process-local bound on in-flight semantic graph queries. The
     /// distributed Provider gate remains authoritative across Relay pods.
     pub(crate) semantic_graph_query_semaphore: Arc<Semaphore>,
+    /// Process-local bound on concurrent Stage C database snapshots and graph
+    /// traversals. Provider waits and response packing do not hold this gate.
+    pub(crate) semantic_graph_traversal_semaphore: Arc<Semaphore>,
     /// Database connection pool.
     pub db: Db,
     /// Redis pool for readiness health checks.
@@ -683,7 +685,10 @@ impl AppState {
         let search_arc = Arc::new(search);
         let semantic_provider = Arc::new(std::sync::OnceLock::new());
         let semantic_graph_query_semaphore =
-            Arc::new(Semaphore::new(SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT));
+            Arc::new(Semaphore::new(config.semantic_graph_query_max_in_flight));
+        let semantic_graph_traversal_semaphore = Arc::new(Semaphore::new(
+            config.semantic_graph_traversal_max_in_flight,
+        ));
 
         let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
@@ -750,6 +755,7 @@ impl AppState {
             config: Arc::new(config),
             semantic_provider,
             semantic_graph_query_semaphore,
+            semantic_graph_traversal_semaphore,
             db,
             redis_pool,
             audit: audit_arc,

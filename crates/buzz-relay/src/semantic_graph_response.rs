@@ -13,13 +13,14 @@ use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     CompletionReason, ExhaustedDimension, SemanticGraphQuery, SemanticGraphQueryCoverage,
     SemanticGraphQueryInputObservations, SemanticGraphQueryObservations, SemanticGraphQueryResult,
-    SemanticPath, SemanticRoot, SummaryOmittedReason,
+    SemanticGraphResultInvariant, SemanticPath, SemanticRoot, SummaryOmittedReason,
 };
 use nostr::{Keys, PublicKey, Timestamp};
 use serde::Serialize;
 
 use crate::semantic_graph_observability::{
-    record_query_error, stage_timer, SemanticGraphMetricStage, SemanticGraphQueryMetricError,
+    record_packing_invariant, record_query_error, stage_timer, SemanticGraphMetricStage,
+    SemanticGraphQueryMetricError,
 };
 
 const RESULT_MARKER: &str = "buzz-project-context-semantic-result";
@@ -112,8 +113,13 @@ pub(crate) enum SemanticGraphResponsePackingError {
         maximum: usize,
     },
     /// Completed traversal material violates the packing contract.
-    #[error("invalid semantic graph response packing input: {0}")]
-    InvalidInput(String),
+    #[error("invalid semantic graph response packing input ({invariant}): {detail}")]
+    InvalidInput {
+        /// Stable content-free invariant reason.
+        invariant: SemanticGraphPackingInvariant,
+        /// Internal contract detail. This is never returned to the caller.
+        detail: String,
+    },
     /// The virtual Event could not be signed.
     #[error("semantic graph virtual result signing failed")]
     Signing,
@@ -135,11 +141,53 @@ pub(crate) enum SemanticGraphResponsePackingError {
     Serialization,
 }
 
+/// Closed, content-free response-packing invariant reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticGraphPackingInvariant {
+    QueryContract,
+    QueryCanonical,
+    PrepackingCoverage,
+    SummaryOwnership,
+    AutomaticRootScore,
+    ExplicitRootShell,
+    CompletedForest(SemanticGraphResultInvariant),
+    PackingAccounting,
+    PackingMaterial,
+    CandidateForest(SemanticGraphResultInvariant),
+    PackedForest(SemanticGraphResultInvariant),
+    SdkVerification,
+}
+
+impl SemanticGraphPackingInvariant {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::QueryContract => "query_contract",
+            Self::QueryCanonical => "query_canonical",
+            Self::PrepackingCoverage => "prepacking_coverage",
+            Self::SummaryOwnership => "summary_ownership",
+            Self::AutomaticRootScore => "automatic_root_score",
+            Self::ExplicitRootShell => "explicit_root_shell",
+            Self::CompletedForest(invariant) => invariant.as_str(),
+            Self::PackingAccounting => "packing_accounting",
+            Self::PackingMaterial => "packing_material",
+            Self::CandidateForest(invariant) => invariant.as_str(),
+            Self::PackedForest(invariant) => invariant.as_str(),
+            Self::SdkVerification => "sdk_verification",
+        }
+    }
+}
+
+impl std::fmt::Display for SemanticGraphPackingInvariant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl SemanticGraphResponsePackingError {
     fn metric_code(&self) -> SemanticGraphQueryMetricError {
         match self {
             Self::ResponseTooLarge { .. } => SemanticGraphQueryMetricError::ResponseTooLarge,
-            Self::InvalidInput(_) => SemanticGraphQueryMetricError::InvalidPackingInput,
+            Self::InvalidInput { .. } => SemanticGraphQueryMetricError::InvalidPackingInput,
             Self::Signing => SemanticGraphQueryMetricError::Signing,
             Self::RelaySignerChanged => SemanticGraphQueryMetricError::RelaySignerChanged,
             Self::SizeEstimateDrift { .. } => SemanticGraphQueryMetricError::SizeEstimateDrift,
@@ -168,6 +216,38 @@ pub(crate) fn pack_semantic_graph_response(
     );
     if let Err(error) = &result {
         record_query_error(SemanticGraphMetricStage::Packing, error.metric_code());
+        if let SemanticGraphResponsePackingError::InvalidInput { invariant, .. } = error {
+            record_packing_invariant(invariant.as_str());
+        }
+    }
+    result
+}
+
+/// Validate the completed traversal forest before it crosses into response
+/// packing. The packer repeats the same check defensively.
+pub(crate) fn validate_completed_semantic_graph_forest(
+    input: &SemanticGraphResponsePackingInput,
+) -> Result<(), SemanticGraphResponsePackingError> {
+    let result = validate_prepacking_input(input);
+    if let Err(SemanticGraphResponsePackingError::InvalidInput { invariant, .. }) = &result {
+        record_query_error(
+            SemanticGraphMetricStage::Traversal,
+            SemanticGraphQueryMetricError::InvalidPackingInput,
+        );
+        record_packing_invariant(invariant.as_str());
+        tracing::error!(
+            invariant = invariant.as_str(),
+            root_count = input.roots.len(),
+            path_count = input.paths.len(),
+            max_observed_hops = input
+                .paths
+                .iter()
+                .map(|path| path.hops.len())
+                .max()
+                .unwrap_or_default(),
+            max_hops_budget = input.query.budget.max_hops_per_path,
+            "semantic graph traversal produced an invalid completed forest"
+        );
     }
     result
 }
@@ -182,9 +262,17 @@ fn pack_semantic_graph_response_inner(
         .query
         .clone()
         .validate_and_canonicalize()
-        .map_err(|error| invalid_input(format!("invalid query: {error}")))?;
+        .map_err(|error| {
+            invalid_input(
+                SemanticGraphPackingInvariant::QueryContract,
+                format!("invalid query: {error}"),
+            )
+        })?;
     if canonical_query != input.query {
-        return Err(invalid_input("query is not canonical"));
+        return Err(invalid_input(
+            SemanticGraphPackingInvariant::QueryCanonical,
+            "query is not canonical",
+        ));
     }
     let effective_limit = usize::try_from(canonical_query.budget.max_response_bytes)
         .unwrap_or(usize::MAX)
@@ -346,8 +434,13 @@ fn pack_semantic_graph_response_inner(
     }
 
     result
-        .validate_for_request(&canonical_query)
-        .map_err(|error| invalid_input(format!("packed result is invalid: {error}")))?;
+        .validate_for_request_detailed(&canonical_query)
+        .map_err(|error| {
+            invalid_input(
+                SemanticGraphPackingInvariant::PackedForest(error.invariant),
+                format!("packed result is invalid: {error}"),
+            )
+        })?;
     debug_assert!(estimated_event_array_bytes <= effective_limit);
     Ok(PackedSemanticGraphResponse {
         result,
@@ -387,7 +480,12 @@ fn sign_packed_semantic_graph_response_inner(
         &packed.result,
         &packed.authenticated_caller,
     )
-    .map_err(|error| invalid_input(format!("SDK rejected packed semantic result: {error}")))?;
+    .map_err(|error| {
+        invalid_input(
+            SemanticGraphPackingInvariant::SdkVerification,
+            format!("SDK rejected packed semantic result: {error}"),
+        )
+    })?;
     let event = builder
         .custom_created_at(packed.created_at)
         .sign_with_keys(relay_keys)
@@ -430,6 +528,7 @@ fn validate_prepacking_input(
             .contains(&ExhaustedDimension::ResponseBytes)
     {
         return Err(invalid_input(
+            SemanticGraphPackingInvariant::PrepackingCoverage,
             "coverage must describe an un-packed completed forest",
         ));
     }
@@ -437,6 +536,7 @@ fn validate_prepacking_input(
         || input.paths.iter().any(path_has_omitted_summary)
     {
         return Err(invalid_input(
+            SemanticGraphPackingInvariant::SummaryOwnership,
             "summary response-budget omission must be owned by the packer",
         ));
     }
@@ -445,7 +545,10 @@ fn validate_prepacking_input(
         .iter()
         .any(|root| !root_is_explicit(root) && root.semantic_score.is_none())
     {
-        return Err(invalid_input("automatic roots must have a semantic score"));
+        return Err(invalid_input(
+            SemanticGraphPackingInvariant::AutomaticRootScore,
+            "automatic roots must have a semantic score",
+        ));
     }
     for accepted in &input.input_observations.accepted_initial_coordinates {
         let retained = input.roots.iter().any(|root| {
@@ -464,6 +567,7 @@ fn validate_prepacking_input(
         });
         if !retained {
             return Err(invalid_input(
+                SemanticGraphPackingInvariant::ExplicitRootShell,
                 "accepted explicit initial Coordinate lacks a required root shell",
             ));
         }
@@ -484,8 +588,13 @@ fn validate_prepacking_input(
     complete.coverage.roots_returned = complete.roots.len() as u64;
     complete.coverage.paths_returned = complete.paths.len() as u64;
     complete
-        .validate_for_request(&input.query)
-        .map_err(|error| invalid_input(format!("completed forest is invalid: {error}")))
+        .validate_for_request_detailed(&input.query)
+        .map_err(|error| {
+            invalid_input(
+                SemanticGraphPackingInvariant::CompletedForest(error.invariant),
+                format!("completed forest is invalid: {error}"),
+            )
+        })
 }
 
 fn refresh_response_accounting(
@@ -502,10 +611,18 @@ fn refresh_response_accounting(
         .count();
     let automatic_roots = total_automatic_roots
         .checked_sub(returned_automatic)
-        .ok_or_else(|| invalid_input("returned automatic root count exceeds selected count"))?;
-    let omitted_paths = total_paths
-        .checked_sub(result.paths.len())
-        .ok_or_else(|| invalid_input("returned path count exceeds retained count"))?;
+        .ok_or_else(|| {
+            invalid_input(
+                SemanticGraphPackingInvariant::PackingAccounting,
+                "returned automatic root count exceeds selected count",
+            )
+        })?;
+    let omitted_paths = total_paths.checked_sub(result.paths.len()).ok_or_else(|| {
+        invalid_input(
+            SemanticGraphPackingInvariant::PackingAccounting,
+            "returned path count exceeds retained count",
+        )
+    })?;
     let omitted_summaries = count_omitted_summaries(result);
     let automatic_roots = as_u64(automatic_roots, "automatic root omission count")?;
     let omitted_paths = as_u64(omitted_paths, "path omission count")?;
@@ -513,7 +630,12 @@ fn refresh_response_accounting(
     let response_omissions = automatic_roots
         .checked_add(omitted_paths)
         .and_then(|value| value.checked_add(omitted_summaries))
-        .ok_or_else(|| invalid_input("response omission count overflow"))?;
+        .ok_or_else(|| {
+            invalid_input(
+                SemanticGraphPackingInvariant::PackingAccounting,
+                "response omission count overflow",
+            )
+        })?;
 
     result.coverage.roots_returned = as_u64(result.roots.len(), "returned root count")?;
     result.coverage.paths_returned = as_u64(result.paths.len(), "returned path count")?;
@@ -543,10 +665,12 @@ fn refresh_response_accounting(
             result.exhausted_dimensions.sort();
         }
     }
-    result
-        .coverage
-        .validate()
-        .map_err(|error| invalid_input(format!("response coverage is invalid: {error}")))
+    result.coverage.validate().map_err(|error| {
+        invalid_input(
+            SemanticGraphPackingInvariant::PackingAccounting,
+            format!("response coverage is invalid: {error}"),
+        )
+    })
 }
 
 fn root_is_explicit(root: &SemanticRoot) -> bool {
@@ -646,9 +770,12 @@ fn summary_restore_order(
 ) -> Result<Vec<SummaryRestore>, SemanticGraphResponsePackingError> {
     let mut summaries = Vec::new();
     for root in &result.roots {
-        let original = original_roots
-            .get(&root.root_id)
-            .ok_or_else(|| invalid_input("returned root lacks original packing material"))?;
+        let original = original_roots.get(&root.root_id).ok_or_else(|| {
+            invalid_input(
+                SemanticGraphPackingInvariant::PackingMaterial,
+                "returned root lacks original packing material",
+            )
+        })?;
         if let Some(summary) = &original.preview.summary {
             summaries.push(SummaryRestore::Root {
                 root_id: root.root_id,
@@ -657,11 +784,15 @@ fn summary_restore_order(
         }
     }
     for path in &result.paths {
-        let original = original_paths
-            .get(&path.path_id)
-            .ok_or_else(|| invalid_input("returned path lacks original packing material"))?;
+        let original = original_paths.get(&path.path_id).ok_or_else(|| {
+            invalid_input(
+                SemanticGraphPackingInvariant::PackingMaterial,
+                "returned path lacks original packing material",
+            )
+        })?;
         if original.hops.len() != path.hops.len() {
             return Err(invalid_input(
+                SemanticGraphPackingInvariant::PackingMaterial,
                 "returned path hop count changed during packing",
             ));
         }
@@ -695,7 +826,12 @@ fn restore_summary(
                 .roots
                 .iter_mut()
                 .find(|root| root.root_id == *root_id)
-                .ok_or_else(|| invalid_input("summary restore root is not packed"))?
+                .ok_or_else(|| {
+                    invalid_input(
+                        SemanticGraphPackingInvariant::PackingMaterial,
+                        "summary restore root is not packed",
+                    )
+                })?
                 .preview
         }
         SummaryRestore::RelationDocument {
@@ -706,7 +842,12 @@ fn restore_summary(
                 .iter_mut()
                 .find(|path| path.path_id == *path_id)
                 .and_then(|path| path.hops.get_mut(*hop_index))
-                .ok_or_else(|| invalid_input("summary restore relation hop is not packed"))?
+                .ok_or_else(|| {
+                    invalid_input(
+                        SemanticGraphPackingInvariant::PackingMaterial,
+                        "summary restore relation hop is not packed",
+                    )
+                })?
                 .selected_relation_document
                 .preview
         }
@@ -718,7 +859,12 @@ fn restore_summary(
                 .iter_mut()
                 .find(|path| path.path_id == *path_id)
                 .and_then(|path| path.hops.get_mut(*hop_index))
-                .ok_or_else(|| invalid_input("summary restore target hop is not packed"))?
+                .ok_or_else(|| {
+                    invalid_input(
+                        SemanticGraphPackingInvariant::PackingMaterial,
+                        "summary restore target hop is not packed",
+                    )
+                })?
                 .continued_to_coordinate
                 .preview
         }
@@ -756,9 +902,12 @@ fn estimate_candidate(
     created_at: Timestamp,
     limit: usize,
 ) -> Result<EstimateAttempt, SemanticGraphResponsePackingError> {
-    result
-        .validate()
-        .map_err(|error| invalid_input(format!("candidate result is invalid: {error}")))?;
+    result.validate_detailed().map_err(|error| {
+        invalid_input(
+            SemanticGraphPackingInvariant::CandidateForest(error.invariant),
+            format!("candidate result is invalid: {error}"),
+        )
+    })?;
     let content = serde_json::to_string(result)
         .map_err(|_| SemanticGraphResponsePackingError::Serialization)?;
     let relay = expected_relay.to_hex();
@@ -788,11 +937,22 @@ fn estimate_candidate(
 }
 
 fn as_u64(value: usize, field: &'static str) -> Result<u64, SemanticGraphResponsePackingError> {
-    u64::try_from(value).map_err(|_| invalid_input(format!("{field} exceeds u64")))
+    u64::try_from(value).map_err(|_| {
+        invalid_input(
+            SemanticGraphPackingInvariant::PackingAccounting,
+            format!("{field} exceeds u64"),
+        )
+    })
 }
 
-fn invalid_input(message: impl Into<String>) -> SemanticGraphResponsePackingError {
-    SemanticGraphResponsePackingError::InvalidInput(message.into())
+fn invalid_input(
+    invariant: SemanticGraphPackingInvariant,
+    detail: impl Into<String>,
+) -> SemanticGraphResponsePackingError {
+    SemanticGraphResponsePackingError::InvalidInput {
+        invariant,
+        detail: detail.into(),
+    }
 }
 
 #[cfg(test)]
@@ -802,32 +962,34 @@ mod tests {
     use buzz_project_context::{canonicalize_coordinates, EdgeKey, ProjectContextCoordinate};
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::{
-        ProjectDocumentSourceBasis, ProjectViewSemanticType, ProjectViewSourceBasis,
+        Digest32, ProjectDocumentSourceBasis, ProjectViewSemanticType, ProjectViewSourceBasis,
         SemanticCoverage, SemanticLifecycleClass, SemanticSourceBasis, SemanticSourceIdentity,
         SemanticSourceKind,
     };
     use buzz_semantic_query::{
-        budget_profile_digest, candidate_score, derive_path_id, derive_root_id, document_score,
-        harmonic_score, path_score, query_contract_digest, ranking_contract_digest,
-        target_coordinate_score, AcceptedInitialCoordinateObservation, AnchorGain,
-        BranchStopReason, CanonicalSourceProvenance, CompletionReason,
+        budget_profile_digest, candidate_score, derive_http_request_binding, derive_path_id,
+        derive_root_id, document_score, harmonic_score, path_score, query_contract_digest,
+        ranking_contract_digest, target_coordinate_score, AcceptedInitialCoordinateObservation,
+        AnchorGain, BranchStopReason, CanonicalSourceProvenance, CompletionReason,
         ContextDocumentBindingObservation, CurrentGraphMembershipObservation, DegradedModeCounts,
-        EmbeddingCoverageCounts, LifecycleFilter, OmittedContextChannelCounts,
+        EmbeddingCoverageCounts, ExhaustedDimension, LifecycleFilter, OmittedContextChannelCounts,
         OmittedForResponseBudgetCounts, ProjectContextBindingProvenance,
         ProjectContextEdgeProvenance, RootDiscoveryChannel, RootStructuralEntrypoint, Score,
         ScoreExplanation, SeedOutcome, SemanticContinuedCoordinate, SemanticEdgeObservation,
         SemanticGraphQuery, SemanticGraphQueryBudget, SemanticGraphQueryCoverage,
         SemanticGraphQueryInputObservations, SemanticGraphQueryObservations,
-        SemanticHeadProvenance, SemanticHeadState, SemanticHyperedgeHop, SemanticPath,
-        SemanticProvenance, SemanticRelationDocument, SemanticRoot, SemanticScoreRole,
-        SemanticSourcePreview, SummaryOmittedReason, TruncationCountsByDimension,
+        SemanticGraphResultInvariant, SemanticHeadProvenance, SemanticHeadState,
+        SemanticHyperedgeHop, SemanticPath, SemanticProvenance, SemanticRelationDocument,
+        SemanticRoot, SemanticScoreRole, SemanticSourcePreview, SummaryOmittedReason,
+        TruncationCountsByDimension,
     };
     use chrono::{TimeZone, Utc};
     use nostr::Keys;
     use uuid::Uuid;
 
     use super::{
-        pack_semantic_graph_response, sign_packed_semantic_graph_response,
+        pack_semantic_graph_response, root_is_explicit, sign_packed_semantic_graph_response,
+        validate_completed_semantic_graph_forest, SemanticGraphPackingInvariant,
         SemanticGraphResponsePackingError, SemanticGraphResponsePackingInput,
     };
 
@@ -1018,83 +1180,115 @@ mod tests {
         document_seed: u64,
         with_summary: bool,
     ) -> SemanticPath {
-        let coordinates = canonicalize_coordinates(vec![entered.clone(), target.clone()])
-            .expect("canonical edge");
-        let edge_key = EdgeKey::derive(project_id, &coordinates).expect("edge key");
-        let document_id = uuid(document_seed);
-        let edge_provenance = ProjectContextEdgeProvenance {
-            last_context_revision: document_seed,
-            source_change_id: digest(document_seed as u8),
-        };
-        let binding_provenance = ProjectContextBindingProvenance {
-            binding_context_revision: document_seed + 1,
-            source_change_id: digest(document_seed as u8 + 1),
-            projection_event_id: digest(document_seed as u8 + 2),
-        };
+        path_through(
+            project_id,
+            generation_id,
+            root,
+            entered,
+            &[target],
+            document_seed,
+            with_summary,
+        )
+    }
+
+    fn path_through(
+        project_id: Uuid,
+        generation_id: Uuid,
+        root: &SemanticRoot,
+        entered: ProjectContextCoordinate,
+        targets: &[ProjectContextCoordinate],
+        document_seed: u64,
+        with_summary: bool,
+    ) -> SemanticPath {
+        assert!(!targets.is_empty(), "path fixture needs at least one hop");
         let problem_score = Score::new(820_000).expect("score");
         let coherence = Score::new(760_000).expect("score");
-        let relation_explanation = relation_explanation(problem_score, coherence);
-        let target_explanation = target_explanation(problem_score, coherence);
-        let transition_score = harmonic_score(
-            relation_explanation.final_score,
-            target_explanation.final_score,
-        );
-        let hop = SemanticHyperedgeHop {
-            ordinal: 1,
-            entered_from_coordinate: Some(entered),
-            edge: SemanticEdgeObservation {
-                edge_key,
-                complete_coordinates: coordinates,
-                provenance: edge_provenance,
-                current_context_document_bindings: vec![ContextDocumentBindingObservation {
+        let mut current = entered;
+        let mut hops = Vec::with_capacity(targets.len());
+        for (index, target) in targets.iter().enumerate() {
+            let hop_seed = document_seed + index as u64;
+            let seed = hop_seed as u8;
+            let coordinates = canonicalize_coordinates(vec![current.clone(), target.clone()])
+                .expect("canonical edge");
+            let edge_key = EdgeKey::derive(project_id, &coordinates).expect("edge key");
+            let document_id = uuid(hop_seed);
+            let edge_provenance = ProjectContextEdgeProvenance {
+                last_context_revision: hop_seed,
+                source_change_id: digest(seed),
+            };
+            let binding_provenance = ProjectContextBindingProvenance {
+                binding_context_revision: hop_seed + 1,
+                source_change_id: digest(seed + 1),
+                projection_event_id: digest(seed + 2),
+            };
+            let relation_explanation = relation_explanation(problem_score, coherence);
+            let target_explanation = target_explanation(problem_score, coherence);
+            let transition_score = harmonic_score(
+                relation_explanation.final_score,
+                target_explanation.final_score,
+            );
+            hops.push(SemanticHyperedgeHop {
+                ordinal: u16::try_from(index + 1).expect("bounded fixture hop ordinal"),
+                entered_from_coordinate: Some(current.clone()),
+                edge: SemanticEdgeObservation {
+                    edge_key,
+                    complete_coordinates: coordinates,
+                    provenance: edge_provenance,
+                    current_context_document_bindings: vec![ContextDocumentBindingObservation {
+                        document_id,
+                        provenance: binding_provenance.clone(),
+                    }],
+                },
+                selected_relation_document: SemanticRelationDocument {
                     document_id,
-                    provenance: binding_provenance.clone(),
-                }],
-            },
-            selected_relation_document: SemanticRelationDocument {
-                document_id,
-                binding_provenance,
-                preview: preview(
-                    &format!("relation-{document_seed}"),
-                    with_summary.then_some("relation summary "),
-                ),
-                canonical_provenance: provenance(
-                    SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
-                        document_revision: document_seed,
-                        source_change_id: digest(document_seed as u8 + 3),
-                    }),
-                    document_seed as u8 + 4,
-                    with_summary,
-                ),
-                semantic_provenance: semantic_provenance(generation_id, document_seed as u8 + 4),
-                document_score: relation_explanation.final_score,
-                score_explanation: relation_explanation,
-            },
-            continued_to_coordinate: SemanticContinuedCoordinate {
-                coordinate: target.clone(),
-                preview: preview(
-                    &format!("target-{document_seed}"),
-                    with_summary.then_some("target summary "),
-                ),
-                lifecycle: SemanticLifecycleClass::Active,
-                canonical_provenance: provenance(
-                    project_view_basis(document_seed as u8 + 5),
-                    document_seed as u8 + 5,
-                    with_summary,
-                ),
-                semantic_provenance: semantic_provenance(generation_id, document_seed as u8 + 5),
-                target_score: target_explanation.final_score,
-                score_explanation: target_explanation,
-            },
-            transition_score,
-        };
-        let explanation = path_score(root.semantic_score, &[transition_score]).expect("path score");
-        let path_id = derive_path_id(root.root_id, std::slice::from_ref(&hop)).expect("path id");
+                    binding_provenance,
+                    preview: preview(
+                        &format!("relation-{hop_seed}"),
+                        with_summary.then_some("relation summary "),
+                    ),
+                    canonical_provenance: provenance(
+                        SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
+                            document_revision: hop_seed,
+                            source_change_id: digest(seed + 3),
+                        }),
+                        seed + 4,
+                        with_summary,
+                    ),
+                    semantic_provenance: semantic_provenance(generation_id, seed + 4),
+                    document_score: relation_explanation.final_score,
+                    score_explanation: relation_explanation,
+                },
+                continued_to_coordinate: SemanticContinuedCoordinate {
+                    coordinate: target.clone(),
+                    preview: preview(
+                        &format!("target-{hop_seed}"),
+                        with_summary.then_some("target summary "),
+                    ),
+                    lifecycle: SemanticLifecycleClass::Active,
+                    canonical_provenance: provenance(
+                        project_view_basis(seed + 5),
+                        seed + 5,
+                        with_summary,
+                    ),
+                    semantic_provenance: semantic_provenance(generation_id, seed + 5),
+                    target_score: target_explanation.final_score,
+                    score_explanation: target_explanation,
+                },
+                transition_score,
+            });
+            current = target.clone();
+        }
+        let transition_scores = hops
+            .iter()
+            .map(|hop| hop.transition_score)
+            .collect::<Vec<_>>();
+        let explanation = path_score(root.semantic_score, &transition_scores).expect("path score");
+        let path_id = derive_path_id(root.root_id, &hops).expect("path id");
         SemanticPath {
             path_id,
             root_id: root.root_id,
-            hops: vec![hop],
-            terminal_coordinate: target,
+            hops,
+            terminal_coordinate: current,
             path_score: explanation.final_score.expect("scored path"),
             path_score_explanation: explanation,
             branch_stop_reason: BranchStopReason::FrontierExhausted,
@@ -1222,6 +1416,155 @@ mod tests {
             completion_reason: CompletionReason::FrontierExhausted,
             exhausted_dimensions: Vec::new(),
         }
+    }
+
+    fn packing_input_with_hops(hop_count: u8) -> SemanticGraphResponsePackingInput {
+        let mut input = packing_input(false);
+        let project_id = input.query.project_id;
+        let generation_id = input.observations.semantic_generation_id;
+        let explicit_start = input.input_observations.accepted_initial_coordinates[0]
+            .coordinate
+            .clone();
+        let explicit_targets = (0..hop_count)
+            .map(|index| coordinate(ProjectViewObjectType::Work, 100 + u64::from(index)))
+            .collect::<Vec<_>>();
+        let automatic = input
+            .roots
+            .iter()
+            .find(|root| !root_is_explicit(root))
+            .expect("automatic root fixture")
+            .clone();
+        let automatic_start = match &automatic.structural_entrypoints[0] {
+            RootStructuralEntrypoint::Coordinate { coordinate } => coordinate.clone(),
+            RootStructuralEntrypoint::ContextDocument { .. } => {
+                panic!("automatic fixture uses a Coordinate entrypoint")
+            }
+        };
+        let automatic_targets = (0..hop_count)
+            .map(|index| coordinate(ProjectViewObjectType::Issue, 200 + u64::from(index)))
+            .collect::<Vec<_>>();
+        let explicit = input
+            .roots
+            .iter()
+            .find(|root| root_is_explicit(root))
+            .expect("explicit root fixture")
+            .clone();
+        let explicit_path = path_through(
+            project_id,
+            generation_id,
+            &explicit,
+            explicit_start,
+            &explicit_targets,
+            40,
+            false,
+        );
+        let automatic_path = path_through(
+            project_id,
+            generation_id,
+            &automatic,
+            automatic_start,
+            &automatic_targets,
+            80,
+            false,
+        );
+        input.input_observations.accepted_initial_coordinates[0]
+            .graph_membership
+            .incident_edge_keys = vec![explicit_path.hops[0].edge.edge_key];
+        input.paths = vec![automatic_path, explicit_path];
+        input.query.budget.max_hops_per_path = hop_count;
+        input.query.budget.max_response_bytes = 256 * 1024;
+        let materialized = u64::from(hop_count) * 2;
+        input.coverage.expanded_coordinates = materialized;
+        input.coverage.incident_edges_materialized = materialized;
+        input.coverage.relation_options_materialized = materialized;
+        input.coverage.target_options_materialized = materialized;
+        input.coverage.truncation_counts_by_dimension.hops_per_path = 2;
+        input.completion_reason = CompletionReason::BudgetExhausted;
+        input.exhausted_dimensions = vec![ExhaustedDimension::HopsPerPath];
+        for path in &mut input.paths {
+            path.branch_stop_reason = BranchStopReason::MaxHopsReached;
+        }
+        input
+    }
+
+    #[test]
+    fn one_through_six_hop_forests_pack_sign_and_sdk_verify() {
+        use buzz_core::{kind::KIND_HTTP_AUTH, CommunityId};
+        use buzz_sdk::semantic_graph::{
+            parse_semantic_graph_query_result, SemanticGraphHttpRequestObservation,
+        };
+        use nostr::{Event, EventBuilder, Kind};
+
+        let relay = Keys::generate();
+        let caller = Keys::generate();
+        for hop_count in 1..=6 {
+            let mut input = packing_input_with_hops(hop_count);
+            let body = serde_json::to_vec(&input.query).expect("query fixture serializes");
+            let auth_event = EventBuilder::new(
+                Kind::Custom(KIND_HTTP_AUTH as u16),
+                "semantic packing fixture",
+            )
+            .sign_with_keys(&caller)
+            .expect("auth fixture signs");
+            input.request_binding_digest = derive_http_request_binding(
+                input.query.project_id,
+                &caller.public_key().to_bytes(),
+                Digest32::from_bytes(auth_event.id.to_bytes()),
+                &body,
+            )
+            .expect("request binding");
+            validate_completed_semantic_graph_forest(&input)
+                .expect("traversal forest validates before packing");
+            let query = input.query.clone();
+            let packed = pack_semantic_graph_response(
+                input,
+                &relay.public_key(),
+                &caller.public_key(),
+                256 * 1024,
+            )
+            .expect("multi-hop response packs");
+            let signed = sign_packed_semantic_graph_response(packed, &relay)
+                .expect("multi-hop response signs");
+            let events: Vec<Event> = serde_json::from_slice(&signed.event_array_bytes)
+                .expect("signed event array parses");
+            assert_eq!(events.len(), 1);
+            let verified = parse_semantic_graph_query_result(
+                &events[0],
+                &relay.public_key(),
+                SemanticGraphHttpRequestObservation {
+                    project_id: CommunityId::from_uuid(query.project_id),
+                    authenticated_caller: caller.public_key(),
+                    request: &query,
+                    nip98_auth_event_id: auth_event.id,
+                    exact_authenticated_body: &body,
+                },
+            )
+            .expect("SDK verifies multi-hop response");
+            assert!(verified
+                .paths
+                .iter()
+                .all(|path| path.hops.len() == usize::from(hop_count)));
+        }
+    }
+
+    #[test]
+    fn completed_forest_reports_path_contiguity_without_exposing_path_content() {
+        let mut input = packing_input_with_hops(3);
+        let path = &mut input.paths[0];
+        path.hops[1].entered_from_coordinate = Some(coordinate(ProjectViewObjectType::Goal, 999));
+        path.path_id = derive_path_id(path.root_id, &path.hops).expect("mutated path id");
+
+        let error = validate_completed_semantic_graph_forest(&input)
+            .expect_err("discontinuous traversal output must fail closed");
+        assert!(matches!(
+            error,
+            SemanticGraphResponsePackingError::InvalidInput {
+                invariant: SemanticGraphPackingInvariant::CompletedForest(
+                    SemanticGraphResultInvariant::PathContiguity
+                ),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1426,8 +1769,10 @@ mod tests {
             .expect_err("accepted initial must retain an explicit root shell");
         assert!(matches!(
             error,
-            SemanticGraphResponsePackingError::InvalidInput(message)
-                if message.contains("required root shell")
+            SemanticGraphResponsePackingError::InvalidInput {
+                invariant: SemanticGraphPackingInvariant::ExplicitRootShell,
+                ..
+            }
         ));
     }
 

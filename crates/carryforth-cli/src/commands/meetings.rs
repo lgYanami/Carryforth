@@ -9,6 +9,7 @@ use crate::client::{
     extract_p_tags, extract_tag_value, normalize_write_response, print_create_response,
     CarryforthClient,
 };
+use crate::commands::project_view_snapshot::SupportedExtensionsObservationStatus;
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_file_or_stdin, read_or_stdin, sdk_err, validate_hex64};
 use crate::OutputFormat;
@@ -38,6 +39,8 @@ pub(crate) struct MeetingSummary {
 struct MeetingRelayInfo {
     #[serde(default)]
     supported_extensions: Vec<String>,
+    #[serde(default)]
+    buzz_supported_extensions_status: Option<SupportedExtensionsObservationStatus>,
     #[serde(rename = "self")]
     relay_self: Option<String>,
 }
@@ -600,6 +603,13 @@ async fn meeting_relay_identity(
             .iter()
             .any(|extension| extension == MEETING_SUMMARY_EXTENSION)
     {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(CliError::Unavailable(
+                "Relay Meeting capability observation could not be completed".to_owned(),
+            ));
+        }
         return Err(CliError::Other(format!(
             "unavailable: Relay does not advertise {MEETING_SUMMARY_EXTENSION}"
         )));

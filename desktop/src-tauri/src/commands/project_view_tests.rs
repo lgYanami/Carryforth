@@ -330,6 +330,23 @@ async fn semantic_query_availability_is_an_independent_nip11_capability() {
 }
 
 #[tokio::test]
+async fn incomplete_capability_observation_is_retryable_not_unsupported() {
+    async fn incomplete_info() -> Json<Value> {
+        Json(json!({
+            "supported_extensions": [],
+            "buzz_supported_extensions_status": "temporarily_unavailable",
+        }))
+    }
+
+    let url = spawn_server(Router::new().route("/info", get(incomplete_info))).await;
+    let state = build_app_state();
+    let error = read_identity_at(&state, &url)
+        .await
+        .expect_err("an incomplete observation must not become unsupported");
+    assert!(error.contains("temporarily unavailable"));
+}
+
+#[tokio::test]
 async fn bootstrap_marker_returns_uninitialized_without_projection_queries() {
     let queries = Arc::new(AtomicUsize::new(0));
     let state_fixture = IdentityServerState {

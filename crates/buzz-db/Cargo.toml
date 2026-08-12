@@ -18,6 +18,7 @@ buzz-audit = { workspace = true }
 buzz-semantic = { workspace = true }
 buzz-semantic-query = { workspace = true }
 sqlx        = { workspace = true }
+metrics     = { workspace = true }
 pgvector    = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }

@@ -58,6 +58,20 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-carryforth}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing POSTGRES_PASSWORD}
       PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - max_parallel_workers_per_gather=1
     ports:
       - 127.0.0.1:${CARRYFORTH_POSTGRES_PORT:-55432}:5432
     volumes:
@@ -69,6 +83,10 @@ services:
       timeout: 5s
       retries: 24
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
     restart: unless-stopped
     networks:
       - carryforth-local

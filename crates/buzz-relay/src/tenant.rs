@@ -58,6 +58,202 @@ pub enum BindError<E> {
     Lookup(E),
 }
 
+/// Closed public-surface classification for a Postgres-backed host lookup.
+///
+/// This classification deliberately distinguishes a successful lookup that
+/// found no tenant from a lookup that could not be completed. It never carries
+/// the requested host, SQL text, tenant identity, or the underlying error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostLookupFailureClass {
+    /// The database answered successfully and the normalized host is unmapped.
+    Unmapped,
+    /// A transient database or pool condition prevented a trustworthy answer.
+    DependencyUnavailable(HostLookupDependencyReason),
+    /// A schema, decode, configuration, or otherwise unclassified failure.
+    Internal(HostLookupInternalReason),
+}
+
+/// Low-cardinality reasons for retryable host-lookup dependency failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostLookupDependencyReason {
+    /// The dedicated control pool could not provide a connection in time.
+    PoolAcquireTimeout,
+    /// The dedicated control pool is closing or its worker terminated.
+    PoolUnavailable,
+    /// The connection failed at the transport or TLS layer.
+    ConnectionUnavailable,
+    /// PostgreSQL is starting, recovering, or shutting down.
+    DatabaseRecovery,
+    /// PostgreSQL reported insufficient resources.
+    ResourceExhaustion,
+}
+
+impl HostLookupDependencyReason {
+    /// Stable metric/log code. Contains no request or database content.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::PoolAcquireTimeout => "pool_acquire_timeout",
+            Self::PoolUnavailable => "pool_unavailable",
+            Self::ConnectionUnavailable => "connection_unavailable",
+            Self::DatabaseRecovery => "database_recovery",
+            Self::ResourceExhaustion => "resource_exhaustion",
+        }
+    }
+}
+
+/// Low-cardinality reasons for non-retryable host-lookup failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostLookupInternalReason {
+    /// The query or schema contract does not match the running database.
+    SchemaContract,
+    /// A returned value could not be decoded into the frozen host-map shape.
+    DecodeContract,
+    /// The failure did not match the closed dependency set.
+    UnknownInternal,
+}
+
+impl HostLookupInternalReason {
+    /// Stable metric/log code. Contains no request or database content.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::SchemaContract => "schema_contract",
+            Self::DecodeContract => "decode_contract",
+            Self::UnknownInternal => "unknown_internal",
+        }
+    }
+}
+
+/// Classify one database-backed row-zero failure without leaking its contents.
+pub(crate) fn classify_db_bind_error(
+    error: &BindError<buzz_db::DbError>,
+) -> HostLookupFailureClass {
+    match error {
+        BindError::UnmappedHost => HostLookupFailureClass::Unmapped,
+        BindError::Lookup(buzz_db::DbError::Sqlx(error)) => classify_sqlx_host_lookup_error(error),
+        BindError::Lookup(
+            buzz_db::DbError::InvalidData(_)
+            | buzz_db::DbError::InvalidTimestamp(_)
+            | buzz_db::DbError::Serde(_),
+        ) => HostLookupFailureClass::Internal(HostLookupInternalReason::DecodeContract),
+        BindError::Lookup(buzz_db::DbError::Migrate(_)) => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        }
+        BindError::Lookup(_) => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::UnknownInternal)
+        }
+    }
+}
+
+fn classify_sqlx_host_lookup_error(error: &sqlx::Error) -> HostLookupFailureClass {
+    use sqlx::Error;
+
+    match error {
+        Error::PoolTimedOut => HostLookupFailureClass::DependencyUnavailable(
+            HostLookupDependencyReason::PoolAcquireTimeout,
+        ),
+        Error::PoolClosed | Error::WorkerCrashed => HostLookupFailureClass::DependencyUnavailable(
+            HostLookupDependencyReason::PoolUnavailable,
+        ),
+        Error::Io(_) | Error::Tls(_) | Error::BeginFailed => {
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::ConnectionUnavailable,
+            )
+        }
+        Error::Database(database) => classify_sqlstate(database.code().as_deref()),
+        Error::ColumnDecode { .. } | Error::Decode(_) | Error::Protocol(_) => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::DecodeContract)
+        }
+        Error::TypeNotFound { .. }
+        | Error::ColumnIndexOutOfBounds { .. }
+        | Error::ColumnNotFound(_)
+        | Error::Configuration(_)
+        | Error::InvalidArgument(_)
+        | Error::Encode(_)
+        | Error::AnyDriverError(_)
+        | Error::RowNotFound
+        | Error::InvalidSavePointStatement
+        | Error::ConfigFile(_) => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        }
+        Error::Migrate(_) => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        }
+        _ => HostLookupFailureClass::Internal(HostLookupInternalReason::UnknownInternal),
+    }
+}
+
+fn classify_sqlstate(code: Option<&str>) -> HostLookupFailureClass {
+    match code {
+        Some(code) if code.starts_with("08") => HostLookupFailureClass::DependencyUnavailable(
+            HostLookupDependencyReason::ConnectionUnavailable,
+        ),
+        Some(code) if code.starts_with("53") => HostLookupFailureClass::DependencyUnavailable(
+            HostLookupDependencyReason::ResourceExhaustion,
+        ),
+        Some("57P01" | "57P02" | "57P03") => HostLookupFailureClass::DependencyUnavailable(
+            HostLookupDependencyReason::DatabaseRecovery,
+        ),
+        Some(code) if code.starts_with("42") => {
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        }
+        _ => HostLookupFailureClass::Internal(HostLookupInternalReason::UnknownInternal),
+    }
+}
+
+/// Record one row-zero failure without including high-cardinality request data.
+pub(crate) fn record_host_lookup_failure(class: HostLookupFailureClass) {
+    let (class_code, reason) = match class {
+        HostLookupFailureClass::Unmapped => ("unmapped", "unmapped"),
+        HostLookupFailureClass::DependencyUnavailable(reason) => {
+            ("dependency_unavailable", reason.code())
+        }
+        HostLookupFailureClass::Internal(reason) => ("internal", reason.code()),
+    };
+    metrics::counter!(
+        "buzz_row_zero_host_lookup_failures_total",
+        "class" => class_code,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+/// Content-free HTTP projection for a row-zero host lookup failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostLookupHttpFailure {
+    pub(crate) status: axum::http::StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: &'static str,
+    pub(crate) retryable: bool,
+}
+
+/// Convert a database-backed row-zero failure to the stable public HTTP shape.
+pub(crate) fn host_lookup_http_failure(
+    error: &BindError<buzz_db::DbError>,
+) -> HostLookupHttpFailure {
+    let class = classify_db_bind_error(error);
+    record_host_lookup_failure(class);
+    match class {
+        HostLookupFailureClass::Unmapped => HostLookupHttpFailure {
+            status: axum::http::StatusCode::NOT_FOUND,
+            code: "not_found:relay:community_lookup",
+            message: "relay: no community is configured for this host",
+            retryable: false,
+        },
+        HostLookupFailureClass::DependencyUnavailable(_) => HostLookupHttpFailure {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable:relay:community_lookup",
+            message: "relay: community lookup is temporarily unavailable",
+            retryable: true,
+        },
+        HostLookupFailureClass::Internal(_) => HostLookupHttpFailure {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal:relay:community_lookup",
+            message: "relay: community lookup failed",
+            retryable: false,
+        },
+    }
+}
+
 /// Bind a raw connection host to a [`TenantContext`], failing closed.
 ///
 /// This is the single row-zero entry point. It normalizes the host with the
@@ -150,6 +346,89 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn sqlstate_classification_is_fail_closed_and_narrow() {
+        assert_eq!(
+            classify_sqlstate(Some("08006")),
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::ConnectionUnavailable
+            )
+        );
+        assert_eq!(
+            classify_sqlstate(Some("57P03")),
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::DatabaseRecovery
+            )
+        );
+        assert_eq!(
+            classify_sqlstate(Some("53300")),
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::ResourceExhaustion
+            )
+        );
+        assert_eq!(
+            classify_sqlstate(Some("42P01")),
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        );
+        assert_eq!(
+            classify_sqlstate(Some("23505")),
+            HostLookupFailureClass::Internal(HostLookupInternalReason::UnknownInternal)
+        );
+        assert_eq!(
+            classify_sqlstate(None),
+            HostLookupFailureClass::Internal(HostLookupInternalReason::UnknownInternal)
+        );
+    }
+
+    #[test]
+    fn sqlx_pool_and_decode_errors_have_distinct_public_classes() {
+        assert_eq!(
+            classify_sqlx_host_lookup_error(&sqlx::Error::PoolTimedOut),
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::PoolAcquireTimeout
+            )
+        );
+        assert_eq!(
+            classify_sqlx_host_lookup_error(&sqlx::Error::PoolClosed),
+            HostLookupFailureClass::DependencyUnavailable(
+                HostLookupDependencyReason::PoolUnavailable
+            )
+        );
+        assert_eq!(
+            classify_sqlx_host_lookup_error(&sqlx::Error::ColumnNotFound("host".to_owned())),
+            HostLookupFailureClass::Internal(HostLookupInternalReason::SchemaContract)
+        );
+    }
+
+    #[test]
+    fn public_host_lookup_failures_distinguish_unmapped_transient_and_internal() {
+        let unmapped = host_lookup_http_failure(&BindError::UnmappedHost);
+        assert_eq!(unmapped.status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(unmapped.code, "not_found:relay:community_lookup");
+        assert!(!unmapped.retryable);
+
+        let transient = host_lookup_http_failure(&BindError::Lookup(buzz_db::DbError::Sqlx(
+            sqlx::Error::PoolTimedOut,
+        )));
+        assert_eq!(
+            transient.status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(transient.code, "unavailable:relay:community_lookup");
+        assert!(transient.retryable);
+
+        let internal = host_lookup_http_failure(&BindError::Lookup(buzz_db::DbError::InvalidData(
+            "sensitive database detail".to_owned(),
+        )));
+        assert_eq!(
+            internal.status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(internal.code, "internal:relay:community_lookup");
+        assert!(!internal.retryable);
+        assert!(!internal.message.contains("sensitive"));
+    }
 
     /// In-memory resolver over a fixed host→community map, so the binding seam
     /// is testable without a database.

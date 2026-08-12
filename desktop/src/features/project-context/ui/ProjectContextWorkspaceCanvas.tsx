@@ -53,8 +53,6 @@ export function ProjectContextWorkspaceCanvas({
   semanticOverlay: ProjectContextSemanticOverlay | null;
   semanticSessionOverlay: ProjectContextSemanticOverlay | null;
 }) {
-  if (pending && !result) return <ProjectContextLoadingState />;
-
   if (failure) {
     return (
       <ProjectContextFailureState
@@ -65,6 +63,8 @@ export function ProjectContextWorkspaceCanvas({
       />
     );
   }
+
+  if (pending && !result) return <ProjectContextLoadingState />;
 
   if (result && displayedAllContext && result.context.activeEdgeCount === 0) {
     return <ProjectContextEmptyState />;

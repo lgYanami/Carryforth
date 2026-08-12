@@ -102,18 +102,20 @@ function ValidProjectContextScreen({
     useProjectContextStructuralDraft(appliedQuery);
   const appliedWorkspace = useAppliedWorkspaceIdentity();
   const contextQuery = useProjectContextQuery(appliedQuery);
-  const failureKind = contextQuery.isError
-    ? projectContextFailureKind(contextQuery.error)
+  const contextQueryFailure =
+    contextQuery.error ?? contextQuery.failureReason ?? undefined;
+  const failureKind = contextQueryFailure
+    ? projectContextFailureKind(contextQueryFailure)
     : undefined;
   const verificationFailure = failureKind === "verification_failed";
   const routeResult = verificationFailure ? undefined : contextQuery.data;
   const fatalError =
-    contextQuery.isError && (!contextQuery.data || verificationFailure)
-      ? contextQuery.error
+    contextQueryFailure && (!contextQuery.data || verificationFailure)
+      ? contextQueryFailure
       : undefined;
   const routeRefreshError =
-    contextQuery.isError && contextQuery.data && !verificationFailure
-      ? contextQuery.error
+    contextQueryFailure && contextQuery.data && !verificationFailure
+      ? contextQueryFailure
       : undefined;
   const initialSemanticIdentity =
     React.useMemo<SemanticProjectContextAcceptanceIdentity>(
@@ -137,8 +139,10 @@ function ValidProjectContextScreen({
   const allContextQuery = useProjectContextQuery(ALL_PROJECT_CONTEXT_QUERY, {
     enabled: semanticNeedsAllContext,
   });
-  const allContextFailureKind = allContextQuery.isError
-    ? projectContextFailureKind(allContextQuery.error)
+  const allContextQueryFailure =
+    allContextQuery.error ?? allContextQuery.failureReason ?? undefined;
+  const allContextFailureKind = allContextQueryFailure
+    ? projectContextFailureKind(allContextQueryFailure)
     : undefined;
   const allContextResult =
     allContextFailureKind === "verification_failed"
@@ -257,8 +261,8 @@ function ValidProjectContextScreen({
   );
   const meetingProfilesQuery = useUsersBatchQuery(meetingProfilePubkeys);
   const displayedFatalError = trustedActive
-    ? allContextQuery.isError && !allContextResult
-      ? allContextQuery.error
+    ? allContextQueryFailure && !allContextResult
+      ? allContextQueryFailure
       : undefined
     : fatalError;
   const displayedFailureKind = displayedFatalError
@@ -268,8 +272,8 @@ function ValidProjectContextScreen({
     ? allContextQuery.isPending
     : contextQuery.isPending;
   const displayedRefreshError = semanticNeedsAllContext
-    ? allContextQuery.isError
-      ? allContextQuery.error
+    ? allContextQueryFailure
+      ? allContextQueryFailure
       : undefined
     : routeRefreshError;
   const refreshMessage = displayedRefreshError

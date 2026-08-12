@@ -527,6 +527,13 @@ The command is available only when NIP-11 advertises
 It resolves the current Project identity from the verified Project View v3
 snapshot before sending the query.
 
+Current Relays also publish `buzz_supported_extensions_status`. When it is
+`temporarily_unavailable`, a missing graph-query, Project View, Document, or
+Meeting extension means dependency observation is incomplete—not permanently
+unsupported. `cf` returns retryable `relay_unavailable` (exit 2) and does not
+send a semantic Provider request. Legacy Relays that omit the status retain the
+previous compatibility behavior; a missing extension remains unsupported.
+
 ```bash
 cf project-context semantic-query \
   --problem "why did this release incident recur?" | jq .

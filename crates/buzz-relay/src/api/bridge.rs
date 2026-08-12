@@ -41,13 +41,14 @@ use crate::semantic_graph_observability::{
 };
 use crate::semantic_graph_query::SemanticGraphRootQueryError;
 use crate::semantic_graph_response::{
-    pack_semantic_graph_response, sign_packed_semantic_graph_response, PackedSemanticGraphResponse,
+    pack_semantic_graph_response, sign_packed_semantic_graph_response,
+    validate_completed_semantic_graph_forest, PackedSemanticGraphResponse,
     SemanticGraphResponsePackingError, SemanticGraphResponsePackingInput,
     SignedSemanticGraphResponse,
 };
 use crate::state::AppState;
 
-use super::{api_error, internal_error, not_found};
+use super::{api_error, host_lookup_api_error, internal_error, not_found};
 
 async fn enforce_http_admission(
     state: &AppState,
@@ -585,18 +586,21 @@ async fn execute_semantic_graph_http_query_after_routing(
     require_semantic_absolute_deadline(absolute_deadline)?;
     let observations = semantic_graph_query_observations(&traversal.ticket)
         .map_err(map_semantic_contract_error)?;
+    let packing_input = SemanticGraphResponsePackingInput {
+        query,
+        request_binding_digest,
+        observations,
+        input_observations: traversal.input_observations,
+        roots: traversal.roots,
+        paths: traversal.paths,
+        coverage: traversal.coverage,
+        completion_reason: traversal.completion_reason,
+        exhausted_dimensions: traversal.exhausted_dimensions,
+    };
+    validate_completed_semantic_graph_forest(&packing_input)
+        .map_err(map_semantic_response_packing_error)?;
     let packed = pack_semantic_graph_response(
-        SemanticGraphResponsePackingInput {
-            query,
-            request_binding_digest,
-            observations,
-            input_observations: traversal.input_observations,
-            roots: traversal.roots,
-            paths: traversal.paths,
-            coverage: traversal.coverage,
-            completion_reason: traversal.completion_reason,
-            exhausted_dimensions: traversal.exhausted_dimensions,
-        },
+        packing_input,
         &state.relay_keypair.public_key(),
         &authenticated_caller,
         // HTTP returns the measured `[Event]` as the complete JSON payload;
@@ -770,6 +774,10 @@ fn map_semantic_root_query_error(error: SemanticGraphRootQueryError) -> (StatusC
             StatusCode::TOO_MANY_REQUESTS,
             "busy:semantic_graph_query:process_admission",
         ),
+        SemanticGraphRootQueryError::TraversalBusy => api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy:semantic_graph_query:traversal_busy; retry in 1s",
+        ),
         SemanticGraphRootQueryError::QueryProviderBusy => api_error(
             StatusCode::TOO_MANY_REQUESTS,
             "busy:semantic_graph_query:query_provider_busy",
@@ -852,7 +860,7 @@ fn map_semantic_response_packing_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable:semantic_graph_query:stable_signer",
         ),
-        SemanticGraphResponsePackingError::InvalidInput(_)
+        SemanticGraphResponsePackingError::InvalidInput { .. }
         | SemanticGraphResponsePackingError::Signing
         | SemanticGraphResponsePackingError::SizeEstimateDrift { .. }
         | SemanticGraphResponsePackingError::Serialization => {
@@ -2072,12 +2080,7 @@ pub async fn submit_event(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| host_lookup_api_error(&error))?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
@@ -2384,12 +2387,7 @@ pub async fn query_events(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| host_lookup_api_error(&error))?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
@@ -3330,12 +3328,7 @@ pub async fn count_events(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| host_lookup_api_error(&error))?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
@@ -4079,7 +4072,21 @@ pub async fn workflow_webhook(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| not_found("workflow not found"))?;
+        .map_err(|error| {
+            let failure = crate::tenant::host_lookup_http_failure(&error);
+            if failure.status == StatusCode::NOT_FOUND {
+                not_found("workflow not found")
+            } else {
+                (
+                    failure.status,
+                    Json(serde_json::json!({
+                        "error": failure.message,
+                        "code": failure.code,
+                        "retryable": failure.retryable,
+                    })),
+                )
+            }
+        })?;
     let community_id = tenant.community();
 
     let workflow = state
@@ -4314,12 +4321,7 @@ async fn authorize_moderation_read(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| host_lookup_api_error(&error))?;
 
     let path_with_query = match raw_query {
         Some(q) if !q.is_empty() => format!("{path}?{q}"),

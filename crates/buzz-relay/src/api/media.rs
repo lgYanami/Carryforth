@@ -164,7 +164,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             .unwrap_or("");
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
-            .map_err(|_| MediaError::NotFound)?;
+            .map_err(media_bind_error)?;
 
         let route_mode = upload_route_mode(parts.uri.path())?;
 
@@ -483,7 +483,16 @@ async fn bind_media_read_tenant(
         .unwrap_or("");
     crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| MediaError::NotFound)
+        .map_err(media_bind_error)
+}
+
+fn media_bind_error(error: crate::tenant::BindError<buzz_db::DbError>) -> MediaError {
+    let failure = crate::tenant::host_lookup_http_failure(&error);
+    match failure.status {
+        StatusCode::NOT_FOUND => MediaError::NotFound,
+        StatusCode::SERVICE_UNAVAILABLE => MediaError::DependencyUnavailable,
+        _ => MediaError::Internal,
+    }
 }
 
 async fn authenticate_media_read(

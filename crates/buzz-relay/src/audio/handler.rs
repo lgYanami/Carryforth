@@ -78,12 +78,9 @@ pub async fn ws_audio_handler(
         .unwrap_or("");
     let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
         Ok(ctx) => ctx,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-                .into_response();
+        Err(error) => {
+            let failure = crate::tenant::host_lookup_http_failure(&error);
+            return (failure.status, failure.message).into_response();
         }
     };
 

@@ -257,6 +257,11 @@ async fn capture_context(
         .require_runtime_ready("Project Context")
         .map_err(ProjectContextCommandError::unavailable)?;
     if !identity.project_document_supported {
+        if identity.extensions_temporarily_unavailable {
+            return Err(ProjectContextCommandError::unavailable(
+                "Project Context capabilities are temporarily unavailable.",
+            ));
+        }
         return Err(ProjectContextCommandError::unsupported(
             "Project Context requires Project Documents.",
         ));

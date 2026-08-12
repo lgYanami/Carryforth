@@ -47,6 +47,15 @@ impl SearchService {
         Self { pool }
     }
 
+    /// Return `(size, idle, max)` for bounded Relay pool telemetry.
+    pub fn pool_stats(&self) -> (u32, u32, u32) {
+        (
+            self.pool.size(),
+            self.pool.num_idle() as u32,
+            self.pool.options().get_max_connections(),
+        )
+    }
+
     /// Execute a community-scoped FTS query.
     pub async fn search(&self, query: &SearchQuery) -> Result<SearchResult, SearchError> {
         query::search(&self.pool, query).await

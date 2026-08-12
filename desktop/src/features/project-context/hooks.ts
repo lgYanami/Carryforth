@@ -14,11 +14,46 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import {
   canonicalizeProjectContextQuery,
+  ProjectContextError,
   projectContextQueryKey,
   queryProjectContext,
   type ProjectContextQuery,
   type ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+
+const PROJECT_CONTEXT_RETRY_LIMIT = 4;
+const PROJECT_CONTEXT_RETRY_MAX_DELAY_MS = 8_000;
+
+export function shouldRetryProjectContextQuery(
+  failureCount: number,
+  error: unknown,
+): boolean {
+  return (
+    failureCount < PROJECT_CONTEXT_RETRY_LIMIT &&
+    error instanceof ProjectContextError &&
+    error.retryable
+  );
+}
+
+export function projectContextRetryDelayMs(
+  attemptIndex: number,
+  error?: unknown,
+): number {
+  const exponent = Math.max(0, Math.min(attemptIndex, 3));
+  const base = Math.min(
+    1_000 * 2 ** exponent,
+    PROJECT_CONTEXT_RETRY_MAX_DELAY_MS,
+  );
+  const retryAfter =
+    error instanceof ProjectContextError &&
+    error.retryAfterSeconds !== undefined
+      ? Math.min(
+          Math.max(error.retryAfterSeconds * 1_000, 0),
+          PROJECT_CONTEXT_RETRY_MAX_DELAY_MS,
+        )
+      : 0;
+  return Math.max(base, retryAfter) + Math.floor(Math.random() * 250);
+}
 
 export const ALL_PROJECT_CONTEXT_QUERY: ProjectContextQuery = {
   type: "contains_all",
@@ -111,7 +146,8 @@ export function useProjectContextQuery(
     queryKey: projectContextCacheKey(communityKey, relayOrigin, query),
     queryFn: () => queryProjectContext({ communityKey, query }),
     enabled: Boolean(activeCommunity) && options?.enabled !== false,
-    retry: false,
+    retry: shouldRetryProjectContextQuery,
+    retryDelay: projectContextRetryDelayMs,
     staleTime: 15_000,
     refetchOnWindowFocus: true,
   });

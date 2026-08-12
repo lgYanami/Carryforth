@@ -30,14 +30,14 @@ const fn semantic_graph_http_local_handler_ready_from_facts(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticGraphHttpFleetCheckOutcome {
+pub(crate) enum SemanticGraphHttpRoutingObservation {
     Ready,
     NotReady(Option<SemanticGraphHttpFleetFailure>),
     Unavailable,
 }
 
-impl SemanticGraphHttpFleetCheckOutcome {
-    const fn ready(self) -> bool {
+impl SemanticGraphHttpRoutingObservation {
+    pub(crate) const fn ready(self) -> bool {
         matches!(self, Self::Ready)
     }
 }
@@ -54,7 +54,7 @@ async fn semantic_graph_http_routing_ready_with_fleet_check<'a, Check, CheckFutu
 ) -> bool
 where
     Check: FnOnce(SemanticGraphQueryRoutingTrust<'a>) -> CheckFuture,
-    CheckFuture: Future<Output = SemanticGraphHttpFleetCheckOutcome>,
+    CheckFuture: Future<Output = SemanticGraphHttpRoutingObservation>,
 {
     match routing_trust {
         SemanticGraphQueryRoutingTrust::TrustedSingleRelay => true,
@@ -84,8 +84,8 @@ pub(crate) async fn semantic_graph_http_routing_ready_for_test(
     };
     semantic_graph_http_routing_ready_with_fleet_check(routing_trust, |_| async move {
         match fleet_failure {
-            Some(failure) => SemanticGraphHttpFleetCheckOutcome::NotReady(Some(failure)),
-            None => SemanticGraphHttpFleetCheckOutcome::Ready,
+            Some(failure) => SemanticGraphHttpRoutingObservation::NotReady(Some(failure)),
+            None => SemanticGraphHttpRoutingObservation::Ready,
         }
     })
     .await
@@ -124,36 +124,45 @@ pub(crate) async fn semantic_graph_http_routing_ready(
     state: &AppState,
     community_id: CommunityId,
 ) -> bool {
+    semantic_graph_http_routing_observation(state, community_id)
+        .await
+        .ready()
+}
+
+/// Observe tenant-scoped routing readiness while preserving dependency
+/// unavailability for NIP-11 capability observation.
+pub(crate) async fn semantic_graph_http_routing_observation(
+    state: &AppState,
+    community_id: CommunityId,
+) -> SemanticGraphHttpRoutingObservation {
     let Ok(routing_trust) = semantic_graph_query_routing_trust(state) else {
-        return false;
+        return SemanticGraphHttpRoutingObservation::NotReady(None);
     };
-    semantic_graph_http_routing_ready_with_fleet_check(routing_trust, |routing_trust| async move {
-        let SemanticGraphQueryRoutingTrust::AttestedFleet {
+    match routing_trust {
+        SemanticGraphQueryRoutingTrust::TrustedSingleRelay => {
+            SemanticGraphHttpRoutingObservation::Ready
+        }
+        SemanticGraphQueryRoutingTrust::AttestedFleet {
             deployment_id,
             instance_id,
-        } = routing_trust
-        else {
-            return SemanticGraphHttpFleetCheckOutcome::Unavailable;
-        };
-        match state
+        } => match state
             .db
             .semantic_graph_http_fleet_readiness(community_id, deployment_id, Some(instance_id))
             .await
         {
             Ok(readiness) => match readiness.failure {
-                Some(failure) => SemanticGraphHttpFleetCheckOutcome::NotReady(Some(failure)),
-                None => SemanticGraphHttpFleetCheckOutcome::Ready,
+                Some(failure) => SemanticGraphHttpRoutingObservation::NotReady(Some(failure)),
+                None => SemanticGraphHttpRoutingObservation::Ready,
             },
             Err(error) => {
                 tracing::warn!(
                     community_id = %community_id,
                     "Semantic graph HTTP fleet readiness failed closed: {error}"
                 );
-                SemanticGraphHttpFleetCheckOutcome::Unavailable
+                SemanticGraphHttpRoutingObservation::Unavailable
             }
-        }
-    })
-    .await
+        },
+    }
 }
 
 /// Verify all currently query-enabled Communities for deployment-global
@@ -169,20 +178,20 @@ pub(crate) async fn all_enabled_semantic_graph_http_routes_ready(state: &AppStat
             instance_id,
         } = routing_trust
         else {
-            return SemanticGraphHttpFleetCheckOutcome::Unavailable;
+            return SemanticGraphHttpRoutingObservation::Unavailable;
         };
         match state
             .db
             .all_enabled_semantic_graph_http_fleets_ready(deployment_id, instance_id)
             .await
         {
-            Ok(true) => SemanticGraphHttpFleetCheckOutcome::Ready,
-            Ok(false) => SemanticGraphHttpFleetCheckOutcome::NotReady(None),
+            Ok(true) => SemanticGraphHttpRoutingObservation::Ready,
+            Ok(false) => SemanticGraphHttpRoutingObservation::NotReady(None),
             Err(error) => {
                 tracing::warn!(
                     "Semantic graph HTTP deployment fleet readiness failed closed: {error}"
                 );
-                SemanticGraphHttpFleetCheckOutcome::Unavailable
+                SemanticGraphHttpRoutingObservation::Unavailable
             }
         }
     })
@@ -198,8 +207,8 @@ mod tests {
 
     use super::{
         semantic_graph_http_local_handler_ready_from_facts,
-        semantic_graph_http_routing_ready_with_fleet_check, SemanticGraphHttpFleetCheckOutcome,
-        SemanticGraphHttpLocalHandlerFacts,
+        semantic_graph_http_routing_ready_with_fleet_check, SemanticGraphHttpLocalHandlerFacts,
+        SemanticGraphHttpRoutingObservation,
     };
 
     #[test]
@@ -273,7 +282,7 @@ mod tests {
                 SemanticGraphQueryRoutingTrust::TrustedSingleRelay,
                 |_| async {
                     fleet_checks.set(fleet_checks.get() + 1);
-                    SemanticGraphHttpFleetCheckOutcome::NotReady(Some(dormant_failure))
+                    SemanticGraphHttpRoutingObservation::NotReady(Some(dormant_failure))
                 },
             )
             .await;
@@ -310,7 +319,7 @@ mod tests {
                             instance_id: "relay-0",
                         }
                     );
-                    SemanticGraphHttpFleetCheckOutcome::NotReady(Some(failure))
+                    SemanticGraphHttpRoutingObservation::NotReady(Some(failure))
                 },
             )
             .await;
@@ -328,13 +337,13 @@ mod tests {
         };
         assert!(
             semantic_graph_http_routing_ready_with_fleet_check(trust, |_| async {
-                SemanticGraphHttpFleetCheckOutcome::Ready
+                SemanticGraphHttpRoutingObservation::Ready
             })
             .await
         );
         assert!(
             !semantic_graph_http_routing_ready_with_fleet_check(trust, |_| async {
-                SemanticGraphHttpFleetCheckOutcome::Unavailable
+                SemanticGraphHttpRoutingObservation::Unavailable
             })
             .await
         );

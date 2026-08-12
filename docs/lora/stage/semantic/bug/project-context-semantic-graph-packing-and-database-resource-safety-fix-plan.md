@@ -1,13 +1,13 @@
 # Project Context 图语义查询高跳 Packing 与数据库资源安全修复方案
 
-> 状态：方案已记录，待确认与实施；Live 语义查询验收已停止
+> 状态：核心修复已实施并完成单请求受控复验；query gate 保持关闭，资源阶梯资格待完成
 >
 > 日期：2026-08-12
 >
 > 适用范围：本地单 Relay、Project Context 图语义查询、Desktop 当前支持面
 >
-> 当前发布结论：BLOCKED。受控 1–2 hop 查询已证明主要功能链可用，但默认 3-hop
-> 结果合同和本地 PostgreSQL 资源隔离尚未通过；4–6 hop 同样视为未资格
+> 当前发布结论：BLOCKED。默认查询的 packing 500 已定位并修复，离线 1–6 hop
+> 合同通过；但 disposable 资源并发/故障注入和长期 soak 尚未完成，不能据此恢复常开查询
 >
 > 数据边界：本方案不新增、修改或重放 migration 0057 / 0058，不删除或重建向量，
 > 不改写 Project、Project View、Document、Meeting、Project Context、Event、成员、
@@ -864,15 +864,107 @@ Live 前后至少固定比较：
 
 ## 15. 实施记录
 
-待实施后追加，至少包含：
+### 15.1 已实施的代码与配置
 
-- 精确 typed invariant reason 与修复说明；
-- 1–6 hop 自动化结果；
-- PostgreSQL 最终冻结 profile；
-- pool 总预算与 traversal 默认并发的测量依据；
-- disposable fault/soak 结果；
-- Live 每一级的脱敏 metrics/counter delta；
-- migration/canonical/semantic/Fleet 不变证据；
-- 未完成的资格边界。
+- completed forest 校验已改为闭集 typed invariant；外部仍是无内容 generic 500，内部只记录
+  reason、root/path count、observed/budget hop，不记录 problem、overview、ID、path、vector 或密钥；
+- traversal producer 与 packer 复用 request-aware validator；`FrontierPathState` 在 append 时校验
+  entrypoint、contiguity、Edge membership 和 cycle；
+- 离线真实 `TraversalEngine -> completed forest -> pack -> sign -> SDK verify` 已覆盖 1–6 hops；
+- pool ceiling 已显式化，新增独立 control pool；当前本地预算为 writer main 12、control 2、
+  audit 2、search 2、server reserve 4，启动时按 endpoint fail closed 校验；
+- Stage C traversal 新增 Provider 后、repeatable-read 前的 fail-fast gate，当前默认 2；permit 只覆盖
+  snapshot/traversal transaction，不覆盖 Provider wait 或 response packing；
+- root 与 `deploy/local` PostgreSQL profile 调整为 2 GiB、40 connections、256 MiB
+  shared buffers、4 MiB work memory，并提供 `just semantic-local-capacity-check`；
+- row-zero host lookup 使用 control pool；unmapped=404、transient dependency=retryable 503、
+  permanent contract/decode=generic 500；NIP-11、`cf`、Tauri、Desktop 增加
+  `temporarily_unavailable`/reconnecting 语义和有界退避；
+- readiness 在 DB probe 失败时不再并发执行全部依赖 DB 的 feature checks。
 
-在实际代码、scratch qualification 和受控 Live 验收完成前，不得把本节预写成“已实施”或“已通过”。
+### 15.2 2026-08-12 受控诊断与根因
+
+在 operator 显式 `query-enable`、唯一一次默认查询、`query-disable` 的受控窗口中，新的 typed
+reason 将旧 generic `invalid_packing_input` 精确定位为：
+
+```text
+budget_expanded_coordinates
+roots=6, paths=12, max_observed_hops=3, max_hops_budget=3
+```
+
+根因是 `advance_incident()` 只在 per-work quantum 为 0 时检查全局
+`max_expanded_coordinates`。前一个 work 已消耗第 64 个全局 slot 后，后续 work 获得新的
+`global_step()` quantum=1，可先把计数递增到 65；遍历随后正常结束，但签名前 request-aware
+validator 正确拒绝超预算 forest。这是全局预算与公平调度 quantum 之间的 N+1 admission bug，
+不是三跳合同、Provider、response byte cap、签名或 serialization 故障。
+
+修复后，Coordinate expansion 使用单一 admission helper，按以下顺序原子判定：
+
+1. 全局计数已达到 cap -> 记录 `ExpandedCoordinates` exhaustion 并停止；
+2. 当前 quantum 为 0 -> defer；
+3. 两者均允许 -> 同时递增全局计数并消费 quantum。
+
+新增 producer 级回归用一条两跳合成链和 `max_expanded_coordinates=1` 证明：第一跳消耗额度后，
+第二轮即使得到 fresh quantum 也不能产生 N+1 expansion；结果以合法 1-hop
+`GlobalBudgetExhausted` forest 结束。辅助边界测试另覆盖 63 -> 64 -> 拒绝 65。
+
+### 15.3 受控复验结果
+
+相同非敏感默认 problem 在修复后成功：
+
+- roots=6，paths=12；
+- completion=`budget_exhausted`；
+- exhausted dimensions 包含 semantic roots、hop、beam、expanded Coordinates 和 paths；
+- 本次实际返回路径最深 2 hops，因为 64-coordinate 全局预算先耗尽；这不是把服务端 1–6 hop
+  合同降到 2，离线真实 traversal/pack/sign 矩阵仍覆盖到 6；
+- 14 条 canonical `read_commands` 全部回读成功；
+- 查询后 `query-disable` 成功，active Community query gate 计数为 0。
+
+PostgreSQL container 使用原 `buzz-postgres-data` named volume 非破坏性 recreate；此前先生成并验证
+逻辑备份。recreate 后：
+
+- Memory=2 GiB，`OOMKilled=false`，restart count=0；
+- 本次受控请求后约 176 MiB / 2 GiB；
+- 新 container cgroup `high/max/oom/oom_kill` 均为 0；
+- readiness 200，普通 Project View canonical read 成功；
+- Community=50、Events=3447、Project View objects=36、Documents=30、Context Edges=23；
+- active generation=1、heads=81、succeeded jobs=81、queued/claimed/poison=0；
+- persisted virtual events=0；
+- migration 0057/0058 文件 SHA-256 仍分别为
+  `ed4483984abc53496ef4658ab118b3a58a614773dd7f364cf2859631807cb59e` 与
+  `ee15144b372c05437e34dd773438c6170bb381ab6b04ebda5e9708a73f34c755`。
+
+### 15.4 已通过的离线门
+
+- `buzz-semantic-query` unit tests；
+- Relay response packer 1–6 hop matrix；
+- Relay synthetic TraversalEngine 1–6 hop matrix；
+- expanded-coordinate N+1 producer regression；
+- `carryforth-cli` 全量 unit tests；
+- Desktop frontend unit/check；
+- Tauri focused tests；
+- root 与 Tauri changed-surface Clippy；
+- source asset inventory、Rust fmt、diff check；
+- Relay / `cf` / `buzz-admin` build；
+- `RUST_TEST_THREADS=1 CARGO_INCREMENTAL=0 just ci` 完整通过，包括 Desktop/Web build、
+  Tauri 全量测试（1728 passed、14 ignored，另 3 个音频集成测试通过）和 Mobile
+  测试（570 passed、1 skipped）。默认并行 Tauri 测试曾在既有 `relay_admission`
+  虚拟时间用例上发生调度停滞；相同完整测试集单线程无失败；
+- `scripts/test-semantic-migrations.sh` 在自有 disposable pgvector 容器中通过 migration upgrade、
+  semantic pipeline、Fleet policy Stage B/D、desired-schema 和 ledger-less fresh-schema gates；
+- 现有 content-free exact-kernel qualification 在无网络、无挂载、自有 disposable 容器中按
+  concurrency 1 -> 2 -> 4 -> 8 分别完成 8 秒 baseline 与 concurrent VACUUM 测量：所有档位
+  `failed_transactions=0`、statement cancellation 无遗留 session、post-soak 无 semantic query 或
+  idle transaction，owned container/anonymous volume 已清理。该测量使用 10,000-source 合成
+  kernel，不等同于完整 canonical graph/Provider/Desktop 负载资格。
+
+### 15.5 仍未关闭的资格边界
+
+以下未完成，因此整体仍为 BLOCKED，query gate 保持关闭：
+
+- 以完整 canonical traversal SQL 与 2 GiB cgroup profile 执行的资源曲线、内存余量和默认值冻结；
+- disposable DB outage/recovery fault injection、重连速率和长时 soak；
+- Desktop + Meeting + 多 Agent 背景负载下的完整阶梯；
+- production/LB/multi-Pod/policy-homogeneity 和长期 relevance 资格。
+
+不得把本次单请求成功解释成上述资格已经完成，也不得在完成资源阶梯前常开 query gate。

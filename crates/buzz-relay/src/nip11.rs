@@ -35,6 +35,48 @@ pub(crate) const MEETING_SUMMARY_EXTENSION: &str = "buzz-meeting-summary-v1";
 /// Community-wide Meeting history/read authorization contract.
 pub(crate) const MEETING_COMMUNITY_READ_EXTENSION: &str = "buzz-meeting-community-read-v1";
 
+/// Whether this NIP-11 response completed its dynamic extension observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportedExtensionsObservationStatus {
+    /// The host map and every dynamic capability check completed.
+    #[default]
+    Observed,
+    /// A dependency or internal failure prevented a complete observation.
+    TemporarilyUnavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CapabilityObservation<T> {
+    value: T,
+    complete: bool,
+}
+
+impl<T> CapabilityObservation<T> {
+    const fn observed(value: T) -> Self {
+        Self {
+            value,
+            complete: true,
+        }
+    }
+
+    fn unavailable(value: T, stage: &'static str) -> Self {
+        metrics::counter!(
+            "buzz_nip11_extension_observation_failures_total",
+            "stage" => stage
+        )
+        .increment(1);
+        tracing::warn!(
+            stage,
+            "NIP-11 dynamic extension observation was unavailable"
+        );
+        Self {
+            value,
+            complete: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SemanticGraphHttpCapabilityFacts {
     database_ready: bool,
@@ -76,6 +118,13 @@ pub struct RelayInfo {
     /// Draft/extension protocol identifiers supported by this relay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_extensions: Option<Vec<String>>,
+    /// Completion status for dynamic `supported_extensions` observation.
+    ///
+    /// Legacy relays omit this field. A current client must not interpret a
+    /// missing extension as permanently unsupported when this value is
+    /// `temporarily_unavailable`.
+    #[serde(default)]
+    pub buzz_supported_extensions_status: SupportedExtensionsObservationStatus,
     /// Reserved NIP-PL executor descriptor field.
     ///
     /// Carryforth leaves this absent because Push is outside the supported
@@ -203,6 +252,7 @@ impl RelayInfo {
             contact: None,
             supported_nips,
             supported_extensions: Some(supported_extensions),
+            buzz_supported_extensions_status: SupportedExtensionsObservationStatus::Observed,
             push: None,
             software: "https://github.com/lgYanami/Carryforth".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -233,58 +283,109 @@ pub async fn relay_info_handler(
 /// host-scoped workspace icon.
 pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &str) -> RelayInfo {
     let (relay_self, advertise_nip43) = nip11_facts(state);
-    let icon = workspace_icon_for_host(state, raw_host).await;
-    let project_view_ready = project_view_ready_for_host(state, raw_host).await;
+    let (tenant, mut observations_complete) =
+        match crate::tenant::bind_community(&state.db, raw_host).await {
+            Ok(tenant) => (Some(tenant), true),
+            Err(error) => {
+                let class = crate::tenant::classify_db_bind_error(&error);
+                crate::tenant::record_host_lookup_failure(class);
+                match class {
+                    crate::tenant::HostLookupFailureClass::Unmapped => (None, true),
+                    crate::tenant::HostLookupFailureClass::DependencyUnavailable(_)
+                    | crate::tenant::HostLookupFailureClass::Internal(_) => {
+                        metrics::counter!(
+                            "buzz_nip11_extension_observation_failures_total",
+                            "stage" => "host_binding"
+                        )
+                        .increment(1);
+                        (None, false)
+                    }
+                }
+            }
+        };
+    let tenant = tenant.as_ref();
+    let icon = workspace_icon_for_tenant(state, tenant).await;
+    observations_complete &= icon.complete;
+    let project_view_ready = project_view_ready_for_tenant(state, tenant).await;
+    observations_complete &= project_view_ready.complete;
     let mut info = RelayInfo::build(
         relay_self.as_deref(),
-        icon.as_deref(),
+        icon.value.as_deref(),
         advertise_nip43,
-        project_view_ready,
+        project_view_ready.value,
         state.config.max_frame_bytes,
         state.config.pairing_relay_url.as_deref(),
     );
+    let project_context_ready = project_context_ready_for_tenant(state, tenant).await;
+    observations_complete &= project_context_ready.complete;
     append_extension(
         &mut info,
         PROJECT_CONTEXT_EXTENSION,
-        project_context_ready_for_host(state, raw_host).await,
+        project_context_ready.value,
     );
-    let meeting_community_read_ready = meeting_community_read_ready_for_host(state, raw_host).await;
+    let meeting_community_read_ready = meeting_community_read_ready_for_tenant(state, tenant).await;
+    observations_complete &= meeting_community_read_ready.complete;
     append_extension(
         &mut info,
         MEETING_COMMUNITY_READ_EXTENSION,
-        meeting_community_read_ready,
+        meeting_community_read_ready.value,
     );
     let project_context_edge_ready =
-        project_context_edge_ready_for_host(state, raw_host, meeting_community_read_ready).await;
+        project_context_edge_ready_for_tenant(state, tenant, meeting_community_read_ready.value)
+            .await;
+    observations_complete &= project_context_edge_ready.complete;
     append_extension(
         &mut info,
         PROJECT_CONTEXT_CAPABILITY,
-        project_context_edge_ready,
+        project_context_edge_ready.value,
     );
+    let semantic_graph_query_ready =
+        semantic_graph_query_http_ready_for_tenant(state, tenant, project_context_edge_ready.value)
+            .await;
+    observations_complete &= semantic_graph_query_ready.complete;
     append_extension(
         &mut info,
         SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
-        semantic_graph_query_http_ready_for_host(state, raw_host, project_context_edge_ready).await,
+        semantic_graph_query_ready.value,
     );
-    append_project_document_extension(
-        &mut info,
-        project_document_ready_for_host(state, raw_host).await,
-    );
+    let project_document_ready = project_document_ready_for_tenant(state, tenant).await;
+    observations_complete &= project_document_ready.complete;
+    append_project_document_extension(&mut info, project_document_ready.value);
+    let project_view_bootstrap = if project_view_ready.value {
+        CapabilityObservation::observed(false)
+    } else {
+        project_view_v3_bootstrap_discoverable_for_tenant(state, tenant).await
+    };
+    observations_complete &= project_view_bootstrap.complete;
     append_extension(
         &mut info,
         PROJECT_VIEW_V3_BOOTSTRAP_EXTENSION,
-        !project_view_ready
-            && project_view_v3_bootstrap_discoverable_for_host(state, raw_host).await,
+        project_view_bootstrap.value,
     );
     let meeting_v2_ready = meeting_v2_runtime_ready(state).await;
+    observations_complete &= meeting_v2_ready.complete;
+    let meeting_summary_ready = meeting_summary_runtime_ready(state, meeting_v2_ready.value).await;
+    observations_complete &= meeting_summary_ready.complete;
     apply_meeting_v2_extensions(
         &mut info,
-        meeting_v2_ready,
+        meeting_v2_ready.value,
         state.config.meeting_v2_create_enabled,
         state.config.meeting_v2_direct_actions_create_enabled,
-        meeting_summary_runtime_ready(state, meeting_v2_ready).await,
+        meeting_summary_ready.value,
     );
+    info.buzz_supported_extensions_status =
+        supported_extensions_observation_status(observations_complete);
     info
+}
+
+const fn supported_extensions_observation_status(
+    observations_complete: bool,
+) -> SupportedExtensionsObservationStatus {
+    if observations_complete {
+        SupportedExtensionsObservationStatus::Observed
+    } else {
+        SupportedExtensionsObservationStatus::TemporarilyUnavailable
+    }
 }
 
 fn append_project_document_extension(info: &mut RelayInfo, ready: bool) {
@@ -300,143 +401,128 @@ fn append_extension(info: &mut RelayInfo, extension: &str, ready: bool) {
     }
 }
 
-async fn project_context_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
+async fn project_context_ready_for_tenant(
+    state: &crate::state::AppState,
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     match state
         .db
         .project_context_v1_advertised_ready(tenant.community(), &state.relay_keypair.public_key())
         .await
     {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project Context NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "project_context"),
     }
 }
 
-async fn project_context_edge_ready_for_host(
+async fn project_context_edge_ready_for_tenant(
     state: &crate::state::AppState,
-    raw_host: &str,
+    tenant: Option<&buzz_core::TenantContext>,
     meeting_community_read_ready: bool,
-) -> bool {
+) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() || !meeting_community_read_ready {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     match state
         .db
         .project_context_advertised_ready(tenant.community(), &state.relay_keypair.public_key())
         .await
     {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project Context Edge NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "project_context_edge"),
     }
 }
 
-async fn semantic_graph_query_http_ready_for_host(
+async fn semantic_graph_query_http_ready_for_tenant(
     state: &crate::state::AppState,
-    raw_host: &str,
+    tenant: Option<&buzz_core::TenantContext>,
     project_context_ready: bool,
-) -> bool {
+) -> CapabilityObservation<bool> {
     let deployment_master = state.config.semantic_graph_query_http_available;
     let stable_signer = state.config.relay_private_key.is_some();
 
     if !deployment_master || !stable_signer || !project_context_ready {
-        return false;
+        return CapabilityObservation::observed(false);
     }
 
     let provider_available = matches!(state.semantic_provider(), Ok(Some(_)));
     if !provider_available {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
-    let routing_ready =
-        crate::semantic_fleet::semantic_graph_http_routing_ready(state, tenant.community()).await;
-    if !routing_ready {
-        return false;
-    }
+    let routing =
+        crate::semantic_fleet::semantic_graph_http_routing_observation(state, tenant.community())
+            .await;
+    let routing_ready = match routing {
+        crate::semantic_fleet::SemanticGraphHttpRoutingObservation::Ready => true,
+        crate::semantic_fleet::SemanticGraphHttpRoutingObservation::NotReady(_) => {
+            return CapabilityObservation::observed(false);
+        }
+        crate::semantic_fleet::SemanticGraphHttpRoutingObservation::Unavailable => {
+            return CapabilityObservation::unavailable(false, "semantic_routing");
+        }
+    };
     match state
         .db
         .semantic_graph_query_readiness(tenant.community())
         .await
     {
-        Ok(readiness) => semantic_graph_http_capability_ready(SemanticGraphHttpCapabilityFacts {
-            database_ready: readiness.database_ready(),
-            query_enabled: readiness.query_enabled,
-            project_context_ready,
-            deployment_master,
-            stable_signer,
-            provider_available,
-            routing_ready,
-        }),
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Semantic graph HTTP NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(readiness) => CapabilityObservation::observed(semantic_graph_http_capability_ready(
+            SemanticGraphHttpCapabilityFacts {
+                database_ready: readiness.database_ready(),
+                query_enabled: readiness.query_enabled,
+                project_context_ready,
+                deployment_master,
+                stable_signer,
+                provider_available,
+                routing_ready,
+            },
+        )),
+        Err(_) => CapabilityObservation::unavailable(false, "semantic_graph_query"),
     }
 }
 
-async fn meeting_community_read_ready_for_host(
+async fn meeting_community_read_ready_for_tenant(
     state: &crate::state::AppState,
-    raw_host: &str,
-) -> bool {
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<bool> {
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     match crate::handlers::req::meeting_community_read_active(state, tenant.community()).await {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Meeting Community-read NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "meeting_community_read"),
     }
 }
 
-async fn project_document_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
+async fn project_document_ready_for_tenant(
+    state: &crate::state::AppState,
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     match state
         .db
         .project_document_capability_ready(tenant.community(), &state.relay_keypair.public_key())
         .await
     {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project Document NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "project_document"),
     }
 }
 
@@ -467,38 +553,35 @@ fn apply_meeting_v2_extensions(
 async fn meeting_summary_runtime_ready(
     state: &crate::state::AppState,
     meeting_v2_ready: bool,
-) -> bool {
+) -> CapabilityObservation<bool> {
     if !meeting_v2_ready || state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
     match state.db.meeting_summary_schema_ready().await {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!("Meeting summary NIP-11 readiness failed closed: {error}");
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "meeting_summary"),
     }
 }
 
-async fn meeting_v2_runtime_ready(state: &crate::state::AppState) -> bool {
+async fn meeting_v2_runtime_ready(state: &crate::state::AppState) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
     match state.db.meeting_v2_schema_ready().await {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!("Meeting V2 NIP-11 readiness failed closed: {error}");
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "meeting_v2"),
     }
 }
 
-async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &str) -> bool {
+async fn project_view_ready_for_tenant(
+    state: &crate::state::AppState,
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     let schema_version = match state
         .db
@@ -507,15 +590,12 @@ async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &
     {
         Ok(version) => version,
         Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project View NIP-11 schema lookup failed closed: {error}"
-            );
-            return false;
+            let _ = error;
+            return CapabilityObservation::unavailable(false, "project_view_schema");
         }
     };
     if !project_view_schema_is_advertisable(schema_version) {
-        return false;
+        return CapabilityObservation::observed(false);
     }
     match state
         .db
@@ -525,14 +605,8 @@ async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &
         )
         .await
     {
-        Ok(ready) => ready,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project View NIP-11 readiness failed closed: {error}"
-            );
-            false
-        }
+        Ok(ready) => CapabilityObservation::observed(ready),
+        Err(_) => CapabilityObservation::unavailable(false, "project_view"),
     }
 }
 
@@ -542,29 +616,23 @@ async fn project_view_ready_for_host(state: &crate::state::AppState, raw_host: &
 /// present only for a schema-v3 Community with no canonical state and cannot
 /// authorize ordinary reads or writes. An initialized-but-disabled Community
 /// is a maintenance state and therefore does not masquerade as greenfield.
-async fn project_view_v3_bootstrap_discoverable_for_host(
+async fn project_view_v3_bootstrap_discoverable_for_tenant(
     state: &crate::state::AppState,
-    raw_host: &str,
-) -> bool {
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<bool> {
     if state.config.relay_private_key.is_none() {
-        return false;
+        return CapabilityObservation::observed(false);
     }
-    let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
-        return false;
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(false);
     };
     match state
         .db
         .project_view_v3_bootstrap_discoverable(tenant.community())
         .await
     {
-        Ok(discoverable) => discoverable,
-        Err(error) => {
-            tracing::warn!(
-                community_id = %tenant.community(),
-                "Project View bootstrap discovery lookup failed closed: {error}"
-            );
-            false
-        }
+        Ok(discoverable) => CapabilityObservation::observed(discoverable),
+        Err(_) => CapabilityObservation::unavailable(false, "project_view_bootstrap"),
     }
 }
 
@@ -581,16 +649,17 @@ const fn project_view_schema_is_advertisable(schema_version: i16) -> bool {
 /// [`crate::tenant::bind_community`] — never an unscoped query. Fails open to
 /// `None` (no `icon` field): NIP-11 is intentionally served to unmapped hosts
 /// too, and an icon lookup failure must not break that.
-async fn workspace_icon_for_host(state: &crate::state::AppState, raw_host: &str) -> Option<String> {
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
-        .await
-        .ok()?;
-    state
-        .db
-        .get_community_icon(tenant.community())
-        .await
-        .ok()
-        .flatten()
+async fn workspace_icon_for_tenant(
+    state: &crate::state::AppState,
+    tenant: Option<&buzz_core::TenantContext>,
+) -> CapabilityObservation<Option<String>> {
+    let Some(tenant) = tenant else {
+        return CapabilityObservation::observed(None);
+    };
+    match state.db.get_community_icon(tenant.community()).await {
+        Ok(icon) => CapabilityObservation::observed(icon),
+        Err(_) => CapabilityObservation::unavailable(None, "workspace_icon"),
+    }
 }
 
 /// Derives the two NIP-11 facts that depend on runtime config:
@@ -700,6 +769,29 @@ mod tests {
             "Local-first collaboration relay for Carryforth"
         );
         assert_eq!(info.software, "https://github.com/lgYanami/Carryforth");
+        assert_eq!(
+            info.buzz_supported_extensions_status,
+            SupportedExtensionsObservationStatus::Observed
+        );
+        assert_eq!(
+            serde_json::to_value(&info)
+                .expect("serialize")
+                .get("buzz_supported_extensions_status")
+                .and_then(serde_json::Value::as_str),
+            Some("observed")
+        );
+    }
+
+    #[test]
+    fn incomplete_dynamic_observation_is_explicitly_temporary() {
+        assert_eq!(
+            supported_extensions_observation_status(true),
+            SupportedExtensionsObservationStatus::Observed
+        );
+        assert_eq!(
+            supported_extensions_observation_status(false),
+            SupportedExtensionsObservationStatus::TemporarilyUnavailable
+        );
     }
 
     #[test]

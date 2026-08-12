@@ -82,16 +82,16 @@ export function projectContextWorkspaceStateEvent({
   syncMessage?: string;
   syncState?: string;
 }): { key: string; message: string } | undefined {
-  if (pending) {
-    return {
-      key: `context:${projectId}:loading`,
-      message: "Reading and verifying the complete Project Context snapshot.",
-    };
-  }
   if (failureKind) {
     return {
       key: `context:${projectId}:failure:${failureKind}`,
       message: "Project Context could not be displayed.",
+    };
+  }
+  if (pending) {
+    return {
+      key: `context:${projectId}:loading`,
+      message: "Reading and verifying the complete Project Context snapshot.",
     };
   }
   return syncMessage && revision !== undefined

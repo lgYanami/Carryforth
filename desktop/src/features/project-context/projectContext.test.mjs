@@ -7,8 +7,10 @@ import {
   projectContextCacheKey,
   projectContextCommunityKey,
   projectContextRelayOrigin,
+  projectContextRetryDelayMs,
   projectContextResultIdentity,
   projectContextSemanticMeetingLiveFilters,
+  shouldRetryProjectContextQuery,
 } from "./hooks.ts";
 import {
   projectContextFailureKind,
@@ -76,6 +78,42 @@ test("community and Relay cache scopes include reinit and canonical origin", () 
     projectContextRelayOrigin("wss://Relay.Example/path"),
     "https://relay.example",
   );
+});
+
+test("temporary dependency failures retry with a bounded exponential delay", () => {
+  const error = new ProjectContextError({
+    code: "unavailable",
+    message: "Relay dependency is temporarily unavailable.",
+    retryable: true,
+    retryAfterSeconds: 3,
+  });
+  assert.equal(shouldRetryProjectContextQuery(0, error), true);
+  assert.equal(shouldRetryProjectContextQuery(3, error), true);
+  assert.equal(shouldRetryProjectContextQuery(4, error), false);
+  assert.equal(
+    shouldRetryProjectContextQuery(
+      0,
+      new ProjectContextError({
+        code: "unsupported",
+        message: "unsupported",
+        retryable: false,
+      }),
+    ),
+    false,
+  );
+
+  const retryAfterDelay = projectContextRetryDelayMs(0, error);
+  assert.ok(retryAfterDelay >= 3_000 && retryAfterDelay < 3_250);
+  const cappedDelay = projectContextRetryDelayMs(
+    9,
+    new ProjectContextError({
+      code: "unavailable",
+      message: "Relay dependency is temporarily unavailable.",
+      retryable: true,
+      retryAfterSeconds: 30,
+    }),
+  );
+  assert.ok(cappedDelay >= 8_000 && cappedDelay < 8_250);
 });
 
 test("only stale identities from the same Community cache are removed", () => {

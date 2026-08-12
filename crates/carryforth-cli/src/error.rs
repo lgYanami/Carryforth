@@ -32,6 +32,11 @@ pub enum CliError {
     #[error("{0}")]
     NotFound(String),
 
+    /// A read-only capability observation could not be completed because a
+    /// dependency is temporarily unavailable. Retrying later is safe.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
+
     /// A non-idempotent command's outcome is unknown: the request may have
     /// reached the relay, but the response was lost. Never auto-retried and
     /// never labeled retryable — the relay executes these commands before any
@@ -79,6 +84,7 @@ pub fn is_retryable_error(e: &CliError) -> bool {
                 || net_err.is_decode()
         }
         CliError::Relay { status, .. } => matches!(status, 429 | 502 | 503 | 504),
+        CliError::Unavailable(_) => true,
         CliError::DeliveryUnknown(_) => false,
         _ => false,
     }
@@ -102,6 +108,7 @@ pub fn exit_code(e: &CliError) -> i32 {
         CliError::Key(_) => 3,
         CliError::Conflict(_) => 5,
         CliError::NotFound(_) => 1,
+        CliError::Unavailable(_) => 2,
         CliError::DeliveryUnknown(_) => 2,
         CliError::Other(_) => 4,
     }
@@ -124,6 +131,7 @@ pub fn print_error(e: &CliError) {
         CliError::Key(_) => "key_error",
         CliError::Conflict(_) => "conflict",
         CliError::NotFound(_) => "not_found",
+        CliError::Unavailable(_) => "relay_unavailable",
         CliError::DeliveryUnknown(_) => "delivery_unknown",
         CliError::Other(_) => "error",
     };
@@ -187,6 +195,9 @@ mod tests {
             "superseded".into()
         )));
         assert!(!is_retryable_error(&CliError::NotFound("gone".into())));
+        assert!(is_retryable_error(&CliError::Unavailable(
+            "capability observation".into()
+        )));
         assert!(!is_retryable_error(&CliError::Other("unexpected".into())));
     }
 

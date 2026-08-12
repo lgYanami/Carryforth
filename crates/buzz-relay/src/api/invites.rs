@@ -202,12 +202,7 @@ async fn authenticate(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| crate::api::host_lookup_api_error(&error))?;
 
     let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
     let (pubkey, event_id_bytes) = bridge::verify_bridge_auth_with_options(

@@ -67,12 +67,22 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) context_edge_migration_required: bool,
     pub(crate) document_enabled: bool,
     pub(crate) semantic_query_http_enabled: bool,
+    pub(crate) extensions_temporarily_unavailable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SupportedExtensionsObservationStatus {
+    Observed,
+    TemporarilyUnavailable,
 }
 
 #[derive(Deserialize)]
 struct Nip11Document {
     #[serde(default)]
     supported_extensions: Vec<String>,
+    #[serde(default)]
+    buzz_supported_extensions_status: Option<SupportedExtensionsObservationStatus>,
     #[serde(rename = "self")]
     relay_self: Option<String>,
 }
@@ -103,6 +113,13 @@ fn v3_identity_from_nip11(info: Nip11Document) -> Result<Option<ProjectViewIdent
         .iter()
         .any(|extension| extension == PROJECT_VIEW_V3_EXTENSION)
     {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(CliError::Unavailable(
+                "Relay capability observation could not be completed".to_owned(),
+            ));
+        }
         return Ok(None);
     }
     identity_from_nip11(info, ProjectViewSchema::V3).map(Some)
@@ -128,6 +145,8 @@ fn identity_from_nip11(
     info: Nip11Document,
     schema: ProjectViewSchema,
 ) -> Result<ProjectViewIdentity, CliError> {
+    let extensions_temporarily_unavailable = info.buzz_supported_extensions_status
+        == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable);
     let relay_self = info.relay_self.ok_or_else(|| {
         project_view_integrity_error("NIP-11 document has no canonical Relay `self` key")
     })?;
@@ -162,6 +181,7 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION),
+        extensions_temporarily_unavailable,
     })
 }
 
@@ -690,8 +710,8 @@ mod tests {
     use super::{
         identity_from_nip11, is_managed_runtime_value, runtime_fence_from_file,
         runtime_fence_from_legacy_env, v3_identity_from_nip11, Nip11Document, ProjectViewSchema,
-        PROJECT_CONTEXT_EDGE_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
-        SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+        SupportedExtensionsObservationStatus, PROJECT_CONTEXT_EDGE_EXTENSION,
+        PROJECT_VIEW_V3_EXTENSION, SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
     };
     use buzz_project_view::v2::RuntimeFence;
     use nostr::Keys;
@@ -702,6 +722,7 @@ mod tests {
         let relay_pubkey = Keys::generate().public_key().to_hex();
         let ordinary = v3_identity_from_nip11(Nip11Document {
             supported_extensions: vec!["buzz-project-view-v2".to_owned()],
+            buzz_supported_extensions_status: None,
             relay_self: Some(relay_pubkey.clone()),
         })
         .expect("parse v2-only NIP-11 identity");
@@ -710,6 +731,7 @@ mod tests {
         let migration = identity_from_nip11(
             Nip11Document {
                 supported_extensions: vec![PROJECT_VIEW_V3_EXTENSION.to_owned()],
+                buzz_supported_extensions_status: None,
                 relay_self: Some(relay_pubkey.clone()),
             },
             ProjectViewSchema::V2,
@@ -721,6 +743,7 @@ mod tests {
         let bootstrap = identity_from_nip11(
             Nip11Document {
                 supported_extensions: Vec::new(),
+                buzz_supported_extensions_status: None,
                 relay_self: Some(relay_pubkey.clone()),
             },
             ProjectViewSchema::V3,
@@ -732,6 +755,7 @@ mod tests {
         let context_v2 = identity_from_nip11(
             Nip11Document {
                 supported_extensions: vec![PROJECT_CONTEXT_EDGE_EXTENSION.to_owned()],
+                buzz_supported_extensions_status: None,
                 relay_self: Some(relay_pubkey.clone()),
             },
             ProjectViewSchema::V3,
@@ -743,6 +767,7 @@ mod tests {
         let context_v1 = identity_from_nip11(
             Nip11Document {
                 supported_extensions: vec!["buzz-project-context-edge-v1".to_owned()],
+                buzz_supported_extensions_status: None,
                 relay_self: Some(relay_pubkey),
             },
             ProjectViewSchema::V3,
@@ -757,12 +782,27 @@ mod tests {
                     PROJECT_VIEW_V3_EXTENSION.to_owned(),
                     SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned(),
                 ],
+                buzz_supported_extensions_status: None,
                 relay_self: Some(Keys::generate().public_key().to_hex()),
             },
             ProjectViewSchema::V3,
         )
         .expect("read semantic query identity");
         assert!(semantic.semantic_query_http_enabled);
+
+        let unavailable = v3_identity_from_nip11(Nip11Document {
+            supported_extensions: Vec::new(),
+            buzz_supported_extensions_status: Some(
+                SupportedExtensionsObservationStatus::TemporarilyUnavailable,
+            ),
+            relay_self: None,
+        })
+        .expect_err("incomplete capability observation must be retryable, not unsupported");
+        assert!(matches!(
+            unavailable,
+            crate::error::CliError::Unavailable(_)
+        ));
+        assert!(crate::error::is_retryable_error(&unavailable));
     }
 
     #[test]

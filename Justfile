@@ -392,6 +392,10 @@ semantic-test: semantic-pgvector-test semantic-migration-test
 semantic-query-qualification:
     ./scripts/qualify-semantic-exact-query.sh
 
+# Read-only preflight for the supported local semantic PostgreSQL profile.
+semantic-local-capacity-check:
+    ./scripts/check-local-semantic-capacity.sh
+
 # Run the real Relay + real cf CLI Project View end-to-end test.
 project-view-test-e2e:
     ./scripts/test-project-view-e2e.sh

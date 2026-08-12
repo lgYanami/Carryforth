@@ -64,7 +64,21 @@ pub async fn claim_initial_owner(
 
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| api_error(StatusCode::NOT_FOUND, "not found"))?;
+        .map_err(|error| {
+            let failure = crate::tenant::host_lookup_http_failure(&error);
+            if failure.status == StatusCode::NOT_FOUND {
+                api_error(StatusCode::NOT_FOUND, "not found")
+            } else {
+                (
+                    failure.status,
+                    Json(serde_json::json!({
+                        "error": failure.message,
+                        "code": failure.code,
+                        "retryable": failure.retryable,
+                    })),
+                )
+            }
+        })?;
     if tenant.host() != LOCAL_DESKTOP_AUTHORITY {
         return Err(api_error(StatusCode::NOT_FOUND, "not found"));
     }

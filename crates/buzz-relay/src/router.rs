@@ -314,15 +314,16 @@ async fn nip11_or_ws_handler(
     // `icon` simply absent), so the doc cannot leak which hosts are mapped.
     let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
         Ok(ctx) => ctx,
-        Err(_) => {
-            // Generic rejection: do not distinguish "unmapped" from "lookup
-            // error", and never echo the host, so an unauthenticated caller
-            // cannot probe which communities exist on this deployment.
-            return (
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-                .into_response();
+        Err(error) => {
+            let failure = crate::tenant::host_lookup_http_failure(&error);
+            let mut response = (failure.status, failure.message).into_response();
+            if failure.retryable {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            return response;
         }
     };
 
@@ -451,9 +452,18 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 
     let check = async {
+        let (pg_ok, redis_ok) = tokio::join!(state.db.ping(), async {
+            state.redis_pool.get().await.is_ok()
+        });
+        if !pg_ok {
+            metrics::counter!(
+                "buzz_db_dependency_short_circuits_total",
+                "surface" => "readiness"
+            )
+            .increment(1);
+            return (false, redis_ok, false, false, false, false, false, false);
+        }
         let (
-            pg_ok,
-            redis_ok,
             project_view_ok,
             project_document_ok,
             project_context_ok,
@@ -461,8 +471,6 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             meeting_v2_ok,
             semantic_ok,
         ) = tokio::join!(
-            state.db.ping(),
-            async { state.redis_pool.get().await.is_ok() },
             async {
                 state
                     .db

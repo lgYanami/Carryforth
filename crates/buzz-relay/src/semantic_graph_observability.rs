@@ -113,6 +113,7 @@ pub(crate) enum SemanticGraphQueryMetricError {
     QueryDisabled,
     InvalidProject,
     ProcessBusy,
+    TraversalBusy,
     ProviderUnavailable,
     ProviderBusy,
     SemanticGenerationChanged,
@@ -136,10 +137,11 @@ pub(crate) enum SemanticGraphQueryMetricError {
 
 impl SemanticGraphQueryMetricError {
     #[cfg(test)]
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 23] = [
         Self::QueryDisabled,
         Self::InvalidProject,
         Self::ProcessBusy,
+        Self::TraversalBusy,
         Self::ProviderUnavailable,
         Self::ProviderBusy,
         Self::SemanticGenerationChanged,
@@ -166,6 +168,7 @@ impl SemanticGraphQueryMetricError {
             Self::QueryDisabled => "query_disabled",
             Self::InvalidProject => "invalid_project",
             Self::ProcessBusy => "process_busy",
+            Self::TraversalBusy => "traversal_busy",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderBusy => "provider_busy",
             Self::SemanticGenerationChanged => "semantic_generation_changed",
@@ -198,6 +201,15 @@ pub(crate) fn record_query_error(
         "buzz_semantic_graph_query_errors_total",
         "stage" => stage.label(),
         "code" => error.label()
+    )
+    .increment(1);
+}
+
+/// Record one content-free response-packing invariant reason.
+pub(crate) fn record_packing_invariant(reason: &'static str) {
+    metrics::counter!(
+        "buzz_semantic_graph_packing_invariant_failures_total",
+        "reason" => reason
     )
     .increment(1);
 }

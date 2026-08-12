@@ -163,6 +163,44 @@ abandoned unit sets.
 
 ## Semantic graph-query qualification
 
+### Supported local resource profile
+
+The repository-supported semantic local profile uses the pinned PostgreSQL 17
+/ pgvector 0.8.5 image with a 2 GiB container limit, `max_connections=40`,
+`shared_buffers=256MB`, `work_mem=4MB`, `maintenance_work_mem=128MB`,
+`effective_cache_size=1536MB`, and one parallel worker per gather. The Relay
+uses explicit main/read/control/audit/search pool ceilings. Row-zero host
+binding and readiness use the dedicated control pool; semantic Stage C uses a
+separate fail-fast traversal admission gate and cannot consume the ordinary
+main-pool reserve.
+
+Before enabling graph queries, apply the current Compose profile without
+removing or recreating the PostgreSQL volume, then run the read-only preflight:
+
+```bash
+just semantic-local-capacity-check
+```
+
+The check refuses remote Docker contexts and foreign containers, validates the
+running PostgreSQL/pgvector/settings/migration/schema contract, verifies the
+connection budget and traversal reserve, and prints only aggregate resource
+evidence. It never changes settings, starts a query, enables a Community,
+rebuilds an index, or prints database/provider credentials. A failure means the
+query gate stays closed; never use `docker compose down -v` to apply this
+profile.
+
+`BUZZ_SEMANTIC_GRAPH_TRAVERSAL_MAX_IN_FLIGHT=2` is the provisional local
+default. Saturation returns a retryable busy response before opening the Stage C
+read transaction. It must be requalified in a disposable stack at 1, 2, 4, and
+8 before raising the default; concurrency 1 is a smoke-test setting, not the
+long-term product limit.
+
+During PostgreSQL recovery, tenant-scoped row-zero reads return generic
+retryable 503 instead of an incorrect permanent 404. NIP-11 remains available
+and marks dynamic extension observation as `temporarily_unavailable`; current
+Desktop/`cf` clients back off and re-verify. Only a healthy lookup that truly has
+no host mapping returns 404.
+
 Graph query is present but fail-closed by default. Enabling the HTTP deployment
 master or choosing a Fleet policy does not enable Provider egress: each
 Community still requires the explicit query gate and problem-egress

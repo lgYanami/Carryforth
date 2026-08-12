@@ -84,6 +84,21 @@ impl std::fmt::Debug for SemanticWorkerConfig {
     }
 }
 
+/// Explicit sizing and timeout contract for one Relay-owned Postgres pool.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabasePoolConfig {
+    /// Pool connection ceiling.
+    pub max_connections: u32,
+    /// Minimum idle connections maintained by SQLx.
+    pub min_connections: u32,
+    /// Acquire timeout in seconds.
+    pub acquire_timeout_secs: u64,
+    /// Maximum connection lifetime in seconds.
+    pub max_lifetime_secs: u64,
+    /// Idle connection timeout in seconds.
+    pub idle_timeout_secs: u64,
+}
+
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -94,6 +109,20 @@ pub struct Config {
     /// Optional read-replica connection URL (e.g. an Aurora `cluster-ro-`
     /// endpoint). Unset means all reads stay on the writer.
     pub read_database_url: Option<String>,
+    /// Authoritative writer pool sizing.
+    pub db_main_pool: DatabasePoolConfig,
+    /// Optional read-replica pool sizing.
+    pub db_read_pool: DatabasePoolConfig,
+    /// Row-zero host-binding and readiness pool sizing.
+    pub db_control_pool: DatabasePoolConfig,
+    /// Audit pool sizing when audit logging is enabled.
+    pub db_audit_pool: DatabasePoolConfig,
+    /// Full-text search pool sizing.
+    pub db_search_pool: DatabasePoolConfig,
+    /// Writer-pool slots reserved from semantic traversal for ordinary work.
+    pub db_ordinary_main_reserve: u32,
+    /// PostgreSQL server slots reserved for operations and recovery.
+    pub db_server_connection_reserve: u32,
     /// Redis connection URL used by the pub/sub manager.
     pub redis_url: String,
     /// Maximum connections in the shared Redis pool. Defaults to 16.
@@ -288,6 +317,13 @@ pub struct Config {
     /// This does not enable any Community and defaults to false. Community DB
     /// readiness and the configured routing policy remain separate gates.
     pub semantic_graph_query_http_available: bool,
+    /// Maximum concurrent semantic graph requests admitted by this process.
+    pub semantic_graph_query_max_in_flight: usize,
+    /// Maximum concurrent Stage C database snapshot/traversal sessions.
+    ///
+    /// This is distinct from Provider concurrency and preserves ordinary
+    /// database capacity under graph-query load.
+    pub semantic_graph_traversal_max_in_flight: usize,
     /// Topology trust applied to semantic graph HTTP query routing.
     ///
     /// Local source builds default to trusting the one Relay process. The
@@ -371,6 +407,66 @@ fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
             "{name} must be valid Unicode"
         ))),
     }
+}
+
+fn database_pool_config_from_env(
+    prefix: &str,
+    defaults: DatabasePoolConfig,
+) -> Result<DatabasePoolConfig, ConfigError> {
+    let max_name = format!("{prefix}_MAX_CONNECTIONS");
+    let min_name = format!("{prefix}_MIN_CONNECTIONS");
+    let acquire_name = format!("{prefix}_ACQUIRE_TIMEOUT_SECS");
+    let lifetime_name = format!("{prefix}_MAX_LIFETIME_SECS");
+    let idle_name = format!("{prefix}_IDLE_TIMEOUT_SECS");
+    let max_connections = u32::try_from(positive_u64_from_env(
+        &max_name,
+        u64::from(defaults.max_connections),
+    )?)
+    .map_err(|_| ConfigError::InvalidValue(format!("{max_name} exceeds u32")))?;
+    let min_connections = u32::try_from(positive_u64_from_env(
+        &min_name,
+        u64::from(defaults.min_connections),
+    )?)
+    .map_err(|_| ConfigError::InvalidValue(format!("{min_name} exceeds u32")))?;
+    if min_connections > max_connections {
+        return Err(ConfigError::InvalidValue(format!(
+            "{min_name} must not exceed {max_name}"
+        )));
+    }
+    Ok(DatabasePoolConfig {
+        max_connections,
+        min_connections,
+        acquire_timeout_secs: positive_u64_from_env(&acquire_name, defaults.acquire_timeout_secs)?,
+        max_lifetime_secs: positive_u64_from_env(&lifetime_name, defaults.max_lifetime_secs)?,
+        idle_timeout_secs: positive_u64_from_env(&idle_name, defaults.idle_timeout_secs)?,
+    })
+}
+
+fn validate_semantic_traversal_capacity(
+    process_limit: usize,
+    traversal_limit: usize,
+    main_pool_max: u32,
+    ordinary_main_reserve: u32,
+) -> Result<(), ConfigError> {
+    if traversal_limit == 0 || traversal_limit > process_limit {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_SEMANTIC_GRAPH_TRAVERSAL_MAX_IN_FLIGHT must be in 1..=BUZZ_SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT"
+                .to_owned(),
+        ));
+    }
+    if ordinary_main_reserve >= main_pool_max {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_DB_ORDINARY_MAIN_RESERVE must be smaller than BUZZ_DB_MAIN_MAX_CONNECTIONS"
+                .to_owned(),
+        ));
+    }
+    if traversal_limit > (main_pool_max - ordinary_main_reserve) as usize {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_SEMANTIC_GRAPH_TRAVERSAL_MAX_IN_FLIGHT exceeds the semantic share of the writer pool"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn rate_limit_config_from_env() -> Result<buzz_auth::RateLimitConfig, ConfigError> {
@@ -558,6 +654,71 @@ impl Config {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+
+        let db_main_pool = database_pool_config_from_env(
+            "BUZZ_DB_MAIN",
+            DatabasePoolConfig {
+                max_connections: 12,
+                min_connections: 2,
+                acquire_timeout_secs: 3,
+                max_lifetime_secs: 1_800,
+                idle_timeout_secs: 600,
+            },
+        )?;
+        let db_read_pool = database_pool_config_from_env(
+            "BUZZ_DB_READ",
+            DatabasePoolConfig {
+                max_connections: 8,
+                min_connections: 1,
+                acquire_timeout_secs: 3,
+                max_lifetime_secs: 1_800,
+                idle_timeout_secs: 600,
+            },
+        )?;
+        let db_control_pool = database_pool_config_from_env(
+            "BUZZ_DB_CONTROL",
+            DatabasePoolConfig {
+                max_connections: 2,
+                min_connections: 1,
+                acquire_timeout_secs: 1,
+                max_lifetime_secs: 1_800,
+                idle_timeout_secs: 600,
+            },
+        )?;
+        let db_audit_pool = database_pool_config_from_env(
+            "BUZZ_DB_AUDIT",
+            DatabasePoolConfig {
+                max_connections: 2,
+                min_connections: 1,
+                acquire_timeout_secs: 3,
+                max_lifetime_secs: 1_800,
+                idle_timeout_secs: 600,
+            },
+        )?;
+        let db_search_pool = database_pool_config_from_env(
+            "BUZZ_DB_SEARCH",
+            DatabasePoolConfig {
+                max_connections: 2,
+                min_connections: 1,
+                acquire_timeout_secs: 3,
+                max_lifetime_secs: 1_800,
+                idle_timeout_secs: 600,
+            },
+        )?;
+        let db_ordinary_main_reserve = u32::try_from(positive_u64_from_env(
+            "BUZZ_DB_ORDINARY_MAIN_RESERVE",
+            4,
+        )?)
+        .map_err(|_| {
+            ConfigError::InvalidValue("BUZZ_DB_ORDINARY_MAIN_RESERVE exceeds u32".to_owned())
+        })?;
+        let db_server_connection_reserve = u32::try_from(positive_u64_from_env(
+            "BUZZ_DB_SERVER_CONNECTION_RESERVE",
+            4,
+        )?)
+        .map_err(|_| {
+            ConfigError::InvalidValue("BUZZ_DB_SERVER_CONNECTION_RESERVE exceeds u32".to_owned())
+        })?;
 
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -954,6 +1115,32 @@ impl Config {
         let semantic_worker_enabled = parse_bool("BUZZ_SEMANTIC_WORKER_ENABLED", false)?;
         let semantic_graph_query_http_available =
             parse_bool("BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE", false)?;
+        let semantic_graph_query_max_in_flight = usize::try_from(positive_u64_from_env(
+            "BUZZ_SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT",
+            8,
+        )?)
+        .ok()
+        .filter(|value| *value <= 64)
+        .ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT must be in 1..=64".to_owned(),
+            )
+        })?;
+        let semantic_graph_traversal_max_in_flight = usize::try_from(positive_u64_from_env(
+            "BUZZ_SEMANTIC_GRAPH_TRAVERSAL_MAX_IN_FLIGHT",
+            2,
+        )?)
+        .map_err(|_| {
+            ConfigError::InvalidValue(
+                "BUZZ_SEMANTIC_GRAPH_TRAVERSAL_MAX_IN_FLIGHT exceeds usize".to_owned(),
+            )
+        })?;
+        validate_semantic_traversal_capacity(
+            semantic_graph_query_max_in_flight,
+            semantic_graph_traversal_max_in_flight,
+            db_main_pool.max_connections,
+            db_ordinary_main_reserve,
+        )?;
         let semantic_graph_query_fleet_policy = parse_semantic_query_fleet_policy()?;
         let semantic_graph_query_deployment_id =
             parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")?;
@@ -1144,6 +1331,13 @@ impl Config {
             bind_addr,
             database_url,
             read_database_url,
+            db_main_pool,
+            db_read_pool,
+            db_control_pool,
+            db_audit_pool,
+            db_search_pool,
+            db_ordinary_main_reserve,
+            db_server_connection_reserve,
             redis_url,
             redis_pool_size,
             relay_url,
@@ -1185,6 +1379,8 @@ impl Config {
             runtime_supervision_claim_secs,
             semantic_worker,
             semantic_graph_query_http_available,
+            semantic_graph_query_max_in_flight,
+            semantic_graph_traversal_max_in_flight,
             semantic_graph_query_fleet_policy,
             semantic_graph_query_deployment_id,
             semantic_graph_query_instance_id,
@@ -1239,6 +1435,28 @@ impl Config {
                 })
             }
         }
+    }
+
+    /// Conservative connection ceiling charged to the writer endpoint.
+    ///
+    /// Until a deployment provides verified endpoint grouping, an optional
+    /// read pool is included here so host aliases cannot undercount capacity.
+    pub fn conservative_postgres_connection_budget(&self) -> u32 {
+        self.db_main_pool
+            .max_connections
+            .saturating_add(self.db_control_pool.max_connections)
+            .saturating_add(
+                self.read_database_url
+                    .as_ref()
+                    .map_or(0, |_| self.db_read_pool.max_connections),
+            )
+            .saturating_add(if self.audit_enabled {
+                self.db_audit_pool.max_connections
+            } else {
+                0
+            })
+            .saturating_add(self.db_search_pool.max_connections)
+            .saturating_add(self.db_server_connection_reserve)
     }
 }
 
@@ -1353,6 +1571,43 @@ mod tests {
                 deployment_id: "deployment-a",
                 instance_id: "relay-0",
             }
+        );
+    }
+
+    #[test]
+    fn database_pool_and_traversal_capacity_contracts_are_closed() {
+        let defaults = DatabasePoolConfig {
+            max_connections: 12,
+            min_connections: 2,
+            acquire_timeout_secs: 3,
+            max_lifetime_secs: 1_800,
+            idle_timeout_secs: 600,
+        };
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("TEST_DB_POOL_MAX_CONNECTIONS", "2");
+        std::env::set_var("TEST_DB_POOL_MIN_CONNECTIONS", "3");
+        let invalid = database_pool_config_from_env("TEST_DB_POOL", defaults);
+        std::env::remove_var("TEST_DB_POOL_MAX_CONNECTIONS");
+        std::env::remove_var("TEST_DB_POOL_MIN_CONNECTIONS");
+        assert!(invalid.is_err());
+
+        assert!(validate_semantic_traversal_capacity(8, 2, 12, 4).is_ok());
+        assert!(validate_semantic_traversal_capacity(8, 0, 12, 4).is_err());
+        assert!(validate_semantic_traversal_capacity(8, 9, 12, 4).is_err());
+        assert!(validate_semantic_traversal_capacity(8, 2, 4, 4).is_err());
+        assert!(validate_semantic_traversal_capacity(8, 5, 8, 4).is_err());
+    }
+
+    #[test]
+    fn conservative_pool_budget_never_undercounts_an_unverified_read_endpoint() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::from_env().expect("default config");
+        config.read_database_url = None;
+        let without_read = config.conservative_postgres_connection_budget();
+        config.read_database_url = Some("postgres://reader.invalid/carryforth".to_owned());
+        assert_eq!(
+            config.conservative_postgres_connection_budget(),
+            without_read + config.db_read_pool.max_connections
         );
     }
 

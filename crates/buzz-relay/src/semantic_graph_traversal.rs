@@ -488,10 +488,12 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
             .clone()
             .ok_or_else(|| invalid_state("Coordinate incident work lacks a Coordinate"))?;
         if !work.incident_started {
-            if quantum.expanded_coordinates == 0 {
-                if self.materialization.expanded_coordinates
-                    >= usize::from(self.budget.max_expanded_coordinates)
-                {
+            match admit_coordinate_expansion(
+                &mut self.materialization.expanded_coordinates,
+                usize::from(self.budget.max_expanded_coordinates),
+                &mut quantum.expanded_coordinates,
+            ) {
+                CoordinateExpansionAdmission::GlobalExhausted => {
                     self.record_global_exhaustion(
                         ExhaustedDimension::ExpandedCoordinates,
                         1,
@@ -501,11 +503,9 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
                         BranchStopReason::GlobalBudgetExhausted,
                     ));
                 }
-                return Ok(UnitAdvance::Deferred);
+                CoordinateExpansionAdmission::Deferred => return Ok(UnitAdvance::Deferred),
+                CoordinateExpansionAdmission::Admitted => work.incident_started = true,
             }
-            self.materialization.expanded_coordinates += 1;
-            quantum.expanded_coordinates -= 1;
-            work.incident_started = true;
         }
 
         let global_remaining = usize::from(self.budget.max_relation_options_materialized)
@@ -1193,6 +1193,29 @@ enum Admission {
     Admitted,
     Deferred,
     GlobalExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinateExpansionAdmission {
+    Admitted,
+    Deferred,
+    GlobalExhausted,
+}
+
+fn admit_coordinate_expansion(
+    expanded: &mut usize,
+    cap: usize,
+    quantum: &mut usize,
+) -> CoordinateExpansionAdmission {
+    if *expanded >= cap {
+        CoordinateExpansionAdmission::GlobalExhausted
+    } else if *quantum == 0 {
+        CoordinateExpansionAdmission::Deferred
+    } else {
+        *expanded += 1;
+        *quantum -= 1;
+        CoordinateExpansionAdmission::Admitted
+    }
 }
 
 fn admit_new_key<T: Eq + std::hash::Hash>(
@@ -2321,14 +2344,29 @@ fn invalid_state(reason: &'static str) -> SemanticGraphRootQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::CommunityId;
+    use buzz_db::semantic_query::SemanticExactQueryVector;
+    use buzz_project_context::canonicalize_coordinates;
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::{
-        ProjectDocumentSourceBasis, ProjectViewSemanticType, ProjectViewSourceBasis,
-        SemanticCoverage, SemanticLifecycleClass, SemanticSourceBasis,
+        DeterministicFakeEncoder, EmbeddingVector, ProjectDocumentSourceBasis,
+        ProjectViewSemanticType, ProjectViewSourceBasis, SemanticCoverage, SemanticEncoder,
+        SemanticLifecycleClass, SemanticSourceBasis,
     };
     use buzz_semantic_query::{
-        candidate_score, CanonicalSourceProvenance, ProjectContextEdgeProvenance,
-        RootDiscoveryChannel,
+        budget_profile_digest, candidate_score, derive_root_id, query_contract_digest,
+        ranking_contract_digest, CanonicalSourceProvenance, DegradedModeCounts,
+        EmbeddingCoverageCounts, OmittedContextChannelCounts, OmittedForResponseBudgetCounts,
+        ProjectContextEdgeProvenance, RootDiscoveryChannel, SemanticGraphQuery,
+        SemanticGraphQueryCoverage, SemanticGraphQueryInputObservations,
+        SemanticGraphQueryObservations, TruncationCountsByDimension,
+    };
+    use chrono::Utc;
+    use nostr::Keys;
+
+    use crate::semantic_graph_response::{
+        pack_semantic_graph_response, sign_packed_semantic_graph_response,
+        validate_completed_semantic_graph_forest, SemanticGraphResponsePackingInput,
     };
 
     fn digest(value: u8) -> Digest32 {
@@ -2347,6 +2385,18 @@ mod tests {
         ProjectContextCoordinate::ProjectViewObject {
             object_type: ProjectViewObjectType::Work,
             object_id: uuid::Uuid::from_u128(value),
+        }
+    }
+
+    fn fixture_uuid(seed: u64) -> uuid::Uuid {
+        uuid::Uuid::parse_str(&format!("00000000-0000-4000-8000-{seed:012x}"))
+            .expect("UUIDv4 fixture")
+    }
+
+    fn linear_work(seed: u64) -> ProjectContextCoordinate {
+        ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Work,
+            object_id: fixture_uuid(seed),
         }
     }
 
@@ -2540,6 +2590,537 @@ mod tests {
         )
         .append_hop(hop)
         .expect("one-hop successor")
+    }
+
+    #[derive(Clone)]
+    struct LinearStep {
+        entered: ProjectContextCoordinate,
+        target: ProjectContextCoordinate,
+        edge: SemanticEdgeObservation,
+        document_id: uuid::Uuid,
+        binding: ContextDocumentBindingObservation,
+        entered_head: SemanticCurrentHead,
+        document_head: SemanticCurrentHead,
+        target_head: SemanticCurrentHead,
+    }
+
+    struct LinearTraversalBackend {
+        ticket: SemanticGraphQueryTicket,
+        problem_channel_id: Digest32,
+        steps: Vec<LinearStep>,
+    }
+
+    impl LinearTraversalBackend {
+        fn snapshot(&self) -> buzz_db::semantic_query::SemanticGraphSnapshotBinding {
+            buzz_db::semantic_query::SemanticGraphSnapshotBinding {
+                community_id: self.ticket.community_id,
+                generation_id: self.ticket.generation.generation_id,
+                query_fences: self.ticket.query_fences,
+                extractor_version: self.ticket.generation.extractor_version.clone(),
+                project_context_revision: self.ticket.project_context_revision,
+                observed_at: self.ticket.observed_at,
+            }
+        }
+
+        fn step_for_entered(&self, entered: &ProjectContextCoordinate) -> &LinearStep {
+            self.steps
+                .iter()
+                .find(|step| &step.entered == entered)
+                .expect("synthetic traversal entered Coordinate")
+        }
+
+        fn step_for_edge(&self, edge_key: EdgeKey) -> &LinearStep {
+            self.steps
+                .iter()
+                .find(|step| step.edge.edge_key == edge_key)
+                .expect("synthetic traversal Edge")
+        }
+
+        fn document_source(&self, step: &LinearStep) -> SemanticSourceIdentity {
+            SemanticSourceIdentity {
+                community_id: *self.ticket.community_id.as_uuid(),
+                kind: SemanticSourceKind::ProjectDocument,
+                source_id: step.document_id,
+            }
+        }
+
+        fn score_row(
+            &self,
+            source: SemanticSourceIdentity,
+            head: SemanticCurrentHead,
+            roles: buzz_db::semantic_query::SemanticGraphStructuralRoles,
+        ) -> SemanticExactSourceScore {
+            SemanticExactSourceScore {
+                channel_id: self.problem_channel_id,
+                source,
+                head,
+                lifecycle: SemanticLifecycleClass::Active,
+                source_status: None,
+                roles,
+                score: score(900_000),
+                channel_rank: 1,
+            }
+        }
+
+        fn hydrated(
+            &self,
+            source: SemanticSourceIdentity,
+            head: SemanticCurrentHead,
+        ) -> SemanticHydratedCurrentSource {
+            SemanticHydratedCurrentSource {
+                canonical: buzz_db::semantic_query::SemanticCanonicalSourceSnapshot {
+                    source,
+                    source_invalidation_epoch: head.invalidation_epoch,
+                    source_basis: head.source_basis.clone(),
+                    source_snapshot_digest: head.snapshot_digest,
+                    lifecycle: SemanticLifecycleClass::Active,
+                    source_status: None,
+                    title: "synthetic traversal source".to_owned(),
+                    summary: Some("content-free offline fixture".to_owned()),
+                },
+                semantic_head: head,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TraversalBackend for LinearTraversalBackend {
+        async fn load_hyperedge(
+            &mut self,
+            expectation: &SemanticHyperedgeExpectation,
+        ) -> Result<SemanticHyperedgeReadOutcome, buzz_db::DbError> {
+            Ok(SemanticHyperedgeReadOutcome::Current(Box::new(
+                self.step_for_edge(expectation.edge_key).edge.clone(),
+            )))
+        }
+
+        async fn rank_relations(
+            &mut self,
+            request: SemanticIncidentRelationRankRequest<'_>,
+        ) -> Result<SemanticIncidentRelationRankOutcome, buzz_db::DbError> {
+            let step = self.step_for_entered(request.entered_from);
+            let document_source = self.document_source(step);
+            let document_score = document_score(score(900_000), Score::ZERO, Some(score(850_000)));
+            let entered_source =
+                semantic_source_identity_for_coordinate(self.ticket.community_id, &step.entered)?;
+            Ok(SemanticIncidentRelationRankOutcome::Ranked(Box::new(
+                buzz_db::semantic_query::SemanticIncidentRelationRankBatch {
+                    snapshot: self.snapshot(),
+                    options: vec![SemanticRankedRelationOption {
+                        edge_key: step.edge.edge_key,
+                        edge_provenance: step.edge.provenance.clone(),
+                        document_id: step.document_id,
+                        binding_provenance: step.binding.provenance.clone(),
+                        channel_scores: vec![self.score_row(
+                            document_source.clone(),
+                            step.document_head.clone(),
+                            buzz_db::semantic_query::SemanticGraphStructuralRoles {
+                                coordinate: false,
+                                coordinate_entry_eligible: false,
+                                coordinate_incident_edge_keys: Vec::new(),
+                                context_document_bindings: Vec::new(),
+                            },
+                        )],
+                        local_coherence: Some(
+                            buzz_db::semantic_query::SemanticCurrentSourcePairDistance {
+                                left: document_source,
+                                right: entered_source,
+                                left_head: step.document_head.clone(),
+                                right_head: step.entered_head.clone(),
+                                score: score(850_000),
+                            },
+                        ),
+                        document_score,
+                    }],
+                    omitted: Vec::new(),
+                    below_relation_floor: 0,
+                    exhaustion: SemanticTraversalSliceExhaustion::Exhausted,
+                },
+            )))
+        }
+
+        async fn rank_targets(
+            &mut self,
+            request: SemanticEdgeTargetRankRequest<'_>,
+        ) -> Result<SemanticEdgeTargetRankOutcome, buzz_db::DbError> {
+            let step = self.step_for_edge(request.hyperedge.edge_key);
+            let document_source = self.document_source(step);
+            let target_source =
+                semantic_source_identity_for_coordinate(self.ticket.community_id, &step.target)?;
+            let coherence = score(850_000);
+            let target_score = target_coordinate_score(score(900_000), Score::ZERO, coherence);
+            let transition_score = harmonic_score(request.document_score, target_score);
+            Ok(SemanticEdgeTargetRankOutcome::Ranked(Box::new(
+                buzz_db::semantic_query::SemanticEdgeTargetRankBatch {
+                    snapshot: self.snapshot(),
+                    edge: step.edge.clone(),
+                    options: vec![SemanticRankedTargetOption {
+                        coordinate: step.target.clone(),
+                        channel_scores: vec![self.score_row(
+                            target_source.clone(),
+                            step.target_head.clone(),
+                            buzz_db::semantic_query::SemanticGraphStructuralRoles {
+                                coordinate: true,
+                                coordinate_entry_eligible: true,
+                                coordinate_incident_edge_keys: vec![step.edge.edge_key],
+                                context_document_bindings: Vec::new(),
+                            },
+                        )],
+                        relation_document_coherence:
+                            buzz_db::semantic_query::SemanticCurrentSourcePairDistance {
+                                left: document_source,
+                                right: target_source,
+                                left_head: step.document_head.clone(),
+                                right_head: step.target_head.clone(),
+                                score: coherence,
+                            },
+                        target_score,
+                        transition_score,
+                    }],
+                    omitted: Vec::new(),
+                    below_target_floor: 0,
+                    below_transition_floor: 0,
+                    exhaustion: SemanticTraversalSliceExhaustion::Exhausted,
+                },
+            )))
+        }
+
+        async fn hydrate(
+            &mut self,
+            scores: &[SemanticExactSourceScore],
+        ) -> Result<SemanticCanonicalHydrationBatch, buzz_db::DbError> {
+            Ok(SemanticCanonicalHydrationBatch {
+                snapshot: self.snapshot(),
+                sources: scores
+                    .iter()
+                    .map(|score| self.hydrated(score.source.clone(), score.head.clone()))
+                    .collect(),
+            })
+        }
+    }
+
+    fn document_head(value: u8) -> SemanticCurrentHead {
+        SemanticCurrentHead {
+            invalidation_epoch: 1,
+            snapshot_digest: digest(value),
+            source_basis: SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
+                document_revision: 1,
+                source_change_id: digest(value.wrapping_add(1)),
+            }),
+            unit_set_id: uuid::Uuid::from_u128(500 + u128::from(value)),
+            unit_key: "overview".to_owned(),
+            semantic_text_digest: digest(value.wrapping_add(2)),
+            summary_coverage: SemanticCoverage::TitleAndSummary,
+        }
+    }
+
+    fn linear_ticket() -> (SemanticGraphQueryTicket, SemanticExactQueryVector, Digest32) {
+        let encoder = DeterministicFakeEncoder::new(3).expect("fake encoder");
+        let contract = encoder.contract().clone();
+        let query_fences =
+            buzz_semantic_query::QueryCompatibilityFences::for_source_contract(&contract)
+                .expect("query fences");
+        let community_id = CommunityId::from_uuid(fixture_uuid(1));
+        let observed_at = Utc::now();
+        let ticket = SemanticGraphQueryTicket {
+            community_id,
+            generation: buzz_db::semantic::SemanticGenerationRecord {
+                community_id,
+                generation_id: fixture_uuid(2),
+                lifecycle: "active".to_owned(),
+                extractor_version: "overview-v1".to_owned(),
+                model_contract: contract.clone(),
+                model_contract_digest: query_fences.source_generation_contract_digest,
+                rebuild_completed_at: Some(observed_at),
+                created_at: observed_at,
+            },
+            query_fences,
+            project_context_revision: 7,
+            observed_at,
+        };
+        let problem_channel_id = digest(1);
+        let vector = SemanticExactQueryVector::new(
+            &ticket,
+            problem_channel_id,
+            query_fences,
+            EmbeddingVector::new(vec![1.0, 0.0, 0.0], &contract).expect("query vector"),
+        )
+        .expect("bound query vector");
+        (ticket, vector, problem_channel_id)
+    }
+
+    fn linear_steps(project_id: uuid::Uuid, hop_count: u8) -> Vec<LinearStep> {
+        (1..=hop_count)
+            .map(|index| {
+                let entered = linear_work(u64::from(index));
+                let target = linear_work(u64::from(index) + 1);
+                let complete_coordinates =
+                    canonicalize_coordinates(vec![entered.clone(), target.clone()])
+                        .expect("canonical synthetic Edge");
+                let edge_key = EdgeKey::derive(project_id, &complete_coordinates)
+                    .expect("synthetic Edge identity");
+                let document_id = fixture_uuid(1_000 + u64::from(index));
+                let binding = binding(index, document_id);
+                LinearStep {
+                    entered,
+                    target,
+                    edge: SemanticEdgeObservation {
+                        edge_key,
+                        complete_coordinates,
+                        provenance: ProjectContextEdgeProvenance {
+                            last_context_revision: u64::from(index),
+                            source_change_id: digest(40_u8.wrapping_add(index)),
+                        },
+                        current_context_document_bindings: vec![binding.clone()],
+                    },
+                    document_id,
+                    binding,
+                    entered_head: view_head(index),
+                    document_head: document_head(60_u8.wrapping_add(index)),
+                    target_head: view_head(index.wrapping_add(1)),
+                }
+            })
+            .collect()
+    }
+
+    fn linear_root(
+        ticket: &SemanticGraphQueryTicket,
+        problem_score: Score,
+    ) -> SemanticGraphSelectedRoot {
+        let coordinate = linear_work(1);
+        let source = semantic_source_identity_for_coordinate(ticket.community_id, &coordinate)
+            .expect("synthetic root source");
+        let entrypoint = RootStructuralEntrypoint::Coordinate { coordinate };
+        let root_id = derive_root_id(
+            *ticket.community_id.as_uuid(),
+            &source,
+            std::slice::from_ref(&entrypoint),
+        )
+        .expect("synthetic root identity");
+        let final_score = candidate_score(problem_score, Score::ZERO, AnchorGain::None);
+        let explanation = ScoreExplanation {
+            score_role: SemanticScoreRole::Candidate,
+            problem_score,
+            conditioned_evidence: Vec::new(),
+            highest_gain: Score::ZERO,
+            second_highest_gain: Score::ZERO,
+            environment_gain: Score::ZERO,
+            anchor_gain: AnchorGain::None,
+            local_coherence: None,
+            document_score: None,
+            target_coordinate_score: None,
+            transition_score: None,
+            penalties: Vec::new(),
+            final_score,
+        };
+        let head = view_head(1);
+        SemanticGraphSelectedRoot {
+            root_id,
+            source,
+            discovery_channels: vec![RootDiscoveryChannel::ProblemNeutral],
+            structural_entrypoints: vec![entrypoint],
+            preview: SemanticSourcePreview {
+                title: "synthetic root".to_owned(),
+                summary: Some("content-free offline fixture".to_owned()),
+                summary_omitted_reason: None,
+            },
+            lifecycle: SemanticLifecycleClass::Active,
+            source_status: None,
+            canonical_provenance: CanonicalSourceProvenance {
+                source_basis: head.source_basis.clone(),
+                source_invalidation_epoch: head.invalidation_epoch,
+                source_snapshot_digest: head.snapshot_digest,
+                summary_coverage: head.summary_coverage,
+            },
+            semantic_provenance: Some(SemanticProvenance {
+                generation_id: ticket.generation.generation_id,
+                unit_key: "overview".to_owned(),
+                source_snapshot_digest: head.snapshot_digest,
+                source_generation_contract_digest: ticket
+                    .query_fences
+                    .source_generation_contract_digest,
+                embedding_space_fence: ticket.query_fences.embedding_space_fence,
+            }),
+            semantic_head: Some(head),
+            semantic_score: Some(final_score),
+            score_explanation: Some(explanation),
+            automatic_lane: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_engine_one_through_six_hops_pack_and_sign() {
+        for hop_count in 1..=6 {
+            let (ticket, vector, problem_channel_id) = linear_ticket();
+            let budget = SemanticGraphQueryBudget {
+                max_hops_per_path: hop_count,
+                max_paths: 1,
+                max_response_bytes: 256 * 1024,
+                ..SemanticGraphQueryBudget::default()
+            };
+            let root = linear_root(&ticket, score(900_000));
+            let mut backend = LinearTraversalBackend {
+                steps: linear_steps(*ticket.community_id.as_uuid(), hop_count),
+                ticket: ticket.clone(),
+                problem_channel_id,
+            };
+            let channels = TraversalChannels {
+                problem_channel_id,
+                conditioned: Vec::new(),
+            };
+            let query_vectors = vec![vector];
+            let search = TraversalEngine::new(
+                &mut backend,
+                &ticket,
+                &query_vectors,
+                &channels,
+                LifecycleFilter::AllCurrent,
+                budget,
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .expect("synthetic traversal engine")
+            .search(std::slice::from_ref(&root))
+            .await
+            .expect("synthetic linear traversal");
+            assert_eq!(search.paths.len(), 1);
+            assert_eq!(search.paths[0].hops.len(), usize::from(hop_count));
+            assert_eq!(
+                search.exhausted_dimensions,
+                vec![ExhaustedDimension::HopsPerPath]
+            );
+            assert_eq!(
+                search.paths[0].branch_stop_reason,
+                BranchStopReason::MaxHopsReached
+            );
+
+            let query = SemanticGraphQuery {
+                request_id: fixture_uuid(10 + u64::from(hop_count)),
+                project_id: *ticket.community_id.as_uuid(),
+                problem: "synthetic graph traversal regression".to_owned(),
+                initial_coordinates: Vec::new(),
+                context_coordinates: Vec::new(),
+                lifecycle_filter: LifecycleFilter::AllCurrent,
+                budget,
+            };
+            let mut coverage = SemanticGraphQueryCoverage {
+                authorized_graph_sources: 1,
+                current_indexed_graph_sources: 1,
+                title_only_sources: 0,
+                embedding_coverage: EmbeddingCoverageCounts {
+                    current: 1,
+                    ..EmbeddingCoverageCounts::default()
+                },
+                query_channels_requested: 1,
+                query_channels_executed: 1,
+                omitted_context_channel_counts_by_reason: OmittedContextChannelCounts::default(),
+                neutral_candidates_considered: 1,
+                conditioned_candidates_considered: 0,
+                roots_selected: 1,
+                roots_returned: 0,
+                expanded_coordinates: 0,
+                incident_edges_materialized: 0,
+                relation_options_materialized: 0,
+                target_options_materialized: 0,
+                paths_generated: 0,
+                paths_retained: 0,
+                paths_returned: 0,
+                omitted_for_response_budget: OmittedForResponseBudgetCounts::default(),
+                truncation_counts_by_dimension: TruncationCountsByDimension::default(),
+                truncation_samples: Vec::new(),
+                degraded_mode_counts: DegradedModeCounts::default(),
+            };
+            apply_search_coverage(&mut coverage, &search);
+            let observations = SemanticGraphQueryObservations {
+                semantic_generation_id: ticket.generation.generation_id,
+                source_generation_contract_digest: ticket
+                    .query_fences
+                    .source_generation_contract_digest,
+                embedding_space_fence: ticket.query_fences.embedding_space_fence,
+                query_contract_digest: query_contract_digest(),
+                ranking_contract_digest: ranking_contract_digest().expect("ranking digest"),
+                budget_profile_digest: budget_profile_digest().expect("budget digest"),
+                extractor_version: ticket.generation.extractor_version.clone(),
+                project_context_revision: ticket.project_context_revision,
+                snapshot_observed_at: ticket.observed_at,
+            };
+            let input = SemanticGraphResponsePackingInput {
+                query,
+                request_binding_digest: digest(99),
+                observations,
+                input_observations: SemanticGraphQueryInputObservations {
+                    accepted_initial_coordinates: Vec::new(),
+                    initial_not_in_graph: Vec::new(),
+                    omitted_initial_coordinates: Vec::new(),
+                    accepted_context_coordinates: Vec::new(),
+                    omitted_context_coordinates: Vec::new(),
+                },
+                roots: search.roots,
+                paths: search.paths,
+                coverage,
+                completion_reason: CompletionReason::BudgetExhausted,
+                exhausted_dimensions: search.exhausted_dimensions,
+            };
+            validate_completed_semantic_graph_forest(&input)
+                .expect("TraversalEngine output validates before packing");
+            let relay = Keys::generate();
+            let caller = Keys::generate();
+            let packed = pack_semantic_graph_response(
+                input,
+                &relay.public_key(),
+                &caller.public_key(),
+                256 * 1024,
+            )
+            .expect("TraversalEngine output packs");
+            let signed = sign_packed_semantic_graph_response(packed, &relay)
+                .expect("TraversalEngine output signs");
+            assert!(!signed.event_array_bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_stops_before_an_n_plus_one_coordinate_expansion() {
+        let (ticket, vector, problem_channel_id) = linear_ticket();
+        let budget = SemanticGraphQueryBudget {
+            max_hops_per_path: 2,
+            max_expanded_coordinates: 1,
+            max_paths: 1,
+            max_response_bytes: 256 * 1024,
+            ..SemanticGraphQueryBudget::default()
+        };
+        let root = linear_root(&ticket, score(900_000));
+        let mut backend = LinearTraversalBackend {
+            steps: linear_steps(*ticket.community_id.as_uuid(), 2),
+            ticket: ticket.clone(),
+            problem_channel_id,
+        };
+        let channels = TraversalChannels {
+            problem_channel_id,
+            conditioned: Vec::new(),
+        };
+        let search = TraversalEngine::new(
+            &mut backend,
+            &ticket,
+            &[vector],
+            &channels,
+            LifecycleFilter::AllCurrent,
+            budget,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("synthetic traversal engine")
+        .search(std::slice::from_ref(&root))
+        .await
+        .expect("bounded synthetic traversal");
+
+        assert_eq!(search.expanded_coordinates, 1);
+        assert_eq!(search.paths.len(), 1);
+        assert_eq!(search.paths[0].hops.len(), 1);
+        assert_eq!(
+            search.paths[0].branch_stop_reason,
+            BranchStopReason::GlobalBudgetExhausted
+        );
+        assert!(search
+            .exhausted_dimensions
+            .contains(&ExhaustedDimension::ExpandedCoordinates));
     }
 
     fn cutoff_work_with_beam_suppression(beam_width: u16) -> ExpansionWork {
@@ -2786,6 +3367,34 @@ mod tests {
             Admission::GlobalExhausted
         ));
         assert_eq!(materialized, HashSet::from([1_u8]));
+    }
+
+    #[test]
+    fn coordinate_expansion_checks_the_global_cap_before_a_fresh_quantum() {
+        let mut expanded = 63;
+        let mut quantum = 1;
+        assert_eq!(
+            admit_coordinate_expansion(&mut expanded, 64, &mut quantum),
+            CoordinateExpansionAdmission::Admitted
+        );
+        assert_eq!((expanded, quantum), (64, 0));
+
+        // A later global-step quantum must not admit the N+1 expansion after
+        // another work item consumed the final global slot.
+        quantum = 1;
+        assert_eq!(
+            admit_coordinate_expansion(&mut expanded, 64, &mut quantum),
+            CoordinateExpansionAdmission::GlobalExhausted
+        );
+        assert_eq!((expanded, quantum), (64, 1));
+
+        let mut below_cap = 63;
+        let mut empty_quantum = 0;
+        assert_eq!(
+            admit_coordinate_expansion(&mut below_cap, 64, &mut empty_quantum),
+            CoordinateExpansionAdmission::Deferred
+        );
+        assert_eq!((below_cap, empty_quantum), (63, 0));
     }
 
     #[test]

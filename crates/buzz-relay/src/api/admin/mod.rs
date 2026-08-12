@@ -212,7 +212,14 @@ async fn feedback_attachment(
     // a community, host, object key, extension, or upstream URL.
     let tenant = crate::tenant::bind_community(&state.db, &feedback.community_host)
         .await
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(|error| {
+            let failure = crate::tenant::host_lookup_http_failure(&error);
+            match failure.status {
+                axum::http::StatusCode::NOT_FOUND => ApiError::not_found(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE => ApiError::service_unavailable(),
+                _ => ApiError::internal(),
+            }
+        })?;
     if tenant.community().as_uuid() != &feedback.community_id {
         tracing::warn!(
             feedback_id = %feedback.id,

@@ -34,10 +34,22 @@ pub async fn nostr_nip05(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let json = match (
-        params.name,
-        crate::tenant::bind_community(&state.db, raw_host).await,
-    ) {
+    let binding = crate::tenant::bind_community(&state.db, raw_host).await;
+    if let Err(error) = &binding {
+        let failure = crate::tenant::host_lookup_http_failure(error);
+        if failure.status != axum::http::StatusCode::NOT_FOUND {
+            return (
+                failure.status,
+                Json(serde_json::json!({
+                    "error": failure.message,
+                    "code": failure.code,
+                    "retryable": failure.retryable,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let json = match (params.name, binding) {
         (Some(n), Ok(tenant)) => {
             let name = n.to_lowercase();
             // NIP-05 identity is host-scoped in a multi-tenant relay: the

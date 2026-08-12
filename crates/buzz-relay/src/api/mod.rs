@@ -23,6 +23,21 @@ pub(crate) fn api_error(status: StatusCode, msg: &str) -> (StatusCode, Json<serd
     (status, Json(serde_json::json!({ "error": msg })))
 }
 
+/// Stable, content-free JSON mapping for a row-zero community lookup failure.
+pub(crate) fn host_lookup_api_error(
+    error: &crate::tenant::BindError<buzz_db::DbError>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let failure = crate::tenant::host_lookup_http_failure(error);
+    (
+        failure.status,
+        Json(serde_json::json!({
+            "error": failure.message,
+            "code": failure.code,
+            "retryable": failure.retryable,
+        })),
+    )
+}
+
 pub(crate) fn internal_error(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     tracing::error!("Internal error: {msg}");
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")

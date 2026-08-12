@@ -127,7 +127,14 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             .unwrap_or("");
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
-            .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
+            .map_err(|error| {
+                let failure = crate::tenant::host_lookup_http_failure(&error);
+                if failure.status == StatusCode::NOT_FOUND {
+                    (StatusCode::NOT_FOUND, "repository not found").into_response()
+                } else {
+                    (failure.status, failure.message).into_response()
+                }
+            })?;
         let expected_url = git_expected_url(
             &state.config.relay_url,
             &tenant,

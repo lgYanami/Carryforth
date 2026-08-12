@@ -63,6 +63,15 @@ impl AuditService {
         Self { pool }
     }
 
+    /// Return `(size, idle, max)` for bounded Relay pool telemetry.
+    pub fn pool_stats(&self) -> (u32, u32, u32) {
+        (
+            self.pool.size(),
+            self.pool.num_idle() as u32,
+            self.pool.options().get_max_connections(),
+        )
+    }
+
     /// Append a new entry to the calling community's chain.
     ///
     /// Serialized per-community via `pg_advisory_lock`. Postgres advisory locks

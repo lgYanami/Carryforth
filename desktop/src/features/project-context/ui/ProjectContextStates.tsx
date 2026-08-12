@@ -133,9 +133,9 @@ export function ProjectContextFailureState({
     },
     unavailable: {
       description:
-        "No verified Project Context projection is currently available. An advertised capability alone is not treated as an empty catalog.",
+        "Project Context is temporarily unavailable while the Relay reconnects. Desktop will retry without treating this as unsupported.",
       icon: <TimerReset className="h-5 w-5" />,
-      title: "Project Context is not available yet",
+      title: "Project Context is reconnecting",
     },
     snapshot_conflict: {
       description:

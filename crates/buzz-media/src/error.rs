@@ -38,6 +38,8 @@ pub enum MediaError {
     StorageError(String),
     #[error("internal error")]
     Internal,
+    #[error("request dependency is temporarily unavailable")]
+    DependencyUnavailable,
     #[error("not found")]
     NotFound,
     #[error("missing authorization header")]
@@ -151,6 +153,10 @@ impl IntoResponse for MediaError {
             | Self::InvalidVideo
             | Self::InvalidImage
             | Self::MetadataForbidden => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
+            Self::DependencyUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request dependency is temporarily unavailable".into(),
+            ),
             Self::Io(_) | Self::StorageError(_) | Self::Internal => {
                 tracing::error!(error = %self, "media storage error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

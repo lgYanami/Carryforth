@@ -147,7 +147,21 @@ async fn main() -> anyhow::Result<()> {
     let db_config = DbConfig {
         database_url: config.database_url.clone(),
         read_database_url: config.read_database_url.clone(),
-        ..DbConfig::default()
+        max_connections: config.db_main_pool.max_connections,
+        min_connections: config.db_main_pool.min_connections,
+        acquire_timeout_secs: config.db_main_pool.acquire_timeout_secs,
+        max_lifetime_secs: config.db_main_pool.max_lifetime_secs,
+        idle_timeout_secs: config.db_main_pool.idle_timeout_secs,
+        read_max_connections: config.db_read_pool.max_connections,
+        read_min_connections: config.db_read_pool.min_connections,
+        read_acquire_timeout_secs: config.db_read_pool.acquire_timeout_secs,
+        read_max_lifetime_secs: config.db_read_pool.max_lifetime_secs,
+        read_idle_timeout_secs: config.db_read_pool.idle_timeout_secs,
+        control_max_connections: config.db_control_pool.max_connections,
+        control_min_connections: config.db_control_pool.min_connections,
+        control_acquire_timeout_secs: config.db_control_pool.acquire_timeout_secs,
+        control_max_lifetime_secs: config.db_control_pool.max_lifetime_secs,
+        control_idle_timeout_secs: config.db_control_pool.idle_timeout_secs,
     };
     let db = Db::new(&db_config).await.map_err(|e| {
         error!("Failed to connect to Postgres: {e}");
@@ -158,6 +172,34 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("Postgres connected");
     }
+    let server_max_connections = db.server_max_connections().await?;
+    // Until a future deployment provides a verified endpoint-group identity,
+    // conservatively charge an optional read pool to the writer budget too.
+    // This cannot undercount aliases that happen to resolve to the same PG.
+    let relay_pool_budget = config.conservative_postgres_connection_budget();
+    if relay_pool_budget > server_max_connections {
+        return Err(anyhow::anyhow!(
+            "Relay Postgres pool budget {relay_pool_budget} exceeds server max_connections {server_max_connections}"
+        ));
+    }
+    info!(
+        writer_main = config.db_main_pool.max_connections,
+        read_main = if config.read_database_url.is_some() {
+            config.db_read_pool.max_connections
+        } else {
+            0
+        },
+        control = config.db_control_pool.max_connections,
+        audit = if config.audit_enabled {
+            config.db_audit_pool.max_connections
+        } else {
+            0
+        },
+        search = config.db_search_pool.max_connections,
+        server_reserve = config.db_server_connection_reserve,
+        server_max_connections,
+        "validated Relay Postgres connection budget"
+    );
 
     let auto_migrate =
         buzz_auto_migrate_enabled(std::env::var("BUZZ_AUTO_MIGRATE").ok().as_deref());
@@ -352,9 +394,23 @@ async fn main() -> anyhow::Result<()> {
 
     let audit = if config.audit_enabled {
         let audit_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .min_connections(1)
-            .connect(&config.database_url)
+            .max_connections(config.db_audit_pool.max_connections)
+            .min_connections(config.db_audit_pool.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(
+                config.db_audit_pool.acquire_timeout_secs,
+            ))
+            .max_lifetime(std::time::Duration::from_secs(
+                config.db_audit_pool.max_lifetime_secs,
+            ))
+            .idle_timeout(std::time::Duration::from_secs(
+                config.db_audit_pool.idle_timeout_secs,
+            ))
+            .connect_with(
+                config
+                    .database_url
+                    .parse::<sqlx::postgres::PgConnectOptions>()?
+                    .application_name("carryforth-relay-audit"),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
         info!("Audit service ready");
@@ -408,7 +464,22 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .unwrap_or(&config.database_url);
     let search_pool = sqlx::postgres::PgPoolOptions::new()
-        .connect(search_db_url)
+        .max_connections(config.db_search_pool.max_connections)
+        .min_connections(config.db_search_pool.min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(
+            config.db_search_pool.acquire_timeout_secs,
+        ))
+        .max_lifetime(std::time::Duration::from_secs(
+            config.db_search_pool.max_lifetime_secs,
+        ))
+        .idle_timeout(std::time::Duration::from_secs(
+            config.db_search_pool.idle_timeout_secs,
+        ))
+        .connect_with(
+            search_db_url
+                .parse::<sqlx::postgres::PgConnectOptions>()?
+                .application_name("carryforth-relay-search"),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("Search DB connection failed: {e}"))?;
     let search = SearchService::new(search_pool);
@@ -1029,6 +1100,13 @@ async fn main() -> anyhow::Result<()> {
                 metrics::gauge!("buzz_db_pool_active").set(active as f64);
                 metrics::gauge!("buzz_db_pool_max").set(db_stats.max as f64);
 
+                let control_stats = pool_state.db.control_pool_stats();
+                let control_active = control_stats.size.saturating_sub(control_stats.idle);
+                metrics::gauge!("buzz_db_control_pool_size").set(control_stats.size as f64);
+                metrics::gauge!("buzz_db_control_pool_idle").set(control_stats.idle as f64);
+                metrics::gauge!("buzz_db_control_pool_active").set(control_active as f64);
+                metrics::gauge!("buzz_db_control_pool_max").set(control_stats.max as f64);
+
                 if let Some(read_stats) = pool_state.db.read_pool_stats() {
                     let read_active = read_stats.size.saturating_sub(read_stats.idle);
                     metrics::gauge!("buzz_db_read_pool_size").set(read_stats.size as f64);
@@ -1049,6 +1127,21 @@ async fn main() -> anyhow::Result<()> {
                             metrics::gauge!("buzz_db_replica_fence_open").set(0.0);
                         }
                     }
+                }
+
+                let (search_size, search_idle, search_max) = pool_state.search.pool_stats();
+                metrics::gauge!("buzz_db_search_pool_size").set(search_size as f64);
+                metrics::gauge!("buzz_db_search_pool_idle").set(search_idle as f64);
+                metrics::gauge!("buzz_db_search_pool_active")
+                    .set(search_size.saturating_sub(search_idle) as f64);
+                metrics::gauge!("buzz_db_search_pool_max").set(search_max as f64);
+                if let Some(audit) = &pool_state.audit {
+                    let (audit_size, audit_idle, audit_max) = audit.pool_stats();
+                    metrics::gauge!("buzz_db_audit_pool_size").set(audit_size as f64);
+                    metrics::gauge!("buzz_db_audit_pool_idle").set(audit_idle as f64);
+                    metrics::gauge!("buzz_db_audit_pool_active")
+                        .set(audit_size.saturating_sub(audit_idle) as f64);
+                    metrics::gauge!("buzz_db_audit_pool_max").set(audit_max as f64);
                 }
 
                 let rs = pool_state.redis_pool.status();

@@ -187,12 +187,7 @@ async fn authenticate_tenant_request(
         .unwrap_or("");
     let tenant = crate::tenant::bind_community(&state.db, raw_host)
         .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+        .map_err(|error| crate::api::host_lookup_api_error(&error))?;
     let path_with_query = match raw_query {
         Some(query) if !query.is_empty() => format!("{path}?{query}"),
         _ => path.to_owned(),

@@ -57,6 +57,14 @@ impl ApiError {
             message: "request failed",
         }
     }
+
+    pub fn service_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "dependency_unavailable",
+            message: "request dependency is temporarily unavailable",
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

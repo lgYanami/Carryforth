@@ -395,6 +395,11 @@ async fn require_semantic_identity(
         ));
     }
     if !identity.semantic_query_http_enabled {
+        if identity.extensions_temporarily_unavailable {
+            return Err(CliError::Unavailable(
+                "Relay semantic capability observation could not be completed".to_owned(),
+            ));
+        }
         return Err(CliError::Other(format!(
             "unsupported:semantic_graph_query:relay_does_not_advertise_{SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION}"
         )));
@@ -1978,6 +1983,7 @@ mod tests {
             context_edge_migration_required: false,
             document_enabled: true,
             semantic_query_http_enabled: false,
+            extensions_temporarily_unavailable: false,
         }
     }
 

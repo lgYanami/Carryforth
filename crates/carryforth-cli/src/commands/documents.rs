@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::client::{CarryforthClient, ProjectCommandDelivery};
+use crate::commands::project_view_snapshot::SupportedExtensionsObservationStatus;
 use crate::error::CliError;
 use crate::validate::{read_bounded_file_or_stdin, sdk_err};
 use crate::{DocumentsCmd, OutputFormat};
@@ -54,6 +55,8 @@ struct PatchRequest {
 struct Nip11Document {
     #[serde(default)]
     supported_extensions: Vec<String>,
+    #[serde(default)]
+    buzz_supported_extensions_status: Option<SupportedExtensionsObservationStatus>,
     #[serde(rename = "self")]
     relay_self: Option<String>,
 }
@@ -204,6 +207,13 @@ async fn require_identity(client: &CarryforthClient) -> Result<DocumentIdentity,
         .iter()
         .any(|extension| extension == DOCUMENT_CAPABILITY)
     {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(CliError::Unavailable(
+                "Relay Project Document capability observation could not be completed".to_owned(),
+            ));
+        }
         return Err(CliError::Other(format!(
             "unavailable: Relay does not advertise {DOCUMENT_CAPABILITY}"
         )));

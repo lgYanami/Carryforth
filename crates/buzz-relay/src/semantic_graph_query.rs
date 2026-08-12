@@ -131,6 +131,7 @@ async fn begin_semantic_graph_root_query_inner(
                     absolute_deadline: deadlines.absolute,
                     snapshot_started_at: stage.snapshot_started_at,
                     _process_permit: process_permit,
+                    _traversal_permit: stage.traversal_permit,
                 });
             }
             Err(error @ SemanticGraphRootQueryError::SemanticGenerationChanged)
@@ -311,9 +312,27 @@ async fn root_query_attempt(
     let query_vectors = bind_exact_query_vectors(&ticket, &input_build.inputs, encoded)?;
     drop(input_build);
 
+    let traversal_permit = state
+        .semantic_graph_traversal_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            metrics::counter!("buzz_semantic_graph_traversal_admission_total", "outcome" => "busy")
+                .increment(1);
+            SemanticGraphRootQueryError::TraversalBusy
+        })?;
+    metrics::counter!("buzz_semantic_graph_traversal_admission_total", "outcome" => "admitted")
+        .increment(1);
+    metrics::histogram!("buzz_semantic_graph_traversal_admission_wait_seconds").record(0.0);
+    metrics::gauge!("buzz_semantic_graph_traversal_limit")
+        .set(state.config.semantic_graph_traversal_max_in_flight as f64);
+    let traversal_permit = SemanticGraphTraversalPermit::new(traversal_permit);
     let read = begin_generation_bound_read(state, &ticket, reader_pubkey, deadlines.work).await?;
     build_stage_c_roots(
-        read,
+        StageCReadAdmission {
+            read,
+            traversal_permit,
+        },
         query,
         &stage_a_context,
         channels,
@@ -369,6 +388,24 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) absolute_deadline: Instant,
     pub(crate) snapshot_started_at: std::time::Instant,
     _process_permit: OwnedSemaphorePermit,
+    _traversal_permit: SemanticGraphTraversalPermit,
+}
+
+struct SemanticGraphTraversalPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl SemanticGraphTraversalPermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        metrics::gauge!("buzz_semantic_graph_traversal_in_flight").increment(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for SemanticGraphTraversalPermit {
+    fn drop(&mut self) {
+        metrics::gauge!("buzz_semantic_graph_traversal_in_flight").decrement(1.0);
+    }
 }
 
 impl std::fmt::Debug for SemanticGraphRootQuerySession {
@@ -446,6 +483,8 @@ pub(crate) enum SemanticGraphRootQueryError {
     InvalidProject,
     #[error("semantic graph query process admission is busy")]
     ProcessBusy,
+    #[error("semantic graph Stage C traversal admission is busy")]
+    TraversalBusy,
     #[error("semantic graph query Provider is unavailable")]
     QueryEncoderUnavailable,
     #[error("semantic graph query Provider admission is busy")]
@@ -484,6 +523,7 @@ impl SemanticGraphRootQueryError {
             Self::QueryDisabled => SemanticGraphQueryMetricError::QueryDisabled,
             Self::InvalidProject => SemanticGraphQueryMetricError::InvalidProject,
             Self::ProcessBusy => SemanticGraphQueryMetricError::ProcessBusy,
+            Self::TraversalBusy => SemanticGraphQueryMetricError::TraversalBusy,
             Self::QueryEncoderUnavailable => SemanticGraphQueryMetricError::ProviderUnavailable,
             Self::QueryProviderBusy => SemanticGraphQueryMetricError::ProviderBusy,
             Self::QueryFleetUnavailable => SemanticGraphQueryMetricError::Readiness,
@@ -580,10 +620,16 @@ struct ExplicitRootMaterial {
 
 struct StageCRootBuild {
     read: SemanticGraphReadTx,
+    traversal_permit: SemanticGraphTraversalPermit,
     outcome: SemanticGraphRootQueryOutcome,
     query_vectors: Vec<SemanticExactQueryVector>,
     channels: Vec<QueryChannelBinding>,
     snapshot_started_at: std::time::Instant,
+}
+
+struct StageCReadAdmission {
+    read: SemanticGraphReadTx,
+    traversal_permit: SemanticGraphTraversalPermit,
 }
 
 fn prepare_candidate_scores(
@@ -1504,7 +1550,7 @@ fn canonical_provenance_from_snapshot(
 }
 
 async fn build_stage_c_roots(
-    mut read: SemanticGraphReadTx,
+    admission: StageCReadAdmission,
     query: &SemanticGraphQuery,
     expected_context: &SemanticContextCoordinateObservationBatch,
     channels: Vec<QueryChannelBinding>,
@@ -1512,6 +1558,10 @@ async fn build_stage_c_roots(
     unsupported_conditioned: &HashSet<ProjectContextCoordinate>,
     deadlines: QueryDeadlines,
 ) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
+    let StageCReadAdmission {
+        mut read,
+        traversal_permit,
+    } = admission;
     let snapshot_started_at = std::time::Instant::now();
     let observed_context = run_before_work_deadline(
         deadlines.work,
@@ -1676,6 +1726,7 @@ async fn build_stage_c_roots(
     let ticket = read.ticket().clone();
     Ok(StageCRootBuild {
         read,
+        traversal_permit,
         outcome: SemanticGraphRootQueryOutcome {
             ticket,
             input_observations,

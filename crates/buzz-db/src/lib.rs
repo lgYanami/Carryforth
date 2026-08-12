@@ -98,7 +98,8 @@ pub use event::{EventQuery, ReactionEventInsertOutcome};
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, QueryBuilder, Row};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
@@ -212,6 +213,11 @@ pub struct Db {
     pub(crate) pool: PgPool,
     /// Maximum connections configured for this pool (from [`DbConfig::max_connections`]).
     pub(crate) max_connections: u32,
+    /// Dedicated writer-endpoint pool reserved for row-zero host binding and
+    /// short readiness probes. Semantic traversal never uses this pool.
+    pub(crate) control_pool: PgPool,
+    pub(crate) control_max_connections: u32,
+    control_dependency_backoff: Arc<ControlDependencyBackoff>,
     /// Optional read-replica pool (from [`DbConfig::read_database_url`]).
     ///
     /// `None` means no replica is configured and every read routes to the
@@ -219,6 +225,7 @@ pub struct Db {
     /// route here (see [`Db::read`]); locks, transactions, and anything
     /// consistency-critical stays on `pool`.
     pub(crate) read_pool: Option<PgPool>,
+    pub(crate) read_max_connections: u32,
     /// Freshness fence gating cursor-page routing to the replica.
     ///
     /// Starts closed; a background probe ([`replica_fence::run_probe`])
@@ -229,6 +236,102 @@ pub struct Db {
     /// Cloned handles share attestations; independent/scratch databases do not.
     pub(crate) project_view_v3_readiness:
         std::sync::Arc<project_view_v3::V3ReadinessAttestationCache>,
+}
+
+#[derive(Debug, Default)]
+struct ControlDependencyBackoff {
+    state: Mutex<ControlDependencyBackoffState>,
+}
+
+#[derive(Debug, Default)]
+struct ControlDependencyBackoffState {
+    consecutive_failures: u8,
+    next_probe_at: Option<Instant>,
+}
+
+impl ControlDependencyBackoff {
+    fn admit(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.next_probe_at {
+            Some(next_probe_at) if now < next_probe_at => {
+                metrics::counter!(
+                    "buzz_db_dependency_circuit_total",
+                    "role" => "control",
+                    "outcome" => "rejected"
+                )
+                .increment(1);
+                false
+            }
+            Some(_) => {
+                // Reserve the next bounded probe so a recovery stampede cannot
+                // send every row-zero request back to Postgres simultaneously.
+                state.next_probe_at = Some(now + Duration::from_millis(200));
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn record_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.next_probe_at.is_some() {
+            metrics::counter!(
+                "buzz_db_dependency_circuit_total",
+                "role" => "control",
+                "outcome" => "recovered"
+            )
+            .increment(1);
+        }
+        state.consecutive_failures = 0;
+        state.next_probe_at = None;
+        metrics::gauge!("buzz_db_dependency_circuit_open", "role" => "control").set(0.0);
+    }
+
+    fn record_dependency_failure(&self) {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1).min(5);
+        let exponent = u32::from(state.consecutive_failures.saturating_sub(1));
+        let base_ms = 200_u64.saturating_mul(1_u64 << exponent).min(2_000);
+        // Content-free deterministic jitter prevents synchronized cloned
+        // processes from probing at exactly the same boundary.
+        let jitter_ms = u64::from(std::process::id() % 53);
+        state.next_probe_at = Some(now + Duration::from_millis(base_ms + jitter_ms));
+        metrics::counter!(
+            "buzz_db_dependency_circuit_total",
+            "role" => "control",
+            "outcome" => "opened"
+        )
+        .increment(1);
+        metrics::gauge!("buzz_db_dependency_circuit_open", "role" => "control").set(1.0);
+    }
+}
+
+fn is_transient_database_dependency(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::BeginFailed => true,
+        sqlx::Error::Database(database) => database.code().is_some_and(|code| {
+            code.starts_with("08")
+                || code.starts_with("53")
+                || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+        }),
+        _ => false,
+    }
 }
 
 /// Snapshot of Postgres connection pool utilisation.
@@ -282,6 +385,26 @@ pub struct DbConfig {
     pub max_lifetime_secs: u64,
     /// Seconds a connection may sit idle before being closed.
     pub idle_timeout_secs: u64,
+    /// Maximum connections in the optional read-replica pool.
+    pub read_max_connections: u32,
+    /// Minimum idle connections in the optional read-replica pool.
+    pub read_min_connections: u32,
+    /// Read-pool acquire timeout in seconds.
+    pub read_acquire_timeout_secs: u64,
+    /// Read-pool maximum connection lifetime in seconds.
+    pub read_max_lifetime_secs: u64,
+    /// Read-pool idle timeout in seconds.
+    pub read_idle_timeout_secs: u64,
+    /// Maximum connections reserved for row-zero/control-plane reads.
+    pub control_max_connections: u32,
+    /// Minimum idle connections reserved for row-zero/control-plane reads.
+    pub control_min_connections: u32,
+    /// Control-pool acquire timeout in seconds.
+    pub control_acquire_timeout_secs: u64,
+    /// Control-pool maximum connection lifetime in seconds.
+    pub control_max_lifetime_secs: u64,
+    /// Control-pool idle timeout in seconds.
+    pub control_idle_timeout_secs: u64,
 }
 
 impl Default for DbConfig {
@@ -292,13 +415,32 @@ impl Default for DbConfig {
         Self {
             database_url: "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string(), // sadscan:disable np.postgres.1
             read_database_url: None,
-            max_connections: 20,
+            max_connections: 12,
             min_connections: 2,
             acquire_timeout_secs: 3,
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
+            read_max_connections: 8,
+            read_min_connections: 1,
+            read_acquire_timeout_secs: 3,
+            read_max_lifetime_secs: 1800,
+            read_idle_timeout_secs: 600,
+            control_max_connections: 2,
+            control_min_connections: 1,
+            control_acquire_timeout_secs: 1,
+            control_max_lifetime_secs: 1800,
+            control_idle_timeout_secs: 600,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PgPoolSizing {
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout_secs: u64,
+    max_lifetime_secs: u64,
+    idle_timeout_secs: u64,
 }
 
 /// Community host-map row returned by [`Db::lookup_community_by_host`].
@@ -402,15 +544,55 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url, true).await?;
+        let writer_sizing = PgPoolSizing {
+            max_connections: config.max_connections,
+            min_connections: config.min_connections,
+            acquire_timeout_secs: config.acquire_timeout_secs,
+            max_lifetime_secs: config.max_lifetime_secs,
+            idle_timeout_secs: config.idle_timeout_secs,
+        };
+        let read_sizing = PgPoolSizing {
+            max_connections: config.read_max_connections,
+            min_connections: config.read_min_connections,
+            acquire_timeout_secs: config.read_acquire_timeout_secs,
+            max_lifetime_secs: config.read_max_lifetime_secs,
+            idle_timeout_secs: config.read_idle_timeout_secs,
+        };
+        let control_sizing = PgPoolSizing {
+            max_connections: config.control_max_connections,
+            min_connections: config.control_min_connections,
+            acquire_timeout_secs: config.control_acquire_timeout_secs,
+            max_lifetime_secs: config.control_max_lifetime_secs,
+            idle_timeout_secs: config.control_idle_timeout_secs,
+        };
+        let pool = Self::connect_pool(
+            &config.database_url,
+            writer_sizing,
+            true,
+            "carryforth-relay-main",
+        )
+        .await?;
+        let control_pool = Self::connect_pool(
+            &config.database_url,
+            control_sizing,
+            false,
+            "carryforth-relay-control",
+        )
+        .await?;
         let read_pool = match &config.read_database_url {
-            Some(url) => Some(Self::connect_pool(config, url, false).await?),
+            Some(url) => {
+                Some(Self::connect_pool(url, read_sizing, false, "carryforth-relay-read").await?)
+            }
             None => None,
         };
         Ok(Self {
             pool,
             max_connections: config.max_connections,
+            control_pool,
+            control_max_connections: config.control_max_connections,
+            control_dependency_backoff: Arc::new(ControlDependencyBackoff::default()),
             read_pool,
+            read_max_connections: config.read_max_connections,
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             project_view_v3_readiness: std::sync::Arc::new(
                 project_view_v3::V3ReadinessAttestationCache::default(),
@@ -424,13 +606,18 @@ impl Db {
     /// every connection, arming the deferred commit-time trigger from
     /// migration 0021. Writer pools must arm it; replica pools are read-only
     /// so the trigger never fires there.
-    async fn connect_pool(config: &DbConfig, url: &str, arm_floor_guard: bool) -> Result<PgPool> {
+    async fn connect_pool(
+        url: &str,
+        sizing: PgPoolSizing,
+        arm_floor_guard: bool,
+        application_name: &'static str,
+    ) -> Result<PgPool> {
         let mut options = PgPoolOptions::new()
-            .max_connections(config.max_connections)
-            .min_connections(config.min_connections)
-            .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
-            .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
+            .max_connections(sizing.max_connections)
+            .min_connections(sizing.min_connections)
+            .acquire_timeout(Duration::from_secs(sizing.acquire_timeout_secs))
+            .max_lifetime(Duration::from_secs(sizing.max_lifetime_secs))
+            .idle_timeout(Duration::from_secs(sizing.idle_timeout_secs));
         if arm_floor_guard {
             options = options.after_connect(|conn, _meta| {
                 Box::pin(async move {
@@ -443,15 +630,22 @@ impl Db {
                 })
             });
         }
-        Ok(options.connect(url).await?)
+        let connect = url
+            .parse::<sqlx::postgres::PgConnectOptions>()?
+            .application_name(application_name);
+        Ok(options.connect_with(connect).await?)
     }
 
     /// Creates a `Db` from an existing `PgPool` (useful in tests).
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             max_connections: pool.options().get_max_connections(),
+            control_max_connections: pool.options().get_max_connections(),
+            control_pool: pool.clone(),
+            control_dependency_backoff: Arc::new(ControlDependencyBackoff::default()),
             pool,
             read_pool: None,
+            read_max_connections: 0,
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             project_view_v3_readiness: std::sync::Arc::new(
                 project_view_v3::V3ReadinessAttestationCache::default(),
@@ -469,7 +663,11 @@ impl Db {
     pub fn from_pools(pool: PgPool, read_pool: PgPool) -> Self {
         Self {
             max_connections: pool.options().get_max_connections(),
+            control_max_connections: pool.options().get_max_connections(),
+            control_pool: pool.clone(),
+            control_dependency_backoff: Arc::new(ControlDependencyBackoff::default()),
             pool,
+            read_max_connections: read_pool.options().get_max_connections(),
             read_pool: Some(read_pool),
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             project_view_v3_readiness: std::sync::Arc::new(
@@ -545,7 +743,35 @@ impl Db {
 
     /// Returns `true` if the database is reachable (used by readiness probes).
     pub async fn ping(&self) -> bool {
-        sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+        if !self.control_dependency_backoff.admit() {
+            return false;
+        }
+        match sqlx::query("SELECT 1").execute(&self.control_pool).await {
+            Ok(_) => {
+                self.control_dependency_backoff.record_success();
+                true
+            }
+            Err(error) => {
+                if is_transient_database_dependency(&error) {
+                    self.control_dependency_backoff.record_dependency_failure();
+                } else {
+                    self.control_dependency_backoff.record_success();
+                }
+                false
+            }
+        }
+    }
+
+    /// Read the writer server's configured connection ceiling through the
+    /// dedicated control pool.
+    pub async fn server_max_connections(&self) -> Result<u32> {
+        let value =
+            sqlx::query_scalar::<_, i32>("SELECT current_setting('max_connections')::integer")
+                .fetch_one(&self.control_pool)
+                .await?;
+        u32::try_from(value).map_err(|_| {
+            DbError::InvalidData("Postgres max_connections must be a positive u32".to_owned())
+        })
     }
 
     /// Returns pool utilisation stats for metrics emission.
@@ -566,8 +792,17 @@ impl Db {
         self.read_pool.as_ref().map(|p| DbPoolStats {
             size: p.size(),
             idle: p.num_idle() as u32,
-            max: self.max_connections,
+            max: self.read_max_connections,
         })
+    }
+
+    /// Pool utilisation stats for the row-zero/control-plane pool.
+    pub fn control_pool_stats(&self) -> DbPoolStats {
+        DbPoolStats {
+            size: self.control_pool.size(),
+            idle: self.control_pool.num_idle() as u32,
+            max: self.control_max_connections,
+        }
     }
 
     /// Try to acquire the detached session advisory lock for relay usage metrics.
@@ -726,7 +961,10 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<Option<CommunityRecord>> {
-        let row = sqlx::query(
+        if !self.control_dependency_backoff.admit() {
+            return Err(DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        }
+        let row = match sqlx::query(
             r#"
             SELECT id, host
             FROM communities
@@ -735,8 +973,22 @@ impl Db {
             "#,
         )
         .bind(normalized_host)
-        .fetch_optional(&self.pool)
-        .await?;
+        .fetch_optional(&self.control_pool)
+        .await
+        {
+            Ok(row) => {
+                self.control_dependency_backoff.record_success();
+                row
+            }
+            Err(error) => {
+                if is_transient_database_dependency(&error) {
+                    self.control_dependency_backoff.record_dependency_failure();
+                } else {
+                    self.control_dependency_backoff.record_success();
+                }
+                return Err(error.into());
+            }
+        };
 
         row.map(|row| {
             let id: Uuid = row.try_get("id")?;
@@ -4289,6 +4541,25 @@ mod tests {
     use uuid::Uuid;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+    #[test]
+    fn control_dependency_backoff_opens_rejects_and_recovers() {
+        let backoff = ControlDependencyBackoff::default();
+        assert!(backoff.admit());
+        backoff.record_dependency_failure();
+        assert!(!backoff.admit());
+        backoff.record_success();
+        assert!(backoff.admit());
+    }
+
+    #[test]
+    fn transient_dependency_classifier_is_narrow() {
+        assert!(is_transient_database_dependency(&sqlx::Error::PoolTimedOut));
+        assert!(is_transient_database_dependency(&sqlx::Error::PoolClosed));
+        assert!(!is_transient_database_dependency(
+            &sqlx::Error::ColumnNotFound("host".to_owned())
+        ));
+    }
 
     async fn setup_db() -> Db {
         let database_url =

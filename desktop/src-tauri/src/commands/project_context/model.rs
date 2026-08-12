@@ -113,6 +113,7 @@ impl ProjectContextCommandError {
         if message.starts_with("relay returned 403") {
             Self::restricted()
         } else if message.starts_with("relay unreachable:")
+            || message.starts_with("relay capability observation temporarily unavailable:")
             || message.starts_with("relay rate-limited:")
             || message.starts_with("relay returned 409")
             || message.starts_with("relay returned 5")

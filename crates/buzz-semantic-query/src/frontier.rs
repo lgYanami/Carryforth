@@ -81,6 +81,51 @@ impl FrontierPathState {
     /// Edge cycles and recomputing the exact fixed-point path score.
     pub fn append_hop(&self, mut hop: SemanticHyperedgeHop) -> QueryContractResult<Self> {
         let target = hop.continued_to_coordinate.coordinate.clone();
+        if hop.entered_from_coordinate != self.current_coordinate {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "frontier successor is not Coordinate-contiguous".to_owned(),
+            ));
+        }
+        if self.hops.is_empty() {
+            let starts_at_entrypoint = match &self.structural_entrypoint {
+                RootStructuralEntrypoint::Coordinate { coordinate } => {
+                    hop.entered_from_coordinate.as_ref() == Some(coordinate)
+                }
+                RootStructuralEntrypoint::ContextDocument {
+                    edge_key,
+                    document_id,
+                    edge_provenance,
+                    binding_provenance,
+                } => {
+                    hop.entered_from_coordinate.is_none()
+                        && hop.edge.edge_key == *edge_key
+                        && hop.edge.provenance == *edge_provenance
+                        && hop.selected_relation_document.document_id == *document_id
+                        && hop.selected_relation_document.binding_provenance == *binding_provenance
+                }
+            };
+            if !starts_at_entrypoint {
+                return Err(SemanticGraphQueryError::InvalidState(
+                    "frontier successor does not start at its structural entrypoint".to_owned(),
+                ));
+            }
+        }
+        if hop
+            .entered_from_coordinate
+            .as_ref()
+            .is_some_and(|entered| !hop.edge.complete_coordinates.contains(entered))
+        {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "frontier entered Coordinate is not a complete Hyperedge member".to_owned(),
+            ));
+        }
+        if !hop.edge.complete_coordinates.contains(&target)
+            || hop.entered_from_coordinate.as_ref() == Some(&target)
+        {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "frontier target Coordinate is not a distinct complete Hyperedge member".to_owned(),
+            ));
+        }
         if self.visited_edges.contains(&hop.edge.edge_key)
             || self.visited_coordinates.contains(&target)
         {

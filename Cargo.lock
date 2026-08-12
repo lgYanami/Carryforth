@@ -935,6 +935,7 @@ dependencies = [
  "buzz-semantic-query",
  "chrono",
  "hex",
+ "metrics",
  "nostr",
  "pgvector",
  "rand 0.10.1",

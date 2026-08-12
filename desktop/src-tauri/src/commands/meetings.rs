@@ -27,7 +27,9 @@ mod directory;
 use directory::list_item_from_load;
 mod model;
 use model::*;
+mod capability_observation;
 mod pending;
+use capability_observation::{Nip11Document, SupportedExtensionsObservationStatus};
 mod summary;
 pub use summary::update_meeting_summary;
 
@@ -38,7 +40,7 @@ use buzz_core_pkg::kind::{
     KIND_NIP29_GROUP_METADATA, KIND_STREAM_MESSAGE,
 };
 use nostr::{Event, PublicKey};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use tauri::State;
@@ -60,14 +62,6 @@ const SNAPSHOT_EVENT_LIMIT: usize = 20;
 const MAX_LIST_MEETINGS: usize = 64;
 const DEFAULT_SPEECH_PAGE_SIZE: usize = 50;
 const MAX_SPEECH_PAGE_SIZE: usize = 100;
-
-#[derive(Debug, Deserialize)]
-struct Nip11Document {
-    #[serde(default)]
-    supported_extensions: Vec<String>,
-    #[serde(rename = "self")]
-    relay_self: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 struct MeetingIdentity {
@@ -308,6 +302,13 @@ async fn read_meeting_identity_at(
     }
     let info: Nip11Document = parse_json_response(response).await?;
     if !has_extension(&info, MEETING_V2_EXTENSION) {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(
+                "relay capability observation temporarily unavailable: retry later".to_owned(),
+            );
+        }
         return Ok(None);
     }
     let relay_self = info.relay_self.as_deref().ok_or_else(|| {

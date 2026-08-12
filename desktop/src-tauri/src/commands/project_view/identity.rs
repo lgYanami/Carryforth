@@ -21,8 +21,17 @@ const PROJECT_CONTEXT_EDGE_EXTENSION: &str = buzz_project_context_pkg::PROJECT_C
 struct Nip11Document {
     #[serde(default)]
     supported_extensions: Vec<String>,
+    #[serde(default)]
+    buzz_supported_extensions_status: Option<SupportedExtensionsObservationStatus>,
     #[serde(rename = "self")]
     relay_self: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SupportedExtensionsObservationStatus {
+    Observed,
+    TemporarilyUnavailable,
 }
 
 pub(super) async fn read_identity(state: &AppState) -> Result<Option<ProjectViewIdentity>, String> {
@@ -55,6 +64,13 @@ pub(crate) async fn read_identity_at_with_client(
         ));
     }
     if !runtime_ready && !bootstrap_discoverable {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(
+                "relay capability observation temporarily unavailable: retry later".to_owned(),
+            );
+        }
         return Ok(None);
     }
 
@@ -79,6 +95,8 @@ pub(crate) async fn read_identity_at_with_client(
             .supported_extensions
             .iter()
             .any(|extension| extension == SEMANTIC_QUERY_HTTP_EXTENSION),
+        extensions_temporarily_unavailable: info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable),
     }))
 }
 
@@ -94,6 +112,13 @@ pub(crate) async fn read_project_document_identity_at(
         .iter()
         .any(|extension| extension == PROJECT_DOCUMENT_CAPABILITY)
     {
+        if info.buzz_supported_extensions_status
+            == Some(SupportedExtensionsObservationStatus::TemporarilyUnavailable)
+        {
+            return Err(
+                "relay capability observation temporarily unavailable: retry later".to_owned(),
+            );
+        }
         return Ok(None);
     }
     parse_relay_self(&info, "Project Document").map(Some)

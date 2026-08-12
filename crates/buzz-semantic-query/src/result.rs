@@ -18,6 +18,175 @@ use crate::{
     Score, SemanticGraphQuery, SemanticGraphQueryError, MAX_TRUNCATION_SAMPLES,
 };
 
+/// Closed, content-free reason a completed semantic graph result violated its
+/// structural or request-bound contract.
+///
+/// These values are safe to use as low-cardinality metric labels. They never
+/// carry Project text, source identities, paths, vectors, or credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticGraphResultInvariant {
+    /// Embedding coverage does not partition the authorized source set.
+    CoveragePartition,
+    /// Coverage counters violate their monotonic or bounded relationships.
+    CoverageBounds,
+    /// Completion and exhausted-dimension observations disagree.
+    Completion,
+    /// One returned root violates its closed identity or provenance contract.
+    RootContract,
+    /// A returned root has an invalid title/summary omission state.
+    RootPreview,
+    /// More than one returned root has the same deterministic identity.
+    DuplicateRoot,
+    /// A path references a root that is not returned.
+    MissingPathRoot,
+    /// More than one returned path has the same deterministic identity.
+    DuplicatePath,
+    /// Returned root/path counters disagree with the serialized payload.
+    ReturnedCounts,
+    /// The caller request is not a valid canonical query.
+    RequestContract,
+    /// The result is bound to a different request or Project.
+    RequestIdentity,
+    /// A compiled query, ranking, or budget contract digest differs.
+    ContractDigest,
+    /// Caller Coordinate observations do not exactly partition the request.
+    InputObservations,
+    /// Executed Provider query channels do not match accepted inputs.
+    QueryChannels,
+    /// Root evidence or requested lifecycle evidence is inconsistent.
+    RootEvidence,
+    /// Automatic semantic roots exceed the caller's root budget.
+    BudgetAutomaticRoots,
+    /// Selected roots exceed explicit inputs plus the automatic-root budget.
+    BudgetSelectedRoots,
+    /// Neutral Provider candidates exceed the per-channel recall budget.
+    BudgetNeutralCandidates,
+    /// Context-conditioned candidates exceed their aggregate recall budget.
+    BudgetConditionedCandidates,
+    /// Expanded Coordinates exceed the caller's traversal budget.
+    BudgetExpandedCoordinates,
+    /// Materialized incident Hyperedges exceed the caller's traversal budget.
+    BudgetIncidentEdges,
+    /// Materialized relation options exceed the caller's traversal budget.
+    BudgetRelationOptions,
+    /// Materialized target options exceed the caller's traversal budget.
+    BudgetTargetOptions,
+    /// Retained-path accounting exceeds the caller's path budget.
+    BudgetPathsRetained,
+    /// Returned path payload exceeds the caller's path budget.
+    BudgetReturnedPaths,
+    /// A returned path exceeds the caller's per-path hop budget.
+    BudgetPathHops,
+    /// Path identity, ordinal, terminal, or duplicated score is inconsistent.
+    PathIdentity,
+    /// A path does not start at one of its root's structural entrypoints.
+    PathEntrypoint,
+    /// Consecutive path hops are not Coordinate-contiguous.
+    PathContiguity,
+    /// A path repeats a Hyperedge.
+    PathRepeatedEdge,
+    /// A path repeats a Coordinate.
+    PathRepeatedCoordinate,
+    /// An entered Coordinate is not a complete Hyperedge member.
+    EnteredCoordinateMembership,
+    /// Only a relation-Document root may omit the entered Coordinate.
+    MissingEnteredCoordinate,
+    /// A continued Coordinate is not a distinct unvisited Hyperedge member.
+    ContinuedCoordinateMembership,
+    /// One hop violates its identity, lifecycle, binding, score, or preview contract.
+    HopContract,
+    /// A returned hop has an invalid title/summary omission state.
+    HopPreview,
+    /// One hop's semantic provenance does not match the query snapshot.
+    HopProvenance,
+    /// A path score does not recompute from its root and ordered transitions.
+    PathScore,
+}
+
+impl SemanticGraphResultInvariant {
+    /// Stable snake-case label for logs and metrics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoveragePartition => "coverage_partition",
+            Self::CoverageBounds => "coverage_bounds",
+            Self::Completion => "completion",
+            Self::RootContract => "root_contract",
+            Self::RootPreview => "root_preview",
+            Self::DuplicateRoot => "duplicate_root",
+            Self::MissingPathRoot => "missing_path_root",
+            Self::DuplicatePath => "duplicate_path",
+            Self::ReturnedCounts => "returned_counts",
+            Self::RequestContract => "request_contract",
+            Self::RequestIdentity => "request_identity",
+            Self::ContractDigest => "contract_digest",
+            Self::InputObservations => "input_observations",
+            Self::QueryChannels => "query_channels",
+            Self::RootEvidence => "root_evidence",
+            Self::BudgetAutomaticRoots => "budget_automatic_roots",
+            Self::BudgetSelectedRoots => "budget_selected_roots",
+            Self::BudgetNeutralCandidates => "budget_neutral_candidates",
+            Self::BudgetConditionedCandidates => "budget_conditioned_candidates",
+            Self::BudgetExpandedCoordinates => "budget_expanded_coordinates",
+            Self::BudgetIncidentEdges => "budget_incident_edges",
+            Self::BudgetRelationOptions => "budget_relation_options",
+            Self::BudgetTargetOptions => "budget_target_options",
+            Self::BudgetPathsRetained => "budget_paths_retained",
+            Self::BudgetReturnedPaths => "budget_returned_paths",
+            Self::BudgetPathHops => "budget_path_hops",
+            Self::PathIdentity => "path_identity",
+            Self::PathEntrypoint => "path_entrypoint",
+            Self::PathContiguity => "path_contiguity",
+            Self::PathRepeatedEdge => "path_repeated_edge",
+            Self::PathRepeatedCoordinate => "path_repeated_coordinate",
+            Self::EnteredCoordinateMembership => "entered_coordinate_membership",
+            Self::MissingEnteredCoordinate => "missing_entered_coordinate",
+            Self::ContinuedCoordinateMembership => "continued_coordinate_membership",
+            Self::HopContract => "hop_contract",
+            Self::HopPreview => "hop_preview",
+            Self::HopProvenance => "hop_provenance",
+            Self::PathScore => "path_score",
+        }
+    }
+}
+
+impl std::fmt::Display for SemanticGraphResultInvariant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Typed validation failure for a completed semantic graph forest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("semantic graph result invariant {invariant}: {detail}")]
+pub struct SemanticGraphResultValidationError {
+    /// Content-free closed reason suitable for metrics.
+    pub invariant: SemanticGraphResultInvariant,
+    /// Human-readable contract detail. Callers must not emit this as an
+    /// externally visible error or an unbounded metric label.
+    pub detail: String,
+}
+
+impl SemanticGraphResultValidationError {
+    fn new(invariant: SemanticGraphResultInvariant, detail: impl Into<String>) -> Self {
+        Self {
+            invariant,
+            detail: detail.into(),
+        }
+    }
+
+    fn from_contract(
+        invariant: SemanticGraphResultInvariant,
+        error: SemanticGraphQueryError,
+    ) -> Self {
+        Self::new(invariant, error.to_string())
+    }
+
+    fn into_contract_error(self) -> SemanticGraphQueryError {
+        SemanticGraphQueryError::InvalidState(self.detail)
+    }
+}
+
 /// Exact query/index/graph observations that fence one returned snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -880,27 +1049,66 @@ impl SemanticGraphQueryResult {
     /// Validate cross-object identities, score recomputation, path integrity,
     /// coverage accounting, and completion semantics before signing.
     pub fn validate(&self) -> QueryContractResult<()> {
-        self.coverage.validate()?;
+        self.validate_detailed()
+            .map_err(SemanticGraphResultValidationError::into_contract_error)
+    }
+
+    /// Validate the completed forest and return a stable, content-free reason
+    /// code when an invariant is violated.
+    pub fn validate_detailed(&self) -> Result<(), SemanticGraphResultValidationError> {
+        let classified = self
+            .coverage
+            .embedding_coverage
+            .current
+            .saturating_add(self.coverage.embedding_coverage.missing)
+            .saturating_add(self.coverage.embedding_coverage.building)
+            .saturating_add(self.coverage.embedding_coverage.failed)
+            .saturating_add(self.coverage.embedding_coverage.unsupported)
+            .saturating_add(self.coverage.embedding_coverage.non_queryable_zero_vector);
+        if classified != self.coverage.authorized_graph_sources
+            || self.coverage.embedding_coverage.current
+                != self.coverage.current_indexed_graph_sources
+        {
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::CoveragePartition,
+                "embedding coverage does not partition authorized graph sources",
+            ));
+        }
+        if self.coverage.title_only_sources > self.coverage.current_indexed_graph_sources
+            || self.coverage.paths_generated < self.coverage.paths_retained
+            || self.coverage.paths_retained < self.coverage.paths_returned
+            || self.coverage.roots_selected < self.coverage.roots_returned
+            || self.coverage.query_channels_requested < self.coverage.query_channels_executed
+            || self.coverage.truncation_samples.len() > MAX_TRUNCATION_SAMPLES
+        {
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::CoverageBounds,
+                "semantic query coverage counters violate monotonic bounds",
+            ));
+        }
         if self
             .exhausted_dimensions
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "exhausted dimensions must be strictly canonical".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::Completion,
+                "exhausted dimensions must be strictly canonical",
             ));
         }
         match self.completion_reason {
             CompletionReason::BudgetExhausted if self.exhausted_dimensions.is_empty() => {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "budget exhaustion requires an exhausted dimension".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::Completion,
+                    "budget exhaustion requires an exhausted dimension",
                 ));
             }
             CompletionReason::FrontierExhausted | CompletionReason::WallTimeExhausted
                 if !self.exhausted_dimensions.is_empty() =>
             {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "non-budget completion must not report exhausted dimensions".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::Completion,
+                    "non-budget completion must not report exhausted dimensions",
                 ));
             }
             _ => {}
@@ -908,30 +1116,48 @@ impl SemanticGraphQueryResult {
 
         let mut roots_by_id = BTreeMap::new();
         for root in &self.roots {
-            root.validate(self.project_id, &self.observations)?;
+            validate_preview(&root.preview).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::RootPreview,
+                    error,
+                )
+            })?;
+            root.validate(self.project_id, &self.observations)
+                .map_err(|error| {
+                    SemanticGraphResultValidationError::from_contract(
+                        SemanticGraphResultInvariant::RootContract,
+                        error,
+                    )
+                })?;
             if roots_by_id.insert(root.root_id, root).is_some() {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "duplicate returned root id".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::DuplicateRoot,
+                    "duplicate returned root id",
                 ));
             }
         }
         let mut path_ids = BTreeSet::new();
         for path in &self.paths {
             let root = roots_by_id.get(&path.root_id).ok_or_else(|| {
-                SemanticGraphQueryError::InvalidState("path references a missing root".to_owned())
+                SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::MissingPathRoot,
+                    "path references a missing root",
+                )
             })?;
-            path.validate(self.project_id, root, &self.observations)?;
+            path.validate_detailed(self.project_id, root, &self.observations)?;
             if !path_ids.insert(path.path_id) {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "duplicate path id".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::DuplicatePath,
+                    "duplicate path id",
                 ));
             }
         }
         if self.coverage.roots_returned != self.roots.len() as u64
             || self.coverage.paths_returned != self.paths.len() as u64
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "returned root/path coverage does not match payload".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::ReturnedCounts,
+                "returned root/path coverage does not match payload",
             ));
         }
         Ok(())
@@ -945,26 +1171,76 @@ impl SemanticGraphQueryResult {
     /// prevents a correctly signed result from claiming channels, roots,
     /// paths, lifecycle eligibility, or work beyond the caller's budget.
     pub fn validate_for_request(&self, request: &SemanticGraphQuery) -> QueryContractResult<()> {
-        let request = request.clone().validate_and_canonicalize()?;
-        self.validate()?;
+        self.validate_for_request_detailed(request)
+            .map_err(SemanticGraphResultValidationError::into_contract_error)
+    }
+
+    /// Validate the completed forest against the exact caller request while
+    /// preserving a closed, content-free failure reason.
+    pub fn validate_for_request_detailed(
+        &self,
+        request: &SemanticGraphQuery,
+    ) -> Result<(), SemanticGraphResultValidationError> {
+        let request = request
+            .clone()
+            .validate_and_canonicalize()
+            .map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::RequestContract,
+                    error,
+                )
+            })?;
+        self.validate_detailed()?;
 
         if self.request_id != request.request_id || self.project_id != request.project_id {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "semantic result does not belong to the canonical request".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::RequestIdentity,
+                "semantic result does not belong to the canonical request",
             ));
         }
+        let expected_ranking_digest = ranking_contract_digest().map_err(|error| {
+            SemanticGraphResultValidationError::from_contract(
+                SemanticGraphResultInvariant::ContractDigest,
+                error,
+            )
+        })?;
+        let expected_budget_digest = budget_profile_digest().map_err(|error| {
+            SemanticGraphResultValidationError::from_contract(
+                SemanticGraphResultInvariant::ContractDigest,
+                error,
+            )
+        })?;
         if self.observations.query_contract_digest != query_contract_digest()
-            || self.observations.ranking_contract_digest != ranking_contract_digest()?
-            || self.observations.budget_profile_digest != budget_profile_digest()?
+            || self.observations.ranking_contract_digest != expected_ranking_digest
+            || self.observations.budget_profile_digest != expected_budget_digest
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "semantic result compiled contract digests do not match this verifier".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::ContractDigest,
+                "semantic result compiled contract digests do not match this verifier",
             ));
         }
 
-        self.validate_input_observations_for_request(&request)?;
-        self.validate_query_channels_for_request(&request)?;
-        self.validate_root_evidence_for_request(&request)?;
+        self.validate_input_observations_for_request(&request)
+            .map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::InputObservations,
+                    error,
+                )
+            })?;
+        self.validate_query_channels_for_request(&request)
+            .map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::QueryChannels,
+                    error,
+                )
+            })?;
+        self.validate_root_evidence_for_request(&request)
+            .map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::RootEvidence,
+                    error,
+                )
+            })?;
         self.validate_budget_for_request(&request)
     }
 
@@ -1298,7 +1574,10 @@ impl SemanticGraphQueryResult {
         Ok(())
     }
 
-    fn validate_budget_for_request(&self, request: &SemanticGraphQuery) -> QueryContractResult<()> {
+    fn validate_budget_for_request(
+        &self,
+        request: &SemanticGraphQuery,
+    ) -> Result<(), SemanticGraphResultValidationError> {
         let budget = request.budget;
         let explicit_roots = self
             .roots
@@ -1316,28 +1595,83 @@ impl SemanticGraphQueryResult {
             self.input_observations.accepted_context_coordinates.len() as u64
                 * u64::from(budget.max_recall_per_channel);
 
-        if automatic_roots > u64::from(budget.max_semantic_roots)
-            || self.coverage.roots_selected > maximum_selected_roots
-            || self.coverage.neutral_candidates_considered
-                > u64::from(budget.max_recall_per_channel)
-            || self.coverage.conditioned_candidates_considered > maximum_conditioned_candidates
-            || self.coverage.expanded_coordinates > u64::from(budget.max_expanded_coordinates)
-            || self.coverage.incident_edges_materialized
-                > u64::from(budget.max_incident_edges_materialized)
-            || self.coverage.relation_options_materialized
-                > u64::from(budget.max_relation_options_materialized)
-            || self.coverage.target_options_materialized
-                > u64::from(budget.max_target_options_materialized)
-            || self.coverage.paths_retained > u64::from(budget.max_paths)
-            || self.paths.len() > usize::from(budget.max_paths)
-            || self
-                .paths
-                .iter()
-                .any(|path| path.hops.len() > usize::from(budget.max_hops_per_path))
+        let exceeded =
+            |invariant, detail| Err(SemanticGraphResultValidationError::new(invariant, detail));
+        if automatic_roots > u64::from(budget.max_semantic_roots) {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetAutomaticRoots,
+                "automatic roots exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.roots_selected > maximum_selected_roots {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetSelectedRoots,
+                "selected roots exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.neutral_candidates_considered > u64::from(budget.max_recall_per_channel) {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetNeutralCandidates,
+                "neutral candidates exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.conditioned_candidates_considered > maximum_conditioned_candidates {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetConditionedCandidates,
+                "conditioned candidates exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.expanded_coordinates > u64::from(budget.max_expanded_coordinates) {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetExpandedCoordinates,
+                "expanded Coordinates exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.incident_edges_materialized
+            > u64::from(budget.max_incident_edges_materialized)
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "semantic result exceeds a caller-requested work budget".to_owned(),
-            ));
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetIncidentEdges,
+                "incident Hyperedges exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.relation_options_materialized
+            > u64::from(budget.max_relation_options_materialized)
+        {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetRelationOptions,
+                "relation options exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.target_options_materialized
+            > u64::from(budget.max_target_options_materialized)
+        {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetTargetOptions,
+                "target options exceed the caller-requested budget",
+            );
+        }
+        if self.coverage.paths_retained > u64::from(budget.max_paths) {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetPathsRetained,
+                "retained-path accounting exceeds the caller-requested budget",
+            );
+        }
+        if self.paths.len() > usize::from(budget.max_paths) {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetReturnedPaths,
+                "returned path payload exceeds the caller-requested budget",
+            );
+        }
+        if self
+            .paths
+            .iter()
+            .any(|path| path.hops.len() > usize::from(budget.max_hops_per_path))
+        {
+            return exceeded(
+                SemanticGraphResultInvariant::BudgetPathHops,
+                "a returned path exceeds the caller-requested hop budget",
+            );
         }
         Ok(())
     }
@@ -1553,12 +1887,12 @@ impl SemanticRoot {
 }
 
 impl SemanticPath {
-    fn validate(
+    fn validate_detailed(
         &self,
         project_id: Uuid,
         root: &SemanticRoot,
         observations: &SemanticGraphQueryObservations,
-    ) -> QueryContractResult<()> {
+    ) -> Result<(), SemanticGraphResultValidationError> {
         if self.hops.is_empty()
             || self
                 .hops
@@ -1568,24 +1902,34 @@ impl SemanticPath {
             || self.hops.last().is_none_or(|hop| {
                 hop.continued_to_coordinate.coordinate != self.terminal_coordinate
             })
-            || derive_path_id(self.root_id, &self.hops)? != self.path_id
+            || derive_path_id(self.root_id, &self.hops).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::PathIdentity,
+                    error,
+                )
+            })? != self.path_id
             || self.path_score_explanation.final_score != Some(self.path_score)
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "path identity, ordinal, terminal, or score is inconsistent".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::PathIdentity,
+                "path identity, ordinal, terminal, or score is inconsistent",
             ));
         }
 
         let first_hop = self.hops.first().ok_or_else(|| {
-            SemanticGraphQueryError::InvalidState("path has no first hop".to_owned())
+            SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::PathIdentity,
+                "path has no first hop",
+            )
         })?;
         if !root
             .structural_entrypoints
             .iter()
             .any(|entrypoint| path_starts_at_entrypoint(first_hop, entrypoint))
         {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "path does not start at one of its root structural entrypoints".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::PathEntrypoint,
+                "path does not start at one of its root structural entrypoints",
             ));
         }
 
@@ -1593,32 +1937,59 @@ impl SemanticPath {
         let mut visited_coordinates = BTreeSet::new();
         let mut previous_coordinate = None;
         for (index, hop) in self.hops.iter().enumerate() {
-            hop.validate(project_id)?;
-            hop.validate_provenance(observations)?;
+            validate_preview(&hop.selected_relation_document.preview).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::HopPreview,
+                    error,
+                )
+            })?;
+            validate_preview(&hop.continued_to_coordinate.preview).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::HopPreview,
+                    error,
+                )
+            })?;
+            hop.validate(project_id).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::HopContract,
+                    error,
+                )
+            })?;
+            hop.validate_provenance(observations).map_err(|error| {
+                SemanticGraphResultValidationError::from_contract(
+                    SemanticGraphResultInvariant::HopProvenance,
+                    error,
+                )
+            })?;
             if index > 0 && hop.entered_from_coordinate.as_ref() != previous_coordinate.as_ref() {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "path hops are not Coordinate-contiguous".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::PathContiguity,
+                    "path hops are not Coordinate-contiguous",
                 ));
             }
             if !visited_edges.insert(hop.edge.edge_key) {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "path repeats a Hyperedge".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::PathRepeatedEdge,
+                    "path repeats a Hyperedge",
                 ));
             }
             if let Some(entered) = hop.entered_from_coordinate.as_ref() {
                 if !hop.edge.complete_coordinates.contains(entered) {
-                    return Err(SemanticGraphQueryError::InvalidState(
-                        "entered Coordinate is not a member of the complete Hyperedge".to_owned(),
+                    return Err(SemanticGraphResultValidationError::new(
+                        SemanticGraphResultInvariant::EnteredCoordinateMembership,
+                        "entered Coordinate is not a member of the complete Hyperedge",
                     ));
                 }
                 if index == 0 && !visited_coordinates.insert(entered.clone()) {
-                    return Err(SemanticGraphQueryError::InvalidState(
-                        "path repeats a Coordinate".to_owned(),
+                    return Err(SemanticGraphResultValidationError::new(
+                        SemanticGraphResultInvariant::PathRepeatedCoordinate,
+                        "path repeats a Coordinate",
                     ));
                 }
             } else if index > 0 {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "only a relation-Document root may omit entered Coordinate".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::MissingEnteredCoordinate,
+                    "only a relation-Document root may omit entered Coordinate",
                 ));
             }
 
@@ -1627,8 +1998,9 @@ impl SemanticPath {
                 || hop.entered_from_coordinate.as_ref() == Some(continued)
                 || !visited_coordinates.insert(continued.clone())
             {
-                return Err(SemanticGraphQueryError::InvalidState(
-                    "continued Coordinate is not a distinct unvisited Hyperedge member".to_owned(),
+                return Err(SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::ContinuedCoordinateMembership,
+                    "continued Coordinate is not a distinct unvisited Hyperedge member",
                 ));
             }
             previous_coordinate = Some(continued.clone());
@@ -1639,11 +2011,17 @@ impl SemanticPath {
             .iter()
             .map(|hop| hop.transition_score)
             .collect::<Vec<_>>();
-        let expected_explanation = path_score(root.semantic_score, &transition_scores)
-            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
+        let expected_explanation =
+            path_score(root.semantic_score, &transition_scores).map_err(|error| {
+                SemanticGraphResultValidationError::new(
+                    SemanticGraphResultInvariant::PathScore,
+                    error.to_string(),
+                )
+            })?;
         if self.path_score_explanation != expected_explanation {
-            return Err(SemanticGraphQueryError::InvalidState(
-                "path score explanation does not match its root and ordered transitions".to_owned(),
+            return Err(SemanticGraphResultValidationError::new(
+                SemanticGraphResultInvariant::PathScore,
+                "path score explanation does not match its root and ordered transitions",
             ));
         }
         Ok(())
