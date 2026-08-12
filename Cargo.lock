@@ -1801,20 +1801,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "countdown-bot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "buzz-sdk",
- "futures-util",
- "nostr",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "url",
-]
-
-[[package]]
 name = "countio"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

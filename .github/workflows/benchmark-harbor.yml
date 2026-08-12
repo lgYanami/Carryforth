@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "benchmarks/harbor-buzz-orchestra/**"
+      - "benchmarks/harbor-carryforth-orchestra/**"
       - ".github/workflows/benchmark-harbor.yml"
   pull_request:
     paths:
-      - "benchmarks/harbor-buzz-orchestra/**"
+      - "benchmarks/harbor-carryforth-orchestra/**"
       - ".github/workflows/benchmark-harbor.yml"
 
 permissions:
@@ -26,13 +26,13 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Test adapter
-        working-directory: benchmarks/harbor-buzz-orchestra
+        working-directory: benchmarks/harbor-carryforth-orchestra
         run: |
           python -m pip install --disable-pip-version-check -e ".[dev]"
           pytest -q
           ruff check .
       - name: Test provisioner
-        working-directory: benchmarks/harbor-buzz-orchestra/testbed
+        working-directory: benchmarks/harbor-carryforth-orchestra/testbed
         run: |
           python -m pip install --disable-pip-version-check -e ".[dev]"
           pytest -q

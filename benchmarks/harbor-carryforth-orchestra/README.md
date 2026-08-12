@@ -44,7 +44,7 @@ already running, execute one task (`-p`), a directory of tasks, or replace
 `-p` with Harbor's dataset and task selectors:
 
 ```bash
-uv run --project benchmarks/harbor-buzz-orchestra/testbed harbor run --yes -p <TASK_OR_DIRECTORY> --agent harbor_buzz_orchestra:BuzzOrchestraAgent --agent-kwarg manifest=<CONDITION.yaml> --agent-kwarg provisioner_factory=harbor_buzz_testbed:provisioner_from_dict --agent-kwarg provisioner_config=<PROVISIONER.json> --agent-kwarg endpoint_config=<ENDPOINTS.json> --agent-kwarg artifact_root=benchmarks/harbor-buzz-orchestra --agent-kwarg buzz_acp_binary=<LINUX_BIN>/buzz-acp --agent-kwarg buzz_agent_binary=<LINUX_BIN>/buzz-agent --agent-kwarg buzz_dev_mcp_binary=<LINUX_BIN>/buzz-dev-mcp --agent-kwarg cf_binary=target/debug/cf --agent-kwarg run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)" --agent-timeout-multiplier 15 --n-concurrent 1
+uv run --project benchmarks/harbor-carryforth-orchestra/testbed harbor run --yes -p <TASK_OR_DIRECTORY> --agent harbor_buzz_orchestra:BuzzOrchestraAgent --agent-kwarg manifest=<CONDITION.yaml> --agent-kwarg provisioner_factory=harbor_buzz_testbed:provisioner_from_dict --agent-kwarg provisioner_config=<PROVISIONER.json> --agent-kwarg endpoint_config=<ENDPOINTS.json> --agent-kwarg artifact_root=benchmarks/harbor-carryforth-orchestra --agent-kwarg buzz_acp_binary=<LINUX_BIN>/buzz-acp --agent-kwarg buzz_agent_binary=<LINUX_BIN>/buzz-agent --agent-kwarg buzz_dev_mcp_binary=<LINUX_BIN>/buzz-dev-mcp --agent-kwarg cf_binary=target/debug/cf --agent-kwarg run_id="bench-$(date -u +%Y%m%dT%H%M%SZ)" --agent-timeout-multiplier 15 --n-concurrent 1
 ```
 
 `buzz_acp_binary`/`buzz_agent_binary`/`buzz_dev_mcp_binary` must be **Linux**
@@ -115,12 +115,12 @@ overrides, so the job directory it produces passes Harbor's static validation
 as-is. Give it a problem set, attempts per problem, and a team manifest:
 
 ```bash
-uv run --project benchmarks/harbor-buzz-orchestra/testbed \
-    benchmarks/harbor-buzz-orchestra/scripts/run_leaderboard.py \
+uv run --project benchmarks/harbor-carryforth-orchestra/testbed \
+    benchmarks/harbor-carryforth-orchestra/scripts/run_leaderboard.py \
     --dataset terminal-bench/terminal-bench-2-1 \
     --attempts 5 \
-    --manifest benchmarks/harbor-buzz-orchestra/manifests/<TEAM>.yaml \
-    --endpoint-config benchmarks/harbor-buzz-orchestra/testbed/endpoints/<ENDPOINTS>.json \
+    --manifest benchmarks/harbor-carryforth-orchestra/manifests/<TEAM>.yaml \
+    --endpoint-config benchmarks/harbor-carryforth-orchestra/testbed/endpoints/<ENDPOINTS>.json \
     --provisioner-config <PROVISIONER.json>
 ```
 
@@ -133,7 +133,7 @@ and prints the `harbor upload` / `harbor leaderboard submit` commands.
 ## Validate
 
 ```bash
-cd benchmarks/harbor-buzz-orchestra
+cd benchmarks/harbor-carryforth-orchestra
 uv run --extra dev pytest -q
 uv run --extra dev ruff check .
 cd testbed

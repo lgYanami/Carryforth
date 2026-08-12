@@ -36,7 +36,7 @@ reject_matches \
   "the Carryforth CLI still reads a retired BUZZ_* public identity variable" \
   'BUZZ_(RELAY_URL|PRIVATE_KEY|AUTH_TAG|CONNECT_TIMEOUT_SECS|TIMEOUT_SECS|CLI_TEST_DURATION_SECS)' \
   crates/carryforth-cli \
-  benchmarks/harbor-buzz-orchestra/testbed/src/harbor_buzz_testbed/cf_cli.py
+  benchmarks/harbor-carryforth-orchestra/testbed/src/harbor_buzz_testbed/cf_cli.py
 
 reject_matches \
   "Desktop still packages the retired buzz CLI sidecar" \

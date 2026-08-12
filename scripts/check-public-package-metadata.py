@@ -95,8 +95,8 @@ def main() -> None:
         check_javascript_package(relative)
 
     for relative in (
-        "benchmarks/harbor-buzz-orchestra/pyproject.toml",
-        "benchmarks/harbor-buzz-orchestra/testbed/pyproject.toml",
+        "benchmarks/harbor-carryforth-orchestra/pyproject.toml",
+        "benchmarks/harbor-carryforth-orchestra/testbed/pyproject.toml",
     ):
         check_python_package(relative)
 

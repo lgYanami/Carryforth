@@ -10,12 +10,12 @@ exact upload/submit commands.
 Run inside the testbed environment so ``harbor`` and the adapter are
 importable:
 
-    uv run --project benchmarks/harbor-buzz-orchestra/testbed \
-        benchmarks/harbor-buzz-orchestra/scripts/run_leaderboard.py \
+    uv run --project benchmarks/harbor-carryforth-orchestra/testbed \
+        benchmarks/harbor-carryforth-orchestra/scripts/run_leaderboard.py \
         --dataset terminal-bench/terminal-bench-2-1 \
         --attempts 5 \
-        --manifest benchmarks/harbor-buzz-orchestra/manifests/<TEAM>.yaml \
-        --endpoint-config benchmarks/harbor-buzz-orchestra/testbed/endpoints/<ENDPOINTS>.json \
+        --manifest benchmarks/harbor-carryforth-orchestra/manifests/<TEAM>.yaml \
+        --endpoint-config benchmarks/harbor-carryforth-orchestra/testbed/endpoints/<ENDPOINTS>.json \
         --provisioner-config <PROVISIONER.json> \
         --agent-bin-dir <DIR with Linux buzz-acp/buzz-agent/buzz-dev-mcp>
 """

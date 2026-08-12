@@ -70,8 +70,8 @@ fi
 reject_pattern \
   'global\.block-artifacts\.com|block-pypi|blox\.sqprod|\.sqprod\.co' \
   "public dependency locks still contain Block-internal package coordinates" \
-  "benchmarks/harbor-buzz-orchestra/uv.lock" \
-  "benchmarks/harbor-buzz-orchestra/testbed/uv.lock"
+  "benchmarks/harbor-carryforth-orchestra/uv.lock" \
+  "benchmarks/harbor-carryforth-orchestra/testbed/uv.lock"
 
 reject_pattern \
   'global\.block-artifacts\.com|\.sqprod\.co|sprout-oss\.stage|buzz-oss\.stage|block(-lakehouse-production)?\.cloud\.databricks\.com' \

@@ -13,7 +13,7 @@ pre-commit:
   parallel: true
   commands:
     rust-fmt:
-      glob: ["crates/**", "examples/countdown-bot/**"]
+      glob: ["crates/**"]
       run: just fmt
       stage_fixed: true
     desktop-tauri-fmt:

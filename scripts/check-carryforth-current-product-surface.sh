@@ -35,6 +35,13 @@ reject_pattern() {
 }
 
 for retired in \
+  examples \
+  perf \
+  benchmarks/harbor-buzz-orchestra \
+  .agents/skills/sprout-cli \
+  .claude/skills/sprout-cli \
+  .codex/skills/sprout-cli \
+  .goose/skills/sprout-cli \
   deploy/charts \
   .github/workflows/helm-chart.yml \
   ct.yaml \
@@ -127,16 +134,16 @@ reject_pattern \
   'ghcr\.io/block/buzz(:|@)|github\.com/block/buzz|"product"[[:space:]]*:[[:space:]]*"Buzz"|"organization"[[:space:]]*:[[:space:]]*"Block"' \
   "the active benchmark surface still defaults to a Block/Buzz image or public submission identity" \
   .github/workflows/benchmark-harbor.yml \
-  benchmarks/harbor-buzz-orchestra/scripts/benchmark.py \
-  benchmarks/harbor-buzz-orchestra/scripts/run_leaderboard.py
+  benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py \
+  benchmarks/harbor-carryforth-orchestra/scripts/run_leaderboard.py
 
 reject_pattern \
   'deploy/compose' \
   "the active benchmark runner still depends on the retired Compose tombstone" \
-  benchmarks/harbor-buzz-orchestra/scripts/benchmark.py
+  benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py
 
-benchmark_compose="$REPO_ROOT/benchmarks/harbor-buzz-orchestra/testbed/compose.benchmark.yml"
-benchmark_runner="$REPO_ROOT/benchmarks/harbor-buzz-orchestra/scripts/benchmark.py"
+benchmark_compose="$REPO_ROOT/benchmarks/harbor-carryforth-orchestra/testbed/compose.benchmark.yml"
+benchmark_runner="$REPO_ROOT/benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py"
 if [[ ! -f "$benchmark_compose" ]]; then
   fail "the self-contained benchmark Compose manifest is missing"
 else
@@ -217,10 +224,8 @@ fi
 
 reject_pattern \
   'building on Buzz|Buzz relay|Buzz agents|Buzz participants|Buzz UI|Start Buzz|Buzz-only|Buzz channels|# Buzz$|Buzz admin' \
-  "a current source-build guide or example still presents Buzz as the active product" \
-  desktop/README.md NOSTR.md examples/README.md \
-  examples/countdown-bot/README.md examples/countdown-bot/src/main.rs \
-  examples/meadow-core/README.md crates/buzz-pairing-cli/README.md \
+  "a current source-build guide still presents Buzz as the active product" \
+  desktop/README.md NOSTR.md crates/buzz-pairing-cli/README.md \
   crates/git-credential-nostr/README.md admin-web/index.html
 
 require_absent docs/multi-tenant-conformance.md

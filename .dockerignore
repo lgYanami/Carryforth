@@ -42,10 +42,9 @@ test-results/
 bin/
 sidecars/
 
-# Docs the image doesn't ship. examples/ stays — examples/countdown-bot is
-# a Cargo workspace member, so cargo-chef needs its manifest. Markdown files
-# inside crates (Cargo.toml `readme = ...`) likewise need to be present to
-# avoid manifest warnings; the savings from excluding them are negligible.
+# Docs the image doesn't ship. Markdown files inside crates (Cargo.toml
+# `readme = ...`) still need to be present to avoid manifest warnings; the
+# savings from excluding them are negligible.
 docs/**
 
 # Old Dockerfile noise (this Dockerfile is THE source of truth now)

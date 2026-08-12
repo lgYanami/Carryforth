@@ -1164,15 +1164,15 @@ benchmark *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
-    uv run --project benchmarks/harbor-buzz-orchestra/testbed \
-        benchmarks/harbor-buzz-orchestra/scripts/benchmark.py {{ARGS}}
+    uv run --project benchmarks/harbor-carryforth-orchestra/testbed \
+        benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py {{ARGS}}
 
 # Stop the benchmark Docker stack (state and channels are kept)
 benchmark-down:
     #!/usr/bin/env bash
     set -euo pipefail
-    STATE_DIR="{{justfile_directory()}}/benchmarks/harbor-buzz-orchestra/.benchmark"
-    COMPOSE_FILE="{{justfile_directory()}}/benchmarks/harbor-buzz-orchestra/testbed/compose.benchmark.yml"
+    STATE_DIR="{{justfile_directory()}}/benchmarks/harbor-carryforth-orchestra/.benchmark"
+    COMPOSE_FILE="{{justfile_directory()}}/benchmarks/harbor-carryforth-orchestra/testbed/compose.benchmark.yml"
     if [[ ! -f "$STATE_DIR/.env" ]]; then
         echo "No Carryforth benchmark stack state found; nothing to stop."
         exit 0

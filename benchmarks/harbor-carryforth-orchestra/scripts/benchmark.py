@@ -19,8 +19,8 @@ script owns everything around the run:
 
 Run inside the testbed environment (the just recipe does this):
 
-    uv run --project benchmarks/harbor-buzz-orchestra/testbed \
-        benchmarks/harbor-buzz-orchestra/scripts/benchmark.py [--gui] [...]
+    uv run --project benchmarks/harbor-carryforth-orchestra/testbed \
+        benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py [--gui] [...]
 """
 
 from __future__ import annotations

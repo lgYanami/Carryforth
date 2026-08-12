@@ -21,24 +21,6 @@
         "recipe": "Literal one-pixel, short-text, minimal PNG, or minimal SVG fixture bytes encoded directly beside their assertions."
       }
     },
-    "countdown-bot-project-art": {
-      "classification": "project-art",
-      "license": "Apache-2.0",
-      "usage": ["source"],
-      "copyright_holder": "Block, Inc. and Carryforth contributors",
-      "status": "cleared",
-      "trademark_status": "not-applicable",
-      "provenance": {
-        "description": "Small clock SVG authored inline for the Apache-2.0 countdown-bot example.",
-        "license_evidence": [
-          {
-            "path": "LICENSE",
-            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
-          }
-        ],
-        "created_in_commit": "c6da3a72abfd112741cd9b665d2a847715383614"
-      }
-    },
     "generated-inline-raster-test-fixture": {
       "classification": "test-fixture",
       "license": "Apache-2.0",
@@ -499,7 +481,7 @@
           },
           {
             "path": "Cargo.lock",
-            "sha256": "d55226d7970438c4ec491f40b271f989c331db755749a99831cb2950f723209c"
+            "sha256": "253f8ce9eb213249432dee2d8611e212ba30ad26a8ad6a2b67b7fe73041bafd7"
           }
         ],
         "recipe": "Encode a fixed 2x2 RGB pixel grid (red, red, green, green) with the pinned lossless WebP encoder.",
@@ -845,17 +827,6 @@
       "decoded_bytes": 203,
       "occurrences": 1,
       "rights_profile": "synthetic-inline-test-fixture"
-    },
-    {
-      "id": "inline-examples-countdown-bot-src-main-1",
-      "path": "examples/countdown-bot/src/main.rs",
-      "locators": ["32:34"],
-      "media_type": "image/svg+xml",
-      "encoding": "percent",
-      "decoded_sha256": "16cdc88612030e485c4b057613fb4e81c0bbfe6177ecff4677d7955267b49502",
-      "decoded_bytes": 401,
-      "occurrences": 1,
-      "rights_profile": "countdown-bot-project-art"
     },
     {
       "id": "inline-mobile-test-shared-relay-media-image-test-1",
