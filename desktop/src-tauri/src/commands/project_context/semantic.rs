@@ -1,7 +1,6 @@
 //! Trusted one-shot semantic Project Context query boundary for Desktop.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use buzz_core_pkg::CommunityId;
 use buzz_project_context_pkg::ProjectContextCoordinate;
@@ -19,14 +18,15 @@ use tauri::State;
 use uuid::Uuid;
 
 use super::{coordinate_key, domain_coordinate, ProjectContextCoordinateDto};
-use crate::app_state::{AppState, AppliedWorkspaceCapture, AppliedWorkspaceCaptureError};
+use crate::app_state::{
+    AppState, AppliedWorkspaceCapture, AppliedWorkspaceCaptureError, SEMANTIC_QUERY_HTTP_TIMEOUT,
+};
 use crate::commands::project_view::{
     read_identity_at_with_client, read_verified_v3_meta_at_with_client, ProjectViewReadError,
     ProjectViewSchema,
 };
 use crate::relay::build_nip98_auth_observation_for_keys;
 
-const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
 const SEMANTIC_QUERY_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
 
 #[path = "semantic_model.rs"]
@@ -127,7 +127,7 @@ async fn query_project_context_semantic_inner(
 
     let response = semantic_client
         .post(query_url)
-        .timeout(SEMANTIC_QUERY_TIMEOUT)
+        .timeout(SEMANTIC_QUERY_HTTP_TIMEOUT)
         .header("Authorization", authorization.authorization_header)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(prepared.exact_body.clone())

@@ -108,7 +108,11 @@ async fn complete_semantic_graph_traversal_inner(
         .await?
     };
 
-    run_db_before(session.work_deadline, session.read.commit())
+    // Traversal deliberately stops before the snapshot-close reserve begins.
+    // Committing against the later deadline preserves a valid
+    // `wall_time_exhausted` partial result instead of converting the expected
+    // stop into a hard 504 merely because the traversal deadline elapsed.
+    run_db_before(session.snapshot_close_deadline, session.read.commit())
         .await?
         .ok_or(SemanticGraphRootQueryError::QueryDeadlineExceeded)?;
     record_snapshot_transaction(session.snapshot_started_at.elapsed());
@@ -2368,6 +2372,21 @@ mod tests {
         pack_semantic_graph_response, sign_packed_semantic_graph_response,
         validate_completed_semantic_graph_forest, SemanticGraphResponsePackingInput,
     };
+
+    #[tokio::test]
+    async fn snapshot_close_reserve_remains_usable_after_traversal_deadline() {
+        let traversal_deadline = Instant::now();
+        let snapshot_close_deadline = traversal_deadline + std::time::Duration::from_secs(1);
+        assert!(Instant::now() >= traversal_deadline);
+
+        let closed = run_db_before(snapshot_close_deadline, async {
+            Ok::<_, buzz_db::DbError>(())
+        })
+        .await
+        .expect("snapshot close is not a database error");
+
+        assert_eq!(closed, Some(()));
+    }
 
     fn digest(value: u8) -> Digest32 {
         Digest32::from_bytes([value; 32])

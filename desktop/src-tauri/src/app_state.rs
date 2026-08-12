@@ -23,6 +23,7 @@ mod workspace_transition;
 use workspace_transition::semantic_query_http_client_or_disabled;
 pub(crate) use workspace_transition::{
     AppliedWorkspaceCapture, AppliedWorkspaceCaptureError, WorkspaceTransitionState,
+    SEMANTIC_QUERY_HTTP_TIMEOUT,
 };
 
 mod key_file;

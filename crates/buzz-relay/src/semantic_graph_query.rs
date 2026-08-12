@@ -44,7 +44,7 @@ use buzz_semantic_query::{
     SemanticGraphQueryInputObservations, SemanticHeadProvenance, SemanticHeadState,
     SemanticProvenance, SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderInput,
     SemanticScoreRole, SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR,
-    RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS,
+    RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS, SNAPSHOT_CLOSE_RESERVE_MS,
 };
 use chrono::Utc;
 use tokio::sync::OwnedSemaphorePermit;
@@ -128,6 +128,7 @@ async fn begin_semantic_graph_root_query_inner(
                     query_vectors: stage.query_vectors,
                     channels: stage.channels,
                     work_deadline: deadlines.work,
+                    snapshot_close_deadline: deadlines.snapshot_close,
                     absolute_deadline: deadlines.absolute,
                     snapshot_started_at: stage.snapshot_started_at,
                     _process_permit: process_permit,
@@ -384,7 +385,10 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) outcome: SemanticGraphRootQueryOutcome,
     pub(crate) query_vectors: Vec<SemanticExactQueryVector>,
     pub(crate) channels: Vec<QueryChannelBinding>,
+    /// Last instant at which traversal may start or continue database work.
     pub(crate) work_deadline: Instant,
+    /// Later deadline reserved exclusively for closing the read-only snapshot.
+    pub(crate) snapshot_close_deadline: Instant,
     pub(crate) absolute_deadline: Instant,
     pub(crate) snapshot_started_at: std::time::Instant,
     _process_permit: OwnedSemaphorePermit,
@@ -1911,6 +1915,7 @@ fn map_ticket_error(error: buzz_db::DbError) -> SemanticGraphRootQueryError {
 #[derive(Debug, Clone, Copy)]
 struct QueryDeadlines {
     work: Instant,
+    snapshot_close: Instant,
     absolute: Instant,
 }
 
@@ -1920,8 +1925,12 @@ impl QueryDeadlines {
         max_wall_time_ms: u32,
     ) -> Result<Self, SemanticGraphRootQueryError> {
         let total = Duration::from_millis(u64::from(max_wall_time_ms));
-        let tail = Duration::from_millis(u64::from(RESPONSE_TAIL_RESERVE_MS));
-        let Some(work_budget) = total.checked_sub(tail) else {
+        let response_tail = Duration::from_millis(u64::from(RESPONSE_TAIL_RESERVE_MS));
+        let snapshot_close_reserve = Duration::from_millis(u64::from(SNAPSHOT_CLOSE_RESERVE_MS));
+        let Some(snapshot_close_budget) = total.checked_sub(response_tail) else {
+            return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+        };
+        let Some(work_budget) = snapshot_close_budget.checked_sub(snapshot_close_reserve) else {
             return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
         };
         if work_budget.is_zero() {
@@ -1929,6 +1938,7 @@ impl QueryDeadlines {
         }
         Ok(Self {
             work: started_at + work_budget,
+            snapshot_close: started_at + snapshot_close_budget,
             absolute: started_at + total,
         })
     }
@@ -2166,17 +2176,26 @@ mod tests {
     }
 
     #[test]
-    fn deadline_reserves_a_fixed_response_tail() {
+    fn deadline_reserves_snapshot_close_and_response_tails() {
         let started = Instant::now();
-        let deadlines = QueryDeadlines::new(started, 10_000).expect("deadline");
+        let deadlines =
+            QueryDeadlines::new(started, buzz_semantic_query::MAX_WALL_TIME_MS).expect("deadline");
         assert_eq!(
             deadlines.work.duration_since(started),
-            Duration::from_secs(9)
+            Duration::from_secs(174)
+        );
+        assert_eq!(
+            deadlines.snapshot_close.duration_since(started),
+            Duration::from_secs(179)
         );
         assert_eq!(
             deadlines.absolute.duration_since(started),
-            Duration::from_secs(10)
+            Duration::from_secs(180)
         );
-        assert!(QueryDeadlines::new(started, RESPONSE_TAIL_RESERVE_MS).is_err());
+        assert!(QueryDeadlines::new(
+            started,
+            RESPONSE_TAIL_RESERVE_MS + SNAPSHOT_CLOSE_RESERVE_MS
+        )
+        .is_err());
     }
 }

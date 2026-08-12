@@ -555,7 +555,8 @@ result content. `--format compact` changes JSON whitespace only.
 
 A semantic query can incur Provider cost. The CLI serializes and NIP-98-signs
 the strict single-filter body once, sends exactly one HTTP attempt with a
-45-second total timeout, and never enters the ordinary `/query` retry loop.
+195-second transport timeout (the Relay owns the closed 180-second query
+budget), and never enters the ordinary `/query` retry loop.
 Timeout, body loss, 429, 502, 503, or 504 therefore returns an error without an
 automatic replay. A user-initiated rerun creates a new request UUID and auth
 Event.

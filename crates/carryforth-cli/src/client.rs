@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use buzz_semantic_query::SemanticGraphQuery;
+use buzz_semantic_query::{SemanticGraphQuery, MAX_WALL_TIME_MS};
 use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest, Sha256};
 
@@ -148,7 +148,11 @@ const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
 const RETRY_IN_MAX_SECS: u64 = 30;
 
 /// Dedicated total timeout for one non-replayed semantic graph query.
-const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
+///
+/// The transport envelope deliberately exceeds the Relay's closed three-minute
+/// execution contract so the Relay, rather than the client, owns graceful
+/// wall-time exhaustion and its signed partial result.
+const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(MAX_WALL_TIME_MS as u64 + 15_000);
 
 /// Independent cap for a non-success semantic query response body.
 const SEMANTIC_QUERY_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
@@ -927,7 +931,7 @@ impl CarryforthClient {
     /// [`Self::with_retry_body`]. It canonicalizes the closed request, builds
     /// the exclusive single-filter extension, serializes the body once, signs
     /// one NIP-98 Event over those exact bytes, and performs one HTTP attempt
-    /// with a fixed 45-second total timeout. Any connect, timeout, response,
+    /// with a fixed Relay-budget-plus-grace total timeout. Any connect, timeout, response,
     /// body-transfer, or decode failure is returned without replay.
     pub(crate) async fn semantic_query_once(
         &self,
@@ -2161,7 +2165,7 @@ mod semantic_query_once_tests {
         )
         .is_err());
         assert_eq!(response.response_body, b"[]");
-        assert_eq!(SEMANTIC_QUERY_TIMEOUT, std::time::Duration::from_secs(45));
+        assert_eq!(SEMANTIC_QUERY_TIMEOUT, std::time::Duration::from_secs(195));
     }
 
     #[tokio::test]

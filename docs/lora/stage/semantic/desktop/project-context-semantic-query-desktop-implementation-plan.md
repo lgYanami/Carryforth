@@ -1025,7 +1025,7 @@ Desktop semantic error shape 与普通 Project Context 保持同类字段，但�
 | `restricted` | 401 / 403 | false | 清 overlay，不缓存 preview |
 | `busy` | 429 | true | 显示有界 retry hint，不自动 retry |
 | `conflict` | 409 generation / context changed | true | refresh substrate；结构 gate决定旧 overlay是否暂停 |
-| `timeout` | local 45s / 504 | true | Run again |
+| `timeout` | local 195s transport envelope / Relay 180s budget / 504 | true | Run again |
 | `too_large` | 413 / body cap | false | 不激活新结果，旧 verified overlay不变 |
 | `unavailable` | connect / 500 / 502 / 503 / readiness | true | 保留旧 overlay，人工 retry |
 | `verification_failed` | malformed / signer / binding / invariant | false | fail closed，清 active |

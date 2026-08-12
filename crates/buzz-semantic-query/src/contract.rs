@@ -35,15 +35,19 @@ pub const MAX_TARGET_OPTIONS_MATERIALIZED: u16 = 4_096;
 /// Hard cap for retained result paths.
 pub const MAX_PATHS: u16 = 64;
 /// Hard cap for absolute query wall time.
-pub const MAX_WALL_TIME_MS: u32 = 30_000;
+pub const MAX_WALL_TIME_MS: u32 = 180_000;
 /// Hard cap for a serialized result Event array.
 pub const MAX_RESPONSE_BYTES: u32 = 256 * 1024;
 /// Fixed maximum canonical Hyperedge identity JSON size.
 pub const MAX_HYPEREDGE_IDENTITY_BYTES: usize = 64 * 1024;
 /// Fixed cap on diagnostic truncation samples.
 pub const MAX_TRUNCATION_SAMPLES: usize = 32;
-/// Provisional response tail reserved for packing, postflight, and signing.
+/// Time reserved after traversal for closing its read-only database snapshot.
+pub const SNAPSHOT_CLOSE_RESERVE_MS: u32 = 5_000;
+/// Response tail reserved for packing, postflight, and signing.
 pub const RESPONSE_TAIL_RESERVE_MS: u32 = 1_000;
+
+const _: () = assert!(SNAPSHOT_CLOSE_RESERVE_MS + RESPONSE_TAIL_RESERVE_MS < MAX_WALL_TIME_MS);
 
 /// Closed lifecycle selection applied to automatic Coordinate entrypoints and
 /// continued target Coordinates.
@@ -99,7 +103,7 @@ pub const DEFAULT_QUERY_BUDGET: SemanticGraphQueryBudget = SemanticGraphQueryBud
     max_relation_options_materialized: 128,
     max_target_options_materialized: 192,
     max_paths: 12,
-    max_wall_time_ms: 10_000,
+    max_wall_time_ms: 180_000,
     max_response_bytes: 128 * 1024,
 };
 
@@ -181,6 +185,7 @@ pub fn budget_profile_digest() -> QueryContractResult<Digest32> {
             MAX_RESPONSE_BYTES,
             MAX_HYPEREDGE_IDENTITY_BYTES,
             MAX_TRUNCATION_SAMPLES,
+            SNAPSHOT_CLOSE_RESERVE_MS,
             RESPONSE_TAIL_RESERVE_MS,
         ),
         (
@@ -188,7 +193,7 @@ pub fn budget_profile_digest() -> QueryContractResult<Digest32> {
             "exhausted=k-plus-one-except-hop-conservative",
             "materialize=relation-then-edge-then-target-then-complete-hop",
             "packing=envelope-explicit-roots-automatic-roots-paths-whole-summary-whole-edge",
-            "deadline=one-monotonic-absolute-minus-response-tail",
+            "deadline=one-monotonic-absolute-minus-response-tail-minus-snapshot-close-reserve",
         ),
     ))
     .map_err(|_| SemanticGraphQueryError::Serialization)?;
@@ -460,7 +465,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{SemanticGraphQuery, SemanticGraphQueryError, MAX_CONTEXT_COORDINATES};
+    use super::{
+        SemanticGraphQuery, SemanticGraphQueryError, DEFAULT_QUERY_BUDGET, MAX_CONTEXT_COORDINATES,
+        MAX_WALL_TIME_MS,
+    };
 
     fn uuid(value: u128) -> Uuid {
         Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0000 | value)
@@ -539,6 +547,8 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(DEFAULT_QUERY_BUDGET.max_wall_time_ms, MAX_WALL_TIME_MS);
+        assert_eq!(MAX_WALL_TIME_MS, 180_000);
     }
 
     #[test]

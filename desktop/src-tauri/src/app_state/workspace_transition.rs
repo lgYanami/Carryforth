@@ -1,5 +1,6 @@
 //! Atomic applied-workspace capture for trusted native request paths.
 
+use buzz_semantic_query_pkg::MAX_WALL_TIME_MS;
 use nostr::{Keys, PublicKey};
 
 use super::AppState;
@@ -27,6 +28,13 @@ pub(crate) struct AppliedWorkspaceCapture {
     pub caller: PublicKey,
     signing_eligibility: WorkspaceSigningEligibility,
 }
+
+/// Desktop transport envelope for one explicit semantic query.
+///
+/// This remains longer than the Relay's closed wall-time budget so the Relay
+/// can return a signed partial result after graceful traversal exhaustion.
+pub(crate) const SEMANTIC_QUERY_HTTP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(MAX_WALL_TIME_MS as u64 + 15_000);
 
 impl std::fmt::Debug for AppliedWorkspaceCapture {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +80,7 @@ pub(super) fn build_semantic_query_http_client() -> reqwest::Result<reqwest::Cli
         // Carryforth Desktop is local-only. System HTTP_PROXY/ALL_PROXY must
         // never receive the NIP-98 header or semantic problem body.
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(45))
+        .timeout(SEMANTIC_QUERY_HTTP_TIMEOUT)
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(1)
         .redirect(reqwest::redirect::Policy::none())

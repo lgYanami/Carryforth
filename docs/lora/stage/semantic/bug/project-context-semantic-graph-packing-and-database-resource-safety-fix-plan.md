@@ -968,3 +968,15 @@ PostgreSQL container 使用原 `buzz-postgres-data` named volume 非破坏性 re
 - production/LB/multi-Pod/policy-homogeneity 和长期 relevance 资格。
 
 不得把本次单请求成功解释成上述资格已经完成，也不得在完成资源阶梯前常开 query gate。
+
+### 15.6 2026-08-13 默认查询超时合同修正
+
+Desktop 带两个 soft context Coordinates 的默认查询产生 Q0 + 2 个 conditioned channels，工作量高于
+problem-only CLI smoke；旧默认 10 秒预算因此稳定到达 traversal deadline。进一步检查发现 traversal
+虽能形成 `wall_time_exhausted` 的合法部分 forest，却用同一个已经到期的 deadline 提交 Stage C
+read-only transaction，最终把可签名部分结果错误转换为 504。
+
+当前合同调整为：默认和 hard cap 均为 180 秒；前 174 秒用于 Provider、Stage C 与 traversal，随后
+5 秒只用于关闭 read-only snapshot，最后 1 秒用于 packing、Stage D 与签名。CLI 与 Desktop 的单次
+HTTP transport envelope 为 195 秒，仍不自动重放 Provider 请求。该修复不改变 1–6 hop 合同、不降低
+三跳默认值、不放宽 result validator，也不修改 migration、canonical 数据或 semantic index。

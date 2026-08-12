@@ -116,6 +116,20 @@ fn semantic_proxy_probe_child() {
 }
 
 #[test]
+fn semantic_query_timeout_leaves_transport_grace_after_the_relay_budget() {
+    assert_eq!(
+        super::SEMANTIC_QUERY_HTTP_TIMEOUT,
+        std::time::Duration::from_secs(195)
+    );
+    assert!(
+        super::SEMANTIC_QUERY_HTTP_TIMEOUT
+            > std::time::Duration::from_millis(u64::from(
+                buzz_semantic_query_pkg::MAX_WALL_TIME_MS
+            ),)
+    );
+}
+
+#[test]
 fn applied_workspace_capture_is_exact_and_redacted() {
     let state = build_app_state();
     let keys = Keys::generate();

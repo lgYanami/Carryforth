@@ -125,14 +125,14 @@ impl SemanticGraphQueryEnableRequirement<'_> {
 /// incompatible change to those contracts must change the dated profile and this
 /// descriptor before a mixed fleet can attest itself ready.
 pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-graph-http-runtime-20260811-c\n",
+    "runtime-contract=semantic-graph-http-runtime-20260813-d\n",
     "transport=http-post-query-exclusive-single-filter\n",
     "request=unversioned-closed-request-id-project-id-problem-initial-context-lifecycle-budget\n",
     "result=unversioned-closed-project-request-completion-observations-input-observations-roots-paths-target-lifecycle-typed-basis-path-source-provenance-explicit-provenance-coverage\n",
     "event=kind-40912-relay-only-virtual-p-request-id-request-binding-t-tags-exact\n",
     "binding=host-project-caller-nip98-event-id-exact-authenticated-body\n",
     "authorization=host-bound-community-project-context-read-before-index-or-provider\n",
-    "execution=stage-a-ticket-stage-b-final-egress-permit-one-provider-call-stage-c-repeatable-read-stage-d-result-release-confirmation\n",
+    "execution=stage-a-ticket-stage-b-final-egress-permit-one-provider-call-stage-c-repeatable-read-early-stop-snapshot-close-stage-d-result-release-confirmation\n",
     "packing=deterministic-single-signed-event-whole-summary-whole-path\n",
     "errors=closed-content-free-400-401-403-409-413-429-503-504\n",
     "ordinary-query=semantic-extension-exclusive-kind-40912-always-denied"
@@ -380,7 +380,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "43457649c861d58354ccd57dd574e993eea7f3466cd1975e995ea1d432e6880a",
+            "3aa3b02de0d445f5c4e154374df7c7e7f329aa84fbb14b8bb994b8aec13ba32a",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

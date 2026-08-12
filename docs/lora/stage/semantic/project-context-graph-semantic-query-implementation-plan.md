@@ -1493,18 +1493,21 @@ Stage A ticket 之前；终点是 deterministic packing、Stage D security postf
 它包含 Provider slot wait、encode、最多一次完整 retry、Stage C DB work 与 hydration。所有阶段共享一个
 absolute deadline，不在每个阶段重置计时器。
 
-为了让 `wall_time_exhausted` 仍能安全返回一个完成 postflight 的签名结果，server budget profile 还冻结一个
-调用者不可修改的 `response_tail_reserve_ms`。Phase 0 用 hard-cap fixture 的 packing + composite Stage D +
-签名 p99 加安全余量确定它；不得凭常量猜测后静默修改。执行时：
+为了让 `wall_time_exhausted` 仍能安全返回一个完成 postflight 的签名结果，server budget profile 冻结两个
+调用者不可修改的尾段：`snapshot_close_reserve_ms` 用于关闭 Stage C read-only snapshot，
+`response_tail_reserve_ms` 用于 packing、composite Stage D 与签名。执行时：
 
 ```text
 absolute_deadline = started_at + effective max_wall_time
-work_deadline     = absolute_deadline - response_tail_reserve
+snapshot_close_deadline = absolute_deadline - response_tail_reserve
+work_deadline = snapshot_close_deadline - snapshot_close_reserve
 ```
 
 Provider slot、encode、retry、Stage C statement timeout 与 traversal 都以 `work_deadline` 的剩余时间和各自
-server cap 的最小值为界。到达 `work_deadline` 才形成可签名的
-`completion_reason=wall_time_exhausted`，并立即进入 deterministic packing → Stage D → signing 的保留尾段。
+server cap 的最小值为界。到达 `work_deadline` 后形成
+`completion_reason=wall_time_exhausted`，先在独立 snapshot-close 尾段提交只读事务，再进入
+deterministic packing → Stage D → signing 的 response 尾段。事务提交不得复用已经到期的
+`work_deadline`，否则合法的 wall-time 部分结果会被错误转换成 504。
 Stage D 使用 absolute deadline 的剩余时间，不得因为搜索已超时而跳过或降级。
 
 若未能在 `absolute_deadline` 前完成完整 packing、Stage D 和签名，整次请求返回 closed
@@ -2709,7 +2712,8 @@ problem-only query 仍完全合法。
 10. 冻结 query serializer / DTO / 算法形状，给出 provisional floor，并冻结
     `HOP_PENALTY`、counter 扣减点、stop precedence 和 coverage sample cap；
 11. 冻结 HTTP request-binding digest 与 exact-body golden；
-12. 用 hard-cap fixture 冻结 `response_tail_reserve_ms`，验证 work/absolute 两层 deadline；
+12. 用 hard-cap fixture冻结 `snapshot_close_reserve_ms` 与 `response_tail_reserve_ms`，验证
+    work/snapshot-close/absolute 三层 deadline；
 13. 冻结当前 `semantic-graph-query`、`semantic-graph-score` 和 budget profile 的 digest 计算方法。
 
 #### 退出门
