@@ -8,7 +8,11 @@
 > [`cf` CLI 切换计划](cli-cf-cutover-implementation-plan.md)、
 > [Desktop 产品面去 Buzz 计划](desktop-product-surface-de-buzz-implementation-plan.md)、
 > [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md)、
+> [实验性 Benchmark 源码退役决策](experimental-benchmark-source-retirement-decision.md)、
 > [Desktop 本地化方案](../local/desktop-localization-plan.md)
+
+> 后续变更：本文保留 2026-08-11 对 Harbor benchmark 的收口和测试证据。该实验性 benchmark 已于
+> 2026-08-12 按上述独立决策从活动源码树退役；相关目录、workflow、命令和测试数量不代表当前树状态。
 
 ## 1. 结论
 
@@ -409,8 +413,8 @@ ACP ledger 或 managed Agent 状态。
 - 尚未在一台独立 clean-room 机器上执行 `just setup` / `just dev`、Owner/capability bootstrap 与 4–6 轮 Meeting
   smoke；
 - 尚未执行本计划 8.3 的现有本地身份、Community、消息、Agent 和 Project 三域/Meeting 前后权威回读；
-- Web 与 benchmark 仍是 source-only/experimental；本阶段只移除了 Web 的旧远程下载与无效 Desktop handoff，
-  没有声明完整 Web 产品支持。Mobile 后续已按独立决策从活动源码树退役；
+- Web 仍是 source-only；本阶段只移除了 Web 的旧远程下载与无效 Desktop handoff，没有声明完整 Web 产品支持。
+  Mobile 与实验性 benchmark 后续已按各自独立决策从活动源码树退役；
 - asset/license/SBOM、bundle identity、公开 artifact clean-room、私密报告与发布治理等正式发行门禁仍保持
   fail closed；本轮不交付安装包、生产部署或商店版本。
 

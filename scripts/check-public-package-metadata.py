@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 
@@ -66,19 +65,6 @@ def check_javascript_package(relative: str) -> None:
         fail(f"{relative} is missing a description")
 
 
-def check_python_package(relative: str) -> None:
-    path = ROOT / relative
-    with path.open("rb") as handle:
-        project = tomllib.load(handle)["project"]
-    urls = project.get("urls", {})
-    if project.get("license") != "Apache-2.0":
-        fail(f"{relative} must declare Apache-2.0")
-    if urls.get("Repository") != CANONICAL_REPOSITORY:
-        fail(f"{relative} has a non-Carryforth repository")
-    if not project.get("description"):
-        fail(f"{relative} is missing a description")
-
-
 def main() -> None:
     for package in cargo_metadata()["packages"]:
         check_cargo_package(package)
@@ -93,12 +79,6 @@ def main() -> None:
         "admin-web/package.json",
     ):
         check_javascript_package(relative)
-
-    for relative in (
-        "benchmarks/harbor-carryforth-orchestra/pyproject.toml",
-        "benchmarks/harbor-carryforth-orchestra/testbed/pyproject.toml",
-    ):
-        check_python_package(relative)
 
     print("Carryforth public package metadata check passed.")
 

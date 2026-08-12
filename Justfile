@@ -972,7 +972,7 @@ _release-pr lane version:
             TAG_PREFIX="relay-v"
             CHANGELOG="crates/buzz-relay/CHANGELOG.md"
             ADD_FILES=(crates/buzz-relay/Cargo.toml Cargo.lock crates/buzz-relay/CHANGELOG.md)
-            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/nips/NIP-PV.md docs/nips/NIP-PV3.md docs/project-view-operations.md docs/lora/stage/meeting/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
+            LOG_PATHS=(crates/buzz-relay/ crates/buzz-core/ crates/buzz-db/ crates/buzz-auth/ crates/buzz-pubsub/ crates/buzz-search/ crates/buzz-audit/ crates/buzz-media/ crates/buzz-sdk/ crates/buzz-project-view/ crates/carryforth-cli/ crates/buzz-admin/ crates/buzz-workflow/ crates/buzz-conformance/ migrations/ schema/ docs/stage/meeting/ deploy/compose/ scripts/test-project-view-db.sh scripts/test-project-view-migrations.sh scripts/test-project-view-e2e.sh scripts/test-project-view-stage5-canary.sh scripts/test-project-view-stage6-canary.sh scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh scripts/check-project-view-v3-runtime.sh scripts/test-project-view-rollback-smoke.sh scripts/test-project-view-release-contract.sh scripts/meeting-v2-actions-live-acceptance.sh)
             ARTIFACT="Carryforth Relay" ;;
         *)
             echo "Error: unknown release lane '{{ lane }}'"
@@ -1111,36 +1111,3 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$BU
     source ./scripts/_goose-env.sh "{{relay}}" "{{key}}" "{{agents}}" "{{heartbeat}}" "{{prompt}}"
     screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}") ./target/release/buzz-acp"
     echo "Agent running in screen session 'goose-agent-{{agents}}'. Attach with: screen -r goose-agent-{{agents}}"
-
-# ─── Benchmarking ─────────────────────────────────────────────────────────────
-
-# Run the Carryforth orchestra benchmark — requires CARRYFORTH_BENCHMARK_IMAGE; use a unique CARRYFORTH_BENCHMARK_PROJECT per checkout.
-benchmark *ARGS:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export PATH="{{justfile_directory()}}/bin:$PATH"
-    uv run --project benchmarks/harbor-carryforth-orchestra/testbed \
-        benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py {{ARGS}}
-
-# Stop the benchmark Docker stack (state and channels are kept)
-benchmark-down:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    STATE_DIR="{{justfile_directory()}}/benchmarks/harbor-carryforth-orchestra/.benchmark"
-    COMPOSE_FILE="{{justfile_directory()}}/benchmarks/harbor-carryforth-orchestra/testbed/compose.benchmark.yml"
-    if [[ ! -f "$STATE_DIR/.env" ]]; then
-        echo "No Carryforth benchmark stack state found; nothing to stop."
-        exit 0
-    fi
-    PROJECT=$(sed -n 's/^CARRYFORTH_BENCHMARK_PROJECT=//p' "$STATE_DIR/.env" | tail -n 1)
-    PROJECT="${PROJECT:-buzz-benchmark}"
-    if [[ ! "$PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-        echo "Invalid benchmark project scope in $STATE_DIR/.env; refusing Docker operation." >&2
-        exit 2
-    fi
-    docker compose \
-        --project-name "$PROJECT" \
-        --project-directory "$STATE_DIR" \
-        --env-file "$STATE_DIR/.env" \
-        -f "$COMPOSE_FILE" \
-        down

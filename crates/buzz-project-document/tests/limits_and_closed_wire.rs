@@ -164,7 +164,7 @@ fn canonical_text_uuid_revision_and_operation_rules_fail_closed() {
 #[test]
 fn tombstone_and_metadata_shapes_cannot_smuggle_business_or_source_fields() {
     let head_event: Value = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-document-v1/events/head-tombstone.json"
+        "../../buzz-sdk/tests/fixtures/project-document-v1/events/head-tombstone.json"
     ))
     .expect("head event");
     let mut head_content: Value =
@@ -174,7 +174,7 @@ fn tombstone_and_metadata_shapes_cannot_smuggle_business_or_source_fields() {
     assert!(serde_json::from_value::<DocumentHeadProjection>(head_content).is_err());
 
     let meta_event: Value = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-document-v1/events/meta-reset.json"
+        "../../buzz-sdk/tests/fixtures/project-document-v1/events/meta-reset.json"
     ))
     .expect("meta event");
     let mut meta: DocumentMetaProjection =

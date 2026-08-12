@@ -68,12 +68,6 @@ if ! jq -e '
 fi
 
 reject_pattern \
-  'global\.block-artifacts\.com|block-pypi|blox\.sqprod|\.sqprod\.co' \
-  "public dependency locks still contain Block-internal package coordinates" \
-  "benchmarks/harbor-carryforth-orchestra/uv.lock" \
-  "benchmarks/harbor-carryforth-orchestra/testbed/uv.lock"
-
-reject_pattern \
   'global\.block-artifacts\.com|\.sqprod\.co|sprout-oss\.stage|buzz-oss\.stage|block(-lakehouse-production)?\.cloud\.databricks\.com' \
   "current source, test fixtures, or public examples still disclose internal service coordinates" \
   "scripts/cutover/1321_backfill_default_community.sql" \

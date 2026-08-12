@@ -34,7 +34,7 @@ use uuid::Uuid;
 macro_rules! fixture {
     ($path:literal) => {
         include_str!(concat!(
-            "../../../docs/nips/fixtures/project-document-v1/",
+            "../../buzz-sdk/tests/fixtures/project-document-v1/",
             $path
         ))
     };

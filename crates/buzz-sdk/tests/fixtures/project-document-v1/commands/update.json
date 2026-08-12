@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "expected_document_revision": 7,
+  "acting_assignment_id": "151f2347-7d24-41a0-ab0d-f272e84fcf88",
+  "runtime_fence": {
+    "runtime_id": "74ad5e95-903b-4488-ac19-d95a73fa62d4",
+    "runtime_epoch": 4
+  },
+  "request": {
+    "type": "update",
+    "document_id": "9c23f672-a397-42d1-b933-104ba2674f26",
+    "title": "Buzz repository guide",
+    "summary": "Clone, initialize, and verify this repository.",
+    "content_markdown": "# Repository\n\nRun `just ci` before review."
+  }
+}

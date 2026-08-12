@@ -7,6 +7,7 @@
 > [`cf` CLI 去 Buzz 化实现计划](cli-cf-cutover-implementation-plan.md)、
 > [Desktop 产品层去 Buzz 化实现计划](desktop-product-surface-de-buzz-implementation-plan.md)、
 > [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md)、
+> [实验性 Benchmark 源码退役决策](experimental-benchmark-source-retirement-decision.md)、
 > [破坏性 migration 测试误删主数据库事故](../bug/destructive-migration-test-main-database-data-loss.md)
 
 ## 1. 结论
@@ -52,10 +53,10 @@ Carryforth 源码仓库
 | 本地依赖栈 | 版本固定、可重复启动、数据默认持久化 |
 | Project 系统 | Project View、Document、Project Context、Meeting |
 
-源码仓库可以继续包含 Web、benchmark 和历史兼容代码，但它们不自动成为首发的“受支持产品”。继承的 Mobile
-客户端已依据 [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md) 从活动树完整退役。继承的
-Helm/Kubernetes 与 hosted Push Gateway executable 由后续的源码/本地开发面收口计划从活动树退役，不再以可执行
-清单保存历史。README、Release Notes 和下载页面不得把未完成 clean-room 验收的组件描述为正式发行物。
+源码仓库可以继续包含 Web 和历史兼容代码，但它们不自动成为首发的“受支持产品”。继承的 Mobile 客户端与实验性
+Harbor benchmark 已依据各自退役决策从活动树完整删除。继承的 Helm/Kubernetes 与 hosted Push Gateway executable
+由后续的源码/本地开发面收口计划从活动树退役，不再以可执行清单保存历史。README、Release Notes 和下载页面不得
+把未完成 clean-room 验收的组件描述为正式发行物。
 
 当前 Relay 构建会内嵌 Web/Admin 资源，因此只把目录标记为 source-only 还不够。首发 Relay image 必须使用不打包、
 不提供 Web/Admin 产品页面的构建/路由配置，只保留 Relay 必要的协议与健康检查 HTTP surface。若实现上无法拆分，
@@ -83,8 +84,9 @@ macOS、Windows 或其他商店发行只有在各自的签名、bundle identity�
 - 不提供本地失败后自动回退到公共 Relay 的路径；
 - 不一次性重命名所有 `buzz-*` Rust crate、数据库表、Nostr kind、capability 或历史 event；
 - 不改写旧 migration、历史事故文档或已有 canonical 数据；
-- 不把 Web 和 benchmark 强行纳入首发支持承诺；
+- 不把 Web 强行纳入首发支持承诺；
 - 不在本计划中恢复已经退役的 Android/iOS Mobile 客户端；
+- 不在本计划中恢复已经退役的 Harbor benchmark；
 - 不承诺多个 Harness 使用同一个 Agent 私钥时的 active-active 协调；
 - 不把 Agent 模型供应商的帐号/API key 与 Carryforth 本地身份混为一体。
 
@@ -104,8 +106,8 @@ macOS、Windows 或其他商店发行只有在各自的签名、bundle identity�
 
 ### 3.2 公开构建仍含内部依赖
 
-两份 benchmark Python lockfile 大量固定到 Block 内部 Artifactory。公共网络环境无法按锁文件复现安装，同时会
-暴露无意义的内部服务坐标。
+初始审计发现两份 benchmark Python lockfile 大量固定到 Block 内部 Artifactory，公共网络环境无法按锁文件复现
+安装。该实验性 benchmark 后续已从活动源码树退役，相关 lockfile 和独立 workflow 不再属于公开构建面。
 
 初始审计时，release、Docker、Mobile 与签名流程也包含 canonical repo 判断、Block namespace、私有 action、私有
 secret 和手工 Buildkite 步骤。这些可以作为上游历史留档，但不能继续作为 Carryforth 的权威公开发布链；其中
@@ -275,7 +277,7 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 5. 建立一台没有 Block VPN、凭据、内部 DNS 和旧 app-data 的 clean-room runner；
 6. 记录当前公开构建失败点、默认外连和内部域名基线；
 7. 为选定升级基线建立只读证据：pubkey、Community、消息、Agent、数据库 schema、三域 revision 与 Meeting 数量；
-8. 把 Web/benchmark 标记为 supported、experimental 或 source-only，按独立决策退役 Mobile，退役 Push/Helm
+8. 把 Web 标记为 supported、experimental 或 source-only，按独立决策退役 Mobile 和 benchmark，退役 Push/Helm
    executable，并验证 Relay artifact 没有偷带 source-only 产品页面；
 9. 与选定上游基线完成一次同步与许可证 review，提交完整 migration 链，确保 RC source 没有未跟踪文件。
 
@@ -285,7 +287,7 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 
 1. 更新 README、AGENTS、CONTRIBUTING、ARCHITECTURE、RELEASING、SECURITY、GOVERNANCE、CODEOWNERS 和
    issue/PR template；
-2. 将 Cargo、Tauri、JS、Python 与容器 metadata 的 repository/homepage/description 指向 Carryforth；
+2. 将 Cargo、Tauri、JS 与容器 metadata 的 repository/homepage/description 指向 Carryforth；
 3. 新增上游归属与第三方 NOTICE；
 4. 选择并公布 Carryforth 的安全联系入口和维护者边界；
 5. 建立产品商标 allowlist，旧 Buzz/Block 名只允许出现在归属、历史和技术兼容位置；
@@ -298,7 +300,7 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 1. 在 Carryforth 首发构建中直接关闭 Relay Push，不暴露启用开关，并从活动源码/部署面退役 Push Gateway；
 2. 删除当前产品面的 Buzz/Builderlab/updater/远程 Community URL 与 fallback；
 3. 从公开 lockfile、workflow、脚本和示例中移除 Block Artifactory、内部 ECR、Blox、sqprod 等坐标；
-4. 在纯公网源重新生成需要随首发保留的 lockfile；不属于首发的 benchmark 可移出默认构建/发行面；
+4. 在纯公网源重新生成需要随首发保留的 lockfile；不属于首发的 benchmark 从活动源码树退役；
 5. 将 GHCR、GitHub repository 和 release URL 参数化为 Carryforth 权威 namespace；
 6. 增加当前工作树和完整 Git history 的 secret 扫描；真实凭据一旦发现，必须先撤销/轮换再清理历史；
 7. 审计 Git history、LFS、子模块、fixture 与文档中的个人信息、内部架构材料和不可公开资产；
@@ -366,7 +368,7 @@ bundle identity 迁移只约束**进入当前支持矩阵的平台**。首发最
 1. 建立每个字体、声音、图标、Logo、安装背景和示例数据的 provenance 表；
 2. 补齐可再分发许可证，将其汇总到 Third-Party Notices；
 3. 无法确认授权的 Provider logo 使用通用图标或文字替代；
-4. 对 Cargo、pnpm 和 Python 依赖运行许可证与漏洞检查；
+4. 对 Cargo 和 pnpm 依赖运行许可证与漏洞检查；
 5. 生成 CycloneDX 或 SPDX SBOM；
 6. 固定 Rust、Node、pnpm 等公开工具链版本，并同步 README/CONTRIBUTING；
 7. 对 vendored binary、Hermit package 和 sidecar 建立来源、版本、校验和与更新流程。

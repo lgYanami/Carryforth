@@ -278,15 +278,15 @@ require_present scripts/test-project-document-e2e.sh \
   'buzz-project-view-v3-bootstrap'
 require_present scripts/test-project-document-e2e.sh \
   'or . == "buzz-project-view-v3"'
-fail_if_present docs/lora/stage/document/stage2-canary.md \
+fail_if_present docs/stage/document/stage2-canary.md \
   '范围：隔离的 Project View v2 Community' \
   'project-view init --profile' \
   'cutover-v2'
-require_present docs/lora/stage/document/stage2-canary.md \
+require_present docs/stage/document/stage2-canary.md \
   'prepare-v3 → owner-signed init-v3 → checked enable'
-fail_if_present docs/lora/stage/document/implementation-design.md \
+fail_if_present docs/stage/document/implementation-design.md \
   '只选 Project View v2 Community；'
-require_present docs/lora/stage/document/implementation-design.md \
+require_present docs/stage/document/implementation-design.md \
   'prepare-v3 → direct Human owner签名init-v3 → checked enable'
 
 fail_if_present scripts/test-project-view-stage5-canary.sh \
@@ -339,11 +339,11 @@ require_present scripts/test-project-view-stage6-canary.sh \
   'first_runtime_retired: true'
 require_present scripts/test-project-view-stage6-canary.sh \
   'fixture_origin: "greenfield_v3"'
-require_present docs/lora/stage/document/stage6-context-canary.md \
+require_present docs/stage/document/stage6-context-canary.md \
   'prepare-v3'
-require_present docs/lora/stage/document/stage6-context-canary.md \
+require_present docs/stage/document/stage6-context-canary.md \
   'PROJECT_VIEW_STAGE6_NO_BUILD=1'
-require_present docs/lora/stage/document/stage6-context-canary.md \
+require_present docs/stage/document/stage6-context-canary.md \
   'Runtime supervision只治理进程lease、恢复与观测，不作为Context业务ACL'
 require_present scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh \
   'Explicit legacy migration/recovery canary'
@@ -397,24 +397,6 @@ require_present crates/buzz-relay/src/main.rs \
 require_present crates/buzz-relay/src/main.rs \
   'readiness will remain unavailable'
 
-# The current runbook must describe the same prepare -> initialize -> checked
-# enable boundary and may mention old majors only through the explicitly named
-# migration fixture.
-fail_if_present docs/project-view-operations.md \
-  'buzz-project-view-v1' \
-  'buzz-project-view-v2' \
-  'project-view cutover-v2' \
-  'project-view init --profile'
-require_present docs/project-view-operations.md \
-  'buzz-project-view-v3-bootstrap'
-require_present docs/project-view-operations.md \
-  'cf --format compact project-view init-v3'
-require_present docs/project-view-operations.md \
-  'buzz-admin project-view enable'
-require_present docs/project-view-operations.md \
-  'test-project-view-legacy-v2-to-v3-migration-canary.sh'
-require_present docs/project-view-operations.md \
-  'Project Documents used as migration input remain capability-disabled'
 fail_if_present crates/carryforth-cli/TESTING.md \
   'Project View v2/v3 Community' \
   'verified Project View v2 identity'

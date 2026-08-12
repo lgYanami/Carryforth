@@ -70,19 +70,19 @@ fn meeting_coordinate() -> ProjectContextCoordinate {
 fn projection_fixture(path: &str) -> Event {
     let content = match path {
         "context_meta" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v2/events/meta-incremental.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-context-edge-v2/events/meta-incremental.json"
         ),
         "context_meta_reproject" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
         ),
         "binding" => include_str!(
-            "../../../../docs/nips/fixtures/project-context-edge-v2/events/binding-active.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-context-edge-v2/events/binding-active.json"
         ),
         "document_meta" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/meta-incremental.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/meta-incremental.json"
         ),
         "document_head" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/head-active.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/head-active.json"
         ),
         _ => panic!("unknown fixture"),
     };

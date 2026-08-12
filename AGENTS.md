@@ -43,7 +43,6 @@ The main code areas are:
 - `desktop/`: Tauri 2 and React 19 desktop application.
 - `web/` and `admin-web/`: browser clients.
 - `migrations/` and `schema/`: database upgrade and fresh-install paths.
-- `benchmarks/`: Carryforth orchestration benchmarks.
 - `deploy/`, `release/`, and `scripts/`: supported deployment, release,
   and developer tooling.
 

@@ -101,10 +101,10 @@ forbid_literal "project-view init " scripts/test-project-document-e2e.sh
 forbid_literal "cutover-v2" scripts/test-project-document-e2e.sh
 forbid_literal "buzz-project-view-v1" scripts/test-project-document-e2e.sh
 forbid_literal "buzz-project-view-v2" scripts/test-project-document-e2e.sh
-require_literal "prepare-v3 → owner-signed init-v3 → checked enable" docs/lora/stage/document/stage2-canary.md
-forbid_literal "范围：隔离的 Project View v2 Community" docs/lora/stage/document/stage2-canary.md
-require_literal "prepare-v3 → direct Human owner签名init-v3 → checked enable" docs/lora/stage/document/implementation-design.md
-forbid_literal "只选 Project View v2 Community；" docs/lora/stage/document/implementation-design.md
+require_literal "prepare-v3 → owner-signed init-v3 → checked enable" docs/stage/document/stage2-canary.md
+forbid_literal "范围：隔离的 Project View v2 Community" docs/stage/document/stage2-canary.md
+require_literal "prepare-v3 → direct Human owner签名init-v3 → checked enable" docs/stage/document/implementation-design.md
+forbid_literal "只选 Project View v2 Community；" docs/stage/document/implementation-design.md
 require_literal "buzz_project_document_migration_required_communities" crates/buzz-relay/src/main.rs
 require_literal "project_document_migration_required_count" crates/buzz-db/src/project_document.rs
 

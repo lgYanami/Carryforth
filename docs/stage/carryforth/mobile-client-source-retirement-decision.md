@@ -191,9 +191,9 @@ inter-variable-font blocker 针对 Desktop/Vite 发行包中 Inter WOFF2 的许�
 - 根与 Desktop `cargo metadata --locked`、Rust fmt、Justfile 解析、workflow YAML 解析和 `git diff --check` 通过；
 - `just ci` dry-run 中没有 Mobile/Flutter/Dart 步骤。
 
-全量 `just ci` 在进入编译前被既有 Project View 文档门禁阻断：当前 `HEAD` 已不存在
-`docs/lora/stage/document/stage2-canary.md`，但 `scripts/check-project-view-v3-runtime.sh` 仍要求该文件。该问题在本次
-Mobile 退役前已经存在，且不属于本决策范围；本次没有通过放宽 Project View 合同来掩盖它。
+Mobile 退役提交前的全量 `just ci` 曾在进入编译前被既有 Project View 文档路径失配阻断：真实文档已经位于
+`docs/stage/document/stage2-canary.md`，活动门禁却仍读取 `docs/lora/stage/document/stage2-canary.md`。后续源码瘦身
+已把活动引用统一到 `docs/**`，没有通过放宽 Project View 合同来掩盖问题。
 
 ## 9. 恢复策略
 

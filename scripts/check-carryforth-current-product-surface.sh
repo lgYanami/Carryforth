@@ -38,13 +38,14 @@ for retired in \
   examples \
   perf \
   mobile \
-  benchmarks/harbor-buzz-orchestra \
+  benchmarks \
   .agents/skills/sprout-cli \
   .claude/skills/sprout-cli \
   .codex/skills/sprout-cli \
   .goose/skills/sprout-cli \
   deploy/charts \
   .github/workflows/helm-chart.yml \
+  .github/workflows/benchmark-harbor.yml \
   ct.yaml \
   deploy/local/build-and-deploy.sh \
   deploy/local/quickstart-ha-values.yaml \
@@ -104,8 +105,7 @@ reject_pattern \
   'deploy/charts|helm-chart\.yml|build-and-deploy\.sh|quickstart-ha-values\.yaml' \
   "a current build, CI, or operator surface still references the retired Helm/Kubernetes path" \
   Justfile .github/workflows/ci.yml scripts/run-tests.sh \
-  scripts/test-project-view-release-contract.sh README.md RELEASING.md \
-  docs/project-view-operations.md docs/multi-tenant-relay.md
+  scripts/test-project-view-release-contract.sh README.md RELEASING.md
 
 reject_pattern \
   'Buzz Dev|Buzz Backend|real buzz CLI|command -v buzz|Buzz dev environment|local Buzz|Buzz app' \
@@ -126,40 +126,9 @@ reject_pattern \
   .github/workflows/sprig.yml
 
 reject_pattern \
-  'ghcr\.io/block/buzz(:|@)|github\.com/block/buzz|"product"[[:space:]]*:[[:space:]]*"Buzz"|"organization"[[:space:]]*:[[:space:]]*"Block"' \
-  "the active benchmark surface still defaults to a Block/Buzz image or public submission identity" \
-  .github/workflows/benchmark-harbor.yml \
-  benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py \
-  benchmarks/harbor-carryforth-orchestra/scripts/run_leaderboard.py
-
-reject_pattern \
-  'deploy/compose' \
-  "the active benchmark runner still depends on the retired Compose tombstone" \
-  benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py
-
-benchmark_compose="$REPO_ROOT/benchmarks/harbor-carryforth-orchestra/testbed/compose.benchmark.yml"
-benchmark_runner="$REPO_ROOT/benchmarks/harbor-carryforth-orchestra/scripts/benchmark.py"
-if [[ ! -f "$benchmark_compose" ]]; then
-  fail "the self-contained benchmark Compose manifest is missing"
-else
-  for service in relay postgres redis minio minio-init; do
-    if ! rg -q "^[[:space:]]{2}${service}:$" "$benchmark_compose"; then
-      fail "the benchmark Compose manifest is missing service: $service"
-    fi
-  done
-  if ! rg -Fq 'image: ${BUZZ_IMAGE:?' "$benchmark_compose"; then
-    fail "the benchmark Relay image is not explicit and fail closed"
-  fi
-fi
-if [[ ! -f "$benchmark_runner" ]] ||
-  ! rg -Fq 'PACKAGE_ROOT / "testbed" / "compose.benchmark.yml"' "$benchmark_runner"; then
-  fail "the benchmark runner does not use its self-contained Compose manifest"
-fi
-
-reject_pattern \
   'ghcr\.io/block/(buzz|buzz-push-gateway)|oci://ghcr\.io/block|push\.buzz\.xyz|app\.builderlab\.xyz|buzz-desktop-latest|github\.com/block/buzz/releases' \
   "a current local, workflow, or generated-artifact surface still references the retired hosted product" \
-  .github/workflows/sprig.yml .github/workflows/benchmark-harbor.yml \
+  .github/workflows/sprig.yml \
   deploy/local/README.md deploy/local/compose.yml deploy/local/.env.example \
   scripts/build-sprig.sh scripts/instance-env.sh
 
@@ -193,13 +162,7 @@ reject_pattern \
   crates/buzz-acp/src/meeting_moderator_prompt.md \
   crates/buzz-acp/src/meeting_granted_speech_prompt.md \
   crates/buzz-admin/src/main.rs TESTING.md crates/carryforth-cli/TESTING.md \
-  docs/buzz-shared-compute-dev.md crates/buzz-persona/PERSONA_PACK_SPEC.md
-
-reject_pattern \
-  'Buzz can expose|Buzz clients|In Buzz,|Buzz-agent supports' \
-  "a current engineering document still presents Buzz as the active product" \
-  docs/admin/README.md docs/MCP_DRIVEN_HOOKS.md \
-  docs/bridge-channel-window.md docs/git-on-object-storage.md
+  crates/buzz-persona/PERSONA_PACK_SPEC.md
 
 reject_pattern \
   'Buzz Nest|Buzz/relay media URLs|Buzz community|across Buzz|Buzz[[:space:]]*<b>Admin' \
@@ -237,11 +200,6 @@ for retired_vision in \
     fail "$retired_vision retains a retired upstream Buzz product narrative"
   fi
 done
-
-if [[ -f "$REPO_ROOT/.github/workflows/benchmark-harbor.yml" ]] &&
-  ! rg -q '^name:[[:space:]]+.*Carryforth' "$REPO_ROOT/.github/workflows/benchmark-harbor.yml"; then
-  fail "benchmark workflow display name is not Carryforth"
-fi
 
 check_package_name() {
   local relative="$1"

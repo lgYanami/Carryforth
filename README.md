@@ -38,11 +38,11 @@ The first supported release surface is intentionally narrow:
 - the `cf` agent-first CLI;
 - channels, messages, Project View, Documents, Project Context, and Meetings.
 
-The `web/` and benchmark trees are currently source-only or experimental.
-Their presence in the repository is not a release or support commitment. The
-inherited Mobile, Helm/Kubernetes, and hosted Push Gateway sources have been
-retired from the active source tree. Carryforth local-only builds do not use
-the legacy hosted community, account, updater, or push services.
+The `web/` tree is currently source-only; its presence in the repository is not
+a release or support commitment. The inherited Mobile, experimental Harbor
+benchmark, Helm/Kubernetes, and hosted Push Gateway sources have been retired
+from the active source tree. Carryforth local-only builds do not use the legacy
+hosted community, account, updater, or push services.
 
 The release-readiness work and its data-safety boundaries are tracked in
 [the open-source release surface plan](docs/stage/carryforth/open-source-release-surface-plan.md).
@@ -143,7 +143,6 @@ migrations/             Forward-only Relay database migrations
 scripts/                Development and release tooling
 deploy/                 Deployment sources under release-readiness review
 web/                    Source-only browser client
-benchmarks/             Experimental benchmark tooling
 docs/                   Design, operations, and development records
 ```
 
