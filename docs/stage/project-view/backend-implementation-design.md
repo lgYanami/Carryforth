@@ -2127,20 +2127,11 @@ patch 混入。
 - 不删除已产生的 command、object、receipt 或 projection；
 - 只有确认数据库真实损坏时才使用备份恢复，不能把恢复备份当普通 rollback。
 
-### 20.5 Buzz 多仓发布边界
+### 20.5 Carryforth 仓库边界
 
-本功能不在其他仓复制实现：
-
-| Repo | Project View 影响 |
-|---|---|
-| `block/buzz` | 唯一源代码、migration、schema、Relay image contract、Chart、SDK、CLI、admin 和测试 |
-| `squareup/sprout-oss` | 按现有流水线从同一 source SHA 构建 Relay image；确认 image 同时包含 migration 与 `buzz-admin` |
-| `squareup/block-coder-tf-stacks` | 采用本文的 server-first 两阶段 rollout/migration/admin enable，不另建数据库或服务 |
-| `squareup/sprout-releases` | 只有以后把新版 `buzz-cli` 随 Desktop 分发时才进入；本后端首版不要求 Desktop release |
-| `squareup/sprout-backend-blox` | 若 Blox Agent pin Sprig，则在 Relay 启用后更新到对应 `sprig-v*`；不实现第二套 Project View API |
-
-内部部署仓只编排同一个 Buzz artifact 和中心 DB 开关；协议与领域逻辑始终留在 OSS
-`block/buzz`。
+Project View 的源代码、migration、schema、Relay 合同、SDK、CLI、admin
+和测试均保留在 Carryforth 公开仓库。部署配置和下游打包只消费同一源码
+修订或可发布产物，不复制 Project View 协议与领域逻辑。
 
 ## 21. 推荐实施切片
 
