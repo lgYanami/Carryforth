@@ -25,16 +25,14 @@ There is no rolling updater release, hosted-service configuration injection,
 or Block signing step. The community lane is not evidence of a stable release
 until the remaining release-readiness gates pass.
 
-The packaged-asset gate is deliberately fail-closed. Its current blockers and
-provenance evidence are recorded in
-[`docs/release/THIRD_PARTY_ASSETS.md`](docs/release/THIRD_PARTY_ASSETS.md); do
-not publish by removing or weakening that gate. The inventory currently
-reports eight blockers: the Inter packaged-license obligation and seven
-release obligations. The old Provider, Starter-Team, and notification assets
-have been removed or replaced with rights-cleared project outputs.
+Third-party dependencies, fonts, native libraries, and packaged assets still
+require a complete license and provenance audit before the first stable binary
+release. A successful build is not evidence that every redistributed component
+has been cleared. The current audit boundary is recorded in
+[`release/THIRD_PARTY_ASSETS.md`](release/THIRD_PARTY_ASSETS.md).
 
-The implementation and acceptance contract is maintained in
-[`docs/lora/stage/carryforth/open-source-release-surface-plan.md`](docs/lora/stage/carryforth/open-source-release-surface-plan.md).
+The implementation and acceptance work is maintained in
+[`docs/stage/carryforth/open-source-release-surface-plan.md`](docs/stage/carryforth/open-source-release-surface-plan.md).
 
 ## First public release surface
 
@@ -91,7 +89,7 @@ A stable release is incomplete without:
 - build provenance tied to the immutable tag;
 - release notes, known limitations, and data-migration instructions.
 
-## Release-obligation evidence
+## Release acceptance evidence
 
 Operational acceptance and Human governance decisions are release inputs, not
 informal follow-up tasks. In particular, publication remains blocked until the
@@ -106,12 +104,10 @@ machine-readable inventory records passed evidence for:
 - stable private security/conduct reporting routes and the remaining Human
   release-governance decisions.
 
-Every cleared release obligation must point to a tracked
-`docs/release/evidence/<v-semver-tag>/<obligation-id>.json` record. The
-inventory binds that record by schema and SHA-256; strict mode also verifies
-the recorded source commit against the release tag and `HEAD`. Merely changing
-`release_status` to `cleared`, attaching an untracked report, or reusing a
-report from another tag does not satisfy the gate.
+Acceptance evidence must identify the exact release tag and source commit and
+must be retained with the release records. Results from another tag, an
+untracked local report, or an unrelated development environment do not qualify
+the candidate.
 
 ## Release candidate procedure
 
@@ -138,9 +134,9 @@ does not authorize calling a release stable.
    secrets, internal URLs, and assets without redistribution evidence.
 10. Publish the candidate, checksums, SBOM, provenance, and acceptance record.
 
-The acceptance record must close each machine-readable release obligation with
-tag-bound evidence as described above. Until then the candidate may be useful
-for development testing, but it is not an authorized stable release.
+The acceptance record must be tied to the candidate tag. Until then the
+candidate may be useful for development testing, but it is not an authorized
+stable release.
 
 No individual platform result substitutes for another. A platform enters the
 support matrix only after its signing, application identity, keyring/app-data

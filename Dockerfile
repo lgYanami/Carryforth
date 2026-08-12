@@ -97,7 +97,7 @@ COPY --from=builder    /build/target/release/buzz-relay /usr/local/bin/buzz-rela
 COPY --from=builder    /build/target/release/buzz-admin /usr/local/bin/buzz-admin
 COPY --from=builder    /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
 COPY LICENSE NOTICE UPSTREAM.md /usr/share/licenses/carryforth/
-COPY docs/release/THIRD_PARTY_ASSETS.md /usr/share/licenses/carryforth/THIRD_PARTY_ASSETS.md
+COPY release/THIRD_PARTY_ASSETS.md /usr/share/licenses/carryforth/THIRD_PARTY_ASSETS.md
 
 # 3000: app (WS + REST)  ·  8080: /_liveness, /_readiness  ·  9102: /metrics
 EXPOSE 3000 8080 9102

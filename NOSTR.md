@@ -300,8 +300,7 @@ A kind:9033 command similarly makes the relay store the workspace icon (per
 community) and serve it in the standard NIP-11 `icon` field of its relay
 information document. Clients render it in the workspace rail/switcher; anyone
 can read it (`curl -H 'Accept: application/nostr+json' http://localhost:3000`),
-but only admins/owners can set it. Full spec:
-[docs/nips/NIP-WP.md](docs/nips/NIP-WP.md).
+but only admins/owners can set it.
 
 ### Known Limitations
 
@@ -350,7 +349,3 @@ but only admins/owners can set it. Full spec:
 | `invalid: channel-scoped events must include an h tag` | kind:9 sent without `#h` tag | Include `--tag "h=<channel-uuid>"` |
 | `invalid: reaction target event not found` | Reaction references unknown event | Ensure the target event exists in the relay |
 | No discovery events | Channel is private + you're not a member | Join the channel first |
-
----
-
-## Further Reading

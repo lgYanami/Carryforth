@@ -45,7 +45,7 @@ have been retired from the active source tree. Carryforth local-only builds do
 not use the legacy hosted community, account, updater, or push services.
 
 The release-readiness work and its data-safety boundaries are tracked in
-[the open-source release surface plan](docs/lora/stage/carryforth/open-source-release-surface-plan.md).
+[the open-source release surface plan](docs/stage/carryforth/open-source-release-surface-plan.md).
 
 ## Local-only model
 
@@ -161,7 +161,6 @@ docs/                   Design, operations, and development records
 
 Carryforth is distributed under the [Apache License 2.0](LICENSE). The license
 and upstream copyright notices remain intact. Third-party components and assets
-may carry their own licenses; the release asset and dependency inventory is
-tracked in [the packaged asset inventory](docs/release/THIRD_PARTY_ASSETS.md).
-Items marked as blockers must be resolved before the first stable binary
-release.
+may carry their own licenses; their current audit boundary is recorded in the
+[release asset inventory](release/THIRD_PARTY_ASSETS.md) and must be cleared
+before the first stable binary release.

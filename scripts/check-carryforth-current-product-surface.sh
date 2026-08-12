@@ -223,21 +223,18 @@ reject_pattern \
   examples/meadow-core/README.md crates/buzz-pairing-cli/README.md \
   crates/git-credential-nostr/README.md admin-web/index.html
 
-if ! rg -Fq 'Historical upstream conformance record' \
-  "$REPO_ROOT/docs/multi-tenant-conformance.md"; then
-  fail "the upstream multi-tenant conformance record lacks a historical boundary"
-fi
+require_absent docs/multi-tenant-conformance.md
 
 if rg -n '^[[:space:]]*buzz[[:space:]]+install\b' \
   "$REPO_ROOT/crates/buzz-persona/PERSONA_PACK_SPEC.md" >/dev/null; then
   fail "the persona pack specification still publishes the retired buzz install command"
 fi
 
-for vision in \
+for retired_vision in \
   VISION.md VISION_ACTIVITY.md VISION_AGENT.md VISION_MESH.md \
   VISION_MODERATION.md VISION_PROJECTS.md VISION_SOVEREIGN.md; do
-  if ! rg -Fq 'Historical upstream vision' "$REPO_ROOT/$vision"; then
-    fail "$vision presents the upstream Buzz narrative without a historical boundary"
+  if [[ -e "$REPO_ROOT/$retired_vision" ]]; then
+    fail "$retired_vision retains a retired upstream Buzz product narrative"
   fi
 done
 

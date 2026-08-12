@@ -54,7 +54,7 @@
       "../../LICENSE": "licenses/LICENSE",
       "../../NOTICE": "licenses/NOTICE",
       "../../UPSTREAM.md": "licenses/UPSTREAM.md",
-      "../../docs/release/THIRD_PARTY_ASSETS.md": "licenses/THIRD_PARTY_ASSETS.md"
+      "../../release/THIRD_PARTY_ASSETS.md": "licenses/THIRD_PARTY_ASSETS.md"
     },
     "externalBin": [
       "binaries/buzz-acp",

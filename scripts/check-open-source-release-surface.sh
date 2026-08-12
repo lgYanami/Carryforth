@@ -47,10 +47,10 @@ reject_pattern() {
 require_file "LICENSE"
 require_file "NOTICE"
 require_file "UPSTREAM.md"
-require_file "docs/lora/stage/carryforth/open-source-release-surface-plan.md"
-require_file "docs/release/THIRD_PARTY_ASSETS.md"
-require_file "docs/release/packaged-assets.json"
-require_file "docs/release/source-assets.json"
+require_file "docs/stage/carryforth/open-source-release-surface-plan.md"
+require_file "release/THIRD_PARTY_ASSETS.md"
+require_file "release/packaged-assets.json"
+require_file "release/source-assets.json"
 require_file "scripts/check-public-package-metadata.py"
 require_file "scripts/check-release-asset-inventory.sh"
 require_file "scripts/check-source-asset-inventory.mjs"
@@ -62,7 +62,7 @@ if ! jq -e '
   and .bundle.resources["../../LICENSE"] == "licenses/LICENSE"
   and .bundle.resources["../../NOTICE"] == "licenses/NOTICE"
   and .bundle.resources["../../UPSTREAM.md"] == "licenses/UPSTREAM.md"
-  and .bundle.resources["../../docs/release/THIRD_PARTY_ASSETS.md"] == "licenses/THIRD_PARTY_ASSETS.md"
+  and .bundle.resources["../../release/THIRD_PARTY_ASSETS.md"] == "licenses/THIRD_PARTY_ASSETS.md"
 ' "$REPO_ROOT/desktop/src-tauri/tauri.conf.json" >/dev/null; then
   fail "Desktop packages do not embed the required license and attribution files"
 fi
@@ -116,11 +116,11 @@ reject_pattern \
   "Dockerfile"
 
 if ! rg -q 'COPY LICENSE NOTICE UPSTREAM\.md /usr/share/licenses/carryforth/' "$REPO_ROOT/Dockerfile" ||
-  ! rg -q 'COPY docs/release/THIRD_PARTY_ASSETS\.md /usr/share/licenses/carryforth/' "$REPO_ROOT/Dockerfile"; then
+  ! rg -q 'COPY release/THIRD_PARTY_ASSETS\.md /usr/share/licenses/carryforth/' "$REPO_ROOT/Dockerfile"; then
   fail "the public Relay image does not embed license and attribution files"
 fi
-if ! rg -q '^!docs/release/THIRD_PARTY_ASSETS\.md$' "$REPO_ROOT/.dockerignore"; then
-  fail "the Relay Docker build context excludes its required attribution file"
+if rg -q '^release(/|$)' "$REPO_ROOT/.dockerignore"; then
+  fail "the Relay Docker build context excludes its required release metadata"
 fi
 if ! rg -q 'COMPOSE_ENTRYPOINT_RETIRED=1' "$REPO_ROOT/deploy/compose/run.sh" ||
   ! rg -q '^services:[[:space:]]*\{\}[[:space:]]*$' "$REPO_ROOT/deploy/compose/compose.yml"; then

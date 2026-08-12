@@ -369,7 +369,7 @@ jobs:
             "$RUNNER_TEMP/relay-provenance/$relay_provenance" \
             "$dist/$relay_provenance"
           cp LICENSE NOTICE UPSTREAM.md "$dist/cf/licenses/"
-          cp docs/release/THIRD_PARTY_ASSETS.md "$dist/cf/licenses/"
+          cp release/THIRD_PARTY_ASSETS.md "$dist/cf/licenses/"
           tar -C "$dist/cf" -czf "$dist/$cli_archive" cf licenses
           rm -rf "$dist/cf"
 
@@ -381,7 +381,7 @@ jobs:
             "$local_stack_runtime_dir/"
           mkdir -p "$local_stack_dir/licenses"
           cp LICENSE NOTICE UPSTREAM.md "$local_stack_dir/licenses/"
-          cp docs/release/THIRD_PARTY_ASSETS.md "$local_stack_dir/licenses/"
+          cp release/THIRD_PARTY_ASSETS.md "$local_stack_dir/licenses/"
           printf '%s\n' "$RELAY_IMAGE" > "$local_stack_runtime_dir/RELAY_IMAGE"
           source_date_epoch=$(git show -s --format=%ct "$SOURCE_SHA")
           tar \
