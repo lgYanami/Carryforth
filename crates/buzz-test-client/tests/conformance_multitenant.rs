@@ -195,13 +195,12 @@ mod row_zero_host_binding {
     ///
     /// # What this row asserts, and how it is *distinct* from its siblings
     ///
-    /// Per `NOSTR.md`: "The Nostr wire format does not grow a tenant tag.
-    /// Client-supplied `#h` tags still name channels/groups and are checked
-    /// against the host-derived community." So the only client-supplied
-    /// community-ish signal on the EVENT wire is the `#h` channel tag, and the
-    /// row-zero contract is that it is resolved *within* the host-derived
-    /// community (`tenant.community()`), never honored as a cross-community
-    /// override.
+    /// The Nostr wire format does not add a tenant tag. Client-supplied `#h`
+    /// tags name channels/groups and are checked against the host-derived
+    /// community. The only client-supplied community-ish signal on the EVENT
+    /// wire is therefore the `#h` channel tag, and the row-zero contract is
+    /// that it is resolved *within* the host-derived community
+    /// (`tenant.community()`), never honored as a cross-community override.
     ///
     /// This is the **override-attempt** scenario, deliberately partitioned from
     /// two siblings that share the same scope branch but assert different

@@ -180,6 +180,5 @@ derived arrays, maps, callbacks, or JSX commonly defeat memoization.
   extension patterns.
 - [TESTING.md](TESTING.md): integration and multi-agent E2E testing.
 - [ARCHITECTURE.md](ARCHITECTURE.md): components, protocols, and data flow.
-- [RELEASING.md](RELEASING.md): public release boundary and blockers.
 - [SECURITY.md](SECURITY.md): security model and reporting policy.
 - [README.md](README.md): product overview and quick start.

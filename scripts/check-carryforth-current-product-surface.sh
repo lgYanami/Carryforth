@@ -105,7 +105,7 @@ reject_pattern \
   'deploy/charts|helm-chart\.yml|build-and-deploy\.sh|quickstart-ha-values\.yaml' \
   "a current build, CI, or operator surface still references the retired Helm/Kubernetes path" \
   Justfile .github/workflows/ci.yml scripts/run-tests.sh \
-  scripts/test-project-view-release-contract.sh README.md RELEASING.md
+  scripts/test-project-view-release-contract.sh README.md
 
 reject_pattern \
   'Buzz Dev|Buzz Backend|real buzz CLI|command -v buzz|Buzz dev environment|local Buzz|Buzz app' \
@@ -183,7 +183,7 @@ fi
 reject_pattern \
   'building on Buzz|Buzz relay|Buzz agents|Buzz participants|Buzz UI|Start Buzz|Buzz-only|Buzz channels|# Buzz$|Buzz admin' \
   "a current source-build guide still presents Buzz as the active product" \
-  desktop/README.md NOSTR.md crates/buzz-pairing-cli/README.md \
+  desktop/README.md crates/buzz-pairing-cli/README.md \
   crates/git-credential-nostr/README.md admin-web/index.html
 
 require_absent docs/multi-tenant-conformance.md
