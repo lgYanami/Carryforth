@@ -505,7 +505,6 @@ const allowedUsage = new Set([
   "source",
   "docs",
   "desktop",
-  "mobile",
   "test",
   "package",
 ]);

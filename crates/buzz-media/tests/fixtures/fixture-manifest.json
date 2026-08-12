@@ -35,46 +35,7 @@
       "ios/uikit-sanitized.png": "bbff185f93b9371fc9044683fe2e77ed8337f77518c4e13b36918cf3421ad65f"
     }
   },
-  "duplicate_contracts": [
-    {
-      "canonical": "android/bitmap-display-p3.jpg",
-      "copies": [
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.jpg"
-      ]
-    },
-    {
-      "canonical": "android/bitmap-display-p3.png",
-      "copies": [
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.png",
-        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-display-p3.png"
-      ]
-    },
-    {
-      "canonical": "android/bitmap-srgb.jpg",
-      "copies": [
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.jpg"
-      ]
-    },
-    {
-      "canonical": "android/bitmap-srgb.png",
-      "copies": [
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.png",
-        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-srgb.png"
-      ]
-    },
-    {
-      "canonical": "ios/uikit-encoded.jpg",
-      "copies": [
-        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.jpg"
-      ]
-    },
-    {
-      "canonical": "ios/uikit-encoded.png",
-      "copies": [
-        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.png"
-      ]
-    }
-  ],
+  "duplicate_contracts": [],
   "intentional_equal_hashes": [
     [
       "android/bitmap-srgb.png",

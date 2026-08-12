@@ -104,7 +104,7 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check
 
 # Keep contributor-facing product and local-development surfaces on Carryforth.
 current-product-surface-check:
@@ -180,11 +180,11 @@ desktop-tauri-fmt:
 desktop-tauri-fmt-check:
     cargo fmt --manifest-path {{desktop_tauri_manifest}} --all -- --check
 
-# Format all code (Rust + Tauri Rust + Dart)
-fmt-all: fmt desktop-tauri-fmt mobile-fmt
+# Format all code
+fmt-all: fmt desktop-tauri-fmt
 
 # Fix all formatting and lint issues
-fix-all: fmt desktop-tauri-fmt desktop-fix web-fix mobile-fix
+fix-all: fmt desktop-tauri-fmt desktop-fix web-fix
 
 # Ensure sidecar placeholder binaries exist (Tauri validates externalBin at compile time)
 # Sidecar binary list must stay in sync with desktop-release-build below.
@@ -294,7 +294,7 @@ desktop-e2e-pre-push: _ensure-migrations
     cd {{desktop_dir}} && pnpm build:e2e && pnpm exec playwright test --only-changed=origin/main
 
 # Run all checks suitable for CI / pre-push (no infra needed)
-ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
+ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
 
@@ -840,51 +840,6 @@ web-build:
 # Run web browser smoke tests
 web-e2e-smoke:
     cd {{web_dir}} && pnpm test:e2e:smoke
-
-# ─── Mobile ──────────────────────────────────────────────────────────────────
-
-mobile_dir := "mobile"
-
-# Install mobile Flutter dependencies
-mobile-install:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter pub get
-
-# Format all Dart code
-mobile-fmt:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format .
-
-# Fix mobile formatting and run analysis
-mobile-fix:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format . && flutter analyze
-
-# Verify Carryforth Mobile icon renditions and cross-platform media fixtures.
-mobile-assets-check:
-    node mobile/scripts/generate-carryforth-icons.mjs --check
-    node crates/buzz-media/tests/fixtures/check-fixtures.mjs
-
-# Run mobile lint and format checks
-mobile-check: mobile-assets-check
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs
-
-# Run mobile tests
-mobile-test:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter test
-
-# Compile an unsigned Android debug APK
-mobile-build-android:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter build apk --debug --no-pub
-
-# Run the mobile app on iOS simulator
-mobile-dev:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! pgrep -x Simulator &>/dev/null; then
-        open -a Simulator
-        sleep 3
-    fi
-    cd {{mobile_dir}}
-    unset GIT_DIR GIT_WORK_TREE
-    flutter run
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 

@@ -42,7 +42,6 @@ The main code areas are:
   Rust libraries.
 - `desktop/`: Tauri 2 and React 19 desktop application.
 - `web/` and `admin-web/`: browser clients.
-- `mobile/`: Flutter mobile application.
 - `migrations/` and `schema/`: database upgrade and fresh-install paths.
 - `benchmarks/`: Carryforth orchestration benchmarks.
 - `deploy/`, `release/`, and `scripts/`: supported deployment, release,
@@ -92,8 +91,6 @@ just desktop-tauri-check
 just desktop-tauri-test
 just web-check
 just web-build
-just mobile-check
-just mobile-test
 ```
 
 Use `just fix-all` for repository formatting and lint fixes. Hooks are
@@ -165,24 +162,6 @@ derived arrays, maps, callbacks, or JSX commonly defeat memoization.
 - Do not host PR screenshots through relay media. Validate hand-written
   Markdown with `scripts/check-pr-image-urls.sh`, then use
   `scripts/post-screenshots.sh` against the current Carryforth fork.
-
-## Mobile rules
-
-Mobile uses Riverpod and Flutter Hooks.
-
-- Do not introduce `StatefulWidget`; use `HookConsumerWidget` or
-  `ConsumerWidget`.
-- Agents must not run `flutter run`, `flutter build`, `flutter clean`, or
-  `flutter upgrade`. Use `flutter test`, `flutter analyze`, and
-  `dart format` through the repository recipes.
-- Use `debugPrint()` or structured logging, never `print()`.
-- Prefer `context.colors` and `context.textTheme`.
-- Feature modules may import only from `shared/`, not from other features.
-- Keep one public widget per file and split files before the enforced
-  1000-line ceiling; never raise or bypass that limit.
-- Use `Grid` spacing and `Radii` radius tokens.
-- Keep mobile Nostr kinds synchronized with
-  `desktop/src/shared/constants/kinds.ts`.
 
 ## Common pitfalls
 

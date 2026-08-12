@@ -7,6 +7,7 @@
 > 关联：[开源发布面收敛计划](open-source-release-surface-plan.md)、
 > [`cf` CLI 切换计划](cli-cf-cutover-implementation-plan.md)、
 > [Desktop 产品面去 Buzz 计划](desktop-product-surface-de-buzz-implementation-plan.md)、
+> [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md)、
 > [Desktop 本地化方案](../local/desktop-localization-plan.md)
 
 ## 1. 结论
@@ -408,8 +409,8 @@ ACP ledger 或 managed Agent 状态。
 - 尚未在一台独立 clean-room 机器上执行 `just setup` / `just dev`、Owner/capability bootstrap 与 4–6 轮 Meeting
   smoke；
 - 尚未执行本计划 8.3 的现有本地身份、Community、消息、Agent 和 Project 三域/Meeting 前后权威回读；
-- Web、Mobile 与 benchmark 仍是 source-only/experimental；本阶段只移除了 Web 的旧远程下载与无效 Desktop
-  handoff，没有声明完整 Web/Mobile 产品支持；
+- Web 与 benchmark 仍是 source-only/experimental；本阶段只移除了 Web 的旧远程下载与无效 Desktop handoff，
+  没有声明完整 Web 产品支持。Mobile 后续已按独立决策从活动源码树退役；
 - asset/license/SBOM、bundle identity、公开 artifact clean-room、私密报告与发布治理等正式发行门禁仍保持
   fail closed；本轮不交付安装包、生产部署或商店版本。
 

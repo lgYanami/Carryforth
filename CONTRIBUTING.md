@@ -49,7 +49,6 @@ contact remains a release-blocking maintainer decision.
 | Rust | 1.95.0 (Hermit-pinned; workspace MSRV 1.88) | Install via [rustup](https://rustup.rs/) when not using Hermit |
 | Node.js | 24.14.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
 | pnpm | 11.4.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
-| Flutter | 3.41+ | Required for mobile app — install via [flutter.dev](https://docs.flutter.dev/get-started/install) |
 | Docker | 24+ | For Postgres, Redis, MinIO |
 | `just` | latest | Task runner — `cargo install just` |
 | `lefthook` | 2.1.3 (Hermit-pinned) | Auto-installed by `just hooks` — no manual install needed |
@@ -190,7 +189,7 @@ Before opening a PR, run the full CI gate locally:
 
 ```bash
 just ci
-# Runs: check + unit tests + desktop build + Tauri check + mobile tests
+# Runs: check + unit tests + desktop build + Tauri check
 ```
 
 This is the same check that runs in CI. PRs that fail `just ci` will not be
@@ -303,7 +302,7 @@ required. The scope (in parentheses) is optional but encouraged.
 ### PR Checklist
 
 ```
-- [ ] `just ci` passes (fmt + clippy + unit tests + mobile)
+- [ ] `just ci` passes (fmt + clippy + unit tests + desktop/Tauri checks)
 - [ ] Integration tests pass (`just test`)
 - [ ] New public APIs / tools / endpoints are documented
 - [ ] No new `unwrap()` in production code paths

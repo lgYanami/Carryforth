@@ -6,6 +6,7 @@
 > 关联：[Desktop 本地化方案](../local/desktop-localization-plan.md)、
 > [`cf` CLI 去 Buzz 化实现计划](cli-cf-cutover-implementation-plan.md)、
 > [Desktop 产品层去 Buzz 化实现计划](desktop-product-surface-de-buzz-implementation-plan.md)、
+> [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md)、
 > [破坏性 migration 测试误删主数据库事故](../bug/destructive-migration-test-main-database-data-loss.md)
 
 ## 1. 结论
@@ -51,7 +52,8 @@ Carryforth 源码仓库
 | 本地依赖栈 | 版本固定、可重复启动、数据默认持久化 |
 | Project 系统 | Project View、Document、Project Context、Meeting |
 
-源码仓库可以继续包含 Web、Mobile、benchmark 和历史兼容代码，但它们不自动成为首发的“受支持产品”。继承的
+源码仓库可以继续包含 Web、benchmark 和历史兼容代码，但它们不自动成为首发的“受支持产品”。继承的 Mobile
+客户端已依据 [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md) 从活动树完整退役。继承的
 Helm/Kubernetes 与 hosted Push Gateway executable 由后续的源码/本地开发面收口计划从活动树退役，不再以可执行
 清单保存历史。README、Release Notes 和下载页面不得把未完成 clean-room 验收的组件描述为正式发行物。
 
@@ -69,8 +71,9 @@ Helm/Kubernetes 与 hosted Push Gateway executable 由后续的源码/本地开�
 - Linux x86_64 `cf`；
 - 一套从空数据目录启动的本地部署入口。
 
-macOS、Windows、Mobile 或商店发行只有在各自的签名、bundle identity、数据迁移和 clean-machine 门禁完成后才加入
-正式矩阵。未进入矩阵的平台可以保留源码构建说明，但不得发布一个未经验证的“正式”安装包。
+macOS、Windows 或其他商店发行只有在各自的签名、bundle identity、数据迁移和 clean-machine 门禁完成后才加入
+正式矩阵。Android/iOS Mobile 源码已经退役；未来若恢复，必须先按独立产品阶段重新引入源码、构建与验收矩阵。
+仍有源码但未进入矩阵的平台可以保留构建说明，但不得发布一个未经验证的“正式”安装包。
 
 ### 2.3 明确非目标
 
@@ -80,7 +83,8 @@ macOS、Windows、Mobile 或商店发行只有在各自的签名、bundle identi
 - 不提供本地失败后自动回退到公共 Relay 的路径；
 - 不一次性重命名所有 `buzz-*` Rust crate、数据库表、Nostr kind、capability 或历史 event；
 - 不改写旧 migration、历史事故文档或已有 canonical 数据；
-- 不把 Web、Mobile 和 benchmark 强行纳入首发支持承诺；
+- 不把 Web 和 benchmark 强行纳入首发支持承诺；
+- 不在本计划中恢复已经退役的 Android/iOS Mobile 客户端；
 - 不承诺多个 Harness 使用同一个 Agent 私钥时的 active-active 协调；
 - 不把 Agent 模型供应商的帐号/API key 与 Carryforth 本地身份混为一体。
 
@@ -103,8 +107,9 @@ macOS、Windows、Mobile 或商店发行只有在各自的签名、bundle identi
 两份 benchmark Python lockfile 大量固定到 Block 内部 Artifactory。公共网络环境无法按锁文件复现安装，同时会
 暴露无意义的内部服务坐标。
 
-当前 release、Docker、Mobile 与签名流程也包含 canonical repo 判断、Block namespace、私有 action、私有 secret
-和手工 Buildkite 步骤。这些可以作为上游历史留档，但不能继续作为 Carryforth 的权威公开发布链。
+初始审计时，release、Docker、Mobile 与签名流程也包含 canonical repo 判断、Block namespace、私有 action、私有
+secret 和手工 Buildkite 步骤。这些可以作为上游历史留档，但不能继续作为 Carryforth 的权威公开发布链；其中
+Mobile 源码和活动接线现已按独立退役决策删除。
 
 另外，当前 release workflow 仍调用 `../../../desktop/scripts/build-release-config.mjs` 重新生成 release-only updater 配置，
 并指向 `block/buzz` 的 `buzz-desktop-latest`。这会让已从日常 Desktop 产品面移除的旧 updater 在正式构建时重新出现；
@@ -270,8 +275,8 @@ binary 的后续重命名不能改变当前 wire/storage 合同。
 5. 建立一台没有 Block VPN、凭据、内部 DNS 和旧 app-data 的 clean-room runner；
 6. 记录当前公开构建失败点、默认外连和内部域名基线；
 7. 为选定升级基线建立只读证据：pubkey、Community、消息、Agent、数据库 schema、三域 revision 与 Meeting 数量；
-8. 把 Web/Mobile/benchmark 标记为 supported、experimental 或 source-only，退役 Push/Helm executable，并验证
-   Relay artifact 没有偷带 source-only 产品页面；
+8. 把 Web/benchmark 标记为 supported、experimental 或 source-only，按独立决策退役 Mobile，退役 Push/Helm
+   executable，并验证 Relay artifact 没有偷带 source-only 产品页面；
 9. 与选定上游基线完成一次同步与许可证 review，提交完整 migration 链，确保 RC source 没有未跟踪文件。
 
 阶段门禁：发布范围不再依赖团队成员的隐式理解，clean-room 构建失败能稳定复现。
@@ -348,8 +353,8 @@ bundle identity 迁移只约束**进入当前支持矩阵的平台**。首发最
 5. 发布 Desktop、Relay image 和 `cf`，生成 checksum、SBOM、provenance 和 release manifest；
 6. Release workflow 从 Tauri/Cargo 配置读取产品名，不再硬编码 `.app` 名；
 7. fork 的 PR 与 tag 构建必须能运行只读验证，不尝试推送到 Block namespace；
-8. 删除 `build-release-config.mjs` 与 release environment 对旧 updater 的再注入，并隔离不再属于当前产品的
-   Mobile/private release；Push Gateway 发布 job 与 executable 直接退役；
+8. 删除 `build-release-config.mjs` 与 release environment 对旧 updater 的再注入，删除不再属于当前产品的
+   Mobile/private release 接线；Push Gateway 发布 job 与 executable 直接退役；
 9. 对最终安装包解包扫描并做运行时网络审计，证明 release-only 配置没有重新带入旧 updater、Buzz URL 或
    `Buzz.app` 产物名。
 
@@ -361,9 +366,9 @@ bundle identity 迁移只约束**进入当前支持矩阵的平台**。首发最
 1. 建立每个字体、声音、图标、Logo、安装背景和示例数据的 provenance 表；
 2. 补齐可再分发许可证，将其汇总到 Third-Party Notices；
 3. 无法确认授权的 Provider logo 使用通用图标或文字替代；
-4. 对 Cargo、pnpm、Python、Flutter 依赖运行许可证与漏洞检查；
+4. 对 Cargo、pnpm 和 Python 依赖运行许可证与漏洞检查；
 5. 生成 CycloneDX 或 SPDX SBOM；
-6. 固定 Rust、Node、pnpm、Flutter 等公开工具链版本，并同步 README/CONTRIBUTING；
+6. 固定 Rust、Node、pnpm 等公开工具链版本，并同步 README/CONTRIBUTING；
 7. 对 vendored binary、Hermit package 和 sidecar 建立来源、版本、校验和与更新流程。
 
 阶段门禁：每个随安装包/容器分发的文件都能说明来源与授权，依赖清单可由 release artifact 回溯。
@@ -454,8 +459,8 @@ migration 可从空库重放、构建记录指向精确 commit。开发者本机
 
 ### 9.1 首发范围较小
 
-不同时发布 Web、Mobile、Push 和所有平台，会减少“全平台”宣传面，但能保证公开承诺与实际可用性一致。后续组件应
-复用本计划门禁逐个加入，而不是降低首发门槛。
+不同时发布 Web、Push 和所有平台，并从活动树退役 Mobile，会减少“全平台”宣传面，但能保证公开承诺与实际可用性
+一致。后续组件应复用本计划门禁逐个加入，而不是降低首发门槛。
 
 ### 9.2 bundle identity 迁移复杂
 
@@ -492,10 +497,11 @@ Carryforth 控制面默认不出网区分开；若未来承诺 air-gap，需要�
 9. 打包资产与依赖的来源、许可和安全扫描通过；
 10. clean-room 端到端验收覆盖消息、Agent、Project 三域与 Meeting，并保留脱敏证据；
 11. release、rebuild、migration 和测试脚本均有数据安全门禁；
-12. 未通过的 Web、Mobile 或平台构建没有被宣传为受支持发行物，Push/Helm executable 不存在于当前活动面。
+12. 未通过的 Web 或平台构建没有被宣传为受支持发行物，Mobile 与 Push/Helm executable 不存在于当前活动面。
 
-完成这些条件后，后续再分别规划 runtime binary/env 去 Buzz 化、内部 crate 命名整理、Web/Mobile 产品面以及可选
-self-hosted Push；这些后续工作不得反向改变本阶段建立的 local-only、无损升级和公开可复现边界。
+完成这些条件后，后续再分别规划 runtime binary/env 去 Buzz 化、内部 crate 命名整理、Web 产品面、未来新建的
+Mobile 产品面以及可选 self-hosted Push；这些后续工作不得反向改变本阶段建立的 local-only、无损升级和公开可复现
+边界。
 
 ## 11. 本轮实施记录（2026-08-11）
 
@@ -509,7 +515,7 @@ self-hosted Push；这些后续工作不得反向改变本阶段建立的 local-
 | 阶段三 | 未开始 | 仍保留旧 bundle、keyring 与 app-data 坐标以保护现有数据。没有无损迁移与回读证据前不得直接改 identifier。 |
 | 阶段四 | 入口已建立，RC 阻断 | `../../../deploy/local` 提供持久化 local-only 栈、随机 secret 与非删除 lifecycle；但 Owner 签名后的 Project View v3/Document/Context Edge/Meeting capability bootstrap 与 canonical readback、从 Human 冻结基线执行的既有数据 migration/readback 仍未完成。当前入口不能宣称为稳定升级路径。 |
 | 阶段五 | 公共 unsigned lane 已建立，发布被门禁阻断 | 公共 workflow 已移除旧 updater、Block 私有签名/移动端/Push 发布链，可构建 Linux Desktop、`cf`、Local Stack 与 Relay OCI，并生成 checksum/provenance。正式 release 在资产、SBOM、container provenance 等门禁未通过时会 fail closed；锁定的 RustSec 审计及其归档证据尚未接入 CI，不能宣称依赖安全门禁已完成。 |
-| 阶段六 | inventory 完成，12 项 blocker | 已建立逐文件资产 provenance/hash inventory，并把原先只存在于文字合同中的四项义务纳入机器门禁。当前为 5 项资产/字体 blocker 与 7 项 release obligation：除依赖/SBOM、Relay container provenance、bundle identity 外，还明确阻断 Owner-signed capability bootstrap、既有数据 migration/readback、clean-room E2E 与 Human 私密报告/发行治理决策。 |
+| 阶段六 | inventory 完成，8 项 blocker | 已建立逐文件资产 provenance/hash inventory，并把原先只存在于文字合同中的四项义务纳入机器门禁。当前为 1 项 Desktop 字体 blocker 与 7 项 release obligation：除依赖/SBOM、Relay container provenance、bundle identity 外，还明确阻断 Owner-signed capability bootstrap、既有数据 migration/readback、clean-room E2E 与 Human 私密报告/发行治理决策。 |
 | 阶段七 | 未开始，RC 阻断 | 尚未执行仅使用公开发行物的 clean-room fresh install、已有数据升级、断旧域名网络审计和完整 Meeting 端到端 RC 验收，也没有对应的 tag-bound evidence。 |
 
 当前开发门禁：

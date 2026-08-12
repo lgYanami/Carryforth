@@ -67,22 +67,6 @@ for (const [relativePath, expectedHash] of expectedFiles) {
   }
 }
 
-const expectedCopies = new Set(
-  manifest.duplicate_contracts.flatMap((contract) => contract.copies),
-);
-for (const copyRoot of [
-  "mobile/android/app/src/test/resources/fixtures",
-  "mobile/android/app/src/androidTest/resources/fixtures",
-  "mobile/ios/RunnerTests/Fixtures",
-]) {
-  for (const path of walkMedia(join(repoRoot, copyRoot))) {
-    const relativePath = path.slice(repoRoot.length + 1).replaceAll("\\", "/");
-    if (!expectedCopies.has(relativePath)) {
-      failures.push(`mobile fixture copy is missing from duplicate contract: ${relativePath}`);
-    }
-  }
-}
-
 for (const contract of manifest.duplicate_contracts) {
   const canonical = readFileSync(join(fixtureRoot, contract.canonical));
   for (const copyPath of contract.copies) {

@@ -6,7 +6,11 @@
 > 不包含：Git 历史改写、branch/tag/ref 清理、远程仓库可见性切换
 > 关联：[Packaged Asset Provenance and License Inventory](../../../release/THIRD_PARTY_ASSETS.md)、
 > [开源发布面收敛计划](open-source-release-surface-plan.md)、
-> [源码与本地开发面去 Buzz 收口计划](source-and-local-development-surface-de-buzz-closure-implementation-plan.md)
+> [源码与本地开发面去 Buzz 收口计划](source-and-local-development-surface-de-buzz-closure-implementation-plan.md)、
+> [Mobile 客户端源码退役决策](mobile-client-source-retirement-decision.md)
+
+> 后续变更：本文保留 2026-08-11 素材清理时 Mobile 仍在活动树中的实施与测试证据。Mobile 客户端已于
+> 2026-08-12 按上述独立决策完整退役；本文中的 Mobile 文件、生成器、测试数量和素材清单数量不代表当前树状态。
 
 ## 1. 结论
 

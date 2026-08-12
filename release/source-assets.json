@@ -17,7 +17,7 @@
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
         ],
-        "toolchain": "The Rust, Node, Playwright, or Flutter test harness named by each source path",
+        "toolchain": "The Rust, Node, or Playwright test harness named by each source path",
         "recipe": "Literal one-pixel, short-text, minimal PNG, or minimal SVG fixture bytes encoded directly beside their assertions."
       }
     },
@@ -39,12 +39,12 @@
         "source": [
           {
             "path": "scripts/generate-inline-media-test-fixture.mjs",
-            "sha256": "02e34e6eca4e7050b94f5f4b2d0fca770b9cd2874915be8cc77ed0897fca104d"
+            "sha256": "85c4956aaf4e4b47f53f0c688cf72fca6ee1550a96f1e7189276511f8e83ac55"
           }
         ],
         "generator": {
           "path": "scripts/generate-inline-media-test-fixture.mjs",
-          "sha256": "02e34e6eca4e7050b94f5f4b2d0fca770b9cd2874915be8cc77ed0897fca104d",
+          "sha256": "85c4956aaf4e4b47f53f0c688cf72fca6ee1550a96f1e7189276511f8e83ac55",
           "command": "node scripts/generate-inline-media-test-fixture.mjs --check"
         },
         "toolchain": "Hermit Node 24.14.0",
@@ -61,7 +61,7 @@
   "marker_profiles": {
     "apache-source-text": {
       "license": "Apache-2.0",
-      "usage": ["source", "docs", "desktop", "mobile", "test"],
+      "usage": ["source", "docs", "desktop", "test"],
       "copyright_holder": "Block, Inc. and Carryforth contributors",
       "status": "cleared",
       "license_evidence": [
@@ -204,87 +204,6 @@
       }
     },
     {
-      "id": "carryforth-mobile-icons",
-      "classification": "generated",
-      "license": "Apache-2.0",
-      "usage": ["source", "mobile", "package"],
-      "copyright_holder": "Carryforth contributors",
-      "status": "cleared",
-      "trademark_status": "project-owned",
-      "paths": [
-        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.png",
-        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png",
-        "mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher_round.png",
-        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.png",
-        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png",
-        "mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher_round.png",
-        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",
-        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png",
-        "mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png",
-        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png",
-        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png",
-        "mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png",
-        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
-        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png",
-        "mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png",
-        "mobile/assets/images/carryforth.svg",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-1024x1024@1x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@1x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@2x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-20x20@3x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@1x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@2x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-29x29@3x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@1x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@2x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-40x40@3x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-60x60@2x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-60x60@3x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-76x76@1x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-76x76@2x.png",
-        "mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-App-83.5x83.5@2x.png"
-      ],
-      "file_count": 31,
-      "tree_sha256": "6f534bd852bad168af10123b8494bcb7bb657d929a75cabd7dc8d193cbbcbecd",
-      "provenance": {
-        "description": "Deterministic Android and iOS renditions generated from Carryforth's canonical source SVG.",
-        "license_evidence": [
-          {
-            "path": "LICENSE",
-            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
-          }
-        ],
-        "source": [
-          {
-            "path": "desktop/src-tauri/icons/carryforth-source.svg",
-            "sha256": "9add133405e9e056e78e479c772bc1178692e39f3fef27c0cb709961aed9edba"
-          }
-        ],
-        "generator": {
-          "path": "mobile/scripts/generate-carryforth-icons.mjs",
-          "sha256": "595bb9bc431e1b8efa0c8f37ae60a8f3ac6bbc14e9177a3d698dba131431fe1c",
-          "command": "node mobile/scripts/generate-carryforth-icons.mjs --check"
-        },
-        "toolchain": "Hermit Node 24.14.0 and locked @tauri-apps/cli 2.11.2",
-        "toolchain_evidence": [
-          {
-            "path": "bin/hermit.hcl",
-            "sha256": "6f1d298c2359682160aa4418eadca51693780f152718fbb7b052b1f03cec8afe"
-          },
-          {
-            "path": "desktop/package.json",
-            "sha256": "f5364a52137a6da6bf7303bbe1c352f13d358a15aca7a882a51c07cca04a8da6"
-          },
-          {
-            "path": "pnpm-lock.yaml",
-            "sha256": "7c151732ee3c8aeb99168db7dd2773bd7feec65af35b8516a07f209df934735a"
-          }
-        ],
-        "recipe": "Render the canonical 1024 SVG at the manifest-declared Android and iOS dimensions, then verify every output hash.",
-        "reproducible": true
-      }
-    },
-    {
       "id": "carryforth-notification-sounds",
       "classification": "generated",
       "license": "Apache-2.0",
@@ -412,34 +331,6 @@
       }
     },
     {
-      "id": "inter-mobile-fonts",
-      "classification": "third-party-font",
-      "license": "OFL-1.1",
-      "usage": ["source", "mobile", "package"],
-      "copyright_holder": "The Inter Project Authors",
-      "status": "cleared",
-      "trademark_status": "factual-text-only",
-      "paths": [
-        "mobile/assets/fonts/InterVariable-Italic.ttf",
-        "mobile/assets/fonts/InterVariable.ttf"
-      ],
-      "file_count": 2,
-      "tree_sha256": "dcd2bdd31a27aaaf3a33f505f3b001ce4378492520d62f70bce7286810416ab6",
-      "provenance": {
-        "description": "Inter Variable 4.001 font files (embedded name-table source revision git-9221beed3, resolved to the immutable upstream commit below) with the complete OFL-1.1 text stored alongside them.",
-        "license_evidence": [
-          {
-            "path": "mobile/assets/fonts/Inter-LICENSE.txt",
-            "sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a"
-          }
-        ],
-        "upstream": {
-          "url": "https://github.com/rsms/inter",
-          "ref": "9221beed3e5b521ce94050ca542f568755c17c22"
-        }
-      }
-    },
-    {
       "id": "synthetic-webp-upload-fixture",
       "classification": "test-fixture",
       "license": "Apache-2.0",
@@ -492,7 +383,7 @@
       "id": "android-media-sanitizer-fixtures",
       "classification": "test-fixture",
       "license": "Apache-2.0",
-      "usage": ["source", "mobile", "test"],
+      "usage": ["source", "test"],
       "copyright_holder": "Block, Inc. and Carryforth contributors",
       "status": "cleared",
       "trademark_status": "not-applicable",
@@ -504,18 +395,12 @@
         "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-display-p3-sanitized.jpg",
         "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-display-p3-sanitized.png",
         "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.jpg",
-        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.png",
-        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-display-p3.png",
-        "mobile/android/app/src/androidTest/resources/fixtures/android/bitmap-srgb.png",
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.jpg",
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-display-p3.png",
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.jpg",
-        "mobile/android/app/src/test/resources/fixtures/android/bitmap-srgb.png"
+        "crates/buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.png"
       ],
-      "file_count": 14,
-      "tree_sha256": "8f318bc706426725aa5fc4a37d476666877f773d55c89e0bdc5cb613e2a77ab3",
+      "file_count": 8,
+      "tree_sha256": "380b02a5244cda44f5553ccbafbf34431708bd7e15371f4157c457ccdc0fff7b",
       "provenance": {
-        "description": "Synthetic 3x2 color grids generated by the tracked Android API 36 Bitmap recipe, sanitized by the product pipeline, and checked against exact duplicate-copy contracts.",
+        "description": "Synthetic 3x2 color grids generated by the tracked Android API 36 Bitmap recipe, sanitized by the product pipeline, and retained as canonical regression fixtures.",
         "license_evidence": [
           {
             "path": "LICENSE",
@@ -525,11 +410,11 @@
         "source": [
           {
             "path": "crates/buzz-media/tests/fixtures/fixture-manifest.json",
-            "sha256": "18357e9f51da1ef04108eda2f99ff4b3eff04cf62a3dfd45a0ea7a1c194346cf"
+            "sha256": "1dd9c546b77f06de35babee50a3f9a488be391ddb2b9f8becef9b4ee8f82db80"
           },
           {
             "path": "crates/buzz-media/tests/fixtures/check-fixtures.mjs",
-            "sha256": "1a1044ec63f7d3b27b8a1e10b8a455ab7c25d8c3f7e3451c6015618d949c4fdb"
+            "sha256": "5ad6ebdcbbae79f6d09b0b153c2cc1a1a1f1a0cc509d938cf2ab1251bb0a34ff"
           }
         ],
         "generator": {
@@ -545,7 +430,7 @@
       "id": "ios-media-sanitizer-fixtures",
       "classification": "test-fixture",
       "license": "Apache-2.0",
-      "usage": ["source", "mobile", "test"],
+      "usage": ["source", "test"],
       "copyright_holder": "Block, Inc. and Carryforth contributors",
       "status": "cleared",
       "trademark_status": "not-applicable",
@@ -554,14 +439,12 @@
         "crates/buzz-media/tests/fixtures/ios/uikit-encoded.png",
         "crates/buzz-media/tests/fixtures/ios/uikit-sanitized.jpg",
         "crates/buzz-media/tests/fixtures/ios/uikit-sanitized.png",
-        "crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.png",
-        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.jpg",
-        "mobile/ios/RunnerTests/Fixtures/UIKitEncoded.png"
+        "crates/buzz-media/tests/fixtures/source/pixel-grid-2x2.png"
       ],
-      "file_count": 7,
-      "tree_sha256": "0cc52899acb2f20b2b845cd1bad5639b53ef38b7538c96c4c08d3cae96322aa7",
+      "file_count": 5,
+      "tree_sha256": "e2af37d68196ee45e1c102e273fe2baea37fe76e496212084767652f28cd94d3",
       "provenance": {
-        "description": "Synthetic 2x2 color grid with tracked source bytes, UIKit encoding recipe, sanitizer derivatives, and exact cross-tree copy contracts.",
+        "description": "Synthetic 2x2 color grid with tracked source bytes, UIKit encoding recipe, sanitizer derivatives, and canonical regression fixtures.",
         "license_evidence": [
           {
             "path": "LICENSE",
@@ -579,11 +462,11 @@
           },
           {
             "path": "crates/buzz-media/tests/fixtures/fixture-manifest.json",
-            "sha256": "18357e9f51da1ef04108eda2f99ff4b3eff04cf62a3dfd45a0ea7a1c194346cf"
+            "sha256": "1dd9c546b77f06de35babee50a3f9a488be391ddb2b9f8becef9b4ee8f82db80"
           },
           {
             "path": "crates/buzz-media/tests/fixtures/check-fixtures.mjs",
-            "sha256": "1a1044ec63f7d3b27b8a1e10b8a455ab7c25d8c3f7e3451c6015618d949c4fdb"
+            "sha256": "5ad6ebdcbbae79f6d09b0b153c2cc1a1a1f1a0cc509d938cf2ab1251bb0a34ff"
           }
         ],
         "generator": {
@@ -827,50 +710,6 @@
       "decoded_bytes": 203,
       "occurrences": 1,
       "rights_profile": "synthetic-inline-test-fixture"
-    },
-    {
-      "id": "inline-mobile-test-shared-relay-media-image-test-1",
-      "path": "mobile/test/shared/relay/media_image_test.dart",
-      "locators": ["15:6"],
-      "media_type": "image/png",
-      "encoding": "base64",
-      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
-      "decoded_bytes": 73,
-      "occurrences": 1,
-      "rights_profile": "generated-inline-raster-test-fixture"
-    },
-    {
-      "id": "inline-mobile-test-shared-widgets-avatar-image-test-1",
-      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
-      "locators": ["10:8"],
-      "media_type": "image/svg+xml",
-      "encoding": "base64",
-      "decoded_sha256": "092af5696d2dedeebe85a63bdfeac64ae343f6f46071bedd548dea072211c803",
-      "decoded_bytes": 119,
-      "occurrences": 1,
-      "rights_profile": "synthetic-inline-test-fixture"
-    },
-    {
-      "id": "inline-mobile-test-shared-widgets-avatar-image-test-2",
-      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
-      "locators": ["14:8"],
-      "media_type": "image/png",
-      "encoding": "base64",
-      "decoded_sha256": "fae7190ceb56f6d7872f9272c2cc40cb7b35c3eee1d92844517ba7873eb7bafa",
-      "decoded_bytes": 73,
-      "occurrences": 1,
-      "rights_profile": "generated-inline-raster-test-fixture"
-    },
-    {
-      "id": "inline-mobile-test-shared-widgets-avatar-image-test-3",
-      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
-      "locators": ["28:10"],
-      "media_type": "image/svg+xml",
-      "encoding": "percent",
-      "decoded_sha256": "97790016cebcabf65f5c07125511a92d7298e7d86c92da391c735a34b0ac7cd9",
-      "decoded_bytes": 246,
-      "occurrences": 1,
-      "rights_profile": "synthetic-inline-test-fixture"
     }
   ],
   "data_uri_markers": [
@@ -1084,20 +923,9 @@
       "rights_profile": "apache-source-text"
     },
     {
-      "id": "marker-mobile-test-shared-widgets-avatar-image-test-1",
-      "path": "mobile/test/shared/widgets/avatar_image_test.dart",
-      "locators": ["54:38"],
-      "statement_sha256": "e0a5e98866d366863b5d960b255e65a4e8c3eb24f662faa00f53718ec2c7b2cb",
-      "statement_bytes": 29,
-      "occurrences": 1,
-      "marker_kind": "test-negative",
-      "purpose": "Deliberately invalid base64 SVG URI used to verify fallback rendering.",
-      "rights_profile": "apache-source-text"
-    },
-    {
       "id": "marker-scripts-generate-inline-media-test-fixture-1",
       "path": "scripts/generate-inline-media-test-fixture.mjs",
-      "locators": ["107:29"],
+      "locators": ["105:29"],
       "statement_sha256": "8e726a09c196f96bcf104fd83a6a6278c5ccca1c0b841dd8ecef621b87acf56a",
       "statement_bytes": 22,
       "occurrences": 1,
@@ -1108,7 +936,7 @@
     {
       "id": "marker-scripts-generate-inline-media-test-fixture-2",
       "path": "scripts/generate-inline-media-test-fixture.mjs",
-      "locators": ["87:18"],
+      "locators": ["85:18"],
       "statement_sha256": "a4944b761264a9dd88d913a70aba6fcf957862e2a11961220c5843a59e4726bf",
       "statement_bytes": 47,
       "occurrences": 1,

@@ -597,10 +597,10 @@ async fn process_picked_path(
                 drop(file); // release fd only after ffmpeg is done
                 result
             } else if heic_by_ext || is_heic_file(&header[..n]) {
-                // HEIC/HEIF still: Chromium/the webview can't decode it, so
-                // transcode to JPEG before upload (mirrors mobile). Resolve the
-                // fd's real path so ffmpeg reads the pinned inode, and keep
-                // `file` alive until the transcode finishes.
+                // HEIC/HEIF still: Chromium/the webview cannot decode it, so
+                // transcode to JPEG before upload. Resolve the fd's real path
+                // so ffmpeg reads the pinned inode, and keep `file` alive until
+                // the transcode finishes.
                 let fd_path = fd_real_path(&file)?;
                 let result = transcode_heic_path_to_jpeg_bytes(&fd_path).map(|jpeg| (jpeg, None));
                 drop(file); // release fd only after ffmpeg is done
@@ -764,7 +764,7 @@ pub async fn upload_media_bytes(
     } else if is_heic_file(&data) {
         // HEIC/HEIF still pasted/dropped: no filename here, so detection is
         // magic-bytes only. ffmpeg needs a path, so write to temp, transcode
-        // to JPEG, and clean up. (Mirrors mobile's pre-upload transcode.)
+        // to JPEG, and clean up.
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
             let tmp_input =
                 std::env::temp_dir().join(format!("buzz-drop-{}", uuid::Uuid::new_v4()));
