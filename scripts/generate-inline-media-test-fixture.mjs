@@ -14,8 +14,6 @@ const FIXTURE_PATHS = [
   "desktop/tests/e2e/onboarding.spec.ts",
   "desktop/tests/e2e/profile-custom-emoji-status.spec.ts",
   "desktop/tests/e2e/relay-connectivity.spec.ts",
-  "mobile/test/shared/relay/media_image_test.dart",
-  "mobile/test/shared/widgets/avatar_image_test.dart",
 ];
 
 function uint32(value) {

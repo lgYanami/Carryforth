@@ -41,23 +41,15 @@ fn timestamp() -> DateTime<Utc> {
 fn fixture(path: &str) -> Event {
     let content = match path {
         "head" => {
-            include_str!("../../../docs/nips/fixtures/project-document-v1/events/head-active.json")
+            include_str!("fixtures/project-document-v1/events/head-active.json")
         }
-        "revision" => include_str!(
-            "../../../docs/nips/fixtures/project-document-v1/events/revision-active.json"
-        ),
-        "meta" => include_str!(
-            "../../../docs/nips/fixtures/project-document-v1/events/meta-incremental.json"
-        ),
+        "revision" => include_str!("fixtures/project-document-v1/events/revision-active.json"),
+        "meta" => include_str!("fixtures/project-document-v1/events/meta-incremental.json"),
         "meta_empty" => {
-            include_str!("../../../docs/nips/fixtures/project-document-v1/events/meta-empty.json")
+            include_str!("fixtures/project-document-v1/events/meta-empty.json")
         }
-        "wrong_signer" => include_str!(
-            "../../../docs/nips/fixtures/project-document-v1/invalid/wrong-signer.json"
-        ),
-        "cross_project" => include_str!(
-            "../../../docs/nips/fixtures/project-document-v1/invalid/cross-project.json"
-        ),
+        "wrong_signer" => include_str!("fixtures/project-document-v1/invalid/wrong-signer.json"),
+        "cross_project" => include_str!("fixtures/project-document-v1/invalid/cross-project.json"),
         _ => panic!("unknown fixture"),
     };
     serde_json::from_str(content).expect("signed event fixture")
@@ -225,7 +217,7 @@ fn wrong_signer_cross_project_and_cross_bundle_fail_closed() {
 
     let head = parse_document_head(&fixture("head"), &relay, project_id()).expect("head");
     let tombstone: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-document-v1/events/revision-tombstone.json"
+        "fixtures/project-document-v1/events/revision-tombstone.json"
     ))
     .expect("tombstone fixture");
     let tombstone =

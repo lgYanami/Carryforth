@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
-const manifestPath = path.join(repoRoot, "docs/release/source-assets.json");
+const manifestPath = path.join(repoRoot, "release/source-assets.json");
 const reportOnly = process.argv.length === 3 && process.argv[2] === "--report";
 if (process.argv.length > (reportOnly ? 3 : 2)) {
   console.error(
@@ -505,7 +505,6 @@ const allowedUsage = new Set([
   "source",
   "docs",
   "desktop",
-  "mobile",
   "test",
   "package",
 ]);

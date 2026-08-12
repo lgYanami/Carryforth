@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-manifest="docs/release/packaged-assets.json"
+manifest="release/packaged-assets.json"
 release_mode=false
 release_obligation_evidence_schema="carryforth.release-obligation-evidence/v1"
 
@@ -85,7 +85,7 @@ jq -e --arg obligation_evidence_schema "${release_obligation_evidence_schema}" '
       if .release_status == "cleared" then
         (.evidence | type == "object")
         and (.evidence.schema == $obligation_evidence_schema)
-        and (.evidence.path | type == "string" and test("^docs/release/evidence/[^/]+/[^/]+[.]json$"))
+        and (.evidence.path | type == "string" and test("^release/evidence/[^/]+/[^/]+[.]json$"))
         and (.evidence.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
         and (.evidence.release_tag | type == "string" and test("^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$"))
       else
@@ -281,7 +281,7 @@ fi
 # obligation must point at a tracked, tag-scoped evidence record whose bytes,
 # schema, release tag, obligation ID, and source commit all agree.
 while IFS=$'\t' read -r obligation_id evidence_schema evidence_path evidence_sha release_tag; do
-  expected_path="docs/release/evidence/${release_tag}/${obligation_id}.json"
+  expected_path="release/evidence/${release_tag}/${obligation_id}.json"
   if [[ "${evidence_path}" != "${expected_path}" ]]; then
     echo "release asset inventory: ${obligation_id} evidence path must be ${expected_path}" >&2
     exit 1

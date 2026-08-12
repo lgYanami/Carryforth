@@ -62,9 +62,7 @@ pub(super) fn is_video_file(buf: &[u8]) -> bool {
 }
 
 /// HEIC/HEIF compatible-brand codes that mark an ISO-BMFF file as a still
-/// HEIF image. Mirrors mobile's `_heicBrands` set in
-/// `mobile/lib/shared/relay/media_upload.dart` so detection stays consistent
-/// across platforms — deliberately broader than the `infer` crate, which only
+/// HEIF image. This is deliberately broader than the `infer` crate, which only
 /// recognizes `heic`/`heix` majors (or `mif1`/`msf1` with a `heic` compatible
 /// brand) and would miss `hevc`/`hevx`/`heim`/`heis`.
 const HEIC_BRANDS: &[&[u8; 4]] = &[
@@ -77,7 +75,7 @@ const HEIC_BRANDS: &[&[u8; 4]] = &[
 /// followed by a major brand and a list of compatible brands. We scan the
 /// major brand plus the compatible-brand list for any of `HEIC_BRANDS`.
 ///
-/// Mirrors mobile's `_looksLikeHeicOrHeif`: requires the `ftyp` marker at
+/// Requires the `ftyp` marker at
 /// offset 4 and scans 4-byte brand codes at offsets 8, 12, 16, ... up to the
 /// first 32 bytes. The Tauri webview / Chromium cannot decode HEIC, so any
 /// match here is transcoded to JPEG before upload.
@@ -88,7 +86,7 @@ pub(super) fn is_heic_file(buf: &[u8]) -> bool {
     }
 
     // Scan the major brand (offset 8) and each compatible brand, bounded to
-    // the first 32 bytes (matches mobile's window).
+    // the first 32 bytes to keep detection predictable on untrusted input.
     let upper = buf.len().min(32);
     let mut offset = 8;
     while offset + 4 <= upper {
@@ -104,11 +102,10 @@ pub(super) fn is_heic_file(buf: &[u8]) -> bool {
 
 /// True if a filename ends in `.heic` or `.heif` (case-insensitive).
 ///
-/// Mirrors mobile's `_hasHeicFileExtension`. Used on the file-picker path as a
-/// secondary signal — some HEIC files from non-Apple tooling carry brands not
-/// in `HEIC_BRANDS`, but the extension still tells us the webview can't render
-/// them. The byte-based path (paste/drag) has no filename and relies solely on
-/// `is_heic_file`.
+/// Used on the file-picker path as a secondary signal: some HEIC files from
+/// non-Apple tooling carry brands not in `HEIC_BRANDS`, but the extension still
+/// tells us the webview cannot render them. The byte-based path (paste/drag)
+/// has no filename and relies solely on `is_heic_file`.
 pub(super) fn has_heic_extension(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -260,7 +257,7 @@ pub(super) fn transcode_to_mp4(
 ///
 /// The Tauri webview / Chromium cannot decode HEIC, so iPhone photos uploaded
 /// as-is render blank in the composer and are unviewable for everyone. This
-/// normalizes them to JPEG (the same fix mobile applies before upload).
+/// normalizes them to JPEG before upload.
 ///
 /// Uses `-frames:v 1` so multi-image HEIF containers (Live Photos, bursts)
 /// yield a single still, and `-q:v 2` for high JPEG quality. Returns the path
@@ -497,8 +494,8 @@ mod tests {
 
     #[test]
     fn test_is_heic_file_variants_infer_misses() {
-        // These brands are detected by mobile but NOT by the `infer` crate's
-        // HEIC heuristic — the whole reason we mirror mobile's full set.
+        // These valid still-image brands are absent from the `infer` crate's
+        // HEIC heuristic, so the detector must cover them explicitly.
         for brand in [b"hevc", b"hevx", b"heim", b"heis"] {
             let buf = ftyp_box(brand, &[]);
             assert!(is_heic_file(&buf), "variant brand {brand:?} not detected");
@@ -534,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_is_heic_file_too_short() {
-        // Has `ftyp` marker but fewer than 12 bytes — below mobile's threshold.
+        // Has `ftyp` marker but fewer than the required 12-byte header.
         let buf = [0x00, 0x00, 0x00, 0x00, b'f', b't', b'y', b'p'];
         assert!(!is_heic_file(&buf));
     }
@@ -549,9 +546,9 @@ mod tests {
 
     #[test]
     fn test_is_heic_file_brand_past_window() {
-        // A HEIC brand sitting beyond the 32-byte scan window must not match,
-        // matching mobile's bounded scan. Use non-HEIC major + filler brands
-        // so the only HEIC brand present is the one pushed past offset 32.
+        // A HEIC brand sitting beyond the 32-byte scan window must not match.
+        // Use a non-HEIC major plus filler brands so the only HEIC brand is the
+        // one pushed past offset 32.
         let mut buf = ftyp_box(b"isom", &[b"iso2", b"iso4", b"avc1", b"mp41", b"mp42"]);
         buf.extend_from_slice(b"heic"); // lands at offset 36, past the window
         assert!(!is_heic_file(&buf));

@@ -5,7 +5,6 @@ desktop/src-tauri/target/
 
 # Native non-relay UI builds (not part of the public image)
 desktop/
-mobile/
 
 # Node artifacts (built inside the image; host outputs would invalidate cache)
 node_modules/
@@ -42,13 +41,10 @@ test-results/
 bin/
 sidecars/
 
-# Docs the image doesn't ship. examples/ stays — examples/countdown-bot is
-# a Cargo workspace member, so cargo-chef needs its manifest. Markdown files
-# inside crates (Cargo.toml `readme = ...`) likewise need to be present to
-# avoid manifest warnings; the savings from excluding them are negligible.
+# Docs the image doesn't ship. Markdown files inside crates (Cargo.toml
+# `readme = ...`) still need to be present to avoid manifest warnings; the
+# savings from excluding them are negligible.
 docs/**
-!docs/release/
-!docs/release/THIRD_PARTY_ASSETS.md
 
 # Old Dockerfile noise (this Dockerfile is THE source of truth now)
 docker-compose.yml

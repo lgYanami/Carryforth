@@ -59,7 +59,6 @@ require_literal "- 'scripts/check-project-view-v3-runtime.sh'" .github/workflows
 require_literal "- name: Project View v3-only runtime contract" .github/workflows/ci.yml
 require_literal "run: scripts/check-project-view-v3-runtime.sh" .github/workflows/ci.yml
 require_literal "- 'scripts/meeting-v2-actions-live-acceptance.sh'" .github/workflows/ci.yml
-require_literal "- 'docs/nips/NIP-PV3.md'" .github/workflows/ci.yml
 require_literal "PROJECT_VIEW_PRE_FEATURE_REF: ab3af828714ab699dfc87644d234014987a4fe6b" .github/workflows/ci.yml
 require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-rollback-smoke.sh
 require_literal "Current additive schema with pre-feature Relay smoke" .github/workflows/ci.yml
@@ -68,11 +67,10 @@ require_literal "version = 50 AND success" scripts/test-project-view-rollback-sm
 reject_literal "PROJECT_VIEW_COMPATIBLE_REF" .github/workflows/ci.yml
 reject_literal "test-project-view-compatible-rollback-smoke.sh" .github/workflows/ci.yml
 reject_literal "test-project-view-compatible-rollback-smoke.sh" Justfile
-require_literal "docs/nips/NIP-PV3.md" Justfile
 require_literal "scripts/test-project-view-legacy-v2-to-v3-migration-canary.sh" Justfile
 require_literal "scripts/check-project-view-v3-runtime.sh" Justfile
 require_literal "scripts/meeting-v2-actions-live-acceptance.sh" Justfile
-require_literal "docs/lora/stage/meeting/" Justfile
+require_literal "docs/stage/meeting/" Justfile
 if [[ -e scripts/test-project-view-compatible-rollback-smoke.sh ]]; then
   echo "Project View release contract: retired old-runtime rollback smoke must stay removed" >&2
   exit 1
@@ -117,21 +115,5 @@ if rg -n "BUZZ_PROJECT_VIEW_ENABLED" deploy/local deploy/compose; then
   echo "Project View release contract: do not add a process-local Project View flag" >&2
   exit 1
 fi
-
-# The runbook must retain the source-build boundary and the one-way v3
-# operational safety contract without reviving the retired Helm deployment.
-require_literal "Source-first activation" docs/project-view-operations.md
-require_literal "cargo build --locked -p buzz-relay -p buzz-admin -p carryforth-cli" docs/project-view-operations.md
-require_literal "buzz-admin migrate" docs/project-view-operations.md
-require_literal "buzz-admin project-view status" docs/project-view-operations.md
-require_literal "buzz-admin project-view enable" docs/project-view-operations.md
-require_literal "buzz-admin project-view disable" docs/project-view-operations.md
-require_literal "After any Project View mutation has been accepted" docs/project-view-operations.md
-require_literal "forward-fix the current schema-v3 runtime" docs/project-view-operations.md
-require_literal "buzz-project-view-v3-bootstrap" docs/project-view-operations.md
-require_literal "buzz-admin project-view prepare-v3" docs/project-view-operations.md
-require_literal "cf --format compact project-view init-v3" docs/project-view-operations.md
-require_literal "test-project-view-legacy-v2-to-v3-migration-canary.sh" docs/project-view-operations.md
-require_literal "--for-v3-cutover" docs/project-view-operations.md
 
 echo "Project View release contract passed."

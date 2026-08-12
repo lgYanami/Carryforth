@@ -11391,9 +11391,9 @@ export function maybeInstallE2eTauriMocks() {
         // to in-app activity tracking.
         return null;
       case "get_git_identity":
-        // Matches the "Thomas P" author on a mock snapshot commit so the
+        // Matches the "Taylor E" author on a mock snapshot commit so the
         // viewer-identity avatar attribution is exercised in e2e.
-        return { name: "Thomas P", email: "thomasp@example.com" };
+        return { name: "Taylor E", email: "taylor@example.com" };
       case "get_project_repo_snapshot":
         return {
           latest_commit: {
@@ -11416,8 +11416,8 @@ export function maybeInstallE2eTauriMocks() {
             {
               hash: "123456789abcdef0123456789abcdef012345678",
               short_hash: "1234567",
-              author_name: "Thomas P",
-              author_email: "thomasp@example.com",
+              author_name: "Taylor E",
+              author_email: "taylor@example.com",
               timestamp: Math.floor(Date.now() / 1000) - 1_800,
               subject: "Point project repository details at active branch",
             },
@@ -11446,8 +11446,8 @@ export function maybeInstallE2eTauriMocks() {
               last_commit_at: Math.floor(Date.now() / 1000) - 600,
             },
             {
-              name: "Thomas P",
-              email: "thomasp@example.com",
+              name: "Taylor E",
+              email: "taylor@example.com",
               commit_count: 3,
               last_commit_at: Math.floor(Date.now() / 1000) - 1_800,
             },

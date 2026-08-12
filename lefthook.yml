@@ -1,6 +1,6 @@
 # Glob patterns below mirror the `changes` job's dorny/paths-filter groups in
 # .github/workflows/ci.yml — keep the two in sync. Deliberate deviations:
-# - The `.github/workflows/ci.yml` path CI adds to its `rust`/`mobile` filters
+# - The `.github/workflows/ci.yml` path CI adds to its `rust` filter
 #   is omitted; a CI-workflow-only edit doesn't need a local test run.
 # - `desktop-check`/`desktop-test` don't trigger on `rust` changes, though CI's
 #   Desktop Core job does. Those commands are pure TS (biome + node:test) with
@@ -13,7 +13,7 @@ pre-commit:
   parallel: true
   commands:
     rust-fmt:
-      glob: ["crates/**", "examples/countdown-bot/**"]
+      glob: ["crates/**"]
       run: just fmt
       stage_fixed: true
     desktop-tauri-fmt:
@@ -28,10 +28,6 @@ pre-commit:
     web-fix:
       glob: ["web/**", "pnpm-lock.yaml"]
       run: just web-fix
-      stage_fixed: true
-    mobile-fix:
-      glob: ["mobile/**"]
-      run: just mobile-fix
       stage_fixed: true
     carryforth-product-surface:
       run: ./scripts/check-carryforth-current-product-surface.sh
@@ -60,6 +56,3 @@ pre-push:
       # buzz-sdk, buzz-agent (desktop/src-tauri/Cargo.toml:88-91).
       glob: ["desktop/src-tauri/**", "crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "justfile"]
       run: just desktop-tauri-test
-    mobile-test:
-      glob: ["mobile/**"]
-      run: just mobile-test

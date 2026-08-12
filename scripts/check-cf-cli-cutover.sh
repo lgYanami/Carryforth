@@ -26,8 +26,8 @@ fi
 reject_matches \
   "the retired Cargo package, library, or standalone CLI path is still referenced" \
   '(^|[^[:alnum:]_-])(buzz-cli|buzz_cli|crates/buzz-cli)([^[:alnum:]_-]|$)|target/(debug|release|ci)/buzz([^[:alnum:]_-]|$)' \
-  Cargo.toml Cargo.lock Justfile .github/workflows scripts crates desktop benchmarks AGENTS.md README.md TESTING.md \
-  --glob '!scripts/check-cf-cli-cutover.sh' --glob '!docs/lora/**' \
+  Cargo.toml Cargo.lock Justfile .github/workflows scripts crates desktop AGENTS.md README.md TESTING.md \
+  --glob '!scripts/check-cf-cli-cutover.sh' --glob '!docs/**' \
   --glob '!desktop/src-tauri/src/managed_agents/nest.rs' \
   --glob '!desktop/src-tauri/src/managed_agents/nest/tests.rs' \
   --glob '!**/target/**' --glob '!desktop/node_modules/**'
@@ -35,8 +35,7 @@ reject_matches \
 reject_matches \
   "the Carryforth CLI still reads a retired BUZZ_* public identity variable" \
   'BUZZ_(RELAY_URL|PRIVATE_KEY|AUTH_TAG|CONNECT_TIMEOUT_SECS|TIMEOUT_SECS|CLI_TEST_DURATION_SECS)' \
-  crates/carryforth-cli \
-  benchmarks/harbor-buzz-orchestra/testbed/src/harbor_buzz_testbed/cf_cli.py
+  crates/carryforth-cli
 
 reject_matches \
   "Desktop still packages the retired buzz CLI sidecar" \
@@ -52,7 +51,7 @@ reject_matches \
   "a current Human/Agent-facing surface still emits an actionable buzz CLI command" \
   '(?<![-[:alnum:]_])buzz[[:space:]]+(messages|channels|dms|reactions|canvas|feed|users|workflows|social|repos|upload|mem|notes|patches|pr|issues|emoji|pack|agents|project-view|project-context|documents|roles|resources|meetings|moderation)([^-[:alnum:]_]|$)' \
   crates/buzz-acp/src crates/buzz-agent/src crates/buzz-dev-mcp/src crates/buzz-sdk/src \
-  crates/carryforth-cli desktop/src desktop/src-tauri/src scripts benchmarks \
+  crates/carryforth-cli desktop/src desktop/src-tauri/src scripts \
   AGENTS.md README.md TESTING.md \
   --glob '!**/target/**' --glob '!desktop/node_modules/**'
 

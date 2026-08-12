@@ -210,41 +210,40 @@ fn deleted_binding_bundle_is_strict() {
 fn v2_meeting_fixtures_are_normative_and_production_parseable() {
     let relay = keys(1).public_key();
     let command_attach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/command-attach.json"
+        "fixtures/project-context-edge-v2/events/command-attach.json"
     ))
     .expect("v2 attach event fixture");
     let binding_active: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/binding-active.json"
+        "fixtures/project-context-edge-v2/events/binding-active.json"
     ))
     .expect("v2 active binding fixture");
     let meta_incremental: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-incremental.json"
+        "fixtures/project-context-edge-v2/events/meta-incremental.json"
     ))
     .expect("v2 incremental metadata fixture");
     let command_detach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/command-detach.json"
+        "fixtures/project-context-edge-v2/events/command-detach.json"
     ))
     .expect("v2 detach event fixture");
     let binding_deleted: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/binding-deleted.json"
+        "fixtures/project-context-edge-v2/events/binding-deleted.json"
     ))
     .expect("v2 deleted binding fixture");
     let meta_detach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-detach.json"
+        "fixtures/project-context-edge-v2/events/meta-detach.json"
     ))
     .expect("v2 detach metadata fixture");
     let meta_reset: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset.json"
+        "fixtures/project-context-edge-v2/events/meta-reset.json"
     ))
     .expect("v2 reset metadata fixture");
     let meta_reset_reproject: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
+        "fixtures/project-context-edge-v2/events/meta-reset-reproject.json"
     ))
     .expect("v2 reproject metadata fixture");
-    let golden: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v2/golden.json"
-    ))
-    .expect("v2 golden manifest");
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/project-context-edge-v2/golden.json"))
+            .expect("v2 golden manifest");
 
     let attach = parse_project_context_command(&command_attach, project_id())
         .expect("parse v2 Meeting attach");
@@ -280,17 +279,13 @@ fn v2_meeting_fixtures_are_normative_and_production_parseable() {
             .reset
     );
 
-    let raw_attach =
-        include_str!("../../../docs/nips/fixtures/project-context-edge-v2/commands/attach.json")
-            .trim();
+    let raw_attach = include_str!("fixtures/project-context-edge-v2/commands/attach.json").trim();
     assert_eq!(
         serde_json::to_string(&ProjectContextCommand::from_json(raw_attach).expect("v2 attach"))
             .expect("serialize v2 attach"),
         raw_attach
     );
-    let receipt_raw =
-        include_str!("../../../docs/nips/fixtures/project-context-edge-v2/receipt-detach.json")
-            .trim();
+    let receipt_raw = include_str!("fixtures/project-context-edge-v2/receipt-detach.json").trim();
     let receipt: ProjectContextReceipt =
         serde_json::from_str(receipt_raw).expect("v2 receipt fixture");
     receipt.validate().expect("validate v2 receipt");
@@ -314,41 +309,40 @@ fn v2_meeting_fixtures_are_normative_and_production_parseable() {
 fn legacy_v1_fixtures_are_migration_only_and_rejected_by_v2_runtime_parsers() {
     let relay = keys(1).public_key();
     let command_attach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/command-attach.json"
+        "fixtures/project-context-edge-v1/events/command-attach.json"
     ))
     .expect("command fixture");
     let binding_active: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/binding-active.json"
+        "fixtures/project-context-edge-v1/events/binding-active.json"
     ))
     .expect("binding fixture");
     let meta_incremental: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/meta-incremental.json"
+        "fixtures/project-context-edge-v1/events/meta-incremental.json"
     ))
     .expect("meta fixture");
     let command_detach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/command-detach.json"
+        "fixtures/project-context-edge-v1/events/command-detach.json"
     ))
     .expect("detach command fixture");
     let binding_deleted: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/binding-deleted.json"
+        "fixtures/project-context-edge-v1/events/binding-deleted.json"
     ))
     .expect("deleted binding fixture");
     let meta_detach: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/meta-detach.json"
+        "fixtures/project-context-edge-v1/events/meta-detach.json"
     ))
     .expect("detach meta fixture");
     let meta_reset: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/meta-reset.json"
+        "fixtures/project-context-edge-v1/events/meta-reset.json"
     ))
     .expect("reset meta fixture");
     let meta_reset_reproject: Event = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/events/meta-reset-reproject.json"
+        "fixtures/project-context-edge-v1/events/meta-reset-reproject.json"
     ))
     .expect("reproject reset meta fixture");
-    let golden: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/nips/fixtures/project-context-edge-v1/golden.json"
-    ))
-    .expect("golden manifest");
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/project-context-edge-v1/golden.json"))
+            .expect("golden manifest");
 
     assert!(parse_project_context_command(&command_attach, project_id()).is_err());
     assert!(parse_project_context_command(&command_detach, project_id()).is_err());
@@ -401,22 +395,16 @@ fn legacy_v1_fixtures_are_migration_only_and_rejected_by_v2_runtime_parsers() {
         assert_eq!(golden[field], event.id.to_hex(), "golden field {field}");
     }
 
-    let attach_raw =
-        include_str!("../../../docs/nips/fixtures/project-context-edge-v1/commands/attach.json")
-            .trim();
+    let attach_raw = include_str!("fixtures/project-context-edge-v1/commands/attach.json").trim();
     let attach: serde_json::Value = serde_json::from_str(attach_raw).expect("raw attach fixture");
     assert_eq!(attach["schema_version"], 1);
     assert!(ProjectContextCommand::from_json(attach_raw).is_err());
-    let detach_raw =
-        include_str!("../../../docs/nips/fixtures/project-context-edge-v1/commands/detach.json")
-            .trim();
+    let detach_raw = include_str!("fixtures/project-context-edge-v1/commands/detach.json").trim();
     let detach: serde_json::Value = serde_json::from_str(detach_raw).expect("raw detach fixture");
     assert_eq!(detach["schema_version"], 1);
     assert!(ProjectContextCommand::from_json(detach_raw).is_err());
 
-    let receipt_raw =
-        include_str!("../../../docs/nips/fixtures/project-context-edge-v1/receipt-detach.json")
-            .trim();
+    let receipt_raw = include_str!("fixtures/project-context-edge-v1/receipt-detach.json").trim();
     let receipt: ProjectContextReceipt =
         serde_json::from_str(receipt_raw).expect("receipt fixture");
     assert!(receipt.validate().is_err());

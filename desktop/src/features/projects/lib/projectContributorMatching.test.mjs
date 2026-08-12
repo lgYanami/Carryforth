@@ -16,9 +16,9 @@ const PROFILES = {
     isAgent: true,
   },
   [USER_PUBKEY]: {
-    displayName: "Thomas P",
-    avatarUrl: "https://example.com/thomas.png",
-    nip05Handle: "thomasp@example.com",
+    displayName: "Taylor E",
+    avatarUrl: "https://example.com/taylor.png",
+    nip05Handle: "taylor@example.com",
   },
 };
 
@@ -26,8 +26,8 @@ function makeCommit(overrides = {}) {
   return {
     hash: "fed2b2c993896352400f3d8c574fa31a84188f18",
     shortHash: "fed2b2c",
-    authorName: "Thomas Petersen",
-    authorEmail: "thomasp@squareup.com",
+    authorName: "Taylor Example",
+    authorEmail: "taylor@studio.example",
     timestamp: 1_700_000_000,
     subject: "Add simple score HUD",
     ...overrides,
@@ -73,7 +73,7 @@ test("profileForCommit prefers the signed PR-event mapping", () => {
 
 test("profileForCommit falls back to exact git author matching", () => {
   // No mapping entry — the git author email matches the user's NIP-05.
-  const commit = makeCommit({ authorEmail: "thomasp@example.com" });
+  const commit = makeCommit({ authorEmail: "taylor@example.com" });
   const matched = profileForCommit(commit, PROFILES, new Map());
   assert.equal(matched?.pubkey, USER_PUBKEY);
 });
@@ -84,23 +84,23 @@ test("profileForCommit returns null when nothing matches", () => {
 });
 
 test("mapped pubkey without a fetched profile falls back to git author", () => {
-  const commit = makeCommit({ authorEmail: "thomasp@example.com" });
+  const commit = makeCommit({ authorEmail: "taylor@example.com" });
   const map = new Map([[commit.hash, "f".repeat(64)]]);
   const matched = profileForCommit(commit, PROFILES, map);
   assert.equal(matched?.pubkey, USER_PUBKEY);
 });
 
 test("viewer git identity attributes their own commits", () => {
-  // Git author "Thomas Petersen <thomasp@squareup.com>" matches no profile
+  // Git author "Taylor Example <taylor@studio.example>" matches no profile
   // field, but it is the viewer's own git config identity.
   const commit = makeCommit();
   const matched = profileForCommit(commit, PROFILES, new Map(), {
     pubkey: USER_PUBKEY,
-    name: "Thomas Petersen",
-    email: "thomasp@squareup.com",
+    name: "Taylor Example",
+    email: "taylor@studio.example",
   });
   assert.equal(matched?.pubkey, USER_PUBKEY);
-  assert.equal(matched?.profile.displayName, "Thomas P");
+  assert.equal(matched?.profile.displayName, "Taylor E");
 });
 
 test("viewer git identity does not claim other authors' commits", () => {
@@ -110,8 +110,8 @@ test("viewer git identity does not claim other authors' commits", () => {
   });
   const matched = profileForCommit(commit, PROFILES, new Map(), {
     pubkey: USER_PUBKEY,
-    name: "Thomas Petersen",
-    email: "thomasp@squareup.com",
+    name: "Taylor Example",
+    email: "taylor@studio.example",
   });
   assert.equal(matched, null);
 });
@@ -121,8 +121,8 @@ test("signed PR mapping wins over the viewer git identity", () => {
   const map = new Map([[commit.hash, AGENT_PUBKEY]]);
   const matched = profileForCommit(commit, PROFILES, map, {
     pubkey: USER_PUBKEY,
-    name: "Thomas Petersen",
-    email: "thomasp@squareup.com",
+    name: "Taylor Example",
+    email: "taylor@studio.example",
   });
   assert.equal(matched?.pubkey, AGENT_PUBKEY);
 });

@@ -99,19 +99,19 @@ async fn spawn_verified_read_server(state: VerifiedReadState) -> String {
 fn projection_fixture(path: &str) -> Event {
     let content = match path {
         "meta" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/meta-incremental.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/meta-incremental.json"
         ),
         "head" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/head-active.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/head-active.json"
         ),
         "revision" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/revision-active.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/revision-active.json"
         ),
         "tombstone" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/events/revision-tombstone.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/events/revision-tombstone.json"
         ),
         "wrong_signer" => include_str!(
-            "../../../../docs/nips/fixtures/project-document-v1/invalid/wrong-signer.json"
+            "../../../../crates/buzz-sdk/tests/fixtures/project-document-v1/invalid/wrong-signer.json"
         ),
         _ => panic!("unknown projection fixture"),
     };
