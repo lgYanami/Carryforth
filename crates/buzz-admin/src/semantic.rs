@@ -14,6 +14,7 @@ use buzz_db::semantic_fleet::WriteSemanticGraphHttpFleetAttestation;
 use buzz_semantic::{SemanticEncoder, SemanticModelContract, OVERVIEW_EXTRACTOR_VERSION};
 use buzz_semantic_query::{
     semantic_graph_http_runtime_digest, SemanticGraphHttpFleetInventory,
+    SemanticGraphQueryEnableRequirement, SemanticGraphQueryFleetPolicy,
     MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES,
 };
 
@@ -43,7 +44,11 @@ pub enum SemanticCommand {
     /// Disable worker/provider/query eligibility while currentness capture continues.
     Disable,
     /// Inspect database/runtime prerequisites for the graph-query gate.
-    QueryReadiness,
+    QueryReadiness {
+        /// Observe the live Relay through its loopback-only `/_status` endpoint.
+        #[arg(long)]
+        relay_status_url: Option<url::Url>,
+    },
     /// Invalidate historical zero-vector heads in the active generation and
     /// idempotently schedule their exact current source epochs for rebuild.
     RepairQueryVectors,
@@ -161,7 +166,9 @@ pub async fn run(command: SemanticCommand) -> Result<i32> {
         } => generation_create(generation_id, fake_dimensions, volcengine).await,
         SemanticCommand::Enable => set_enabled(true).await,
         SemanticCommand::Disable => set_enabled(false).await,
-        SemanticCommand::QueryReadiness => query_readiness().await,
+        SemanticCommand::QueryReadiness { relay_status_url } => {
+            query_readiness(relay_status_url.as_ref()).await
+        }
         SemanticCommand::RepairQueryVectors => repair_query_vectors().await,
         SemanticCommand::QueryEnable {
             acknowledge_problem_egress,
@@ -313,26 +320,249 @@ async fn set_enabled(enabled: bool) -> Result<i32> {
     Ok(0)
 }
 
-async fn query_readiness() -> Result<i32> {
+#[derive(Debug)]
+struct QueryHttpRuntimeObservation {
+    source: &'static str,
+    endpoint: Option<String>,
+    live_relay_observed: bool,
+    deployment_master: bool,
+    fleet_policy: SemanticGraphQueryFleetPolicy,
+    deployment_id: Option<String>,
+    instance_id: Option<String>,
+    runtime_digest: String,
+    parser_ready: Option<bool>,
+    handler_ready: Option<bool>,
+    relay_reported_fleet_attestation_status: Option<String>,
+}
+
+const MAX_RELAY_STATUS_BYTES: usize = 64 * 1024;
+
+fn query_http_runtime_from_environment() -> Result<QueryHttpRuntimeObservation> {
+    Ok(QueryHttpRuntimeObservation {
+        source: "admin_process_environment",
+        endpoint: None,
+        live_relay_observed: false,
+        deployment_master: query_http_deployment_master()?,
+        fleet_policy: query_http_fleet_policy()?,
+        deployment_id: optional_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")?,
+        instance_id: optional_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?,
+        runtime_digest: semantic_graph_http_runtime_digest()?.to_hex(),
+        parser_ready: None,
+        handler_ready: None,
+        relay_reported_fleet_attestation_status: None,
+    })
+}
+
+async fn observe_live_query_http_runtime(
+    relay_status_url: &url::Url,
+) -> Result<QueryHttpRuntimeObservation> {
+    validate_relay_status_url(relay_status_url)?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build isolated Relay status client")?;
+    let mut response = client
+        .get(relay_status_url.clone())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .with_context(|| format!("read live Relay status from {relay_status_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "live Relay status endpoint returned non-success HTTP {}",
+            response.status()
+        );
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELAY_STATUS_BYTES as u64)
+    {
+        anyhow::bail!("live Relay status response exceeds {MAX_RELAY_STATUS_BYTES} bytes");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("read live Relay status response body")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RELAY_STATUS_BYTES {
+            anyhow::bail!("live Relay status response exceeds {MAX_RELAY_STATUS_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).context("decode live Relay status JSON")?;
+    parse_live_query_http_runtime(relay_status_url, &value)
+}
+
+fn validate_relay_status_url(relay_status_url: &url::Url) -> Result<()> {
+    if !matches!(relay_status_url.scheme(), "http" | "https") {
+        anyhow::bail!("--relay-status-url must use http or https");
+    }
+    if !relay_status_url.username().is_empty() || relay_status_url.password().is_some() {
+        anyhow::bail!("--relay-status-url must not contain credentials");
+    }
+    if relay_status_url.query().is_some() || relay_status_url.fragment().is_some() {
+        anyhow::bail!("--relay-status-url must not contain a query or fragment");
+    }
+    if relay_status_url.path() != "/_status" {
+        anyhow::bail!("--relay-status-url path must be exactly /_status");
+    }
+    let loopback = match relay_status_url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    if !loopback {
+        anyhow::bail!("--relay-status-url host must be a literal loopback IP address");
+    }
+    Ok(())
+}
+
+fn parse_live_query_http_runtime(
+    relay_status_url: &url::Url,
+    status: &serde_json::Value,
+) -> Result<QueryHttpRuntimeObservation> {
+    let root = status
+        .as_object()
+        .context("live Relay status must be a JSON object")?;
+    if root.get("service").and_then(serde_json::Value::as_str) != Some("buzz-relay") {
+        anyhow::bail!("live Relay status has an unexpected service identity");
+    }
+    let runtime = root
+        .get("semantic_graph_query_http")
+        .and_then(serde_json::Value::as_object)
+        .context("live Relay status is missing semantic_graph_query_http")?;
+    let deployment_master = required_status_bool(runtime, "deployment_master")?;
+    let parser_ready = required_status_bool(runtime, "parser_ready")?;
+    let handler_ready = required_status_bool(runtime, "handler_ready")?;
+    let fleet_policy: SemanticGraphQueryFleetPolicy =
+        required_status_string(runtime, "fleet_policy")?
+            .parse()
+            .context("live Relay status has an invalid fleet_policy")?;
+    let fleet_attestation_required = required_status_bool(runtime, "fleet_attestation_required")?;
+    if fleet_attestation_required != (fleet_policy == SemanticGraphQueryFleetPolicy::AttestedFleet)
+    {
+        anyhow::bail!("live Relay status fleet_attestation_required conflicts with fleet_policy");
+    }
+    let relay_reported_fleet_attestation_status =
+        required_status_string(runtime, "fleet_attestation_status")?.to_owned();
+    let expected_reported_status = match fleet_policy {
+        SemanticGraphQueryFleetPolicy::TrustedSingleRelay => "not_required",
+        SemanticGraphQueryFleetPolicy::AttestedFleet => "community_scoped_not_evaluated",
+    };
+    if relay_reported_fleet_attestation_status != expected_reported_status {
+        anyhow::bail!("live Relay status has an inconsistent fleet_attestation_status");
+    }
+    let deployment_id = optional_status_identity(runtime, "deployment_id")?;
+    let instance_id = optional_status_identity(runtime, "instance_id")?;
+    if fleet_policy == SemanticGraphQueryFleetPolicy::AttestedFleet
+        && deployment_master
+        && (deployment_id.is_none() || instance_id.is_none())
+    {
+        anyhow::bail!("live attested-fleet Relay status is missing its deployment identity");
+    }
+    let runtime_digest = required_status_string(runtime, "runtime_digest")?.to_owned();
+    let compiled_runtime_digest = semantic_graph_http_runtime_digest()?.to_hex();
+    if runtime_digest != compiled_runtime_digest {
+        anyhow::bail!(
+            "live Relay semantic HTTP runtime digest does not match this buzz-admin binary"
+        );
+    }
+    Ok(QueryHttpRuntimeObservation {
+        source: "live_relay_status",
+        endpoint: Some(relay_status_url.as_str().to_owned()),
+        live_relay_observed: true,
+        deployment_master,
+        fleet_policy,
+        deployment_id,
+        instance_id,
+        runtime_digest,
+        parser_ready: Some(parser_ready),
+        handler_ready: Some(handler_ready),
+        relay_reported_fleet_attestation_status: Some(relay_reported_fleet_attestation_status),
+    })
+}
+
+fn required_status_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<bool> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .with_context(|| format!("live Relay status field {field} must be a boolean"))
+}
+
+fn required_status_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("live Relay status field {field} must be a string"))
+}
+
+fn optional_status_identity(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<String>> {
+    match object.get(field) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(serde_json::Value::String(value)) => validate_query_identity(field, value).map(Some),
+        Some(_) => anyhow::bail!("live Relay status field {field} must be a string or null"),
+    }
+}
+
+async fn query_readiness(relay_status_url: Option<&url::Url>) -> Result<i32> {
+    let runtime = match relay_status_url {
+        Some(url) => observe_live_query_http_runtime(url).await?,
+        None => {
+            eprintln!(
+                "warning: semantic HTTP runtime fields come from the buzz-admin process environment, not a live Relay; pass --relay-status-url http://127.0.0.1:8080/_status to observe one"
+            );
+            query_http_runtime_from_environment()?
+        }
+    };
     let (db, tenant) = tenant_db().await?;
     let report = db
         .semantic_graph_query_readiness(tenant.community())
         .await?;
-    let deployment_master = query_http_deployment_master()?;
-    let deployment_id = query_http_deployment_id().ok();
-    let instance_id = query_http_instance_id();
-    let fleet = match deployment_id.as_deref() {
-        Some(deployment_id) => Some(
+    let fleet = match (runtime.fleet_policy, runtime.deployment_id.as_deref()) {
+        (SemanticGraphQueryFleetPolicy::AttestedFleet, Some(deployment_id)) => Some(
             db.semantic_graph_http_fleet_readiness(
                 tenant.community(),
                 deployment_id,
-                instance_id.as_deref(),
+                runtime.instance_id.as_deref(),
             )
             .await?,
         ),
-        None => None,
+        _ => None,
     };
     let fleet_ready = fleet.as_ref().is_some_and(|readiness| readiness.ready());
+    let fleet_required = runtime.fleet_policy == SemanticGraphQueryFleetPolicy::AttestedFleet;
+    let fleet_status = if !fleet_required {
+        "not_required"
+    } else if fleet_ready {
+        "ready"
+    } else {
+        fleet
+            .as_ref()
+            .and_then(|readiness| readiness.failure)
+            .map_or("deployment_identity_missing", |failure| failure.code())
+    };
+    let routing_ready = !fleet_required || fleet_ready;
+    let http_runtime_ready = runtime.live_relay_observed.then_some(
+        runtime.deployment_master
+            && runtime.parser_ready == Some(true)
+            && runtime.handler_ready == Some(true),
+    );
+    let admin_process_configuration_ready = (!runtime.live_relay_observed)
+        .then_some(report.database_ready() && runtime.deployment_master && routing_ready);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -346,10 +576,24 @@ async fn query_readiness() -> Result<i32> {
             "non_queryable_current_heads": report.non_queryable_current_heads,
             "persisted_virtual_events": report.persisted_virtual_events,
             "database_ready": report.database_ready(),
-            "http_deployment_master": deployment_master,
-            "http_deployment_id": deployment_id,
+            "http_runtime_source": runtime.source,
+            "http_runtime_endpoint": runtime.endpoint.as_deref(),
+            "live_relay_observed": runtime.live_relay_observed,
+            "http_deployment_master": runtime.deployment_master,
+            "http_deployment_id": runtime.deployment_id.as_deref(),
+            "http_instance_id": runtime.instance_id.as_deref(),
+            "http_runtime_digest": &runtime.runtime_digest,
             "compiled_http_runtime_digest": semantic_graph_http_runtime_digest()?,
-            "fleet_attestation_ready": fleet_ready,
+            "http_parser_ready": runtime.parser_ready,
+            "http_handler_ready": runtime.handler_ready,
+            "http_runtime_ready": http_runtime_ready,
+            "relay_reported_fleet_attestation_status": runtime
+                .relay_reported_fleet_attestation_status
+                .as_deref(),
+            "fleet_policy": runtime.fleet_policy,
+            "fleet_attestation_required": fleet_required,
+            "fleet_attestation_status": fleet_status,
+            "fleet_attestation_ready": if fleet_required { Some(fleet_ready) } else { None },
             "fleet_attestation_failure": fleet.as_ref()
                 .and_then(|readiness| readiness.failure)
                 .map(|failure| failure.code()),
@@ -359,7 +603,11 @@ async fn query_readiness() -> Result<i32> {
             "fleet_attestation_expires_at": fleet.as_ref()
                 .and_then(|readiness| readiness.attestation.as_ref())
                 .map(|attestation| attestation.expires_at),
-            "base_enable_ready": report.database_ready() && deployment_master && fleet_ready,
+            "database_and_policy_ready": report.database_ready() && routing_ready,
+            "admin_process_configuration_ready": admin_process_configuration_ready,
+            "community_binding_verified": false,
+            "base_enable_ready_scope": "unbound_diagnostic_components",
+            "base_enable_ready": serde_json::Value::Null,
         }))?
     );
     Ok(0)
@@ -400,17 +648,8 @@ async fn query_enable(acknowledge_problem_egress: bool) -> Result<i32> {
             "semantic query-enable requires BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true"
         );
     }
+    let fleet_policy = query_http_fleet_policy()?;
     let (db, tenant) = tenant_db().await?;
-    let deployment_id = query_http_deployment_id()?;
-    let fleet = db
-        .semantic_graph_http_fleet_readiness(tenant.community(), &deployment_id, None)
-        .await?;
-    if let Some(failure) = fleet.failure {
-        anyhow::bail!(
-            "semantic query-enable requires a current homogeneous HTTP fleet attestation: {}",
-            failure.code()
-        );
-    }
     let report = db
         .semantic_graph_query_readiness(tenant.community())
         .await?;
@@ -419,7 +658,48 @@ async fn query_enable(acknowledge_problem_egress: bool) -> Result<i32> {
             "semantic query-enable database prerequisites are not ready; run semantic query-readiness"
         );
     }
-    db.enable_semantic_graph_query_with_http_fleet(tenant.community(), &deployment_id)
+    let (requirement, fleet_attestation_id) = match fleet_policy {
+        SemanticGraphQueryFleetPolicy::TrustedSingleRelay => (
+            SemanticGraphQueryEnableRequirement::TrustedSingleRelay,
+            None::<Uuid>,
+        ),
+        SemanticGraphQueryFleetPolicy::AttestedFleet => {
+            let deployment_id = query_http_deployment_id()?;
+            let fleet = db
+                .semantic_graph_http_fleet_readiness(tenant.community(), &deployment_id, None)
+                .await?;
+            if let Some(failure) = fleet.failure {
+                anyhow::bail!(
+                    "semantic query-enable requires a current homogeneous HTTP fleet attestation: {}",
+                    failure.code()
+                );
+            }
+            let attestation_id = fleet.attestation.as_ref().map(|value| value.attestation_id);
+            // The database method repeats the Fleet check while holding the
+            // Community and assertion locks. This read is diagnostic only.
+            db.enable_semantic_graph_query(
+                tenant.community(),
+                SemanticGraphQueryEnableRequirement::AttestedFleet {
+                    deployment_id: &deployment_id,
+                },
+            )
+            .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "community_id": tenant.community().as_uuid(),
+                    "query_enabled": true,
+                    "problem_egress_acknowledged": true,
+                    "fleet_policy": fleet_policy,
+                    "fleet_attestation_required": true,
+                    "fleet_attestation_status": "ready",
+                    "fleet_attestation_id": attestation_id,
+                }))?
+            );
+            return Ok(0);
+        }
+    };
+    db.enable_semantic_graph_query(tenant.community(), requirement)
         .await?;
     println!(
         "{}",
@@ -427,7 +707,10 @@ async fn query_enable(acknowledge_problem_egress: bool) -> Result<i32> {
             "community_id": tenant.community().as_uuid(),
             "query_enabled": true,
             "problem_egress_acknowledged": true,
-            "fleet_attestation_id": fleet.attestation.map(|value| value.attestation_id),
+            "fleet_policy": fleet_policy,
+            "fleet_attestation_required": false,
+            "fleet_attestation_status": "not_required",
+            "fleet_attestation_id": fleet_attestation_id,
         }))?
     );
     Ok(0)
@@ -454,6 +737,7 @@ async fn fleet_attest(
     acknowledge_current_routing_inventory: bool,
     attested_by: &str,
 ) -> Result<i32> {
+    require_attested_fleet_policy("fleet-attest")?;
     if !acknowledge_current_routing_inventory {
         anyhow::bail!("semantic fleet-attest requires --acknowledge-current-routing-inventory");
     }
@@ -502,6 +786,7 @@ async fn fleet_attest(
 }
 
 async fn fleet_revoke(revoked_by: &str) -> Result<i32> {
+    require_attested_fleet_policy("fleet-revoke")?;
     let (db, tenant) = tenant_db().await?;
     let revoked = db
         .revoke_semantic_graph_http_fleet_attestation(tenant.community(), revoked_by)
@@ -518,8 +803,22 @@ async fn fleet_revoke(revoked_by: &str) -> Result<i32> {
 }
 
 async fn fleet_check() -> Result<i32> {
+    let fleet_policy = query_http_fleet_policy()?;
+    if fleet_policy == SemanticGraphQueryFleetPolicy::TrustedSingleRelay {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "transport": "http",
+                "fleet_policy": fleet_policy,
+                "applicable": false,
+                "fleet_attestation_required": false,
+                "status": "not_required",
+            }))?
+        );
+        return Ok(0);
+    }
     let deployment_id = query_http_deployment_id()?;
-    let instance_id = query_http_instance_id();
+    let instance_id = query_http_instance_id()?;
     let (db, tenant) = tenant_db().await?;
     let readiness = db
         .semantic_graph_http_fleet_readiness(
@@ -533,6 +832,10 @@ async fn fleet_check() -> Result<i32> {
         serde_json::to_string_pretty(&json!({
             "community_id": tenant.community().as_uuid(),
             "transport": "http",
+            "fleet_policy": fleet_policy,
+            "applicable": true,
+            "fleet_attestation_required": true,
+            "status": if readiness.ready() { "ready" } else { "not_ready" },
             "deployment_id": deployment_id,
             "instance_id": instance_id,
             "compiled_runtime_digest": semantic_graph_http_runtime_digest()?,
@@ -551,6 +854,23 @@ async fn fleet_check() -> Result<i32> {
     Ok(if readiness.ready() { 0 } else { 1 })
 }
 
+fn require_attested_fleet_policy(command: &str) -> Result<()> {
+    if query_http_fleet_policy()? == SemanticGraphQueryFleetPolicy::TrustedSingleRelay {
+        anyhow::bail!(
+            "semantic {command} is not applicable when BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay; use semantic query-disable as the egress kill switch"
+        );
+    }
+    Ok(())
+}
+
+fn query_http_fleet_policy() -> Result<SemanticGraphQueryFleetPolicy> {
+    match std::env::var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY") {
+        Ok(value) => value.trim().parse().map_err(Into::into),
+        Err(std::env::VarError::NotPresent) => Ok(SemanticGraphQueryFleetPolicy::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn query_http_deployment_master() -> Result<bool> {
     match std::env::var("BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE") {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
@@ -567,16 +887,26 @@ fn query_http_deployment_id() -> Result<String> {
     required_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")
 }
 
-fn query_http_instance_id() -> Option<String> {
-    std::env::var("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+fn query_http_instance_id() -> Result<Option<String>> {
+    optional_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")
 }
 
 fn required_query_identity(name: &'static str) -> Result<String> {
     let value = std::env::var(name)
         .with_context(|| format!("{name} is required for semantic HTTP fleet operations"))?;
+    validate_query_identity(name, &value)
+}
+
+fn optional_query_identity(name: &'static str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => validate_query_identity(name, &value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_query_identity(name: &str, value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 128
@@ -816,7 +1146,210 @@ async fn preflight() -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::SemanticCommand;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
+    };
+
+    use super::{
+        observe_live_query_http_runtime, parse_live_query_http_runtime, validate_relay_status_url,
+        SemanticCommand, MAX_RELAY_STATUS_BYTES,
+    };
+
+    async fn read_request_headers(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                .await
+                .expect("status request headers arrive before timeout")
+                .expect("read status request headers");
+            assert_ne!(read, 0, "status request ended before its headers");
+            request.extend_from_slice(&buffer[..read]);
+            assert!(
+                request.len() <= 16 * 1024,
+                "status request headers are bounded"
+            );
+        }
+        assert!(
+            request.starts_with(b"GET /_status HTTP/1.1\r\n"),
+            "diagnostic client requests only the exact status path"
+        );
+    }
+
+    async fn spawn_status_response(response: Vec<u8>) -> (url::Url, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind temporary status server");
+        let address = listener.local_addr().expect("temporary server address");
+        let url = url::Url::parse(&format!("http://{address}/_status"))
+            .expect("temporary loopback status URL");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept status request");
+            read_request_headers(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("write status response");
+            stream.shutdown().await.expect("close status response");
+        });
+        (url, server)
+    }
+
+    fn fixed_length_response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn valid_live_status_body() -> Vec<u8> {
+        let digest = buzz_semantic_query::semantic_graph_http_runtime_digest()
+            .expect("runtime digest")
+            .to_hex();
+        serde_json::to_vec(&json!({
+            "service": "buzz-relay",
+            "semantic_graph_query_http": {
+                "runtime_digest": digest,
+                "parser_ready": true,
+                "handler_ready": true,
+                "deployment_master": true,
+                "fleet_policy": "trusted-single-relay",
+                "fleet_attestation_required": false,
+                "fleet_attestation_status": "not_required",
+                "deployment_id": null,
+                "instance_id": null
+            }
+        }))
+        .expect("encode valid live status")
+    }
+
+    fn assert_error_contains<T>(result: anyhow::Result<T>, expected: &str) {
+        let error = result.err().expect("operation must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(expected),
+            "expected error containing {expected:?}, got {message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_accepts_a_valid_bounded_success_response() {
+        let body = valid_live_status_body();
+        let response = fixed_length_response("200 OK", "", &body);
+        let (url, server) = spawn_status_response(response).await;
+
+        let observation = observe_live_query_http_runtime(&url)
+            .await
+            .expect("observe valid live Relay status");
+        server.await.expect("temporary status server completes");
+
+        assert_eq!(observation.source, "live_relay_status");
+        assert_eq!(observation.endpoint.as_deref(), Some(url.as_str()));
+        assert!(observation.live_relay_observed);
+        assert!(observation.deployment_master);
+        assert_eq!(observation.fleet_policy.to_string(), "trusted-single-relay");
+        assert_eq!(observation.parser_ready, Some(true));
+        assert_eq!(observation.handler_ready, Some(true));
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_rejects_non_success_status_before_parsing() {
+        let response = fixed_length_response("503 Service Unavailable", "", b"not JSON");
+        let (url, server) = spawn_status_response(response).await;
+
+        let result = observe_live_query_http_runtime(&url).await;
+        server.await.expect("temporary status server completes");
+
+        assert_error_contains(result, "non-success HTTP 503 Service Unavailable");
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_does_not_follow_redirects() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind temporary redirect server");
+        let address = listener.local_addr().expect("temporary redirect address");
+        let url = url::Url::parse(&format!("http://{address}/_status"))
+            .expect("temporary loopback redirect URL");
+        let location = url.as_str().to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept initial request");
+            read_request_headers(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nConnection: close\r\nContent-Length: 0\r\nLocation: {location}\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write redirect response");
+            stream.shutdown().await.expect("close redirect response");
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let result = observe_live_query_http_runtime(&url).await;
+        let followed = server.await.expect("temporary redirect server completes");
+
+        assert_error_contains(result, "non-success HTTP 302 Found");
+        assert!(
+            !followed,
+            "isolated status client must not follow redirects"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_rejects_oversized_declared_content_length() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            MAX_RELAY_STATUS_BYTES + 1
+        )
+        .into_bytes();
+        let (url, server) = spawn_status_response(response).await;
+
+        let result = observe_live_query_http_runtime(&url).await;
+        server.await.expect("temporary status server completes");
+
+        assert_error_contains(result, &format!("exceeds {MAX_RELAY_STATUS_BYTES} bytes"));
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_rejects_oversized_chunked_stream() {
+        let first_chunk_len = MAX_RELAY_STATUS_BYTES / 2;
+        let second_chunk_len = MAX_RELAY_STATUS_BYTES - first_chunk_len + 1;
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk_len in [first_chunk_len, second_chunk_len] {
+            response.extend_from_slice(format!("{chunk_len:x}\r\n").as_bytes());
+            response.extend(std::iter::repeat_n(b' ', chunk_len));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let (url, server) = spawn_status_response(response).await;
+
+        let result = observe_live_query_http_runtime(&url).await;
+        server.await.expect("temporary status server completes");
+
+        assert_error_contains(result, &format!("exceeds {MAX_RELAY_STATUS_BYTES} bytes"));
+    }
+
+    #[tokio::test]
+    async fn live_relay_observation_rejects_malformed_json() {
+        let response = fixed_length_response("200 OK", "", b"{ definitely-not-json }");
+        let (url, server) = spawn_status_response(response).await;
+
+        let result = observe_live_query_http_runtime(&url).await;
+        server.await.expect("temporary status server completes");
+
+        assert_error_contains(result, "decode live Relay status JSON");
+    }
 
     #[test]
     fn fleet_attestation_commands_have_closed_cli_shapes() {
@@ -879,5 +1412,104 @@ mod tests {
             "operator-a"
         ])
         .is_ok());
+
+        let readiness = <crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "semantic",
+            "query-readiness",
+            "--relay-status-url",
+            "http://127.0.0.1:8080/_status",
+        ])
+        .expect("query-readiness live status CLI");
+        assert!(matches!(
+            readiness.command,
+            crate::Command::Semantic {
+                command: SemanticCommand::QueryReadiness {
+                    relay_status_url: Some(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn relay_status_url_is_limited_to_an_exact_literal_loopback_endpoint() {
+        for accepted in [
+            "http://127.0.0.1:8080/_status",
+            "https://[::1]:8443/_status",
+        ] {
+            let url = url::Url::parse(accepted).expect("accepted URL parses");
+            validate_relay_status_url(&url).expect("accepted loopback status URL");
+        }
+
+        for rejected in [
+            "http://localhost:8080/_status",
+            "http://192.0.2.1:8080/_status",
+            "http://127.0.0.1:8080/_status/",
+            "http://127.0.0.1:8080/_status?verbose=1",
+            "http://operator@127.0.0.1:8080/_status",
+            "file:///tmp/_status",
+        ] {
+            let url = url::Url::parse(rejected).expect("rejected URL still parses");
+            assert!(
+                validate_relay_status_url(&url).is_err(),
+                "URL should be rejected: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_relay_status_requires_the_closed_policy_and_matching_digest() {
+        let url = url::Url::parse("http://127.0.0.1:8080/_status").expect("URL");
+        let digest = buzz_semantic_query::semantic_graph_http_runtime_digest()
+            .expect("runtime digest")
+            .to_hex();
+        let local = json!({
+            "service": "buzz-relay",
+            "semantic_graph_query_http": {
+                "runtime_digest": digest,
+                "parser_ready": true,
+                "handler_ready": true,
+                "deployment_master": true,
+                "fleet_policy": "trusted-single-relay",
+                "fleet_attestation_required": false,
+                "fleet_attestation_status": "not_required",
+                "deployment_id": null,
+                "instance_id": null
+            }
+        });
+        let parsed = parse_live_query_http_runtime(&url, &local).expect("valid local status");
+        assert!(parsed.live_relay_observed);
+        assert_eq!(parsed.fleet_policy.to_string(), "trusted-single-relay");
+
+        let mut invalid_policy = local.clone();
+        invalid_policy["semantic_graph_query_http"]["fleet_policy"] = json!("local");
+        assert!(parse_live_query_http_runtime(&url, &invalid_policy).is_err());
+
+        let mut mismatched_digest = local;
+        mismatched_digest["semantic_graph_query_http"]["runtime_digest"] = json!("00");
+        assert!(parse_live_query_http_runtime(&url, &mismatched_digest).is_err());
+    }
+
+    #[test]
+    fn live_strict_status_requires_identity_when_the_master_is_enabled() {
+        let url = url::Url::parse("http://127.0.0.1:8080/_status").expect("URL");
+        let digest = buzz_semantic_query::semantic_graph_http_runtime_digest()
+            .expect("runtime digest")
+            .to_hex();
+        let missing_identity = json!({
+            "service": "buzz-relay",
+            "semantic_graph_query_http": {
+                "runtime_digest": digest,
+                "parser_ready": true,
+                "handler_ready": false,
+                "deployment_master": true,
+                "fleet_policy": "attested-fleet",
+                "fleet_attestation_required": true,
+                "fleet_attestation_status": "community_scoped_not_evaluated",
+                "deployment_id": null,
+                "instance_id": null
+            }
+        });
+        assert!(parse_live_query_http_runtime(&url, &missing_identity).is_err());
     }
 }

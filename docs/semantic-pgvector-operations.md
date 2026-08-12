@@ -163,18 +163,30 @@ abandoned unit sets.
 
 ## Semantic graph-query qualification
 
-Graph query is present but fail-closed by default. This section defines the
-safe order for a future qualified deployment; it is not evidence that the
-current build is production-qualified. Real-provider relevance, target-database
-latency and resource measurements, multi-instance routing attestation, soak,
-and an approved first-Community canary must all be completed before enabling
-query egress.
+Graph query is present but fail-closed by default. Enabling the HTTP deployment
+master or choosing a Fleet policy does not enable Provider egress: each
+Community still requires the explicit query gate and problem-egress
+acknowledgement.
+
+Carryforth currently supports local source builds with exactly one Relay. That
+topology uses the default policy:
+
+```text
+BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay
+```
+
+This policy skips only the short-lived load-balancer inventory assertion. It
+does not skip database/schema readiness, Project Context capability, caller
+authorization, current-source checks, Provider admission, or the final
+pre-signing confirmation. It is not qualified for multiple Relays, a load
+balancer, or production deployment.
 
 Keep these gates closed while applying migration 0058 and preparing the
 Foundation generation:
 
 ```text
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
+BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay
 semantic_graph_query_enabled=false
 ```
 
@@ -186,10 +198,47 @@ buzz-admin semantic preflight
 buzz-admin semantic query-readiness
 ```
 
-`query-readiness` must prove the active generation, exact non-zero current
-heads, Project Context structural reads, provider/model contract, stable Relay
-signer, virtual-kind storage constraint, and database prerequisites. If an
-upgrade reports historical zero-vector heads, keep query disabled and run:
+Without `--relay-status-url`, HTTP runtime fields come from the `buzz-admin`
+process environment. The command labels that source in JSON and prints a
+warning because those values do not describe an already-running Relay. To
+observe the local Relay, use its loopback health endpoint:
+
+```bash
+buzz-admin semantic query-readiness \
+  --relay-status-url http://127.0.0.1:8080/_status
+```
+
+Live status diagnostics accept only a literal loopback address and the exact
+`/_status` path. They use no proxy or redirects, have short connection/request
+timeouts, cap the response at 64 KiB, require the Relay schema and matching
+compiled runtime digest, and fail without falling back to the admin process
+environment. The status URL is read-only diagnostic evidence; it is never an
+authorization source for `query-enable` or query execution. Because `/_status`
+is deployment-global and the selected database tenant is Community-scoped, the
+command does not claim that an arbitrary explicitly supplied status endpoint is
+bound to that Community. It reports `community_binding_verified=false` and
+keeps the legacy `base_enable_ready` field null; inspect
+`database_and_policy_ready`, `http_runtime_ready`, and the source/scope fields
+as separate diagnostic observations.
+
+The database observation plus a bound operator configuration or explicit Live
+status observation must together prove the active generation, exact non-zero
+current heads, Project Context structural reads, provider/model contract,
+stable Relay signer, virtual-kind storage constraint, and database
+prerequisites. Environment-only `query-readiness` output does not by itself
+prove a running handler. In local mode it reports:
+
+```json
+{
+  "fleet_policy": "trusted-single-relay",
+  "fleet_attestation_required": false,
+  "fleet_attestation_status": "not_required"
+}
+```
+
+An expired, revoked, or missing dormant Fleet row does not affect local query
+admission. If an upgrade reports historical zero-vector heads, keep query
+disabled and run:
 
 ```bash
 buzz-admin semantic repair-query-vectors
@@ -201,11 +250,47 @@ Do not proceed until the worker has rebuilt every scheduled current head and a
 second repair is a no-op. This repair does not modify canonical Project View,
 Document, Meeting, or Project Context source data.
 
-After all query-capable Relay instances are deployed with the same deployment
-identifier, enumerate the exact instances currently routed by the load
-balancer. With every Community query gate still disabled, set
-`BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true`, create a short-lived fleet
-assertion, and immediately verify it:
+For the supported single-Relay local topology, start the Relay with the HTTP
+master enabled, verify live readiness, and then explicitly authorize the
+selected Community:
+
+```text
+BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
+BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay
+```
+
+Run mutation commands from an operator shell or container that explicitly
+loads the same protected `.env` / deployment configuration as the Relay.
+`buzz-admin` does not load `.env` by itself, and `--relay-status-url` is
+diagnostic only: it never fills mutation configuration from the observed
+process.
+
+```bash
+buzz-admin semantic query-readiness \
+  --relay-status-url http://127.0.0.1:8080/_status
+buzz-admin semantic query-enable --acknowledge-problem-egress
+```
+
+Local `query-enable` still verifies the complete database prerequisites inside
+the enabling transaction; it simply does not read the Fleet Attestation row.
+The acknowledgement authorizes only the query `problem` plus current
+source-owned title/summary overview to cross the configured semantic provider
+boundary. It does not authorize Document bodies, chunks, Meeting Board/Speech,
+topology, runtime hints, or other free text.
+
+### Future multi-Relay qualification
+
+Before introducing a second routable Relay, a load balancer, or a production
+deployment, explicitly switch every instance and operator environment to:
+
+```text
+BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=attested-fleet
+```
+
+Keep every Community query gate disabled, deploy all query-capable instances
+with the same deployment identifier, and give each one a unique stable instance
+identifier. Enumerate the exact instances currently routed by the load balancer,
+then create and verify a short-lived assertion:
 
 ```bash
 buzz-admin semantic fleet-attest \
@@ -216,34 +301,47 @@ buzz-admin semantic fleet-check
 buzz-admin semantic query-readiness
 ```
 
-Only after the external qualification evidence is approved and all readiness
-fields pass may an operator explicitly authorize the first Community:
+In `trusted-single-relay`, `fleet-check` instead returns
+`applicable=false`, `status=not_required`, and exit code 0. `fleet-attest` and
+`fleet-revoke` fail before opening the database, so they cannot mutate dormant
+strict-mode state accidentally. To operate on that state, explicitly select
+`attested-fleet` first.
+
+Only after real-provider relevance, target-database latency/resource evidence,
+policy-homogeneous routing, soak, and an approved first-Community canary may a
+future multi-Relay operator enable the query gate:
 
 ```bash
 buzz-admin semantic query-enable --acknowledge-problem-egress
 ```
 
-The acknowledgement authorizes only the query `problem` plus current
-source-owned title/summary overview to cross the configured semantic provider
-boundary. It does not authorize Document bodies, chunks, Meeting Board/Speech,
-topology, runtime hints, or other free text. Recheck readiness, fleet expiry,
-and NIP-11 after enabling; only the HTTP graph-query capability may be
-advertised.
+Recheck readiness, Fleet expiry, and NIP-11 after enabling; only the HTTP
+graph-query capability may be advertised. `attested-fleet` retains the existing
+short lease and fails closed if the assertion expires, is revoked, does not
+contain the serving instance, or has a different deployment/runtime digest.
 
 ## Graph-query rollback
 
-Contain a query incident before rolling code back:
+In either policy, the immediate query-egress kill switch is:
 
 ```bash
 buzz-admin semantic query-disable
-buzz-admin semantic fleet-revoke
 buzz-admin semantic query-readiness
 ```
 
-Then remove affected instances from routing or set
+In `attested-fleet`, revoke the current assertion as an additional containment
+step:
+
+```bash
+buzz-admin semantic fleet-revoke
+```
+
+`fleet-revoke` is deliberately unavailable in `trusted-single-relay`, where a
+dormant Fleet row has no admission authority. Then remove affected instances
+from routing or set
 `BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false`. Query rollback does not
 delete canonical data, advance a business revision, delete the active semantic
 generation, or stop ordinary Project Context reads. The Foundation indexing
 worker may continue; disabling it is a separate operator decision. Never put an
 older Relay that cannot parse the semantic raw extension back into routing
-while a Community query gate or reusable fleet assertion remains active.
+while a Community query gate or reusable strict Fleet assertion remains active.

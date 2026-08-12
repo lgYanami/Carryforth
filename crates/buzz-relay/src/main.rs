@@ -465,6 +465,16 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    if state.config.semantic_graph_query_http_available
+        && state.config.semantic_graph_query_fleet_policy
+            == buzz_semantic_query::SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+    {
+        warn!(
+            fleet_policy = %state.config.semantic_graph_query_fleet_policy,
+            "Semantic graph query routing trusts this single Relay; this policy is not suitable for multiple Relays or load-balanced deployments"
+        );
+    }
+
     if state.config.semantic_worker.enabled || state.config.semantic_graph_query_http_available {
         let provider = state
             .semantic_provider()

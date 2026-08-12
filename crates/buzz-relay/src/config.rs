@@ -5,6 +5,8 @@ use std::{net::SocketAddr, time::Duration};
 use thiserror::Error;
 use tracing::warn;
 
+use buzz_semantic_query::{SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust};
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -284,11 +286,19 @@ pub struct Config {
     /// Deployment master for the semantic graph query HTTP runtime.
     ///
     /// This does not enable any Community and defaults to false. Community DB
-    /// readiness and the deployment fleet attestation remain separate gates.
+    /// readiness and the configured routing policy remain separate gates.
     pub semantic_graph_query_http_available: bool,
-    /// Deployment identity that must match the current operator fleet assertion.
+    /// Topology trust applied to semantic graph HTTP query routing.
+    ///
+    /// Local source builds default to trusting the one Relay process. The
+    /// attested policy preserves the short-lived fleet inventory gate for a
+    /// future multi-instance deployment.
+    pub semantic_graph_query_fleet_policy: SemanticGraphQueryFleetPolicy,
+    /// Deployment identity that must match the operator Fleet assertion in
+    /// `attested-fleet` mode.
     pub semantic_graph_query_deployment_id: Option<String>,
-    /// Exact control-plane instance identity for this Relay Pod.
+    /// Exact control-plane instance identity for this Relay in
+    /// `attested-fleet` mode.
     pub semantic_graph_query_instance_id: Option<String>,
 
     /// Optional override for ephemeral channel TTL (in seconds).
@@ -451,6 +461,25 @@ fn parse_semantic_query_identity(name: &'static str) -> Result<Option<String>, C
     validate_semantic_query_identity(name, raw)
 }
 
+fn parse_semantic_query_fleet_policy() -> Result<SemanticGraphQueryFleetPolicy, ConfigError> {
+    let raw = match std::env::var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Ok(SemanticGraphQueryFleetPolicy::TrustedSingleRelay);
+        }
+        Err(error) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY must be valid UTF-8: {error}"
+            )));
+        }
+    };
+    raw.trim().parse().map_err(|error| {
+        ConfigError::InvalidValue(format!(
+            "BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY is invalid: {error}"
+        ))
+    })
+}
+
 fn validate_semantic_query_identity(
     name: &'static str,
     raw: Option<String>,
@@ -476,12 +505,17 @@ fn validate_semantic_query_identity(
 
 fn require_semantic_query_fleet_identities(
     deployment_master: bool,
+    fleet_policy: SemanticGraphQueryFleetPolicy,
     deployment_id: Option<&str>,
     instance_id: Option<&str>,
 ) -> Result<(), ConfigError> {
-    if deployment_master && (deployment_id.is_none() || instance_id.is_none()) {
+    if deployment_master
+        && fleet_policy == SemanticGraphQueryFleetPolicy::AttestedFleet
+        && (deployment_id.is_none() || instance_id.is_none())
+    {
         return Err(ConfigError::InvalidValue(
-            "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE requires non-empty \
+            "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE with \
+             BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=attested-fleet requires non-empty \
              BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID and \
              BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID"
                 .to_owned(),
@@ -920,12 +954,14 @@ impl Config {
         let semantic_worker_enabled = parse_bool("BUZZ_SEMANTIC_WORKER_ENABLED", false)?;
         let semantic_graph_query_http_available =
             parse_bool("BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE", false)?;
+        let semantic_graph_query_fleet_policy = parse_semantic_query_fleet_policy()?;
         let semantic_graph_query_deployment_id =
             parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")?;
         let semantic_graph_query_instance_id =
             parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?;
         require_semantic_query_fleet_identities(
             semantic_graph_query_http_available,
+            semantic_graph_query_fleet_policy,
             semantic_graph_query_deployment_id.as_deref(),
             semantic_graph_query_instance_id.as_deref(),
         )?;
@@ -1149,6 +1185,7 @@ impl Config {
             runtime_supervision_claim_secs,
             semantic_worker,
             semantic_graph_query_http_available,
+            semantic_graph_query_fleet_policy,
             semantic_graph_query_deployment_id,
             semantic_graph_query_instance_id,
             ephemeral_ttl_override,
@@ -1167,6 +1204,42 @@ impl Config {
             serve_git_web_gui,
         })
     }
+
+    /// Return the validated routing trust used by semantic query DB fences.
+    ///
+    /// An enabled strict deployment is rejected by [`Config::from_env`] when
+    /// either identity is absent. Returning an error here keeps manually
+    /// constructed disabled configs fail-closed instead of treating a missing
+    /// identity as an implicit single-Relay bypass.
+    pub(crate) fn semantic_graph_query_routing_trust(
+        &self,
+    ) -> Result<SemanticGraphQueryRoutingTrust<'_>, ConfigError> {
+        match self.semantic_graph_query_fleet_policy {
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay => {
+                Ok(SemanticGraphQueryRoutingTrust::TrustedSingleRelay)
+            }
+            SemanticGraphQueryFleetPolicy::AttestedFleet => {
+                let invalid = || {
+                    ConfigError::InvalidValue(
+                        "attested semantic graph query routing requires deployment and instance identities"
+                            .to_owned(),
+                    )
+                };
+                let deployment_id = self
+                    .semantic_graph_query_deployment_id
+                    .as_deref()
+                    .ok_or_else(invalid)?;
+                let instance_id = self
+                    .semantic_graph_query_instance_id
+                    .as_deref()
+                    .ok_or_else(invalid)?;
+                Ok(SemanticGraphQueryRoutingTrust::AttestedFleet {
+                    deployment_id,
+                    instance_id,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1177,6 +1250,31 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn semantic_query_fleet_policy_is_closed_and_defaults_to_single_relay() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY");
+
+        std::env::remove_var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY");
+        assert_eq!(
+            parse_semantic_query_fleet_policy().expect("default policy"),
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+        );
+        std::env::set_var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY", "attested-fleet");
+        assert_eq!(
+            parse_semantic_query_fleet_policy().expect("strict policy"),
+            SemanticGraphQueryFleetPolicy::AttestedFleet
+        );
+        std::env::set_var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY", "automatic");
+        assert!(parse_semantic_query_fleet_policy().is_err());
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY", value);
+        } else {
+            std::env::remove_var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY");
+        }
+    }
 
     #[test]
     fn semantic_query_fleet_identities_use_closed_grammar() {
@@ -1191,15 +1289,71 @@ mod tests {
             validate_semantic_query_identity("TEST", Some("  ".to_owned())).expect("blank"),
             None
         );
-        assert!(require_semantic_query_fleet_identities(true, None, Some("relay-0")).is_err());
-        assert!(require_semantic_query_fleet_identities(true, Some("deployment-a"), None).is_err());
         assert!(require_semantic_query_fleet_identities(
             true,
+            SemanticGraphQueryFleetPolicy::AttestedFleet,
+            None,
+            Some("relay-0")
+        )
+        .is_err());
+        assert!(require_semantic_query_fleet_identities(
+            true,
+            SemanticGraphQueryFleetPolicy::AttestedFleet,
+            Some("deployment-a"),
+            None
+        )
+        .is_err());
+        assert!(require_semantic_query_fleet_identities(
+            true,
+            SemanticGraphQueryFleetPolicy::AttestedFleet,
             Some("deployment-a"),
             Some("relay-0")
         )
         .is_ok());
-        assert!(require_semantic_query_fleet_identities(false, None, None).is_ok());
+        assert!(require_semantic_query_fleet_identities(
+            true,
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+            None,
+            None
+        )
+        .is_ok());
+        assert!(require_semantic_query_fleet_identities(
+            false,
+            SemanticGraphQueryFleetPolicy::AttestedFleet,
+            None,
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn routing_trust_never_treats_missing_strict_identity_as_local() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::from_env().expect("default config");
+        config.semantic_graph_query_fleet_policy =
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay;
+        config.semantic_graph_query_deployment_id = None;
+        config.semantic_graph_query_instance_id = None;
+        assert_eq!(
+            config
+                .semantic_graph_query_routing_trust()
+                .expect("single Relay trust"),
+            SemanticGraphQueryRoutingTrust::TrustedSingleRelay
+        );
+
+        config.semantic_graph_query_fleet_policy = SemanticGraphQueryFleetPolicy::AttestedFleet;
+        assert!(config.semantic_graph_query_routing_trust().is_err());
+        config.semantic_graph_query_deployment_id = Some("deployment-a".to_owned());
+        config.semantic_graph_query_instance_id = Some("relay-0".to_owned());
+        assert_eq!(
+            config
+                .semantic_graph_query_routing_trust()
+                .expect("attested Fleet trust"),
+            SemanticGraphQueryRoutingTrust::AttestedFleet {
+                deployment_id: "deployment-a",
+                instance_id: "relay-0",
+            }
+        );
     }
 
     #[test]
@@ -1675,7 +1829,7 @@ mod tests {
             "BUZZ_PUSH_GATEWAY_TIMEOUT_MS",
             "BUZZ_PUSH_EXECUTOR_KEY_ID",
         ];
-        let previous = names.map(|name| std::env::var_os(name));
+        let previous = names.map(std::env::var_os);
         std::env::set_var(
             "BUZZ_PUSH_GATEWAY_DELIVERY_URL",
             "https://legacy-push.invalid/v1/deliveries/apns",

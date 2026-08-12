@@ -20,10 +20,10 @@ use buzz_semantic_query::{
     document_score, environment_gain, harmonic_score, target_coordinate_score, ConditionedEvidence,
     ContextDocumentBindingObservation, LifecycleFilter, ProjectContextBindingProvenance,
     ProjectContextEdgeProvenance, QueryCompatibilityFences, RelationRankCursor, Score,
-    SemanticEdgeObservation, TargetRankCursor, MAX_CONTEXT_COORDINATES,
-    MAX_HYPEREDGE_IDENTITY_BYTES, MAX_INITIAL_COORDINATES, MAX_QUERY_CHANNELS,
-    MAX_RECALL_PER_CHANNEL, MAX_RELATION_OPTIONS_MATERIALIZED, MAX_TARGET_OPTIONS_MATERIALIZED,
-    RELATION_FLOOR, TARGET_FLOOR, TRANSITION_FLOOR,
+    SemanticEdgeObservation, SemanticGraphQueryRoutingTrust, TargetRankCursor,
+    MAX_CONTEXT_COORDINATES, MAX_HYPEREDGE_IDENTITY_BYTES, MAX_INITIAL_COORDINATES,
+    MAX_QUERY_CHANNELS, MAX_RECALL_PER_CHANNEL, MAX_RELATION_OPTIONS_MATERIALIZED,
+    MAX_TARGET_OPTIONS_MATERIALIZED, RELATION_FLOOR, TARGET_FLOOR, TRANSITION_FLOOR,
 };
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
@@ -546,8 +546,8 @@ pub enum SemanticGraphQueryEgressConfirmation {
     /// One or more conditioned source observations changed during the slot
     /// wait, so the prepared query batch must be discarded.
     ContextChanged,
-    /// The short-lived HTTP routing assertion is no longer valid for this
-    /// exact serving instance.
+    /// Attested-Fleet mode no longer has a valid routing assertion for this
+    /// exact serving instance. This outcome is unreachable in trusted mode.
     FleetUnavailable,
     /// Principal, capability, generation, graph, or read readiness changed.
     Unavailable,
@@ -584,10 +584,8 @@ pub struct SemanticGraphQueryEgressConfirmationRequest<'a> {
     /// Complete accepted/omitted context state that affected the Provider
     /// channel set.
     pub expected_contexts: &'a [SemanticContextEgressExpectation],
-    /// Deployment identity asserted by the current routing inventory.
-    pub deployment_id: &'a str,
-    /// Exact serving instance that must remain in that inventory.
-    pub instance_id: &'a str,
+    /// Explicit single-Relay or attested-Fleet routing requirement.
+    pub routing_trust: SemanticGraphQueryRoutingTrust<'a>,
 }
 
 /// One exact source/channel cosine observation. No raw vector is returned.
@@ -978,8 +976,8 @@ pub struct SemanticEdgeTargetRankRequest<'a> {
 ///
 /// This value is intentionally not `Clone`. It is issued only after the
 /// Community authorization writers, query/index gate, canonical read-model
-/// readiness, and HTTP fleet assertion have been linearized in one short
-/// transaction. The Relay must consume it in the immediately following
+/// readiness, and the selected routing policy have been linearized in one
+/// short transaction. The Relay must consume it in the immediately following
 /// synchronous signing operation without intervening awaitable work.
 #[derive(Debug)]
 pub struct SemanticGraphQueryReleasePermit {
@@ -989,14 +987,14 @@ pub struct SemanticGraphQueryReleasePermit {
 /// Outcome of the final Stage D result-release confirmation.
 #[derive(Debug)]
 pub enum SemanticGraphQueryReleaseConfirmation {
-    /// Every current authorization, query/index, canonical-read, and fleet
-    /// fence passed at the release linearization point.
+    /// Every current authorization, query/index, canonical-read, and selected
+    /// routing-policy fence passed at the release linearization point.
     Permitted(SemanticGraphQueryReleasePermit),
     /// The principal or one of the current query/read prerequisites is no
     /// longer authorized.
     Denied,
-    /// The short-lived HTTP fleet assertion no longer authorizes this exact
-    /// serving instance.
+    /// Attested-Fleet mode no longer authorizes this exact serving instance.
+    /// This outcome is unreachable in trusted mode.
     FleetUnavailable,
 }
 
@@ -1008,10 +1006,8 @@ pub struct SemanticGraphQueryReleaseRequest<'a> {
     pub reader_pubkey: &'a [u8],
     /// Relay projection signer required by all canonical read models.
     pub expected_projection_pubkey: &'a PublicKey,
-    /// Deployment identity asserted by the current routing inventory.
-    pub deployment_id: &'a str,
-    /// Exact serving instance that must remain in that inventory.
-    pub instance_id: &'a str,
+    /// Explicit single-Relay or attested-Fleet routing requirement.
+    pub routing_trust: SemanticGraphQueryRoutingTrust<'a>,
 }
 
 /// Caller-owned writer-pool `REPEATABLE READ READ ONLY` transaction.
@@ -1061,8 +1057,8 @@ impl Db {
         Ok(ticket)
     }
 
-    /// Atomically confirm the current Stage D security/read/fleet prerequisites
-    /// and issue a single-use result-release permit.
+    /// Atomically confirm the current Stage D security/read/routing
+    /// prerequisites and issue a single-use result-release permit.
     ///
     /// The transaction deliberately uses `READ COMMITTED`: it first waits for
     /// the same shared per-Community advisory lock that canonical membership,
@@ -1070,8 +1066,8 @@ impl Db {
     /// only then forms the snapshots used by the following checks. Starting a
     /// `REPEATABLE READ` snapshot before that wait would allow an already
     /// committed revocation to remain invisible. The Community row and fleet
-    /// assertion are also held `FOR SHARE`, closing query/index and fleet
-    /// mutation races through commit.
+    /// row and, in strict mode, the Fleet assertion are also held `FOR SHARE`,
+    /// closing query/index and routing-policy mutation races through commit.
     pub async fn confirm_semantic_graph_query_release(
         &self,
         request: SemanticGraphQueryReleaseRequest<'_>,
@@ -1080,8 +1076,7 @@ impl Db {
             community_id,
             reader_pubkey,
             expected_projection_pubkey,
-            deployment_id,
-            instance_id,
+            routing_trust,
         } = request;
         validate_pubkey(reader_pubkey)?;
         let mut tx = self
@@ -1108,11 +1103,10 @@ impl Db {
             }
             Err(error) => return Err(error),
         }
-        if !crate::semantic_fleet::semantic_graph_http_fleet_ready_in_tx(
+        if !crate::semantic_fleet::semantic_graph_query_routing_ready_in_tx(
             &mut tx,
             community_id,
-            deployment_id,
-            instance_id,
+            routing_trust,
         )
         .await?
         {
@@ -1184,7 +1178,6 @@ impl Db {
             reader_pubkey,
             expected_projection_pubkey,
             &expected_contexts,
-            None,
         )
         .await?
         {
@@ -1194,10 +1187,6 @@ impl Db {
             SemanticGraphQueryEgressRecheck::ContextChanged => {
                 tx.rollback().await?;
                 return Ok(SemanticGraphQueryEgressReservation::ContextChanged);
-            }
-            SemanticGraphQueryEgressRecheck::FleetUnavailable => {
-                tx.rollback().await?;
-                return Ok(SemanticGraphQueryEgressReservation::Unavailable);
             }
             SemanticGraphQueryEgressRecheck::Unavailable => {
                 tx.rollback().await?;
@@ -1243,8 +1232,7 @@ impl Db {
             reader_pubkey,
             expected_projection_pubkey,
             expected_contexts,
-            deployment_id,
-            instance_id,
+            routing_trust,
         } = request;
         let expected_contexts =
             validate_egress_expectations(expected_ticket, reader_pubkey, expected_contexts)?;
@@ -1258,13 +1246,22 @@ impl Db {
             reader_pubkey,
             expected_projection_pubkey,
             &expected_contexts,
-            Some((deployment_id, instance_id)),
         )
         .await?
         {
             SemanticGraphQueryEgressRecheck::Ready {
                 context_state_set_digest,
             } => {
+                if !crate::semantic_fleet::semantic_graph_query_routing_ready_in_tx(
+                    &mut tx,
+                    expected_ticket.community_id,
+                    routing_trust,
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    return Ok(SemanticGraphQueryEgressConfirmation::FleetUnavailable);
+                }
                 tx.commit().await?;
                 Ok(SemanticGraphQueryEgressConfirmation::Permitted(
                     SemanticGraphQueryEgressPermit {
@@ -1276,10 +1273,6 @@ impl Db {
             SemanticGraphQueryEgressRecheck::ContextChanged => {
                 tx.rollback().await?;
                 Ok(SemanticGraphQueryEgressConfirmation::ContextChanged)
-            }
-            SemanticGraphQueryEgressRecheck::FleetUnavailable => {
-                tx.rollback().await?;
-                Ok(SemanticGraphQueryEgressConfirmation::FleetUnavailable)
             }
             SemanticGraphQueryEgressRecheck::Unavailable => {
                 tx.rollback().await?;
@@ -4910,7 +4903,6 @@ ORDER BY channel_id, channel_rank, source_family, source_subtype, source_id, uni
 enum SemanticGraphQueryEgressRecheck {
     Ready { context_state_set_digest: Digest32 },
     ContextChanged,
-    FleetUnavailable,
     Unavailable,
 }
 
@@ -4955,7 +4947,6 @@ async fn recheck_semantic_graph_query_egress_in_tx(
     reader_pubkey: &[u8],
     expected_projection_pubkey: &PublicKey,
     expected_contexts: &[SemanticContextEgressExpectation],
-    expected_http_fleet: Option<(&str, &str)>,
 ) -> Result<SemanticGraphQueryEgressRecheck> {
     if !lock_semantic_graph_query_community_row(tx, expected_ticket.community_id).await? {
         return Ok(SemanticGraphQueryEgressRecheck::Unavailable);
@@ -5016,19 +5007,6 @@ async fn recheck_semantic_graph_query_egress_in_tx(
             observe_context_egress_expectations_in_tx(tx, &observed_ticket, &sources).await?;
         if observed != expected_contexts {
             return Ok(SemanticGraphQueryEgressRecheck::ContextChanged);
-        }
-    }
-
-    if let Some((deployment_id, instance_id)) = expected_http_fleet {
-        let fleet_ready = crate::semantic_fleet::semantic_graph_http_fleet_ready_in_tx(
-            tx,
-            expected_ticket.community_id,
-            deployment_id,
-            instance_id,
-        )
-        .await?;
-        if !fleet_ready {
-            return Ok(SemanticGraphQueryEgressRecheck::FleetUnavailable);
         }
     }
 

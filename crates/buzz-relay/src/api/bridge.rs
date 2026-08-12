@@ -3,7 +3,7 @@
 //! These endpoints provide HTTP access to the relay's Nostr protocol,
 //! authenticated via NIP-98 signed events.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use axum::{
     extract::{Path, Query, RawQuery, State},
@@ -495,7 +495,30 @@ async fn execute_semantic_graph_http_query_inner(
     nip98_auth_event_id: [u8; 32],
     query: SemanticGraphQuery,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if !crate::semantic_fleet::semantic_graph_http_fleet_ready(state, tenant.community()).await {
+    let routing_ready =
+        crate::semantic_fleet::semantic_graph_http_routing_ready(state, tenant.community()).await;
+    execute_with_semantic_graph_http_routing_admission(routing_ready, move || {
+        execute_semantic_graph_http_query_after_routing(
+            state,
+            tenant,
+            exact_authenticated_body,
+            authenticated_caller,
+            nip98_auth_event_id,
+            query,
+        )
+    })
+    .await
+}
+
+async fn execute_with_semantic_graph_http_routing_admission<Execute, ExecuteFuture>(
+    routing_ready: bool,
+    execute: Execute,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)>
+where
+    Execute: FnOnce() -> ExecuteFuture,
+    ExecuteFuture: Future<Output = Result<Json<Value>, (StatusCode, Json<Value>)>>,
+{
+    if !routing_ready {
         record_query_error(
             SemanticGraphMetricStage::Root,
             SemanticGraphQueryMetricError::Readiness,
@@ -505,6 +528,17 @@ async fn execute_semantic_graph_http_query_inner(
             "unavailable:semantic_graph_query:readiness",
         ));
     }
+    execute().await
+}
+
+async fn execute_semantic_graph_http_query_after_routing(
+    state: &AppState,
+    tenant: &TenantContext,
+    exact_authenticated_body: &[u8],
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    query: SemanticGraphQuery,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if state.config.relay_private_key.is_none() {
         record_query_error(
             SemanticGraphMetricStage::Root,
@@ -574,10 +608,7 @@ async fn execute_semantic_graph_http_query_inner(
 
     require_semantic_absolute_deadline(absolute_deadline)?;
     let postflight_timer = stage_timer(SemanticGraphMetricStage::Postflight);
-    let (Some(deployment_id), Some(instance_id)) = (
-        state.config.semantic_graph_query_deployment_id.as_deref(),
-        state.config.semantic_graph_query_instance_id.as_deref(),
-    ) else {
+    let Ok(routing_trust) = crate::semantic_fleet::semantic_graph_query_routing_trust(state) else {
         record_query_error(
             SemanticGraphMetricStage::Postflight,
             SemanticGraphQueryMetricError::Readiness,
@@ -595,8 +626,7 @@ async fn execute_semantic_graph_http_query_inner(
                 community_id: tenant.community(),
                 reader_pubkey: &caller_bytes,
                 expected_projection_pubkey: &state.relay_keypair.public_key(),
-                deployment_id,
-                instance_id,
+                routing_trust,
             }),
     )
     .await
@@ -4451,7 +4481,10 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_db::semantic_fleet::SemanticGraphHttpFleetFailure;
+    use buzz_semantic_query::SemanticGraphQueryFleetPolicy;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
+    use std::cell::Cell;
     use std::sync::Mutex;
 
     fn redis_pool() -> deadpool_redis::Pool {
@@ -4525,6 +4558,55 @@ mod tests {
                 .expect("ordinary filter")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_http_entry_uses_shared_policy_and_blocks_post_admission_work() {
+        for failure in [
+            SemanticGraphHttpFleetFailure::Missing,
+            SemanticGraphHttpFleetFailure::Expired,
+            SemanticGraphHttpFleetFailure::Revoked,
+        ] {
+            let local_routing_ready =
+                crate::semantic_fleet::semantic_graph_http_routing_ready_for_test(
+                    SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+                    Some(failure),
+                )
+                .await;
+            let local_provider_calls = Cell::new(0);
+            let local_result =
+                execute_with_semantic_graph_http_routing_admission(local_routing_ready, || async {
+                    local_provider_calls.set(local_provider_calls.get() + 1);
+                    Ok(Json(serde_json::json!({"result": "provider-complete"})))
+                })
+                .await;
+            assert!(local_result.is_ok(), "local policy rejected {failure:?}");
+            assert_eq!(local_provider_calls.get(), 1);
+
+            let strict_routing_ready =
+                crate::semantic_fleet::semantic_graph_http_routing_ready_for_test(
+                    SemanticGraphQueryFleetPolicy::AttestedFleet,
+                    Some(failure),
+                )
+                .await;
+            let strict_provider_calls = Cell::new(0);
+            let strict_result = execute_with_semantic_graph_http_routing_admission(
+                strict_routing_ready,
+                || async {
+                    strict_provider_calls.set(strict_provider_calls.get() + 1);
+                    Ok(Json(serde_json::json!({"result": "provider-complete"})))
+                },
+            )
+            .await;
+            let (status, body) = strict_result.expect_err("strict policy must fail closed");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["error"], "unavailable:semantic_graph_query:readiness");
+            assert_eq!(
+                strict_provider_calls.get(),
+                0,
+                "post-admission work must not run for strict {failure:?}"
+            );
+        }
     }
 
     #[test]

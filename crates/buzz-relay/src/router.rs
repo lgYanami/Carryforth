@@ -1,5 +1,6 @@
 //! axum routers — app (WebSocket + REST), health (K8s probes), metrics (Prometheus).
 
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -377,6 +378,66 @@ async fn liveness_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RelayReadinessFacts {
+    postgres: bool,
+    redis: bool,
+    project_view: bool,
+    project_document: bool,
+    project_context: bool,
+    meeting_community_read: bool,
+    meeting_v2: bool,
+    semantic: bool,
+}
+
+impl RelayReadinessFacts {
+    const fn ready(self) -> bool {
+        self.postgres
+            && self.redis
+            && self.project_view
+            && self.project_document
+            && self.project_context
+            && self.meeting_community_read
+            && self.meeting_v2
+            && self.semantic
+    }
+}
+
+fn relay_readiness_result(facts: RelayReadinessFacts) -> (StatusCode, Json<serde_json::Value>) {
+    if facts.ready() {
+        (
+            StatusCode::OK,
+            Json(json!({"status": "ready", "meeting_v2": true, "semantic": true})),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "postgres": facts.postgres,
+                "redis": facts.redis,
+                "project_view": facts.project_view,
+                "project_document": facts.project_document,
+                "project_context": facts.project_context,
+                "meeting_community_read": facts.meeting_community_read,
+                "meeting_v2": facts.meeting_v2,
+                "semantic": facts.semantic
+            })),
+        )
+    }
+}
+
+async fn semantic_deployment_readiness_with<Check, CheckFuture, Error>(
+    graph_query_runtime_ready: bool,
+    check: Check,
+) -> bool
+where
+    Check: FnOnce(bool) -> CheckFuture,
+    CheckFuture: Future<Output = Result<bool, Error>>,
+{
+    check(graph_query_runtime_ready).await.unwrap_or(false)
+}
+
 /// Readiness probe — checks shutdown flag, Postgres, and Redis connectivity.
 async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     use std::time::Duration;
@@ -445,16 +506,15 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             },
             async {
                 let graph_query_runtime_ready =
-                    crate::semantic_fleet::all_enabled_semantic_graph_http_fleets_ready(&state)
+                    crate::semantic_fleet::all_enabled_semantic_graph_http_routes_ready(&state)
                         .await;
-                state
-                    .db
-                    .semantic_deployment_ready(
+                semantic_deployment_readiness_with(graph_query_runtime_ready, |routing_ready| {
+                    state.db.semantic_deployment_ready(
                         state.config.semantic_worker.enabled,
-                        graph_query_runtime_ready,
+                        routing_ready,
                     )
-                    .await
-                    .unwrap_or(false)
+                })
+                .await
             },
         );
         (
@@ -482,37 +542,17 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .await
         .unwrap_or((false, false, false, false, false, false, false, false));
 
-    if pg_ok
-        && redis_ok
-        && project_view_ok
-        && project_document_ok
-        && project_context_ok
-        && meeting_community_read_ok
-        && meeting_v2_ok
-        && semantic_ok
-    {
-        (
-            StatusCode::OK,
-            Json(json!({"status": "ready", "meeting_v2": true, "semantic": true})),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "not_ready",
-                "postgres": pg_ok,
-                "redis": redis_ok,
-                "project_view": project_view_ok,
-                "project_document": project_document_ok,
-                "project_context": project_context_ok,
-                "meeting_community_read": meeting_community_read_ok,
-                "meeting_v2": meeting_v2_ok,
-                "semantic": semantic_ok
-            })),
-        )
-            .into_response()
-    }
+    relay_readiness_result(RelayReadinessFacts {
+        postgres: pg_ok,
+        redis: redis_ok,
+        project_view: project_view_ok,
+        project_document: project_document_ok,
+        project_context: project_context_ok,
+        meeting_community_read: meeting_community_read_ok,
+        meeting_v2: meeting_v2_ok,
+        semantic: semantic_ok,
+    })
+    .into_response()
 }
 
 /// Status endpoint — service name, version, uptime.
@@ -523,6 +563,8 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .map(buzz_semantic::Digest32::to_hex);
     let semantic_query_handler_ready =
         crate::semantic_fleet::semantic_graph_http_local_handler_ready(&state);
+    let (fleet_attestation_required, fleet_attestation_status) =
+        semantic_graph_fleet_status(state.config.semantic_graph_query_fleet_policy);
     Json(json!({
         "service": "buzz-relay",
         "version": env!("CARGO_PKG_VERSION"),
@@ -532,10 +574,26 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "parser_ready": true,
             "handler_ready": semantic_query_handler_ready,
             "deployment_master": state.config.semantic_graph_query_http_available,
+            "fleet_policy": state.config.semantic_graph_query_fleet_policy.as_str(),
+            "fleet_attestation_required": fleet_attestation_required,
+            "fleet_attestation_status": fleet_attestation_status,
             "deployment_id": state.config.semantic_graph_query_deployment_id,
             "instance_id": state.config.semantic_graph_query_instance_id,
         },
     }))
+}
+
+const fn semantic_graph_fleet_status(
+    policy: buzz_semantic_query::SemanticGraphQueryFleetPolicy,
+) -> (bool, &'static str) {
+    match policy {
+        buzz_semantic_query::SemanticGraphQueryFleetPolicy::TrustedSingleRelay => {
+            (false, "not_required")
+        }
+        buzz_semantic_query::SemanticGraphQueryFleetPolicy::AttestedFleet => {
+            (true, "community_scoped_not_evaluated")
+        }
+    }
 }
 
 /// `/_mesh` — live mesh status: peer table, connection/phi state, per-peer
@@ -579,6 +637,8 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use axum::{routing::get, Router};
+    use buzz_db::semantic_fleet::SemanticGraphHttpFleetFailure;
+    use buzz_semantic_query::SemanticGraphQueryFleetPolicy;
     use futures_util::SinkExt;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -614,6 +674,77 @@ mod tests {
         assert!(should_serve_spa("/", true));
         assert!(should_serve_spa("/repos/example", true));
         assert!(!should_serve_spa("/arbitrary", true));
+    }
+
+    #[test]
+    fn semantic_graph_status_distinguishes_local_and_community_scoped_fleet_policies() {
+        assert_eq!(
+            semantic_graph_fleet_status(
+                buzz_semantic_query::SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+            ),
+            (false, "not_required")
+        );
+        assert_eq!(
+            semantic_graph_fleet_status(
+                buzz_semantic_query::SemanticGraphQueryFleetPolicy::AttestedFleet
+            ),
+            (true, "community_scoped_not_evaluated")
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_uses_shared_fleet_policy_decision_when_other_gates_are_ready() {
+        let otherwise_ready = RelayReadinessFacts {
+            postgres: true,
+            redis: true,
+            project_view: true,
+            project_document: true,
+            project_context: true,
+            meeting_community_read: true,
+            meeting_v2: true,
+            semantic: true,
+        };
+        for failure in [
+            SemanticGraphHttpFleetFailure::Missing,
+            SemanticGraphHttpFleetFailure::Expired,
+            SemanticGraphHttpFleetFailure::Revoked,
+        ] {
+            for (policy, expected_status) in [
+                (
+                    SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+                    StatusCode::OK,
+                ),
+                (
+                    SemanticGraphQueryFleetPolicy::AttestedFleet,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            ] {
+                let routing_ready =
+                    crate::semantic_fleet::semantic_graph_http_routing_ready_for_test(
+                        policy,
+                        Some(failure),
+                    )
+                    .await;
+                let semantic_ready = semantic_deployment_readiness_with(
+                    routing_ready,
+                    |observed_routing_ready| async move {
+                        assert_eq!(observed_routing_ready, routing_ready);
+                        Ok::<bool, ()>(observed_routing_ready)
+                    },
+                )
+                .await;
+                let (status, Json(body)) = relay_readiness_result(RelayReadinessFacts {
+                    semantic: semantic_ready,
+                    ..otherwise_ready
+                });
+
+                assert_eq!(
+                    status, expected_status,
+                    "readiness policy={policy} fleet_failure={failure:?}"
+                );
+                assert_eq!(body["semantic"], semantic_ready);
+            }
+        }
     }
 
     async fn handler_receives_message_with_limit(limit: usize, size: usize) -> bool {

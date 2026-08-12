@@ -304,8 +304,8 @@ pub struct SemanticQueryVectorRepairReport {
 impl SemanticGraphQueryReadiness {
     /// Whether database-owned enable prerequisites currently pass.
     ///
-    /// Deployment-master, fleet-attestation, provider compatibility, signer,
-    /// and Project Context projection checks remain Relay/operator fences.
+    /// Deployment master, routing policy, provider compatibility, signer, and
+    /// Project Context projection checks remain Relay/operator fences.
     pub const fn database_ready(&self) -> bool {
         self.schema_ready
             && self.index_enabled

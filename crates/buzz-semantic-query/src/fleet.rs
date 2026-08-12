@@ -1,5 +1,7 @@
 //! Closed deployment-inventory contract for semantic graph HTTP queries.
 
+use std::{fmt, str::FromStr};
+
 use buzz_semantic::Digest32;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -14,6 +16,107 @@ pub const SEMANTIC_GRAPH_HTTP_TRANSPORT: &str = "http";
 pub const MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES: usize = 64 * 1024;
 /// Maximum number of concurrently routable instances in one attestation.
 pub const MAX_SEMANTIC_GRAPH_FLEET_INSTANCES: usize = 256;
+
+/// Topology policy used to authorize semantic graph HTTP query routing.
+///
+/// `TrustedSingleRelay` is only suitable when exactly one Relay serves the
+/// deployment. `AttestedFleet` preserves the short-lived routing-inventory
+/// assertion required by multi-Relay deployments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SemanticGraphQueryFleetPolicy {
+    /// Trust the one locally managed Relay and do not consult a Fleet row.
+    #[default]
+    TrustedSingleRelay,
+    /// Require the existing durable, short-lived Fleet Attestation.
+    AttestedFleet,
+}
+
+impl SemanticGraphQueryFleetPolicy {
+    /// Return the exact configuration spelling for this policy.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedSingleRelay => "trusted-single-relay",
+            Self::AttestedFleet => "attested-fleet",
+        }
+    }
+}
+
+impl fmt::Display for SemanticGraphQueryFleetPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SemanticGraphQueryFleetPolicy {
+    type Err = ParseSemanticGraphQueryFleetPolicyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "trusted-single-relay" => Ok(Self::TrustedSingleRelay),
+            "attested-fleet" => Ok(Self::AttestedFleet),
+            _ => Err(ParseSemanticGraphQueryFleetPolicyError),
+        }
+    }
+}
+
+/// Error returned when a Fleet policy is not one of the two closed values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("semantic graph query Fleet policy must be trusted-single-relay or attested-fleet")]
+pub struct ParseSemanticGraphQueryFleetPolicyError;
+
+/// Typed routing requirement for Stage B and Stage D query authorization.
+///
+/// This prevents an absent deployment identity from being interpreted as an
+/// implicit Fleet bypass. Callers must choose the topology policy explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticGraphQueryRoutingTrust<'a> {
+    /// Trust the single Relay and skip only the Fleet row lock and validation.
+    TrustedSingleRelay,
+    /// Require this exact deployment and serving instance in a valid Fleet row.
+    AttestedFleet {
+        /// Deployment identity asserted by the current routing inventory.
+        deployment_id: &'a str,
+        /// Exact serving instance that must remain in that inventory.
+        instance_id: &'a str,
+    },
+}
+
+impl SemanticGraphQueryRoutingTrust<'_> {
+    /// Return the policy represented by this routing requirement.
+    pub const fn policy(self) -> SemanticGraphQueryFleetPolicy {
+        match self {
+            Self::TrustedSingleRelay => SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+            Self::AttestedFleet { .. } => SemanticGraphQueryFleetPolicy::AttestedFleet,
+        }
+    }
+}
+
+/// Typed topology requirement for atomically enabling a Community query gate.
+///
+/// Enabling in strict mode needs only the deployment-level Fleet assertion;
+/// serving-instance membership is checked later at Provider egress and result
+/// release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticGraphQueryEnableRequirement<'a> {
+    /// Apply all database prerequisites without consulting a Fleet row.
+    TrustedSingleRelay,
+    /// Additionally require a valid assertion for this deployment.
+    AttestedFleet {
+        /// Deployment identity asserted by the current routing inventory.
+        deployment_id: &'a str,
+    },
+}
+
+impl SemanticGraphQueryEnableRequirement<'_> {
+    /// Return the policy represented by this enable requirement.
+    pub const fn policy(self) -> SemanticGraphQueryFleetPolicy {
+        match self {
+            Self::TrustedSingleRelay => SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+            Self::AttestedFleet { .. } => SemanticGraphQueryFleetPolicy::AttestedFleet,
+        }
+    }
+}
 
 /// Explicitly bumped closed descriptor for the compiled HTTP query runtime.
 ///
@@ -244,8 +347,10 @@ fn hash_domain(domain: &[u8], parts: &[&[u8]]) -> Digest32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        semantic_graph_http_runtime_digest, SemanticGraphFleetInventoryError,
-        SemanticGraphHttpFleetInstance, SemanticGraphHttpFleetInventory,
+        semantic_graph_http_runtime_digest, ParseSemanticGraphQueryFleetPolicyError,
+        SemanticGraphFleetInventoryError, SemanticGraphHttpFleetInstance,
+        SemanticGraphHttpFleetInventory, SemanticGraphQueryEnableRequirement,
+        SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust,
         SEMANTIC_GRAPH_HTTP_TRANSPORT,
     };
 
@@ -281,6 +386,78 @@ mod tests {
         assert_eq!(
             digest,
             semantic_graph_http_runtime_digest().expect("runtime digest")
+        );
+    }
+
+    #[test]
+    fn fleet_policy_is_strict_stable_and_defaults_to_single_relay() {
+        assert_eq!(
+            SemanticGraphQueryFleetPolicy::default(),
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+        );
+        for (wire, policy) in [
+            (
+                "trusted-single-relay",
+                SemanticGraphQueryFleetPolicy::TrustedSingleRelay,
+            ),
+            (
+                "attested-fleet",
+                SemanticGraphQueryFleetPolicy::AttestedFleet,
+            ),
+        ] {
+            assert_eq!(wire.parse(), Ok(policy));
+            assert_eq!(policy.to_string(), wire);
+            assert_eq!(
+                serde_json::to_string(&policy).expect("serialize"),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<SemanticGraphQueryFleetPolicy>(&format!("\"{wire}\""))
+                    .expect("deserialize"),
+                policy
+            );
+        }
+        for invalid in [
+            "",
+            "trusted_single_relay",
+            " trusted-single-relay",
+            "ATTested-fleet",
+        ] {
+            assert_eq!(
+                invalid.parse::<SemanticGraphQueryFleetPolicy>(),
+                Err(ParseSemanticGraphQueryFleetPolicyError)
+            );
+            assert!(
+                serde_json::from_str::<SemanticGraphQueryFleetPolicy>(&format!("\"{invalid}\""))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_requirements_report_their_explicit_policy() {
+        assert_eq!(
+            SemanticGraphQueryRoutingTrust::TrustedSingleRelay.policy(),
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+        );
+        assert_eq!(
+            SemanticGraphQueryRoutingTrust::AttestedFleet {
+                deployment_id: "deployment-a",
+                instance_id: "relay-0",
+            }
+            .policy(),
+            SemanticGraphQueryFleetPolicy::AttestedFleet
+        );
+        assert_eq!(
+            SemanticGraphQueryEnableRequirement::TrustedSingleRelay.policy(),
+            SemanticGraphQueryFleetPolicy::TrustedSingleRelay
+        );
+        assert_eq!(
+            SemanticGraphQueryEnableRequirement::AttestedFleet {
+                deployment_id: "deployment-a",
+            }
+            .policy(),
+            SemanticGraphQueryFleetPolicy::AttestedFleet
         );
     }
 

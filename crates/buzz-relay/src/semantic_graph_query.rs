@@ -241,14 +241,11 @@ async fn root_query_attempt(
 
     // The provider-slot reservation may wait, so it cannot authorize egress.
     // Revalidate the complete principal, query, generation, graph,
-    // conditioned-source, and fleet state after acquiring the shared
-    // Community writer fence under READ COMMITTED. This deliberately forms
-    // authorization snapshots only after any exclusive revocation writer that
-    // already held the fence has committed.
-    let (Some(deployment_id), Some(instance_id)) = (
-        state.config.semantic_graph_query_deployment_id.as_deref(),
-        state.config.semantic_graph_query_instance_id.as_deref(),
-    ) else {
+    // conditioned-source, and policy-specific routing state after acquiring
+    // the shared Community writer fence under READ COMMITTED. This deliberately
+    // forms authorization snapshots only after any exclusive revocation writer
+    // that already held the fence has committed.
+    let Ok(routing_trust) = crate::semantic_fleet::semantic_graph_query_routing_trust(state) else {
         return Err(SemanticGraphRootQueryError::QueryFleetUnavailable);
     };
     let confirmation = run_before_work_deadline(
@@ -260,8 +257,7 @@ async fn root_query_attempt(
                 reader_pubkey,
                 expected_projection_pubkey: &state.relay_keypair.public_key(),
                 expected_contexts: &context_expectations,
-                deployment_id,
-                instance_id,
+                routing_trust,
             }),
     )
     .await?;

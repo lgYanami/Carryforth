@@ -819,6 +819,7 @@ dependencies = [
  "deadpool-redis",
  "hex",
  "nostr",
+ "reqwest 0.13.4",
  "rustls",
  "serde_json",
  "sqlx",

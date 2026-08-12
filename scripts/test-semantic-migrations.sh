@@ -6,7 +6,7 @@ PGVECTOR_IMAGE="pgvector/pgvector@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92
 TEST_CONTAINER="buzz-semantic-migrations-$$"
 TEST_USER="buzz_semantic_test"
 TEST_PASSWORD="buzz_semantic_test"
-TEST_DATABASE="buzz_semantic_test"
+TEST_DATABASE="buzz_semantic_disposable"
 FRESH_DATABASE="buzz_semantic_fresh"
 PLAN_FILE="$(mktemp)"
 
@@ -34,6 +34,9 @@ done
 docker exec "$TEST_CONTAINER" pg_isready \
   -U "$TEST_USER" -d "$TEST_DATABASE" >/dev/null
 docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
+  -U "$TEST_USER" -d postgres \
+  -c "ALTER DATABASE ${TEST_DATABASE} SET buzz.disposable_test = 'fleet-policy-v1'" >/dev/null
+docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
   -U "$TEST_USER" -d "$TEST_DATABASE" \
   -c "CREATE EXTENSION vector" >/dev/null
 docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
@@ -51,6 +54,9 @@ BUZZ_TEST_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TES
     -- --ignored --nocapture
 BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
   cargo test -p buzz-db semantic_pipeline_activates_only_a_complete_fenced_set -- --nocapture
+BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
+BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
+  cargo test -p buzz-db semantic_fleet::tests:: -- --ignored --nocapture
 
 # Upgraded databases intentionally retain the zero-vector constraint as NOT
 # VALID until historical rows have been repaired. Verify the exact live

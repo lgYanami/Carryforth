@@ -43,7 +43,7 @@ struct SemanticGraphHttpCapabilityFacts {
     deployment_master: bool,
     stable_signer: bool,
     provider_available: bool,
-    fleet_attested: bool,
+    routing_ready: bool,
 }
 
 const fn semantic_graph_http_capability_ready(facts: SemanticGraphHttpCapabilityFacts) -> bool {
@@ -53,7 +53,7 @@ const fn semantic_graph_http_capability_ready(facts: SemanticGraphHttpCapability
         && facts.deployment_master
         && facts.stable_signer
         && facts.provider_available
-        && facts.fleet_attested
+        && facts.routing_ready
 }
 
 /// Relay information document served at `GET /` with `Accept: application/nostr+json`.
@@ -369,9 +369,9 @@ async fn semantic_graph_query_http_ready_for_host(
     let Ok(tenant) = crate::tenant::bind_community(&state.db, raw_host).await else {
         return false;
     };
-    let fleet_attested =
-        crate::semantic_fleet::semantic_graph_http_fleet_ready(state, tenant.community()).await;
-    if !fleet_attested {
+    let routing_ready =
+        crate::semantic_fleet::semantic_graph_http_routing_ready(state, tenant.community()).await;
+    if !routing_ready {
         return false;
     }
     match state
@@ -386,7 +386,7 @@ async fn semantic_graph_query_http_ready_for_host(
             deployment_master,
             stable_signer,
             provider_available,
-            fleet_attested,
+            routing_ready,
         }),
         Err(error) => {
             tracing::warn!(
@@ -644,6 +644,9 @@ const _RELAY_INFO_BUILD_STATIC_INPUT_FENCE: fn(
 
 #[cfg(test)]
 mod tests {
+    use buzz_db::semantic_fleet::SemanticGraphHttpFleetFailure;
+    use buzz_semantic_query::SemanticGraphQueryFleetPolicy;
+
     use super::*;
 
     #[test]
@@ -924,7 +927,7 @@ mod tests {
             deployment_master: true,
             stable_signer: true,
             provider_available: true,
-            fleet_attested: true,
+            routing_ready: true,
         };
         assert!(semantic_graph_http_capability_ready(ready));
         for blocked in [
@@ -953,7 +956,7 @@ mod tests {
                 ..ready
             },
             SemanticGraphHttpCapabilityFacts {
-                fleet_attested: false,
+                routing_ready: false,
                 ..ready
             },
         ] {
@@ -962,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_graph_http_advertisement_stays_fail_closed_when_fleet_check_fails() {
+    fn semantic_graph_http_advertisement_stays_fail_closed_when_routing_check_fails() {
         let mut info = RelayInfo::build(
             Some("0000000000000000000000000000000000000000000000000000000000000001"),
             None,
@@ -981,13 +984,65 @@ mod tests {
                 deployment_master: true,
                 stable_signer: true,
                 provider_available: true,
-                fleet_attested: false,
+                routing_ready: false,
             }),
         );
         assert!(!info
             .supported_extensions
             .unwrap_or_default()
             .contains(&SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned()));
+    }
+
+    #[tokio::test]
+    async fn semantic_graph_http_advertisement_uses_shared_fleet_policy_decision() {
+        for failure in [
+            SemanticGraphHttpFleetFailure::Missing,
+            SemanticGraphHttpFleetFailure::Expired,
+            SemanticGraphHttpFleetFailure::Revoked,
+        ] {
+            for (policy, expected_advertised) in [
+                (SemanticGraphQueryFleetPolicy::TrustedSingleRelay, true),
+                (SemanticGraphQueryFleetPolicy::AttestedFleet, false),
+            ] {
+                let routing_ready =
+                    crate::semantic_fleet::semantic_graph_http_routing_ready_for_test(
+                        policy,
+                        Some(failure),
+                    )
+                    .await;
+                let capability_ready =
+                    semantic_graph_http_capability_ready(SemanticGraphHttpCapabilityFacts {
+                        database_ready: true,
+                        query_enabled: true,
+                        project_context_ready: true,
+                        deployment_master: true,
+                        stable_signer: true,
+                        provider_available: true,
+                        routing_ready,
+                    });
+                let mut info = RelayInfo::build(
+                    Some("0000000000000000000000000000000000000000000000000000000000000001"),
+                    None,
+                    false,
+                    true,
+                    DEFAULT_MAX_FRAME_BYTES,
+                    None,
+                );
+                append_extension(
+                    &mut info,
+                    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+                    capability_ready,
+                );
+
+                assert_eq!(
+                    info.supported_extensions
+                        .unwrap_or_default()
+                        .contains(&SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned()),
+                    expected_advertised,
+                    "NIP-11 policy={policy} fleet_failure={failure:?}"
+                );
+            }
+        }
     }
 
     #[test]
