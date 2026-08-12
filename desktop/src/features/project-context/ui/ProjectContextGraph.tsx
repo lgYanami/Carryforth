@@ -1,18 +1,14 @@
 import "@xyflow/react/dist/style.css";
 import "./project-context-graph.css";
 
-import { Focus, Maximize2, Minus, Plus, Route } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 import * as React from "react";
 import {
   Background,
   BackgroundVariant,
-  type EdgeMouseHandler,
-  type NodeMouseHandler,
   type NodeTypes,
   ReactFlow,
   ReactFlowProvider,
-  useNodesInitialized,
   useReactFlow,
   type EdgeTypes,
 } from "@xyflow/react";
@@ -22,9 +18,15 @@ import { focusProjectContextGraphTarget } from "@/features/project-context/focus
 import {
   buildProjectContextLayoutTopology,
   layoutProjectContextGeometry,
-  type layoutProjectContextGraph,
   materializeProjectContextLayout,
+  type ProjectContextLayout,
 } from "@/features/project-context/layout";
+import {
+  EMPTY_PROJECT_CONTEXT_CANVAS_INSETS,
+  mergeProjectContextCanvasInsets,
+  type ProjectContextCanvasInsets,
+  recenterProjectContextViewportForTextScale,
+} from "@/features/project-context/projectContextViewport";
 import {
   buildProjectContextFlowElements,
   type ProjectContextFlowEdge,
@@ -37,12 +39,31 @@ import {
   type ProjectContextSemanticOverlay,
   semanticOverlayMatchesSubstrate,
 } from "@/features/project-context/semanticOverlay";
+import {
+  ProjectContextCanvasHud,
+  type ProjectContextChromeContributor,
+} from "@/features/project-context/ui/ProjectContextCanvasHud";
 import { ProjectContextCoordinateNode } from "@/features/project-context/ui/ProjectContextCoordinateNode";
 import { ProjectContextEdgeHub } from "@/features/project-context/ui/ProjectContextEdgeHub";
 import { ProjectContextIsland } from "@/features/project-context/ui/ProjectContextIsland";
 import { ProjectContextSpoke } from "@/features/project-context/ui/ProjectContextSpoke";
+import {
+  clearProjectContextGraphHover,
+  projectContextDocumentCount,
+  projectContextSelectedLabel,
+  useProjectContextPointerInteractions,
+  useProjectContextTextScale,
+} from "@/features/project-context/ui/projectContextGraphInteraction";
+import { useProjectContextChromeMeasurement } from "@/features/project-context/ui/useProjectContextChromeMeasurement";
+import {
+  type ProjectContextFitQueueRequest,
+  type ProjectContextFitRequest,
+  useProjectContextFitSubmission,
+} from "@/features/project-context/ui/useProjectContextFitSubmission";
+import { useProjectContextHumanViewportAuthority } from "@/features/project-context/ui/useProjectContextHumanViewportAuthority";
+import { useProjectContextResizePreservation } from "@/features/project-context/ui/useProjectContextResizePreservation";
+import { useProjectContextViewportAuthority } from "@/features/project-context/ui/useProjectContextViewportAuthority";
 import type { ProjectContextQueryResult } from "@/shared/api/tauriProjectContext";
-import { Button } from "@/shared/ui/button";
 
 const NODE_TYPES = {
   contextIsland: ProjectContextIsland,
@@ -54,132 +75,76 @@ const EDGE_TYPES = {
   contextSpoke: ProjectContextSpoke,
 } satisfies EdgeTypes;
 
-function currentTextScale() {
-  if (typeof document === "undefined") return 1;
-  const fontSize = Number.parseFloat(
-    window.getComputedStyle(document.documentElement).fontSize,
-  );
-  return Number.isFinite(fontSize) ? fontSize / 16 : 1;
-}
-
-function useProjectContextTextScale() {
-  const [scale, setScale] = React.useState(currentTextScale);
-  React.useLayoutEffect(() => {
-    const update = () => setScale(currentTextScale());
-    const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class", "style"],
-    });
-    window.addEventListener("resize", update);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", update);
-    };
-  }, []);
-  return scale;
-}
-
-function targetForNode(
-  node: ProjectContextFlowNode,
-): ProjectContextGraphTarget | null {
-  if (node.data.kind === "coordinate") {
-    return { kind: "coordinate", key: node.data.coordinate.coordinateKey };
-  }
-  if (node.data.kind === "hub") {
-    return { kind: "edge", key: node.data.hub.edgeKey };
-  }
-  return null;
-}
-
-function sameTarget(
-  left: ProjectContextGraphTarget | null,
-  right: ProjectContextGraphTarget | null,
-) {
-  return left?.kind === right?.kind && left?.key === right?.key;
-}
-
-function clearGraphHover(root: HTMLElement | null) {
-  for (const element of root?.querySelectorAll("[data-context-graph-kind]") ??
-    []) {
-    element.removeAttribute("data-hover-emphasis");
-  }
-}
-
-function applyGraphHover(
-  root: HTMLElement | null,
-  graph: ReturnType<typeof buildProjectContextGraph>,
-  target: ProjectContextGraphTarget,
-) {
-  if (!root) return;
-  const activeCoordinateKeys = new Set<string>();
-  const activeEdgeKeys = new Set<string>();
-  if (target.kind === "edge") {
-    activeEdgeKeys.add(target.key);
-    for (const key of graph.hubs.find((hub) => hub.edgeKey === target.key)
-      ?.coordinateKeys ?? []) {
-      activeCoordinateKeys.add(key);
-    }
-  } else {
-    activeCoordinateKeys.add(target.key);
-    for (const hub of graph.hubs) {
-      if (hub.coordinateKeys.includes(target.key)) {
-        activeEdgeKeys.add(hub.edgeKey);
-      }
-    }
-  }
-
-  for (const element of root.querySelectorAll("[data-context-graph-kind]")) {
-    const kind = element.getAttribute("data-context-graph-kind");
-    const coordinateKey = element.getAttribute("data-coordinate-key");
-    const edgeKey = element.getAttribute("data-edge-key");
-    const active =
-      kind === "coordinate"
-        ? coordinateKey !== null && activeCoordinateKeys.has(coordinateKey)
-        : kind === "edge"
-          ? edgeKey !== null && activeEdgeKeys.has(edgeKey)
-          : target.kind === "edge"
-            ? edgeKey === target.key
-            : coordinateKey === target.key;
-    element.setAttribute("data-hover-emphasis", active ? "active" : "dimmed");
-  }
-}
+// Dense project-wide Islands need an overview below the legacy card's 0.12
+// floor; Humans can still zoom back in without changing canonical geometry.
+const MIN_ZOOM = 0.05;
+const MAX_ZOOM = 2.2;
+const FIT_MAX_ZOOM = 1.15;
 
 type ProjectContextGraphInnerProps = {
   elements: ProjectContextFlowElements;
+  externalInsets: ProjectContextCanvasInsets;
   fitSemanticPathsRequest: number;
+  fitSuspended: boolean;
   focusSelectionRequest: number;
   graph: ReturnType<typeof buildProjectContextGraph>;
-  layout: ReturnType<typeof layoutProjectContextGraph>;
+  layout: ProjectContextLayout;
+  onClearSemanticResult?: () => void;
   queryIdentity: string;
   selection: ProjectContextGraphTarget | null;
   semanticFreshness: ProjectContextSemanticFreshness;
   semanticOverlay: ProjectContextSemanticOverlay | null;
+  semanticSessionOverlay: ProjectContextSemanticOverlay | null;
   textScale: number;
   onSelectionChange: (selection: ProjectContextGraphTarget | null) => void;
 };
 
 function ProjectContextGraphInner({
   elements,
+  externalInsets,
   fitSemanticPathsRequest,
+  fitSuspended,
   focusSelectionRequest,
   graph,
   layout,
+  onClearSemanticResult,
   onSelectionChange,
   queryIdentity,
   selection,
   semanticFreshness,
   semanticOverlay,
+  semanticSessionOverlay,
   textScale,
 }: ProjectContextGraphInnerProps) {
   const shouldReduceMotion = useReducedMotion();
-  const nodesInitialized = useNodesInitialized();
-  const handledFocusSelectionRequest = React.useRef(0);
-  const handledFitSemanticPathsRequest = React.useRef(0);
   const graphRootRef = React.useRef<HTMLElement>(null);
-  const { fitBounds, fitView, getViewport, setViewport, zoomIn, zoomOut } =
-    useReactFlow<ProjectContextFlowNode, ProjectContextFlowEdge>();
+  const { getViewport, setViewport, zoomIn, zoomOut } = useReactFlow<
+    ProjectContextFlowNode,
+    ProjectContextFlowEdge
+  >();
   const duration = shouldReduceMotion ? 0 : 220;
+  const selectedLabel = React.useMemo(
+    () => projectContextSelectedLabel(graph, selection),
+    [graph, selection],
+  );
+  const expectedChromeContributors = React.useMemo<
+    readonly ProjectContextChromeContributor[]
+  >(
+    () =>
+      selectedLabel
+        ? ["summary", "selection", "controls", "guidance"]
+        : ["summary", "controls", "guidance"],
+    [selectedLabel],
+  );
+  const { measurement, registerChromeContributor } =
+    useProjectContextChromeMeasurement({
+      expectedContributors: expectedChromeContributors,
+      externalInsets,
+      rootRef: graphRootRef,
+    });
+  const measurementGeneration = React.useRef(measurement.generation);
+  measurementGeneration.current = measurement.generation;
+
   const layoutKey = React.useMemo(
     () =>
       layout.nodes
@@ -193,11 +158,94 @@ function ProjectContextGraphInner({
   const semanticGeneration = semanticOverlay
     ? `${semanticOverlay.requestId}:${semanticOverlay.substrateIdentity}`
     : "none";
+  const queryIdentityRef = React.useRef(queryIdentity);
+  const semanticGenerationRef = React.useRef(semanticGeneration);
+  queryIdentityRef.current = queryIdentity;
+  semanticGenerationRef.current = semanticGeneration;
   const hoverResetKey = `${layoutKey}:${selection?.kind ?? "none"}:${selection?.key ?? "none"}:${semanticGeneration}`;
   const previousHoverResetKey = React.useRef<string | null>(null);
-  const fittedQueryIdentity = React.useRef<string | null>(null);
-  const fittedSemanticGeneration = React.useRef<string | null>(null);
   const previousLayout = React.useRef({ layout, queryIdentity, textScale });
+  const handledQueryIdentity = React.useRef<string | null>(null);
+  const queuedQueryIdentity = React.useRef<string | null>(null);
+  const handledSemanticGeneration = React.useRef<string | null>(null);
+  const queuedSemanticGeneration = React.useRef<string | null>(null);
+  const handledFocusSelectionRequest = React.useRef(0);
+  const queuedFocusSelectionRequest = React.useRef(0);
+  const handledFitSemanticPathsRequest = React.useRef(0);
+  const queuedFitSemanticPathsRequest = React.useRef(0);
+  const [pendingFit, setPendingFit] =
+    React.useState<ProjectContextFitRequest | null>(null);
+  const [autoFitCount, setAutoFitCount] = React.useState(0);
+  const [viewportEstablished, setViewportEstablished] = React.useState(false);
+  const fitGeneration = React.useRef(0);
+  const textScaleGeneration = React.useRef(0);
+  const {
+    armHumanInteractionFallback,
+    authorityPending,
+    beginAuthority,
+    currentAuthority,
+    currentHumanViewportGeneration,
+    humanViewportGeneration,
+    invalidateAuthority,
+    settleAuthority,
+    snapshot: viewportAuthoritySnapshot,
+    trackOperation,
+  } = useProjectContextViewportAuthority();
+  const submittedFit = React.useRef<{
+    authority: number;
+    chromeGeneration: number;
+  } | null>(null);
+  const {
+    correctionCount: viewportCorrectionCount,
+    getBaselineSize: getResizeBaselineSize,
+    resetBaseline: resetResizeBaseline,
+  } = useProjectContextResizePreservation({
+    authorityPending,
+    fitGeneration,
+    getViewport,
+    humanViewportGeneration,
+    queryIdentity: queryIdentityRef,
+    rootRef: graphRootRef,
+    setViewport,
+    textScaleGeneration,
+  });
+
+  const queueFit = React.useCallback(
+    (request: ProjectContextFitQueueRequest) => {
+      const authority = beginAuthority();
+      fitGeneration.current += 1;
+      submittedFit.current = null;
+      setPendingFit({
+        ...request,
+        authority,
+        humanViewportGeneration: humanViewportGeneration.current,
+        queryIdentity: queryIdentityRef.current,
+        textScaleGeneration: textScaleGeneration.current,
+      });
+    },
+    [beginAuthority, humanViewportGeneration],
+  );
+
+  const cancelPendingViewportOperation = React.useCallback(() => {
+    submittedFit.current = null;
+    setPendingFit(null);
+    setViewportEstablished(true);
+  }, []);
+  const {
+    beginGesture: beginHumanViewportGesture,
+    continueGesture: continueHumanViewportGesture,
+    endGesture: endHumanViewportGesture,
+    runCommand: runHumanViewportCommand,
+  } = useProjectContextHumanViewportAuthority({
+    armHumanInteractionFallback,
+    beginAuthority,
+    cancelPendingViewportOperation,
+    duration,
+    resetResizeBaseline,
+    settleAuthority,
+    trackOperation,
+  });
+
   const semanticBounds = React.useMemo(() => {
     if (!semanticOverlay) return null;
     const targetIds = new Set(semanticOverlay.boundsTargetIds);
@@ -209,25 +257,34 @@ function ProjectContextGraphInner({
     const maxY = Math.max(...targets.map((node) => node.y + node.height));
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }, [layout.nodes, semanticOverlay]);
-  const fitSemanticPaths = React.useCallback(() => {
-    if (!semanticBounds) return;
-    void fitBounds(semanticBounds, {
-      padding: 0.24,
-      duration,
-    });
-  }, [duration, fitBounds, semanticBounds]);
+
+  const queueSemanticFit = React.useCallback(
+    (completion: ProjectContextFitRequest["completion"]) => {
+      if (!semanticBounds) return;
+      queueFit({
+        bounds: semanticBounds,
+        completion,
+        duration,
+        maxZoom: FIT_MAX_ZOOM,
+        padding: 0.24,
+        semanticGeneration: semanticGenerationRef.current,
+      });
+    },
+    [duration, queueFit, semanticBounds],
+  );
 
   React.useLayoutEffect(() => {
     const previous = previousLayout.current;
     previousLayout.current = { layout, queryIdentity, textScale };
     if (
-      !nodesInitialized ||
       previous.queryIdentity !== queryIdentity ||
       previous.textScale === textScale ||
       previous.textScale <= 0
     ) {
       return;
     }
+    textScaleGeneration.current += 1;
+    fitGeneration.current += 1;
     const viewport = getViewport();
     const selectedId = selection
       ? selection.kind === "coordinate"
@@ -240,107 +297,114 @@ function ProjectContextGraphInner({
     const nextNode = selectedId
       ? layout.nodes.find((node) => node.id === selectedId)
       : undefined;
+    let nextViewport: ReturnType<typeof getViewport>;
     if (previousNode && nextNode) {
       const previousCenterX = previousNode.x + previousNode.width / 2;
       const previousCenterY = previousNode.y + previousNode.height / 2;
       const nextCenterX = nextNode.x + nextNode.width / 2;
       const nextCenterY = nextNode.y + nextNode.height / 2;
-      void setViewport(
-        {
-          x: viewport.x + (previousCenterX - nextCenterX) * viewport.zoom,
-          y: viewport.y + (previousCenterY - nextCenterY) * viewport.zoom,
-          zoom: viewport.zoom,
-        },
-        { duration: 0 },
-      );
-      return;
-    }
-    const root = graphRootRef.current;
-    if (!root) return;
-    const focusX = root.clientWidth / 2;
-    const focusY = root.clientHeight / 2;
-    const ratio = textScale / previous.textScale;
-    const graphX = (focusX - viewport.x) / viewport.zoom;
-    const graphY = (focusY - viewport.y) / viewport.zoom;
-    void setViewport(
-      {
-        x: focusX - graphX * ratio * viewport.zoom,
-        y: focusY - graphY * ratio * viewport.zoom,
+      nextViewport = {
+        x: viewport.x + (previousCenterX - nextCenterX) * viewport.zoom,
+        y: viewport.y + (previousCenterY - nextCenterY) * viewport.zoom,
         zoom: viewport.zoom,
-      },
-      { duration: 0 },
-    );
+      };
+    } else {
+      const root = graphRootRef.current;
+      if (!root) return;
+      const nextSize = {
+        width: root.clientWidth,
+        height: root.clientHeight,
+      };
+      nextViewport = recenterProjectContextViewportForTextScale({
+        nextSize,
+        previousSize: getResizeBaselineSize() ?? nextSize,
+        scaleRatio:
+          previous.layout.bounds.width > 0
+            ? layout.bounds.width / previous.layout.bounds.width
+            : textScale / previous.textScale,
+        viewport,
+      });
+    }
+    const authority = beginAuthority();
+    trackOperation({
+      authority,
+      duration: 0,
+      onSettled: resetResizeBaseline,
+      operation: setViewport(nextViewport, { duration: 0 }),
+    });
   }, [
+    beginAuthority,
+    getResizeBaselineSize,
     getViewport,
     layout,
-    nodesInitialized,
     queryIdentity,
+    resetResizeBaseline,
     selection,
     setViewport,
     textScale,
+    trackOperation,
   ]);
 
   React.useEffect(() => {
     if (
-      !nodesInitialized ||
       layoutKey.length === 0 ||
-      fittedQueryIdentity.current === queryIdentity
+      handledQueryIdentity.current === queryIdentity ||
+      queuedQueryIdentity.current === queryIdentity
     ) {
       return;
     }
-    fittedQueryIdentity.current = queryIdentity;
-    if (semanticOverlay) return;
-    void fitBounds(layout.bounds, { padding: 0.08, duration: 0 });
-  }, [
-    fitBounds,
-    layout.bounds,
-    layoutKey,
-    nodesInitialized,
-    queryIdentity,
-    semanticOverlay,
-  ]);
+    queuedQueryIdentity.current = queryIdentity;
+    if (semanticOverlay) {
+      handledQueryIdentity.current = queryIdentity;
+      queuedQueryIdentity.current = null;
+      return;
+    }
+    queueFit({
+      bounds: layout.bounds,
+      completion: { kind: "query", key: queryIdentity },
+      duration: 0,
+      maxZoom: FIT_MAX_ZOOM,
+      padding: 0.08,
+    });
+  }, [layout.bounds, layoutKey, queryIdentity, queueFit, semanticOverlay]);
 
   React.useEffect(() => {
+    if (semanticGeneration === "none") {
+      queuedSemanticGeneration.current = null;
+      return;
+    }
     if (
-      !nodesInitialized ||
       !semanticBounds ||
-      fittedSemanticGeneration.current === semanticGeneration
+      handledSemanticGeneration.current === semanticGeneration ||
+      queuedSemanticGeneration.current === semanticGeneration
     ) {
       return;
     }
-    fittedSemanticGeneration.current = semanticGeneration;
-    fitSemanticPaths();
-  }, [fitSemanticPaths, nodesInitialized, semanticBounds, semanticGeneration]);
+    queuedSemanticGeneration.current = semanticGeneration;
+    queueSemanticFit({ kind: "semantic", key: semanticGeneration });
+  }, [queueSemanticFit, semanticBounds, semanticGeneration]);
 
   React.useEffect(() => {
     if (
-      !nodesInitialized ||
       !semanticBounds ||
       fitSemanticPathsRequest === 0 ||
-      fitSemanticPathsRequest === handledFitSemanticPathsRequest.current
+      fitSemanticPathsRequest === handledFitSemanticPathsRequest.current ||
+      fitSemanticPathsRequest === queuedFitSemanticPathsRequest.current
     ) {
       return;
     }
-    handledFitSemanticPathsRequest.current = fitSemanticPathsRequest;
-    fitSemanticPaths();
-  }, [
-    fitSemanticPaths,
-    fitSemanticPathsRequest,
-    nodesInitialized,
-    semanticBounds,
-  ]);
-
-  React.useEffect(() => {
-    if (previousHoverResetKey.current === hoverResetKey) return;
-    previousHoverResetKey.current = hoverResetKey;
-    clearGraphHover(graphRootRef.current);
-  }, [hoverResetKey]);
+    queuedFitSemanticPathsRequest.current = fitSemanticPathsRequest;
+    queueSemanticFit({
+      kind: "semantic-request",
+      key: fitSemanticPathsRequest,
+    });
+  }, [fitSemanticPathsRequest, queueSemanticFit, semanticBounds]);
 
   React.useEffect(() => {
     if (
-      !nodesInitialized ||
       focusSelectionRequest === 0 ||
       focusSelectionRequest === handledFocusSelectionRequest.current ||
+      focusSelectionRequest === queuedFocusSelectionRequest.current ||
       !selection
     ) {
       return;
@@ -351,98 +415,154 @@ function ProjectContextGraphInner({
         : `edge-hub:${selection.key}`;
     const node = layout.nodes.find((candidate) => candidate.id === nodeId);
     if (!node) return;
-    handledFocusSelectionRequest.current = focusSelectionRequest;
-    let cancelled = false;
-    const focusTarget = () => {
-      if (!cancelled) focusProjectContextGraphTarget(selection);
-    };
-    focusTarget();
-    void fitBounds(
-      { x: node.x, y: node.y, width: node.width, height: node.height },
-      { padding: 0.8, duration },
-    ).then(focusTarget);
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    duration,
-    fitBounds,
-    focusSelectionRequest,
-    layout.nodes,
-    nodesInitialized,
-    selection,
-  ]);
+    queuedFocusSelectionRequest.current = focusSelectionRequest;
+    focusProjectContextGraphTarget(selection);
+    queueFit({
+      bounds: node,
+      completion: {
+        kind: "focus-request",
+        key: focusSelectionRequest,
+        target: selection,
+      },
+      duration,
+      maxZoom: MAX_ZOOM,
+      padding: 0.8,
+    });
+  }, [duration, focusSelectionRequest, layout.nodes, queueFit, selection]);
 
-  const handleNodeClick = React.useCallback<
-    NodeMouseHandler<ProjectContextFlowNode>
-  >(
-    (_event, node) => {
-      const target = targetForNode(node);
-      if (!target) return;
-      onSelectionChange(sameTarget(selection, target) ? null : target);
-    },
-    [onSelectionChange, selection],
-  );
-  const handleNodeMouseEnter = React.useCallback<
-    NodeMouseHandler<ProjectContextFlowNode>
-  >(
-    (_event, node) => {
-      const target = targetForNode(node);
-      if (target && !selection) {
-        applyGraphHover(graphRootRef.current, graph, target);
+  const cancelFitRequest = React.useCallback(
+    (request: ProjectContextFitRequest, preserveQueuedRequest: boolean) => {
+      if (preserveQueuedRequest) return;
+      switch (request.completion.kind) {
+        case "query":
+          queuedQueryIdentity.current = null;
+          break;
+        case "semantic":
+          queuedSemanticGeneration.current = null;
+          break;
+        case "semantic-request":
+          queuedFitSemanticPathsRequest.current = 0;
+          break;
+        case "focus-request":
+          queuedFocusSelectionRequest.current = 0;
+          break;
+        case "manual":
+          break;
       }
     },
-    [graph, selection],
+    [],
   );
-  const handleNodeMouseLeave = React.useCallback<
-    NodeMouseHandler<ProjectContextFlowNode>
-  >(() => {
-    clearGraphHover(graphRootRef.current);
-  }, []);
-  const handleEdgeClick = React.useCallback<
-    EdgeMouseHandler<ProjectContextFlowEdge>
-  >(
-    (_event, edge) => {
-      if (!edge.data) return;
-      const target = { kind: "edge", key: edge.data.edgeKey } as const;
-      onSelectionChange(sameTarget(selection, target) ? null : target);
-    },
-    [onSelectionChange, selection],
-  );
-  const handleEdgeMouseEnter = React.useCallback<
-    EdgeMouseHandler<ProjectContextFlowEdge>
-  >(
-    (_event, edge) => {
-      if (edge.data) {
-        if (!selection) {
-          applyGraphHover(graphRootRef.current, graph, {
-            kind: "edge",
-            key: edge.data.edgeKey,
-          });
-        }
+  const commitFitRequest = React.useCallback(
+    (request: ProjectContextFitRequest) => {
+      switch (request.completion.kind) {
+        case "query":
+          handledQueryIdentity.current = request.completion.key;
+          queuedQueryIdentity.current = null;
+          setAutoFitCount((current) => current + 1);
+          break;
+        case "semantic":
+          handledSemanticGeneration.current = request.completion.key;
+          queuedSemanticGeneration.current = null;
+          break;
+        case "semantic-request":
+          handledFitSemanticPathsRequest.current = request.completion.key;
+          queuedFitSemanticPathsRequest.current = 0;
+          break;
+        case "focus-request":
+          handledFocusSelectionRequest.current = request.completion.key;
+          queuedFocusSelectionRequest.current = 0;
+          focusProjectContextGraphTarget(request.completion.target);
+          break;
+        case "manual":
+          break;
       }
+      setViewportEstablished(true);
     },
-    [graph, selection],
+    [],
   );
-  const handleEdgeMouseLeave = React.useCallback<
-    EdgeMouseHandler<ProjectContextFlowEdge>
-  >(() => {
-    clearGraphHover(graphRootRef.current);
-  }, []);
-  const selectedLabel = React.useMemo(() => {
-    if (!selection) return undefined;
-    if (selection.kind === "coordinate") {
-      return graph.coordinates.find(
-        (coordinate) => coordinate.coordinateKey === selection.key,
-      )?.displayTitle;
-    }
-    const hub = graph.hubs.find(
-      (candidate) => candidate.edgeKey === selection.key,
-    );
-    return hub
-      ? `Edge · ${hub.coordinateKeys.length} ${hub.coordinateKeys.length === 1 ? "coordinate" : "coordinates"} · ${hub.contextDocumentIds.length} ${hub.contextDocumentIds.length === 1 ? "doc" : "docs"}`
-      : undefined;
-  }, [graph, selection]);
+  useProjectContextFitSubmission({
+    authoritySnapshot: viewportAuthoritySnapshot,
+    currentAuthority,
+    currentHumanViewportGeneration,
+    fitGeneration,
+    fitSuspended,
+    invalidateAuthority,
+    layout,
+    measurement,
+    measurementGeneration,
+    minZoom: MIN_ZOOM,
+    onCanceled: cancelFitRequest,
+    onCommitted: commitFitRequest,
+    pendingFit,
+    queryIdentity: queryIdentityRef,
+    queueFit,
+    resetResizeBaseline,
+    rootRef: graphRootRef,
+    selection,
+    semanticBounds,
+    semanticGeneration: semanticGenerationRef,
+    setPendingFit,
+    setViewport,
+    submittedFit,
+    textScaleGeneration,
+    trackOperation,
+  });
+
+  React.useEffect(() => {
+    if (previousHoverResetKey.current === hoverResetKey) return;
+    previousHoverResetKey.current = hoverResetKey;
+    clearProjectContextGraphHover(graphRootRef.current);
+  }, [hoverResetKey]);
+  const pointerInteractions = useProjectContextPointerInteractions({
+    graph,
+    onSelectionChange,
+    rootRef: graphRootRef,
+    selection,
+  });
+
+  const fitAll = React.useCallback(() => {
+    queueFit({
+      bounds: layout.bounds,
+      completion: { kind: "manual" },
+      duration,
+      maxZoom: FIT_MAX_ZOOM,
+      padding: 0.08,
+    });
+  }, [duration, layout.bounds, queueFit]);
+  const fitIsland = React.useCallback(
+    (island: ProjectContextLayout["islands"][number]) => {
+      queueFit({
+        bounds: island.bounds,
+        completion: { kind: "manual" },
+        duration,
+        maxZoom: FIT_MAX_ZOOM,
+        padding: 0.14,
+      });
+    },
+    [duration, queueFit],
+  );
+  const fitSelection = React.useCallback(() => {
+    if (!selection) return;
+    const nodeId =
+      selection.kind === "coordinate"
+        ? `coordinate:${selection.key}`
+        : `edge-hub:${selection.key}`;
+    const node = layout.nodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    focusProjectContextGraphTarget(selection);
+    queueFit({
+      bounds: node,
+      completion: { kind: "manual" },
+      duration,
+      maxZoom: MAX_ZOOM,
+      padding: 0.8,
+    });
+  }, [duration, layout.nodes, queueFit, selection]);
+
+  const contextDocumentCount = React.useMemo(
+    () => projectContextDocumentCount(graph),
+    [graph],
+  );
 
   return (
     <section
@@ -452,10 +572,25 @@ function ProjectContextGraphInner({
           : "project-context-graph-description"
       }
       aria-label="Project Context graph canvas"
-      className="project-context-graph relative min-h-0 flex-1 overflow-hidden bg-background/35"
-      data-semantic-freshness={semanticOverlay ? semanticFreshness : undefined}
+      className="project-context-graph relative min-h-0 min-w-0 flex-1 overflow-hidden bg-background/35"
+      data-auto-fit-count={autoFitCount}
+      data-chrome-generation={measurement.generation}
+      data-chrome-ready={measurement.ready}
+      data-human-viewport-generation={
+        viewportAuthoritySnapshot.humanViewportGeneration
+      }
+      data-semantic-freshness={
+        semanticSessionOverlay ? semanticFreshness : undefined
+      }
       data-semantic-overlay={semanticOverlay ? "active" : undefined}
       data-testid="project-context-graph"
+      data-viewport-authority-generation={
+        viewportAuthoritySnapshot.authorityGeneration
+      }
+      data-viewport-authority-pending={
+        viewportAuthoritySnapshot.authorityPending
+      }
+      data-viewport-correction-count={viewportCorrectionCount}
       ref={graphRootRef}
     >
       <ReactFlow<ProjectContextFlowNode, ProjectContextFlowEdge>
@@ -466,23 +601,34 @@ function ProjectContextGraphInner({
         edgesReconnectable={false}
         edgeTypes={EDGE_TYPES}
         elementsSelectable
-        fitView
-        fitViewOptions={{ padding: 0.08, maxZoom: 1.15 }}
-        maxZoom={2.2}
-        minZoom={0.12}
+        maxZoom={MAX_ZOOM}
+        minZoom={MIN_ZOOM}
         nodes={elements.nodes}
         nodesConnectable={false}
         nodesDraggable={false}
         nodesFocusable={false}
         nodeTypes={NODE_TYPES}
-        onEdgeClick={handleEdgeClick}
-        onEdgeMouseEnter={handleEdgeMouseEnter}
-        onEdgeMouseLeave={handleEdgeMouseLeave}
-        onNodeClick={handleNodeClick}
-        onNodeMouseEnter={handleNodeMouseEnter}
-        onNodeMouseLeave={handleNodeMouseLeave}
-        onPaneClick={() => onSelectionChange(null)}
-        onlyRenderVisibleElements
+        onEdgeClick={pointerInteractions.onEdgeClick}
+        onEdgeMouseEnter={pointerInteractions.onEdgeMouseEnter}
+        onEdgeMouseLeave={pointerInteractions.onEdgeMouseLeave}
+        onMove={(event) => {
+          if (event) continueHumanViewportGesture();
+        }}
+        onMoveEnd={(event) => {
+          if (event) {
+            endHumanViewportGesture();
+          } else if (!authorityPending.current) {
+            resetResizeBaseline();
+          }
+        }}
+        onMoveStart={(event) => {
+          if (event) beginHumanViewportGesture();
+        }}
+        onNodeClick={pointerInteractions.onNodeClick}
+        onNodeMouseEnter={pointerInteractions.onNodeMouseEnter}
+        onNodeMouseLeave={pointerInteractions.onNodeMouseLeave}
+        onPaneClick={pointerInteractions.onPaneClick}
+        onlyRenderVisibleElements={viewportEstablished}
         panOnDrag
         proOptions={{ hideAttribution: true }}
         selectionOnDrag={false}
@@ -494,112 +640,29 @@ function ProjectContextGraphInner({
           size={1}
           variant={BackgroundVariant.Dots}
         />
-        {semanticOverlay ? (
-          <div
-            className="pointer-events-none absolute left-3 top-3 z-20 flex items-center gap-2 rounded-lg border border-border/70 bg-background/90 px-2.5 py-1.5 text-2xs font-medium shadow-sm backdrop-blur"
-            data-testid="project-context-semantic-legend"
-          >
-            <span
-              aria-hidden
-              className={`h-2.5 w-2.5 rounded-full border-2 ${
-                semanticFreshness === "stale"
-                  ? "border-amber-600 dark:border-amber-300"
-                  : "border-cyan-600 dark:border-cyan-300"
-              }`}
-            />
-            {semanticFreshness === "stale"
-              ? "Stale semantic snapshot"
-              : "Semantic paths"}
-          </div>
-        ) : null}
-        <div className="absolute bottom-3 right-3 z-20 flex items-center gap-1 rounded-xl border border-border/70 bg-background/90 p-1 shadow-lg backdrop-blur">
-          <Button
-            aria-label="Zoom out"
-            onClick={() => void zoomOut({ duration })}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-          >
-            <Minus />
-          </Button>
-          <Button
-            aria-label="Zoom in"
-            onClick={() => void zoomIn({ duration })}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-          >
-            <Plus />
-          </Button>
-          <Button
-            aria-label={
-              graph.isAllContext
-                ? "Fit all Context Islands"
-                : "Fit query result"
-            }
-            data-testid="project-context-fit-all-canvas"
-            onClick={() =>
-              void fitView({ padding: 0.08, duration, maxZoom: 1.15 })
-            }
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-          >
-            <Maximize2 />
-          </Button>
-          {selection ? (
-            <Button
-              aria-label="Fit selected graph item"
-              data-testid="project-context-fit-selection"
-              onClick={() => {
-                const nodeId =
-                  selection.kind === "coordinate"
-                    ? `coordinate:${selection.key}`
-                    : `edge-hub:${selection.key}`;
-                const node = layout.nodes.find(
-                  (candidate) => candidate.id === nodeId,
-                );
-                if (!node) return;
-                focusProjectContextGraphTarget(selection);
-                void fitBounds(
-                  {
-                    x: node.x,
-                    y: node.y,
-                    width: node.width,
-                    height: node.height,
-                  },
-                  { padding: 0.8, duration },
-                ).then(() => focusProjectContextGraphTarget(selection));
-              }}
-              size="icon-xs"
-              type="button"
-              variant="ghost"
-            >
-              <Focus />
-            </Button>
-          ) : null}
-          {semanticOverlay && semanticBounds ? (
-            <Button
-              aria-label="Fit semantic paths"
-              data-testid="project-context-fit-semantic-paths"
-              onClick={fitSemanticPaths}
-              size="icon-xs"
-              type="button"
-              variant="ghost"
-            >
-              <Route />
-            </Button>
-          ) : null}
-        </div>
-        {selectedLabel ? (
-          <div
-            className="absolute right-3 top-3 z-20 max-w-64 truncate rounded-lg border border-border/70 bg-background/90 px-2.5 py-1.5 text-xs font-medium shadow-sm backdrop-blur"
-            data-testid="project-context-selection-status"
-            role="status"
-          >
-            {selectedLabel}
-          </div>
-        ) : null}
+        <ProjectContextCanvasHud
+          contextDocumentCount={contextDocumentCount}
+          externalInsets={externalInsets}
+          graph={graph}
+          layout={layout}
+          onClearSemanticResult={
+            semanticSessionOverlay ? onClearSemanticResult : undefined
+          }
+          onFitAll={fitAll}
+          onFitIsland={fitIsland}
+          onFitSelection={selection ? fitSelection : undefined}
+          onFitSemanticPaths={
+            semanticBounds
+              ? () => queueSemanticFit({ kind: "manual" })
+              : undefined
+          }
+          onZoomIn={() => runHumanViewportCommand(() => zoomIn({ duration }))}
+          onZoomOut={() => runHumanViewportCommand(() => zoomOut({ duration }))}
+          registerChromeContributor={registerChromeContributor}
+          selectedLabel={selectedLabel}
+          semanticFreshness={semanticFreshness}
+          semanticOverlay={semanticSessionOverlay}
+        />
       </ReactFlow>
       <span className="sr-only" id="project-context-graph-description">
         This is an undirected incidence graph. Node placement does not express
@@ -613,39 +676,31 @@ function ProjectContextGraphInner({
           outside the highlight are not declared irrelevant.
         </span>
       ) : null}
-      <div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
-        <span className="rounded-full bg-background/75 px-2.5 py-1 text-2xs text-muted-foreground shadow-sm backdrop-blur">
-          Pan · Scroll to zoom · Undirected · placement carries no rank or
-          causality
-        </span>
-      </div>
-      {selection ? (
-        <div className="sr-only" aria-live="polite" aria-atomic="true">
-          {selection.kind === "edge" ? "Context Edge" : "Coordinate"} selected.
-        </div>
-      ) : null}
-      {semanticOverlay ? (
-        <div className="sr-only" aria-live="polite" aria-atomic="true">
-          Semantic result active. {semanticOverlay.pathCount} paths and{" "}
-          {semanticOverlay.rootCount} roots shown.
-        </div>
-      ) : null}
     </section>
   );
 }
 
+export type { ProjectContextCanvasInsets };
+
 /** Read-only query result graph; stable selection is owned by route state. */
 export function ProjectContextGraph({
+  externalCanvasInsets,
   fitSemanticPathsRequest = 0,
+  fitSuspended = false,
   focusSelectionRequest = 0,
+  onClearSemanticResult,
   onSelectionChange,
   result,
   selection,
   semanticFreshness = "snapshot",
   semanticOverlay = null,
+  semanticSessionOverlay = semanticOverlay,
 }: {
+  externalCanvasInsets?: Partial<ProjectContextCanvasInsets>;
   fitSemanticPathsRequest?: number;
+  fitSuspended?: boolean;
   focusSelectionRequest?: number;
+  onClearSemanticResult?: () => void;
   onSelectionChange: (
     selection: ProjectContextGraphTarget | null,
     options?: { replace?: boolean },
@@ -654,8 +709,23 @@ export function ProjectContextGraph({
   selection: ProjectContextGraphTarget | null;
   semanticFreshness?: ProjectContextSemanticFreshness;
   semanticOverlay?: ProjectContextSemanticOverlay | null;
+  semanticSessionOverlay?: ProjectContextSemanticOverlay | null;
 }) {
   const textScale = useProjectContextTextScale();
+  const externalBottom = externalCanvasInsets?.bottom;
+  const externalLeft = externalCanvasInsets?.left;
+  const externalRight = externalCanvasInsets?.right;
+  const externalTop = externalCanvasInsets?.top;
+  const externalInsets = React.useMemo(
+    () =>
+      mergeProjectContextCanvasInsets(EMPTY_PROJECT_CONTEXT_CANVAS_INSETS, {
+        bottom: externalBottom,
+        left: externalLeft,
+        right: externalRight,
+        top: externalTop,
+      }),
+    [externalBottom, externalLeft, externalRight, externalTop],
+  );
   const visibleSemanticOverlay = React.useMemo(
     () =>
       semanticOverlay &&
@@ -692,130 +762,28 @@ export function ProjectContextGraph({
       ),
     [graph, layout, selection, visibleSemanticOverlay],
   );
-  const contextDocumentCount = new Set(
-    graph.hubs.flatMap((hub) => hub.contextDocumentIds),
-  ).size;
 
   return (
     <ReactFlowProvider>
-      <section className="flex min-h-96 flex-1 flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/25">
-        <div className="border-b border-border/70 bg-background/55 px-3 py-2.5 sm:px-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              {graph.isAllContext ? (
-                <>
-                  <div
-                    className="text-sm font-semibold"
-                    data-testid="project-context-island-summary"
-                  >
-                    {graph.islands.length} context{" "}
-                    {graph.islands.length === 1 ? "island" : "islands"} ·{" "}
-                    {graph.coordinates.length}{" "}
-                    {graph.coordinates.length === 1
-                      ? "coordinate"
-                      : "coordinates"}{" "}
-                    · {graph.hubs.length}{" "}
-                    {graph.hubs.length === 1 ? "edge" : "edges"} ·{" "}
-                    {contextDocumentCount} context{" "}
-                    {contextDocumentCount === 1 ? "doc" : "docs"}
-                  </div>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    {graph.islands.length > 1
-                      ? `The current Project Context contains ${graph.islands.length} disconnected components.`
-                      : "All visible Context Edges form one connected component."}
-                  </p>
-                </>
-              ) : (
-                <>
-                  <div
-                    className="text-sm font-semibold"
-                    data-testid="project-context-query-summary"
-                  >
-                    {graph.hubs.length} matching{" "}
-                    {graph.hubs.length === 1 ? "edge" : "edges"} ·{" "}
-                    {graph.coordinates.length}{" "}
-                    {graph.coordinates.length === 1
-                      ? "coordinate"
-                      : "coordinates"}{" "}
-                    · {contextDocumentCount} context{" "}
-                    {contextDocumentCount === 1 ? "doc" : "docs"}
-                  </div>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    {graph.hubs.length === 0
-                      ? "The query Anchors are shown for orientation. They are not a Context Island or a Gap."
-                      : "This focused result shares its Query Anchors; it is not a project-level Island count."}
-                  </p>
-                </>
-              )}
-            </div>
-            <IslandNavigation
-              layout={layout}
-              showIslands={graph.isAllContext}
-            />
-          </div>
-        </div>
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <ProjectContextGraphInner
           elements={elements}
+          externalInsets={externalInsets}
           fitSemanticPathsRequest={fitSemanticPathsRequest}
+          fitSuspended={fitSuspended}
           focusSelectionRequest={focusSelectionRequest}
           graph={graph}
           layout={layout}
+          onClearSemanticResult={onClearSemanticResult}
           onSelectionChange={onSelectionChange}
           queryIdentity={topology.queryIdentity}
           selection={selection}
           semanticFreshness={semanticFreshness}
           semanticOverlay={visibleSemanticOverlay}
+          semanticSessionOverlay={semanticSessionOverlay}
           textScale={textScale}
         />
       </section>
     </ReactFlowProvider>
-  );
-}
-
-function IslandNavigation({
-  layout,
-  showIslands,
-}: {
-  layout: ReturnType<typeof layoutProjectContextGraph>;
-  showIslands: boolean;
-}) {
-  const shouldReduceMotion = useReducedMotion();
-  const { fitBounds, fitView } = useReactFlow<
-    ProjectContextFlowNode,
-    ProjectContextFlowEdge
-  >();
-  const duration = shouldReduceMotion ? 0 : 220;
-  return (
-    <div className="flex max-w-full items-center gap-1.5 overflow-x-auto pb-0.5">
-      {showIslands
-        ? layout.islands.map((island) => (
-            <Button
-              aria-label={`Fit Island ${island.index}`}
-              data-testid={`project-context-fit-island-${island.index}`}
-              key={island.stableKey}
-              onClick={() =>
-                void fitBounds(island.bounds, { padding: 0.14, duration })
-              }
-              size="xs"
-              type="button"
-              variant="outline"
-            >
-              <Focus />
-              Island {island.index} · {island.edgeKeys.length}{" "}
-              {island.edgeKeys.length === 1 ? "edge" : "edges"}
-            </Button>
-          ))
-        : null}
-      <Button
-        data-testid="project-context-fit-all"
-        onClick={() => void fitView({ padding: 0.08, duration, maxZoom: 1.15 })}
-        size="xs"
-        type="button"
-        variant="ghost"
-      >
-        <Maximize2 />
-        {showIslands ? "Fit all" : "Fit query"}
-      </Button>
-    </div>
   );
 }

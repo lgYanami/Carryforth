@@ -1,10 +1,3 @@
-import {
-  AlertTriangle,
-  FileText,
-  Network,
-  RefreshCw,
-  ShieldCheck,
-} from "lucide-react";
 import * as React from "react";
 
 import {
@@ -17,6 +10,15 @@ import {
   useMeetingLiveSync,
 } from "@/features/meeting/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
+import {
+  projectContextPickerSourceState,
+  projectContextSemanticMeetingIds,
+  projectContextSelectionRemainsVisible,
+  projectContextSemanticToolStatus,
+  projectContextWorkspaceStateEvent,
+  type InvalidProjectContextScreenProps,
+  type ValidProjectContextScreenProps,
+} from "@/features/project-context/projectContextScreenModel";
 import {
   buildProjectContextCoordinateOptions,
   type ProjectContextCoordinateOption,
@@ -44,37 +46,36 @@ import {
   type SubmittedSemanticQueryDraft,
 } from "@/features/project-context/semanticQueryModel";
 import { focusProjectContextGraphTarget } from "@/features/project-context/focus";
-import type { ProjectContextRouteSelection } from "@/features/project-context/routeState";
 import { isAllProjectContextQuery } from "@/features/project-context/routeState";
 import {
   projectContextErrorMessage,
   projectContextFailureKind,
-  visibleContextDocumentCount,
 } from "@/features/project-context/state";
-import { ProjectContextGraph } from "@/features/project-context/ui/ProjectContextGraph";
-import { ProjectContextInspector } from "@/features/project-context/ui/ProjectContextInspector";
-import { ProjectContextSemanticQueryBar } from "@/features/project-context/ui/ProjectContextSemanticQueryBar";
 import {
-  type ProjectContextPickerSourceState,
-  ProjectContextQueryBar,
-} from "@/features/project-context/ui/ProjectContextQueryBar";
+  ProjectContextHeader,
+  ProjectContextSyncBanner,
+} from "@/features/project-context/ui/ProjectContextHeader";
+import { ProjectContextInvalidRoute } from "@/features/project-context/ui/ProjectContextInvalidRoute";
 import {
-  ProjectContextEmptyState,
-  ProjectContextFailureState,
-  ProjectContextLoadingState,
-} from "@/features/project-context/ui/ProjectContextStates";
+  ProjectContextWorkspace,
+  type ProjectContextWorkspaceCanvasRenderContext,
+  type ProjectContextWorkspacePaneRenderContext,
+} from "@/features/project-context/ui/ProjectContextWorkspace";
+import { ProjectContextWorkspaceCanvas } from "@/features/project-context/ui/ProjectContextWorkspaceCanvas";
+import { ProjectContextWorkspacePane } from "@/features/project-context/ui/ProjectContextWorkspacePane";
+import { projectContextWorkspaceSelectionKey } from "@/features/project-context/workspacePanelModel";
 import {
   ALL_PROJECT_CONTEXT_QUERY,
   useProjectContextLiveSync,
   useProjectContextQuery,
 } from "@/features/project-context/hooks";
+import {
+  useProjectContextWorkspaceAnnouncement,
+  useProjectContextStructuralDraft,
+} from "@/features/project-context/useProjectContextWorkspacePresentation";
 import { useAppliedWorkspaceIdentity } from "@/features/communities/AppliedWorkspaceContext";
 import { useProjectViewQuery } from "@/features/project-view/hooks";
 import { indexProjectViewObjects } from "@/features/project-view/model";
-import type {
-  ProjectContextQuery,
-  ProjectContextQueryResult,
-} from "@/shared/api/tauriProjectContext";
 import {
   queryProjectContextSemantic,
   SemanticProjectContextError,
@@ -84,190 +85,6 @@ import {
   isRelayConnectionDegraded,
   useRelayConnection,
 } from "@/shared/api/useRelayConnection";
-import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
-import { Badge } from "@/shared/ui/badge";
-import { Button } from "@/shared/ui/button";
-
-type ValidProjectContextScreenProps = {
-  appliedQuery: ProjectContextQuery;
-  onApplyQuery: (query: ProjectContextQuery) => void;
-  onOpenDocument: (documentId: string) => void;
-  onOpenMeeting: (meetingId: string) => void;
-  onOpenProjectView: (objectId: string) => void;
-  onSelectionChange: (
-    selection: ProjectContextRouteSelection | null,
-    options?: { replace?: boolean },
-  ) => void;
-  selection: ProjectContextRouteSelection | null;
-};
-
-type InvalidProjectContextScreenProps = {
-  onResetRoute: () => void;
-  routeError: string;
-};
-
-function ProjectContextHeader({
-  onRefresh,
-  refreshing,
-  result,
-  syncBadge,
-  syncState,
-}: {
-  onRefresh?: () => void;
-  refreshing?: boolean;
-  result?: ProjectContextQueryResult;
-  syncBadge?: string;
-  syncState?: "live" | "refreshing" | "stale";
-}) {
-  return (
-    <TopChromeInsetHeader flush>
-      <header
-        className="flex h-12 items-center gap-2 px-3 sm:gap-3 sm:px-5"
-        data-tauri-drag-region
-      >
-        <Network className="h-4 w-4 text-muted-foreground" />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold">Project Context</div>
-          <div className="hidden text-2xs text-muted-foreground sm:block">
-            Verified, read-only relationships across project coordinates
-          </div>
-        </div>
-        {result ? (
-          <Badge variant="success">
-            <ShieldCheck className="mr-1 h-3 w-3" />
-            Verified
-          </Badge>
-        ) : null}
-        {result && !result.context.capabilityEnabled ? (
-          <Badge variant="warning">Capability off · read-only</Badge>
-        ) : null}
-        {result ? (
-          <Badge className="hidden sm:inline-flex" variant="outline">
-            Revision {result.context.contextRevision}
-          </Badge>
-        ) : null}
-        {syncState ? (
-          <Badge
-            data-testid="project-context-sync-status"
-            variant={
-              syncState === "stale"
-                ? "warning"
-                : syncState === "live"
-                  ? "success"
-                  : "secondary"
-            }
-          >
-            {syncState === "refreshing" ? (
-              <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
-            ) : null}
-            {syncBadge ??
-              (syncState === "stale"
-                ? "Stale"
-                : syncState === "live"
-                  ? "Live"
-                  : "Syncing")}
-          </Badge>
-        ) : null}
-        {onRefresh ? (
-          <Button
-            aria-label="Refresh Project Context"
-            data-testid="project-context-refresh"
-            disabled={refreshing}
-            onClick={onRefresh}
-            size="icon"
-            type="button"
-            variant="ghost"
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`}
-            />
-          </Button>
-        ) : null}
-      </header>
-    </TopChromeInsetHeader>
-  );
-}
-
-function ProjectContextGraphSlot({
-  fitSemanticPathsRequest,
-  focusSelectionRequest,
-  onSelectionChange,
-  result,
-  selection,
-  semanticFreshness,
-  semanticOverlay,
-}: {
-  fitSemanticPathsRequest: number;
-  focusSelectionRequest: number;
-  onSelectionChange: ValidProjectContextScreenProps["onSelectionChange"];
-  result: ProjectContextQueryResult;
-  selection: ProjectContextRouteSelection | null;
-  semanticFreshness: "snapshot" | "stale";
-  semanticOverlay: ProjectContextSemanticOverlay | null;
-}) {
-  const documentCount = visibleContextDocumentCount(result);
-  return (
-    <main className="min-h-0 min-w-0 flex-1 overflow-auto p-4 sm:p-6">
-      <div className="mx-auto flex h-full min-h-80 max-w-6xl flex-col gap-4">
-        <section
-          className="grid gap-3 sm:grid-cols-3"
-          data-context-document-count={documentCount}
-          data-coordinate-count={result.coordinateDetails.length}
-          data-edge-count={result.edges.length}
-          data-testid="project-context-result-counts"
-        >
-          <div className="rounded-xl border border-border/70 bg-card/60 p-3">
-            <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Matching Edges
-            </div>
-            <div className="mt-1 text-xl font-semibold">
-              {result.edges.length}
-            </div>
-          </div>
-          <div className="rounded-xl border border-border/70 bg-card/60 p-3">
-            <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Visible Coordinates
-            </div>
-            <div className="mt-1 text-xl font-semibold">
-              {result.coordinateDetails.length}
-            </div>
-          </div>
-          <div className="rounded-xl border border-border/70 bg-card/60 p-3">
-            <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Context Documents
-            </div>
-            <div className="mt-1 text-xl font-semibold">{documentCount}</div>
-          </div>
-        </section>
-        <div
-          className="flex min-h-96 flex-1"
-          data-testid="project-context-graph-slot"
-        >
-          <ProjectContextGraph
-            fitSemanticPathsRequest={fitSemanticPathsRequest}
-            focusSelectionRequest={focusSelectionRequest}
-            onSelectionChange={onSelectionChange}
-            result={result}
-            selection={selection}
-            semanticFreshness={semanticFreshness}
-            semanticOverlay={semanticOverlay}
-          />
-        </div>
-      </div>
-    </main>
-  );
-}
-
-function pickerSourceState(input: {
-  error: unknown;
-  loading: boolean;
-  ready: boolean;
-}): ProjectContextPickerSourceState {
-  if (input.ready) return "ready";
-  if (input.error) return "unavailable";
-  if (input.loading) return "loading";
-  return "unavailable";
-}
 
 function ValidProjectContextScreen({
   appliedQuery,
@@ -281,6 +98,8 @@ function ValidProjectContextScreen({
   const [focusSelectionRequest, setFocusSelectionRequest] = React.useState(0);
   const [fitSemanticPathsRequest, setFitSemanticPathsRequest] =
     React.useState(0);
+  const [structuralDraft, setStructuralDraft] =
+    useProjectContextStructuralDraft(appliedQuery);
   const appliedWorkspace = useAppliedWorkspaceIdentity();
   const contextQuery = useProjectContextQuery(appliedQuery);
   const failureKind = contextQuery.isError
@@ -380,13 +199,6 @@ function ValidProjectContextScreen({
       : null;
   const result = trustedActive ? allContextResult : routeResult;
   const semanticMeetingIds = React.useMemo(() => {
-    if (!semanticNeedsAllContext) return [];
-    const ids = new Set<string>();
-    for (const detail of allContextResult?.coordinateDetails ?? []) {
-      if (detail.coordinate.type === "meeting") {
-        ids.add(detail.coordinate.meetingId);
-      }
-    }
     const submittedDrafts: SubmittedSemanticQueryDraft[] = [];
     if (trustedActive) submittedDrafts.push(trustedActive.submittedDraft);
     if (
@@ -395,15 +207,11 @@ function ValidProjectContextScreen({
     ) {
       submittedDrafts.push(semanticState.attempt.submitted);
     }
-    for (const submitted of submittedDrafts) {
-      for (const coordinate of [
-        ...submitted.initialCoordinates,
-        ...submitted.contextCoordinates,
-      ]) {
-        if (coordinate.type === "meeting") ids.add(coordinate.meetingId);
-      }
-    }
-    return [...ids].sort();
+    return projectContextSemanticMeetingIds({
+      coordinateDetails: allContextResult?.coordinateDetails,
+      enabled: semanticNeedsAllContext,
+      submittedDrafts,
+    });
   }, [
     allContextResult?.coordinateDetails,
     semanticNeedsAllContext,
@@ -498,6 +306,26 @@ function ValidProjectContextScreen({
           : syncState === "refreshing"
             ? `Keeping verified Context revision ${result.context.contextRevision} visible while a new complete snapshot is verified.`
             : undefined;
+  const workspaceStateEvent = projectContextWorkspaceStateEvent({
+    failureKind: displayedFatalError
+      ? (displayedFailureKind ?? "error")
+      : undefined,
+    pending: displayedQueryPending,
+    projectId: semanticIdentity.projectId,
+    revision: result?.context.contextRevision,
+    syncMessage,
+    syncState,
+  });
+  const {
+    announcement: workspaceAnnouncement,
+    announceCleared: announceSemanticCleared,
+    announceEvent: announceWorkspaceEvent,
+  } = useProjectContextWorkspaceAnnouncement({
+    active: trustedActive,
+    attempt: semanticState.attempt,
+    selection,
+    workspaceStateEvent,
+  });
   const projectViewObjects = React.useMemo(
     () =>
       projectViewQuery.data?.status === "ready"
@@ -522,19 +350,19 @@ function ValidProjectContextScreen({
       result?.coordinateDetails,
     ],
   );
-  const projectViewState = pickerSourceState({
+  const projectViewState = projectContextPickerSourceState({
     error: projectViewQuery.error,
     loading: projectViewQuery.isPending,
     ready: projectViewQuery.data?.status === "ready",
   });
-  const documentsState = pickerSourceState({
+  const documentsState = projectContextPickerSourceState({
     error: documentMetaQuery.error ?? documentsQuery.error,
     loading:
       documentMetaQuery.isPending ||
       Boolean(documentMetaQuery.data && documentsQuery.isPending),
     ready: Boolean(documentMetaQuery.data && documentsQuery.data),
   });
-  const meetingsState = pickerSourceState({
+  const meetingsState = projectContextPickerSourceState({
     error: channelsQuery.error ?? meetingDirectoryQuery.error,
     loading:
       channelsQuery.isPending ||
@@ -731,8 +559,9 @@ function ValidProjectContextScreen({
   }, [semanticAvailable, semanticDraft, semanticGeneration, semanticIdentity]);
   const cancelSemanticQuery = React.useCallback(() => {
     semanticAttemptRef.current += 1;
+    announceSemanticCleared();
     semanticDispatch({ type: "cancel" });
-  }, []);
+  }, [announceSemanticCleared]);
 
   const semanticStructuralJoinValid = Boolean(
     trustedActive &&
@@ -765,26 +594,150 @@ function ValidProjectContextScreen({
 
   React.useEffect(() => {
     if (!result || !selection) return;
-    const remainsVisible =
-      selection.kind === "edge"
-        ? result.edges.some((edge) => edge.edgeKey === selection.key)
-        : result.coordinateDetails.some(
-            (detail) => detail.coordinateKey === selection.key,
-          ) ||
-          result.edges.some((edge) =>
-            edge.coordinateKeys.includes(selection.key),
-          );
-    if (!remainsVisible) onSelectionChange(null, { replace: true });
+    if (!projectContextSelectionRemainsVisible(result, selection)) {
+      onSelectionChange(null, { replace: true });
+    }
   }, [onSelectionChange, result, selection]);
 
   const closeInspector = React.useCallback(() => {
-    const closingSelection = selection;
     onSelectionChange(null);
-    if (!closingSelection) return;
-    window.requestAnimationFrame(() => {
-      focusProjectContextGraphTarget(closingSelection);
-    });
-  }, [onSelectionChange, selection]);
+  }, [onSelectionChange]);
+
+  const workspaceSelectionKey = selection
+    ? projectContextWorkspaceSelectionKey(selection)
+    : null;
+  const semanticToolStatus = projectContextSemanticToolStatus({
+    active: trustedActive !== null,
+    inFlight: semanticAttemptInFlight,
+    stale: semanticFreshness === "stale",
+  });
+
+  const retryDisplayedContext = React.useCallback(() => {
+    void (trustedActive ? allContextQuery.refetch() : contextQuery.refetch());
+  }, [allContextQuery.refetch, contextQuery.refetch, trustedActive]);
+
+  const renderWorkspaceCanvas = React.useCallback(
+    (canvas: ProjectContextWorkspaceCanvasRenderContext) => (
+      <ProjectContextWorkspaceCanvas
+        canvas={canvas}
+        displayedAllContext={displayedAllContext}
+        failure={displayedFatalError}
+        failureKind={displayedFailureKind}
+        fitSemanticPathsRequest={fitSemanticPathsRequest}
+        focusSelectionRequest={focusSelectionRequest}
+        onClearSemanticResult={cancelSemanticQuery}
+        onRetry={retryDisplayedContext}
+        onSelectionChange={onSelectionChange}
+        pending={displayedQueryPending}
+        result={result}
+        retrying={
+          trustedActive ? allContextQuery.isFetching : contextQuery.isFetching
+        }
+        selection={selection}
+        semanticFreshness={semanticFreshness}
+        semanticOverlay={semanticOverlay}
+        semanticSessionOverlay={trustedActive?.overlay ?? null}
+      />
+    ),
+    [
+      allContextQuery.isFetching,
+      cancelSemanticQuery,
+      contextQuery.isFetching,
+      displayedAllContext,
+      displayedFailureKind,
+      displayedFatalError,
+      displayedQueryPending,
+      fitSemanticPathsRequest,
+      focusSelectionRequest,
+      onSelectionChange,
+      result,
+      retryDisplayedContext,
+      selection,
+      semanticFreshness,
+      semanticOverlay,
+      trustedActive,
+    ],
+  );
+
+  const renderWorkspacePane = React.useCallback(
+    (
+      tool: "structure" | "semantic" | "details",
+      pane: ProjectContextWorkspacePaneRenderContext,
+    ) => (
+      <ProjectContextWorkspacePane
+        activeSemantic={trustedActive}
+        appliedQuery={appliedQuery}
+        coordinateOptions={coordinateOptions}
+        onApplyQuery={onApplyQuery}
+        onAnnouncement={announceWorkspaceEvent}
+        onCancelSemantic={cancelSemanticQuery}
+        onFitSemantic={() => {
+          setFitSemanticPathsRequest((current) => current + 1);
+          pane.closeModalForViewportAction();
+        }}
+        onFocusSelection={() => {
+          setFocusSelectionRequest((current) => current + 1);
+          pane.closeModalForViewportAction(() => {
+            if (selection) focusProjectContextGraphTarget(selection);
+          });
+        }}
+        onOpenDocument={onOpenDocument}
+        onOpenMeeting={onOpenMeeting}
+        onOpenProjectView={onOpenProjectView}
+        onRunSemantic={runSemanticQuery}
+        onSelectionChange={(nextSelection) => onSelectionChange(nextSelection)}
+        onSemanticDraftChange={(draft) =>
+          semanticDispatch({ type: "draft_changed", draft })
+        }
+        onStructuralDraftChange={setStructuralDraft}
+        pickerStates={{
+          documents: documentsState,
+          meetings: meetingsState,
+          projectView: projectViewState,
+        }}
+        projectViewResult={projectViewQuery.data}
+        result={result}
+        selection={selection}
+        semanticAttempt={semanticState.attempt}
+        semanticAvailable={semanticAvailable}
+        semanticDraft={semanticState.draft}
+        semanticFreshness={semanticFreshness}
+        semanticNeedsAllContext={semanticNeedsAllContext}
+        semanticOverlay={semanticOverlay}
+        semanticTopologyAdvanced={semanticTopologyAdvanced}
+        structuralDraft={structuralDraft}
+        tool={tool}
+      />
+    ),
+    [
+      appliedQuery,
+      announceWorkspaceEvent,
+      cancelSemanticQuery,
+      coordinateOptions,
+      documentsState,
+      meetingsState,
+      onApplyQuery,
+      onOpenDocument,
+      onOpenMeeting,
+      onOpenProjectView,
+      onSelectionChange,
+      projectViewQuery.data,
+      projectViewState,
+      result,
+      runSemanticQuery,
+      selection,
+      semanticAvailable,
+      semanticFreshness,
+      semanticNeedsAllContext,
+      semanticOverlay,
+      semanticState.attempt,
+      semanticState.draft,
+      semanticTopologyAdvanced,
+      setStructuralDraft,
+      structuralDraft,
+      trustedActive,
+    ],
+  );
 
   return (
     <div
@@ -807,174 +760,24 @@ function ValidProjectContextScreen({
         syncState={syncState}
       />
 
-      {syncState === "stale" && syncMessage && result ? (
-        <div
-          aria-live="polite"
-          aria-atomic="true"
-          className="flex items-start gap-2 border-b border-warning/30 bg-warning/10 px-4 py-2 text-xs text-muted-foreground"
-          data-testid="project-context-stale-message"
-          role="status"
-        >
-          <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>{syncMessage}</span>
-        </div>
-      ) : syncState === "refreshing" && syncMessage ? (
-        <div
-          aria-live="polite"
-          aria-atomic="true"
-          className="border-b border-border/70 bg-muted/20 px-4 py-2 text-xs text-muted-foreground"
-          data-testid="project-context-refreshing"
-          role="status"
-        >
-          {syncMessage}
-        </div>
-      ) : null}
-
-      <ProjectContextQueryBar
-        appliedQuery={appliedQuery}
-        coordinateOptions={coordinateOptions}
-        documentsState={documentsState}
-        meetingsState={meetingsState}
-        onRun={onApplyQuery}
-        projectViewState={projectViewState}
-        runDisabled={semanticNeedsAllContext}
-        runDisabledReason="Clear the semantic result before changing the structural query."
-      />
-
-      <ProjectContextSemanticQueryBar
-        active={trustedActive}
-        attempt={semanticState.attempt}
-        available={semanticAvailable}
-        canFit={Boolean(semanticOverlay?.boundsTargetIds.length)}
-        coordinateOptions={coordinateOptions}
-        documentsState={documentsState}
-        draft={semanticState.draft}
-        freshness={semanticFreshness}
-        meetingsState={meetingsState}
-        onCancel={cancelSemanticQuery}
-        onDraftChange={(draft) =>
-          semanticDispatch({ type: "draft_changed", draft })
+      <ProjectContextSyncBanner message={syncMessage} state={syncState} />
+      <ProjectContextWorkspace
+        announcement={workspaceAnnouncement}
+        detailsUnavailableReason="Select a Coordinate or Context Edge to inspect details."
+        onCloseSelection={closeInspector}
+        onRestoreCanvasFocus={() =>
+          document
+            .querySelector<HTMLElement>(
+              '[data-testid="project-context-graph-slot"]',
+            )
+            ?.focus({ preventScroll: true })
         }
-        onFit={() => setFitSemanticPathsRequest((current) => current + 1)}
-        onRun={runSemanticQuery}
-        overlayVisible={semanticOverlay !== null}
-        projectViewState={projectViewState}
-        topologyAdvanced={semanticTopologyAdvanced}
+        onRestoreGraphTargetFocus={focusProjectContextGraphTarget}
+        renderCanvas={renderWorkspaceCanvas}
+        renderPane={renderWorkspacePane}
+        selectionKey={workspaceSelectionKey}
+        semanticStatus={semanticToolStatus}
       />
-
-      {displayedQueryPending ? <ProjectContextLoadingState /> : null}
-      {displayedFatalError ? (
-        <ProjectContextFailureState
-          diagnostic={projectContextErrorMessage(displayedFatalError)}
-          kind={
-            displayedFailureKind ??
-            projectContextFailureKind(displayedFatalError)
-          }
-          onRetry={() =>
-            void (trustedActive
-              ? allContextQuery.refetch()
-              : contextQuery.refetch())
-          }
-          retrying={
-            trustedActive ? allContextQuery.isFetching : contextQuery.isFetching
-          }
-        />
-      ) : null}
-      {result && displayedAllContext && result.context.activeEdgeCount === 0 ? (
-        <ProjectContextEmptyState />
-      ) : null}
-      {result &&
-      (!displayedAllContext || result.context.activeEdgeCount > 0) ? (
-        <div className="flex min-h-0 flex-1 overflow-hidden">
-          <ProjectContextGraphSlot
-            fitSemanticPathsRequest={fitSemanticPathsRequest}
-            focusSelectionRequest={focusSelectionRequest}
-            onSelectionChange={onSelectionChange}
-            result={result}
-            selection={selection}
-            semanticFreshness={semanticFreshness}
-            semanticOverlay={semanticOverlay}
-          />
-          {selection ? (
-            <ProjectContextInspector
-              onClose={closeInspector}
-              onFocusSelection={() => {
-                focusProjectContextGraphTarget(selection);
-                setFocusSelectionRequest((current) => current + 1);
-              }}
-              onOpenDocument={onOpenDocument}
-              onOpenMeeting={onOpenMeeting}
-              onOpenProjectView={onOpenProjectView}
-              onSelect={(nextSelection) => onSelectionChange(nextSelection)}
-              onShowIncident={(coordinate) =>
-                onApplyQuery({ type: "incident", coordinate })
-              }
-              projectViewResult={projectViewQuery.data}
-              result={result}
-              selection={selection}
-              semanticRelationDocumentIds={
-                selection.kind === "edge"
-                  ? semanticOverlay?.relationDocumentIdsByEdge.get(
-                      selection.key,
-                    )
-                  : undefined
-              }
-              semanticRootRelationDocumentIds={
-                selection.kind === "edge"
-                  ? semanticOverlay?.rootRelationDocumentIdsByEdge.get(
-                      selection.key,
-                    )
-                  : undefined
-              }
-              showIncidentDisabled={semanticNeedsAllContext}
-            />
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function InvalidProjectContextScreen({
-  onResetRoute,
-  routeError,
-}: InvalidProjectContextScreenProps) {
-  return (
-    <div
-      className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
-      data-testid="project-context-screen"
-    >
-      <ProjectContextHeader />
-      <main
-        className="flex min-h-0 flex-1 items-center justify-center p-6"
-        data-testid="project-context-invalid-route"
-      >
-        <div className="max-w-lg text-center">
-          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border border-destructive/30 bg-destructive/10 text-destructive">
-            <AlertTriangle className="h-5 w-5" />
-          </div>
-          <h1 className="mt-4 text-lg font-semibold">
-            Project Context link is invalid
-          </h1>
-          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-            The query or selection in this link was rejected before Desktop
-            contacted the trusted Project Context boundary.
-          </p>
-          <code className="mt-4 block rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-left text-xs text-muted-foreground">
-            {routeError}
-          </code>
-          <Button
-            className="mt-4"
-            data-testid="project-context-reset-invalid-route"
-            onClick={onResetRoute}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            Open All Context
-          </Button>
-        </div>
-      </main>
     </div>
   );
 }
@@ -984,7 +787,7 @@ export function ProjectContextScreen(
   props: ValidProjectContextScreenProps | InvalidProjectContextScreenProps,
 ) {
   return "routeError" in props ? (
-    <InvalidProjectContextScreen {...props} />
+    <ProjectContextInvalidRoute {...props} />
   ) : (
     <ValidProjectContextScreen {...props} />
   );

@@ -6,8 +6,10 @@ import {
   LoaderCircle,
   ShieldCheck,
 } from "lucide-react";
+import * as React from "react";
 
 import { useProjectDocument } from "@/features/project-documents/hooks";
+import type { ProjectContextWorkspaceAnnouncementEvent } from "@/features/project-context/workspacePanelModel";
 import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
 import type { ProjectContextDocumentDetail } from "@/shared/api/tauriProjectContext";
 import type { ProjectDocumentIdentity } from "@/shared/api/tauriProjectDocument";
@@ -61,10 +63,12 @@ function Metadata({ detail }: { detail: ProjectContextDocumentDetail }) {
 export function ProjectContextDocumentContent({
   detail,
   identity,
+  onAnnouncement,
   onOpenDocument,
 }: {
   detail: ProjectContextDocumentDetail;
   identity?: ProjectDocumentIdentity;
+  onAnnouncement?: (event: ProjectContextWorkspaceAnnouncementEvent) => void;
   onOpenDocument: (documentId: string) => void;
 }) {
   const readable = detail.state === "active" && Boolean(identity);
@@ -82,6 +86,19 @@ export function ProjectContextDocumentContent({
   const summary = currentDocument?.summary;
   const canOpenDocument =
     detail.state === "active" && document?.state !== "deleted";
+
+  React.useEffect(() => {
+    if (!documentQuery.isError) return;
+    onAnnouncement?.({
+      key: `document:${detail.documentId}:verification-failed:${documentQuery.errorUpdatedAt}`,
+      message: "Current Document content could not be verified.",
+    });
+  }, [
+    detail.documentId,
+    documentQuery.errorUpdatedAt,
+    documentQuery.isError,
+    onAnnouncement,
+  ]);
 
   return (
     <div
@@ -180,7 +197,6 @@ export function ProjectContextDocumentContent({
         <div
           className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/20 p-4 text-sm text-muted-foreground"
           data-testid="project-context-document-loading"
-          role="status"
         >
           <LoaderCircle className="h-4 w-4 animate-spin" />
           Verifying current Markdown…
@@ -189,7 +205,6 @@ export function ProjectContextDocumentContent({
         <div
           className="rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-muted-foreground"
           data-testid="project-context-document-error"
-          role="alert"
         >
           <FileWarning className="mb-2 h-4 w-4 text-destructive" />
           The current body could not be verified. The Context Edge and binding

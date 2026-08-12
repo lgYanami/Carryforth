@@ -59,6 +59,23 @@ function semanticResult() {
     projectId: "project-0",
     relayPubkey: "a".repeat(64),
     projectContextRevision: 7,
+    completionReason: "frontier_exhausted",
+    exhaustedDimensions: [],
+    coverage: {
+      authorizedGraphSources: 4,
+      currentIndexedGraphSources: 4,
+      titleOnlySources: 0,
+      rootsReturned: 2,
+      pathsReturned: 2,
+      omittedInitialCoordinates: 0,
+      omittedContextCoordinates: 0,
+      indexCoveragePartial: 0,
+      omittedForResponseBudget: {
+        automaticRoots: 0,
+        paths: 0,
+        summaries: 0,
+      },
+    },
     roots: [
       {
         rootId: "root-1",
@@ -168,8 +185,23 @@ test("atomically builds one complete Hyperedge union with roots and path termina
     "edge-hub:edge-abc",
     "edge-hub:edge-cd",
   ]);
+  assert.equal(overlay.partialCoverage, false);
+  assert.equal(overlay.budgetExhausted, false);
   assert.deepEqual(graph, graphBefore);
   assert.deepEqual(result, resultBefore);
+});
+
+test("retains compact partial-coverage and budget-exhaustion status", () => {
+  const result = semanticResult();
+  result.coverage.currentIndexedGraphSources = 3;
+  result.completionReason = "budget_exhausted";
+  result.exhaustedDimensions = ["paths"];
+
+  const built = buildProjectContextSemanticOverlay(result, substrate());
+
+  assert.equal(built.ok, true);
+  assert.equal(built.overlay.partialCoverage, true);
+  assert.equal(built.overlay.budgetExhausted, true);
 });
 
 test("retains valid zero-hop Coordinate and Context Document roots", () => {

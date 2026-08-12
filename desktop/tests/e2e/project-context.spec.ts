@@ -952,6 +952,16 @@ async function openProjectContext(page: import("@playwright/test").Page) {
   await expect(page).toHaveURL(/#\/project-context$/);
 }
 
+async function openProjectContextTool(
+  page: import("@playwright/test").Page,
+  tool: "semantic" | "structure",
+) {
+  const trigger = page.getByTestId(`project-context-tool-${tool}`);
+  await trigger.click();
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByTestId("project-context-tool-panel")).toBeVisible();
+}
+
 async function seedSemanticResult(
   page: import("@playwright/test").Page,
   input?: { delayedByMs?: number; requestId?: string },
@@ -1084,6 +1094,7 @@ test("semantic query submits problem-only and explicit Coordinate roles through 
   });
   await openProjectContext(page);
   const { workspace } = await seedSemanticResult(page);
+  await openProjectContextTool(page, "semantic");
 
   const problem = page.getByTestId("project-context-semantic-problem");
   const run = page.getByTestId("project-context-semantic-run");
@@ -1192,7 +1203,7 @@ test("semantic query submits problem-only and explicit Coordinate roles through 
 test("semantic overlay survives Coordinate, Edge, pane, and Escape selection until explicit Cancel", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.setViewportSize({ width: 1440, height: 900 });
   await installMockBridge(page, {
     projectContext: semanticCapableInspectorResult(),
     projectDocument: inspectorDocumentState(),
@@ -1200,11 +1211,16 @@ test("semantic overlay survives Coordinate, Edge, pane, and Escape selection unt
   });
   await openProjectContext(page);
   await seedSemanticResult(page);
+  await openProjectContextTool(page, "semantic");
   await page
     .getByTestId("project-context-semantic-problem")
     .fill("Which reasoning path explains the recurring release issue?");
   await page.getByTestId("project-context-semantic-run").click();
   await waitForSemanticOverlay(page);
+  await expect(page.getByTestId("project-context-tool-panel")).toHaveAttribute(
+    "data-presentation",
+    "docked",
+  );
 
   const graph = page.getByTestId("project-context-graph");
   const requirement = page.getByTestId(
@@ -1280,6 +1296,7 @@ test("Cancel fences a delayed semantic response so it cannot revive the overlay"
     delayedByMs: 500,
     requestId: "60000000-0000-4000-8000-000000000002",
   });
+  await openProjectContextTool(page, "semantic");
   await page
     .getByTestId("project-context-semantic-problem")
     .fill("Why did this delayed issue recur?");
@@ -1331,6 +1348,7 @@ for (const theme of [
     });
     await openProjectContext(page);
     await seedSemanticResult(page);
+    await openProjectContextTool(page, "semantic");
 
     await page
       .getByTestId("project-context-semantic-problem")
@@ -1366,7 +1384,7 @@ for (const theme of [
 test("Project View Coordinate Inspector is read-only, responsive, and restores graph focus", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.setViewportSize({ width: 1440, height: 800 });
   await installMockBridge(page, {
     projectContext: inspectorResult(),
     projectDocument: inspectorDocumentState(),
@@ -1419,17 +1437,14 @@ test("Project View Coordinate Inspector is read-only, responsive, and restores g
   await expect(page).not.toHaveURL(/mode=/);
   expect(await documentBodyCalls(page)).toHaveLength(0);
 
-  expect(
-    await inspector.evaluate((element) => getComputedStyle(element).position),
-  ).toBe("relative");
+  const toolsPanel = page.getByTestId("project-context-tool-panel");
+  await expect(toolsPanel).toHaveAttribute("data-presentation", "docked");
   await page.setViewportSize({ width: 560, height: 800 });
-  await expect
-    .poll(() =>
-      inspector.evaluate((element) => getComputedStyle(element).position),
-    )
-    .toBe("fixed");
-  const narrowBox = await inspector.boundingBox();
-  expect(narrowBox?.width).toBeGreaterThan(400);
+  await expect(toolsPanel).toHaveAttribute("data-presentation", "sheet");
+  const sheet = page.getByRole("dialog");
+  await expect(sheet).toHaveAttribute("aria-modal", "true");
+  const narrowBox = await sheet.boundingBox();
+  expect(narrowBox?.width).toBeGreaterThan(500);
   await waitForAnimations(page);
   await page.screenshot({
     path: "test-results/project-context/project-context-narrow-sheet.png",
@@ -1440,7 +1455,25 @@ test("Project View Coordinate Inspector is read-only, responsive, and restores g
     ),
   ).toBe(callsBeforeInspectorInteraction);
 
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.mouse.move(1, 1);
+  await page.getByTestId("project-context-details-close").focus();
+  await expect(page.getByRole("tooltip")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(toolsPanel).toHaveCount(0);
+  await expect(page).toHaveURL(/selected=coordinate/);
+  await expect(requirementNode.locator("button")).toBeFocused();
+
+  await page.getByTestId("project-context-tool-details").click();
+  await expect(toolsPanel).toHaveAttribute("data-presentation", "sheet");
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await page.getByTestId("project-context-details-close").click();
+  await expect(toolsPanel).toHaveCount(0);
+  await expect(page).not.toHaveURL(/selected=/);
+
+  await requirementNode.click();
+  await expect(page.getByTestId("project-context-inspector")).toBeVisible();
+  await page.setViewportSize({ width: 1440, height: 800 });
+  await expect(toolsPanel).toHaveAttribute("data-presentation", "docked");
   await inspector.getByTestId("project-context-open-project-view").click();
   await expect(page).toHaveURL(new RegExp(`/view\\?object=${REQUIREMENT_ID}$`));
   await page.goBack();
@@ -1623,7 +1656,9 @@ test("a Spoke opens the complete Edge and Context Document summaries expand inde
   const inspector = page.getByTestId("project-context-inspector");
   const edgeInspector = inspector.getByTestId("project-context-edge-inspector");
   await expect(edgeInspector).toBeVisible();
-  await expect(inspector.locator("h2")).toHaveText("Context Edge");
+  await expect(
+    edgeInspector.getByRole("heading", { level: 3, name: "Context Edge" }),
+  ).toBeVisible();
   await expect(
     edgeInspector.locator('[data-testid^="project-context-edge-coordinate-"]'),
   ).toHaveCount(3);
@@ -1690,7 +1725,7 @@ test("a Spoke opens the complete Edge and Context Document summaries expand inde
     page.getByTestId("project-context-edge-inspector"),
   ).toBeVisible();
 
-  await page.getByTestId("auxiliary-panel-close").click();
+  await page.getByTestId("project-context-details-close").click();
   const secondEdgeKey = "2".repeat(64);
   const secondSpokeId = `spoke:${secondEdgeKey}:role:${ROLE_ID}`;
   await page
@@ -1830,6 +1865,16 @@ test("a current Document body error is irrelevant to Edge summary expansion", as
     projectView: inspectorProjectView(),
   });
   await openProjectContext(page);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length ?? 0,
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("project-context-sync-status")).toHaveText(
+    "Live",
+  );
   await page.getByTestId(`project-context-edge-${"1".repeat(64)}`).click();
 
   const edgeInspector = page.getByTestId("project-context-edge-inspector");
@@ -1853,6 +1898,27 @@ test("a current Document body error is irrelevant to Edge summary expansion", as
     edgeInspector.getByTestId("project-context-edge-key"),
   ).toHaveText("1".repeat(64));
   expect(await documentBodyCalls(page)).toHaveLength(0);
+  await page.getByTestId("project-context-details-close").click();
+  await page
+    .getByTestId(`project-context-coordinate-document:${CONTEXT_DOCUMENT_A_ID}`)
+    .click();
+  await expect(
+    page.getByTestId("project-context-document-error"),
+  ).toBeVisible();
+  const announcementOwner = page.getByTestId(
+    "project-context-workspace-announcement",
+  );
+  await expect(announcementOwner).toHaveCount(1);
+  await expect(announcementOwner).toHaveText(
+    "Current Document content could not be verified.",
+  );
+  const failedBodyCalls = await documentBodyCalls(page);
+  expect(failedBodyCalls.length).toBeGreaterThanOrEqual(1);
+  for (const call of failedBodyCalls) {
+    expect(call.payload).toMatchObject({
+      input: { documentId: CONTEXT_DOCUMENT_A_ID },
+    });
+  }
 });
 
 test("Query Bar keeps a draft until Run and URL history restores query and selection", async ({
@@ -1868,11 +1934,14 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
   };
   await installMockBridge(page, {
     projectContext: contextResult(),
+    projectDocument: inspectorDocumentState(),
     projectContextsByQuery: {
       [queryKey(incident)]: focusedResult(incident),
     },
   });
   await openProjectContext(page);
+  await waitForProjectContextLive(page);
+  await openProjectContextTool(page, "structure");
 
   await expect
     .poll(() =>
@@ -1922,6 +1991,7 @@ test("Query Bar keeps a draft until Run and URL history restores query and selec
   await page.getByTestId("project-context-graph-slot").screenshot({
     path: "test-results/project-context/project-context-incident-anchor.png",
   });
+  await page.getByTestId("project-context-tools-collapse").click();
   await page.evaluate(() => {
     window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__ = [];
   });
@@ -1953,6 +2023,7 @@ test("Incident Coordinate selection closes safely and ignores stale repeated inp
 }) => {
   await installMockBridge(page, { projectContext: contextResult() });
   await openProjectContext(page);
+  await openProjectContextTool(page, "structure");
   await expect
     .poll(() =>
       page.evaluate(
@@ -1960,6 +2031,9 @@ test("Incident Coordinate selection closes safely and ignores stale repeated inp
       ),
     )
     .toBeGreaterThanOrEqual(2);
+  await expect(page.getByTestId("project-context-sync-status")).toHaveText(
+    "Live",
+  );
   const callsBeforeDraft = await page.evaluate(
     () => window.__BUZZ_E2E_PROJECT_CONTEXT_CALLS__?.length ?? 0,
   );
@@ -2065,6 +2139,7 @@ test("Exact and Contains all enforce arity and submit canonical typed queries", 
     },
   });
   await openProjectContext(page);
+  await openProjectContextTool(page, "structure");
 
   await page.getByTestId("project-context-mode-exact").click();
   await page.getByTestId("project-context-coordinate-picker").click();
@@ -2078,6 +2153,10 @@ test("Exact and Contains all enforce arity and submit canonical typed queries", 
     .fill("Verified resource");
   await page.getByTestId("project-context-coordinate-search").press("Enter");
   await expect(page.getByTestId("project-context-run-query")).toBeEnabled();
+  await page.getByTestId("project-context-coordinate-search").press("Escape");
+  await expect(
+    page.getByTestId("project-context-coordinate-search"),
+  ).toBeHidden();
   await page.getByTestId("project-context-run-query").click();
   await expect(page.getByTestId("project-context-query-summary")).toContainText(
     "1 matching edge",
@@ -2255,6 +2334,20 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
   ).toHaveCount(0);
 
   await page.getByTestId(`project-context-edge-${"2".repeat(64)}`).click();
+  await expect(page).toHaveURL(
+    new RegExp(`selected=edge(?:%3A|:)${"2".repeat(64)}`),
+  );
+  await page.getByTestId("project-context-tools-collapse").click();
+  await expect(page.getByTestId("project-context-tool-panel")).toHaveCount(0);
+  const graph = page.getByTestId("project-context-graph");
+  await page.getByTestId("project-context-fit-all-canvas").click();
+  await expect(graph).toHaveAttribute(
+    "data-viewport-authority-pending",
+    "true",
+  );
+  await expect
+    .poll(() => graph.getAttribute("data-viewport-authority-pending"))
+    .toBe("false");
   await expect(
     page.getByTestId(`project-context-edge-${"2".repeat(64)}`),
   ).toHaveAttribute("data-emphasis", "active");
@@ -2295,9 +2388,14 @@ test("All Context renders binary, hyperedge overlap, and two labelled Islands", 
   );
   await expect(binarySpoke).toHaveCount(1);
   await binarySpoke.dispatchEvent("click");
+  await expect(page).toHaveURL(
+    new RegExp(`selected=edge(?:%3A|:)${"1".repeat(64)}`),
+  );
+  await page.getByTestId("project-context-focus-selection").click();
   await expect(
     page.getByTestId(`project-context-edge-${"1".repeat(64)}`),
   ).toHaveAttribute("data-emphasis", "active");
+  await expect(overlapSpokes).toHaveCount(2);
   for (let index = 0; index < 2; index += 1) {
     await expect(overlapSpokes.nth(index)).toHaveAttribute(
       "data-emphasis",
@@ -2334,7 +2432,10 @@ test("live Context hints merge and split Islands only after a trusted replacemen
   page,
 }) => {
   const split = twoIslandResult();
-  await installMockBridge(page, { projectContext: split });
+  await installMockBridge(page, {
+    projectContext: split,
+    projectDocument: inspectorDocumentState(),
+  });
   await openProjectContext(page);
   await waitForProjectContextLive(page);
   await expect(
@@ -2593,7 +2694,10 @@ test("offline Context stays visible as stale and reconnect replaces the whole tr
   page,
 }) => {
   const initial = contextResult({ edgeCount: 1, revision: 7 });
-  await installMockBridge(page, { projectContext: initial });
+  await installMockBridge(page, {
+    projectContext: initial,
+    projectDocument: inspectorDocumentState(),
+  });
   await openProjectContext(page);
   await waitForProjectContextLive(page);
 
@@ -2628,7 +2732,10 @@ test("offline Context stays visible as stale and reconnect replaces the whole tr
 test("a verification failure after a trusted graph fails closed and can be verified again", async ({
   page,
 }) => {
-  await installMockBridge(page, { projectContext: contextResult() });
+  await installMockBridge(page, {
+    projectContext: contextResult(),
+    projectDocument: inspectorDocumentState(),
+  });
   await openProjectContext(page);
   await waitForProjectContextLive(page);
 
@@ -2661,7 +2768,7 @@ test("keyboard selection, resizable Inspector, reduced motion, and text zoom rem
   page,
 }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.setViewportSize({ width: 1680, height: 900 });
   await installMockBridge(page, {
     projectContext: inspectorResult(),
     projectDocument: inspectorDocumentState(),
@@ -2677,27 +2784,29 @@ test("keyboard selection, resizable Inspector, reduced motion, and text zoom rem
   await page.keyboard.press("Space");
   await expect(page.getByTestId("project-context-inspector")).toBeVisible();
   await expect(requirementButton).toHaveAttribute("aria-pressed", "true");
+  const toolsPanel = page.getByTestId("project-context-tool-panel");
+  const toolsAssembly = toolsPanel.locator("xpath=ancestor::aside[1]");
+  await expect(toolsPanel).toHaveAttribute("data-presentation", "docked");
   await page.getByTestId("project-context-fit-selection").click();
   await expect(requirementButton).toBeFocused();
 
-  const inspector = page.getByTestId("project-context-inspector");
-  const initialInspectorWidth = (await inspector.boundingBox())?.width ?? 0;
-  const resizeHandle = page.getByTestId(
-    "project-context-inspector-resize-handle",
-  );
+  const initialInspectorWidth = (await toolsPanel.boundingBox())?.width ?? 0;
+  const resizeHandle = page.getByTestId("project-context-tools-resize-handle");
   const handleBox = await resizeHandle.boundingBox();
   if (!handleBox) throw new Error("Inspector resize handle is unavailable");
   await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + 80);
   await page.mouse.down();
-  await page.mouse.move(handleBox.x - 100, handleBox.y + 80);
+  await page.mouse.move(handleBox.x - 100, handleBox.y + 80, { steps: 6 });
   await page.mouse.up();
   await expect
-    .poll(async () => (await inspector.boundingBox())?.width ?? 0)
+    .poll(async () => (await toolsPanel.boundingBox())?.width ?? 0)
     .toBeGreaterThan(initialInspectorWidth + 80);
   await resizeHandle.dblclick();
   await expect
-    .poll(async () => Math.round((await inspector.boundingBox())?.width ?? 0))
-    .toBe(440);
+    .poll(async () =>
+      Math.round((await toolsAssembly.boundingBox())?.width ?? 0),
+    )
+    .toBe(488);
 
   await page.keyboard.press("Escape");
   await page.getByTestId("project-context-fit-all-canvas").click();

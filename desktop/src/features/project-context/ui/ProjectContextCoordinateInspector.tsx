@@ -34,6 +34,7 @@ import type {
   ProjectContextCoordinateDetail,
   ProjectContextQueryResult,
 } from "@/shared/api/tauriProjectContext";
+import type { ProjectContextWorkspaceAnnouncementEvent } from "@/features/project-context/workspacePanelModel";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Markdown } from "@/shared/ui/markdown";
@@ -263,6 +264,7 @@ export function ProjectContextCoordinateInspector({
   onOpenDocument,
   onOpenMeeting,
   onOpenProjectView,
+  onAnnouncement,
   onSelectEdge,
   onShowIncident,
   showIncidentDisabled = false,
@@ -273,6 +275,7 @@ export function ProjectContextCoordinateInspector({
   onOpenDocument: (documentId: string) => void;
   onOpenMeeting: (meetingId: string) => void;
   onOpenProjectView: (objectId: string) => void;
+  onAnnouncement?: (event: ProjectContextWorkspaceAnnouncementEvent) => void;
   onSelectEdge: (edgeKey: string) => void;
   onShowIncident: (coordinate: ProjectContextCoordinate) => void;
   showIncidentDisabled?: boolean;
@@ -385,6 +388,7 @@ export function ProjectContextCoordinateInspector({
         <ProjectContextDocumentContent
           detail={documentDetail}
           identity={projectContextDocumentIdentity(result)}
+          onAnnouncement={onAnnouncement}
           onOpenDocument={onOpenDocument}
         />
       ) : (detail.state === "terminal" || detail.state === "active") &&

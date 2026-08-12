@@ -130,6 +130,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
   onFit,
   onRun,
   overlayVisible,
+  panel = false,
   projectViewState,
   topologyAdvanced,
 }: {
@@ -147,10 +148,13 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
   onFit: () => void;
   onRun: () => void;
   overlayVisible: boolean;
+  panel?: boolean;
   projectViewState: ProjectContextPickerSourceState;
   topologyAdvanced: boolean;
 }) {
+  const [problemTouched, setProblemTouched] = React.useState(false);
   const validation = validateSemanticQueryDraft(draft);
+  const showProblemValidation = !validation.valid && problemTouched;
   const inFlight = attempt.status === "running" || attempt.status === "pairing";
   const activeResult: SemanticProjectContextQueryResult | undefined =
     active?.verifiedDisplayResult;
@@ -222,12 +226,16 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
   const canRun = available && validation.valid && !inFlight;
   return (
     <section
-      className="border-b border-border/70 bg-background/85 px-3 py-3 sm:px-5"
+      className={cn(
+        panel
+          ? "min-h-0"
+          : "border-b border-border/70 bg-background/85 px-3 py-3 sm:px-5",
+      )}
       data-active={active ? "true" : "false"}
       data-draft-dirty={dirty}
       data-testid="project-context-semantic-query-bar"
     >
-      <div className="mx-auto flex max-w-6xl flex-col gap-3">
+      <div className={cn("flex flex-col gap-3", !panel && "mx-auto max-w-6xl")}>
         <div className="flex items-center gap-2">
           <Search className="h-4 w-4 shrink-0 text-primary" />
           <div className="min-w-0 flex-1">
@@ -255,27 +263,30 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
           ) : null}
         </div>
 
-        <div className="flex items-end gap-2">
+        <div
+          className={cn(
+            "flex gap-2",
+            panel ? "flex-col items-stretch" : "items-end",
+          )}
+        >
           <label className="min-w-0 flex-1">
             <span className="sr-only">Project problem</span>
             <textarea
               aria-describedby="project-context-semantic-guidance project-context-semantic-problem-bytes"
-              aria-invalid={!validation.valid}
+              aria-invalid={showProblemValidation}
               className="min-h-20 w-full resize-y rounded-xl border border-border bg-background px-3 py-2 text-sm leading-6 outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
               data-testid="project-context-semantic-problem"
+              onBlur={() => setProblemTouched(true)}
               onChange={(event) =>
                 onDraftChange(
                   updateSemanticQueryDraftProblem(draft, event.target.value),
                 )
               }
               onKeyDown={(event) => {
-                if (
-                  event.key === "Enter" &&
-                  (event.metaKey || event.ctrlKey) &&
-                  canRun
-                ) {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
-                  onRun();
+                  setProblemTouched(true);
+                  if (canRun) onRun();
                 }
               }}
               placeholder="For example: Why did this release issue keep recurring?"
@@ -283,6 +294,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
             />
           </label>
           <Button
+            className={panel ? "w-full" : undefined}
             data-testid="project-context-semantic-run"
             disabled={!canRun}
             onClick={onRun}
@@ -305,7 +317,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
           <summary className="cursor-pointer text-xs font-semibold">
             Optional graph inputs
           </summary>
-          <div className="mt-3 grid gap-4 lg:grid-cols-2">
+          <div className={cn("mt-3 grid gap-4", !panel && "lg:grid-cols-2")}>
             <fieldset>
               <legend className="sr-only">Start from</legend>
               <div className="flex flex-wrap items-center gap-2">
@@ -342,10 +354,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
               />
               {draft.initialCoordinates.length >=
               SEMANTIC_PROJECT_CONTEXT_MAX_INITIAL_COORDINATES ? (
-                <p
-                  className="mt-1 text-2xs text-muted-foreground"
-                  role="status"
-                >
+                <p className="mt-1 text-2xs text-muted-foreground">
                   Maximum {SEMANTIC_PROJECT_CONTEXT_MAX_INITIAL_COORDINATES}{" "}
                   starting Coordinates selected.
                 </p>
@@ -387,10 +396,7 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
               />
               {draft.contextCoordinates.length >=
               SEMANTIC_PROJECT_CONTEXT_MAX_CONTEXT_COORDINATES ? (
-                <p
-                  className="mt-1 text-2xs text-muted-foreground"
-                  role="status"
-                >
+                <p className="mt-1 text-2xs text-muted-foreground">
                   Maximum {SEMANTIC_PROJECT_CONTEXT_MAX_CONTEXT_COORDINATES}{" "}
                   query-context Coordinates selected.
                 </p>
@@ -401,11 +407,8 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
 
         {active && activeResult ? (
           <div
-            aria-atomic="true"
-            aria-live="polite"
             className="flex flex-wrap items-center gap-2 rounded-xl border border-border/70 bg-card/55 px-3 py-2 text-xs"
             data-testid="project-context-semantic-result-status"
-            role="status"
           >
             <span className="min-w-0 max-w-full flex-1 truncate font-medium">
               Semantic snapshot · “{activeProblemSummary}”
@@ -458,19 +461,16 @@ export function ProjectContextSemanticQueryBar<TOverlay>({
           <p
             className={cn(
               "min-w-0 flex-1 text-xs",
-              !validation.valid || attempt.status === "failed"
+              showProblemValidation || attempt.status === "failed"
                 ? "text-amber-700 dark:text-amber-300"
                 : "text-muted-foreground",
             )}
             data-testid="project-context-semantic-guidance"
             id="project-context-semantic-guidance"
-            aria-atomic="true"
-            aria-live="polite"
-            role="status"
           >
             {!available
               ? "Semantic query is not available for this Community."
-              : !validation.valid
+              : showProblemValidation
                 ? validation.message
                 : attempt.status === "failed"
                   ? attempt.error.message

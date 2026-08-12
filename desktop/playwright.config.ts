@@ -96,6 +96,7 @@ export default defineConfig({
         "**/project-pr-review.spec.ts",
         "**/project-view.spec.ts",
         "**/project-context.spec.ts",
+        "**/project-context-workspace.spec.ts",
         "**/project-document.spec.ts",
         "**/meeting-read-only.spec.ts",
         "**/meeting-create.spec.ts",

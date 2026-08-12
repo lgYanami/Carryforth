@@ -4,11 +4,11 @@ import * as React from "react";
 import {
   addProjectContextDraftCoordinate,
   changeProjectContextDraftMode,
-  projectContextDraftFromQuery,
   projectContextDraftValidationMessage,
   projectContextQueryFromDraft,
   removeProjectContextDraftCoordinate,
   type ProjectContextCoordinateOption,
+  type ProjectContextQueryDraft,
 } from "@/features/project-context/queryModel";
 import type { ProjectContextQueryMode } from "@/features/project-context/routeState";
 import {
@@ -42,8 +42,11 @@ export function ProjectContextQueryBar({
   appliedQuery,
   coordinateOptions,
   documentsState,
+  draft,
   meetingsState,
+  onDraftChange,
   onRun,
+  panel = false,
   projectViewState,
   runDisabled = false,
   runDisabledReason,
@@ -51,23 +54,16 @@ export function ProjectContextQueryBar({
   appliedQuery: ProjectContextQuery;
   coordinateOptions: ProjectContextCoordinateOption[];
   documentsState: ProjectContextPickerSourceState;
+  draft: ProjectContextQueryDraft;
   meetingsState: ProjectContextPickerSourceState;
+  onDraftChange: React.Dispatch<React.SetStateAction<ProjectContextQueryDraft>>;
   onRun: (query: ProjectContextQuery) => void;
+  panel?: boolean;
   projectViewState: ProjectContextPickerSourceState;
   runDisabled?: boolean;
   runDisabledReason?: string;
 }) {
   const appliedKey = projectContextQueryKey(appliedQuery);
-  const lastAppliedKey = React.useRef(appliedKey);
-  const [draft, setDraft] = React.useState(() =>
-    projectContextDraftFromQuery(appliedQuery),
-  );
-
-  React.useEffect(() => {
-    if (lastAppliedKey.current === appliedKey) return;
-    lastAppliedKey.current = appliedKey;
-    setDraft(projectContextDraftFromQuery(appliedQuery));
-  }, [appliedKey, appliedQuery]);
 
   const selectedKeys = React.useMemo(
     () =>
@@ -104,13 +100,22 @@ export function ProjectContextQueryBar({
 
   return (
     <section
-      className="border-b border-border/70 bg-background/70 px-3 py-3 sm:px-5"
+      className={cn(
+        panel
+          ? "min-h-0"
+          : "border-b border-border/70 bg-background/70 px-3 py-3 sm:px-5",
+      )}
       data-draft-dirty={dirty}
       data-testid="project-context-query-bar"
     >
-      <div className="mx-auto flex max-w-6xl flex-col gap-3">
+      <div className={cn("flex flex-col gap-3", !panel && "mx-auto max-w-6xl")}>
         <div className="flex flex-wrap items-center gap-2">
-          <fieldset className="flex max-w-full flex-nowrap gap-1 overflow-x-auto rounded-xl border border-border/70 bg-muted/25 p-1">
+          <fieldset
+            className={cn(
+              "flex max-w-full flex-nowrap gap-1 overflow-x-auto rounded-xl border border-border/70 bg-muted/25 p-1",
+              panel && "w-full",
+            )}
+          >
             <legend className="sr-only">Project Context query mode</legend>
             {MODES.map((candidate) => (
               <Button
@@ -119,7 +124,7 @@ export function ProjectContextQueryBar({
                 data-testid={`project-context-mode-${candidate.mode}`}
                 key={candidate.mode}
                 onClick={() =>
-                  setDraft((current) =>
+                  onDraftChange((current) =>
                     changeProjectContextDraftMode(current, candidate.mode),
                   )
                 }
@@ -140,7 +145,7 @@ export function ProjectContextQueryBar({
             documentsState={documentsState}
             meetingsState={meetingsState}
             onSelect={(option) =>
-              setDraft((current) =>
+              onDraftChange((current) =>
                 addProjectContextDraftCoordinate(current, option.coordinate),
               )
             }
@@ -152,7 +157,10 @@ export function ProjectContextQueryBar({
             <Button
               data-testid="project-context-clear-coordinates"
               onClick={() =>
-                setDraft((current) => ({ ...current, coordinates: [] }))
+                onDraftChange((current) => ({
+                  ...current,
+                  coordinates: [],
+                }))
               }
               size="sm"
               type="button"
@@ -161,7 +169,7 @@ export function ProjectContextQueryBar({
               Clear
             </Button>
           ) : null}
-          <div className="min-w-4 flex-1" />
+          <div className={cn("min-w-4 flex-1", panel && "hidden")} />
           <Badge variant={dirty ? "warning" : "outline"}>
             {dirty
               ? "Draft · not applied"
@@ -207,7 +215,7 @@ export function ProjectContextQueryBar({
                     aria-label={`Remove ${option?.title ?? key}`}
                     className="rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     onClick={() =>
-                      setDraft((current) =>
+                      onDraftChange((current) =>
                         removeProjectContextDraftCoordinate(current, key),
                       )
                     }
@@ -229,7 +237,6 @@ export function ProjectContextQueryBar({
               : "text-muted-foreground",
           )}
           data-testid="project-context-query-guidance"
-          role={blockingGuidance ? "status" : undefined}
         >
           {blockingGuidance ??
             (draft.mode === "all"
