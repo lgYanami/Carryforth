@@ -27,6 +27,9 @@ export type ProjectContextSemanticResultForOverlay = Pick<
   | "projectId"
   | "relayPubkey"
   | "projectContextRevision"
+  | "completionReason"
+  | "exhaustedDimensions"
+  | "coverage"
   | "roots"
 > & { paths: ProjectContextSemanticPath[] };
 
@@ -39,6 +42,8 @@ export type ProjectContextSemanticOverlay = {
   substrateIdentity: string;
   pathCount: number;
   rootCount: number;
+  partialCoverage: boolean;
+  budgetExhausted: boolean;
   edgeKeys: ReadonlySet<string>;
   rootEdgeKeys: ReadonlySet<string>;
   memberCoordinateKeys: ReadonlySet<string>;
@@ -266,6 +271,17 @@ export function buildProjectContextSemanticOverlay(
       ...[...rootEdgeKeys].map(projectContextHubNodeId),
     ]),
   ].sort();
+  const responseBudgetOmissions =
+    result.coverage.omittedForResponseBudget.automaticRoots +
+    result.coverage.omittedForResponseBudget.paths +
+    result.coverage.omittedForResponseBudget.summaries;
+  const partialCoverage =
+    result.coverage.currentIndexedGraphSources <
+      result.coverage.authorizedGraphSources ||
+    result.coverage.indexCoveragePartial > 0 ||
+    result.coverage.omittedInitialCoordinates > 0 ||
+    result.coverage.omittedContextCoordinates > 0 ||
+    responseBudgetOmissions > 0;
 
   return {
     ok: true,
@@ -278,6 +294,10 @@ export function buildProjectContextSemanticOverlay(
       substrateIdentity: projectContextSemanticSubstrateIdentity(substrate),
       pathCount: result.paths.length,
       rootCount: result.roots.length,
+      partialCoverage,
+      budgetExhausted:
+        result.completionReason !== "frontier_exhausted" ||
+        result.exhaustedDimensions.length > 0,
       edgeKeys,
       rootEdgeKeys,
       memberCoordinateKeys,

@@ -1,10 +1,9 @@
 import { LocateFixed } from "lucide-react";
 import * as React from "react";
 
-import { projectContextInspectedCoordinate } from "@/features/project-context/inspectorModel";
 import type { ProjectContextRouteSelection } from "@/features/project-context/routeState";
-import { ProjectContextCoordinateInspector } from "@/features/project-context/ui/ProjectContextCoordinateInspector";
-import { ProjectContextEdgeInspector } from "@/features/project-context/ui/ProjectContextEdgeInspector";
+import type { ProjectContextWorkspaceAnnouncementEvent } from "@/features/project-context/workspacePanelModel";
+import { ProjectContextInspectorContent } from "@/features/project-context/ui/ProjectContextInspectorContent";
 import type {
   ProjectContextCoordinate,
   ProjectContextQueryResult,
@@ -75,6 +74,7 @@ function useProjectContextInspectorWidth() {
 
 /** Responsive, read-only Inspector driven exclusively by route selection. */
 export function ProjectContextInspector({
+  onAnnouncement,
   onClose,
   onFocusSelection,
   onOpenDocument,
@@ -89,6 +89,7 @@ export function ProjectContextInspector({
   semanticRootRelationDocumentIds,
   showIncidentDisabled = false,
 }: {
+  onAnnouncement?: (event: ProjectContextWorkspaceAnnouncementEvent) => void;
   onClose: () => void;
   onFocusSelection: () => void;
   onOpenDocument: (documentId: string) => void;
@@ -144,28 +145,20 @@ export function ProjectContextInspector({
       widthPx={inspectorWidth.widthPx}
     >
       <AuxiliaryPanelBody className="overflow-y-auto" panelPadding>
-        {selection.kind === "coordinate" ? (
-          <ProjectContextCoordinateInspector
-            detail={projectContextInspectedCoordinate(result, selection.key)}
-            onOpenDocument={onOpenDocument}
-            onOpenMeeting={onOpenMeeting}
-            onOpenProjectView={onOpenProjectView}
-            onSelectEdge={(edgeKey) => onSelect({ kind: "edge", key: edgeKey })}
-            onShowIncident={onShowIncident}
-            projectViewResult={projectViewResult}
-            result={result}
-            showIncidentDisabled={showIncidentDisabled}
-          />
-        ) : (
-          <ProjectContextEdgeInspector
-            edgeKey={selection.key}
-            onOpenDocument={onOpenDocument}
-            onSelectCoordinate={(key) => onSelect({ kind: "coordinate", key })}
-            result={result}
-            semanticRelationDocumentIds={semanticRelationDocumentIds}
-            semanticRootRelationDocumentIds={semanticRootRelationDocumentIds}
-          />
-        )}
+        <ProjectContextInspectorContent
+          onAnnouncement={onAnnouncement}
+          onOpenDocument={onOpenDocument}
+          onOpenMeeting={onOpenMeeting}
+          onOpenProjectView={onOpenProjectView}
+          onSelect={onSelect}
+          onShowIncident={onShowIncident}
+          projectViewResult={projectViewResult}
+          result={result}
+          selection={selection}
+          semanticRelationDocumentIds={semanticRelationDocumentIds}
+          semanticRootRelationDocumentIds={semanticRootRelationDocumentIds}
+          showIncidentDisabled={showIncidentDisabled}
+        />
       </AuxiliaryPanelBody>
     </AuxiliaryPanel>
   );

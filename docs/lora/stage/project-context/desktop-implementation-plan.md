@@ -8,6 +8,11 @@
 >
 > 已交付后端基线：[Project Context Edge V0 后端实现设计](./implementation-design.md)。
 >
+> 后续纯前端信息架构改造：
+> [Project Context 全画布与可折叠右侧工具栏分阶段实现计划](./desktop/project-context-full-canvas-workspace-implementation-plan.md)
+> 取代本计划中顶部查询栏、图卡片与独立 Inspector 的固定位置描述；本计划已经交付的可信读取、
+> route、查询、图模型和 canonical 内容合同不变。
+>
 > 本文只规划 Buzz Desktop 交付，包括 Desktop Tauri/Rust 可信读取适配、React 前端、图形
 > 呈现、Desktop mock bridge 与 Desktop 测试。Relay、数据库、领域协议、SDK 基础、CLI、
 > ACP、Web 和 Mobile 均视为已经交付或不在本计划范围内。

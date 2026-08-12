@@ -8,6 +8,11 @@
 >
 > 已交付后端边界参考：[Project Context Edge V0 后端实现设计](./implementation-design.md)。
 >
+> Desktop 信息架构更新：
+> [Project Context 全画布与可折叠右侧工具栏分阶段实现计划](./desktop/project-context-full-canvas-workspace-implementation-plan.md)
+> 取代本文 §8 中“顶部 Query Bar + Canvas + 右侧 Inspector”的固定位置描述。本文的领域、
+> 查询、权限、selection 与 canonical Inspector 产品语义继续有效。
+>
 > 本文记录 Project Context 在 Desktop 中的产品语义、信息架构、图形表达、查询行为、
 > Inspector、页面状态与首版边界。本文不重新定义领域或协议，不规定组件拆分、Tauri
 > command、缓存结构、图库选择、具体视觉参数或阶段开发计划。Desktop 的实现设计与开发

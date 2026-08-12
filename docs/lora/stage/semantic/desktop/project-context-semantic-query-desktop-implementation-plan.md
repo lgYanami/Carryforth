@@ -19,6 +19,11 @@
 > [Project Context Desktop 分阶段实现计划](../../project-context/desktop-implementation-plan.md)、
 > [Desktop Project Context 有机网状图布局实现设计](../../project-context/desktop-organic-graph-layout-implementation-design.md)
 >
+> Desktop 信息架构更新：
+> [Project Context 全画布与可折叠右侧工具栏分阶段实现计划](../../project-context/desktop/project-context-full-canvas-workspace-implementation-plan.md)
+> 取代本文 §4.1 中 Semantic Query Bar 位于结构 Query Bar 下方的固定位置描述。自然语言输入、
+> session、All Context pairing、overlay、currentness 与安全边界继续有效。
+>
 > 本计划范围：Desktop 自然语言问题、可选初始 Coordinate、可选上下文 Coordinate、
 > Native 可信查询、验证后的语义路径展示 DTO、All Context 图底座、持久语义高亮图层、
 > selection / hover 正交组合、Context Document 路径标记及 Desktop 测试

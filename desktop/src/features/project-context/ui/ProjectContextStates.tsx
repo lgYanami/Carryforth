@@ -77,7 +77,6 @@ export function ProjectContextLoadingState() {
       aria-busy="true"
       className="min-h-0 flex-1 p-4 sm:p-6"
       data-testid="project-context-loading"
-      role="status"
     >
       <span className="sr-only">
         Reading and verifying the complete Project Context snapshot.
