@@ -49,7 +49,8 @@ contact remains a release-blocking maintainer decision.
 | Rust | 1.95.0 (Hermit-pinned; workspace MSRV 1.88) | Install via [rustup](https://rustup.rs/) when not using Hermit |
 | Node.js | 24.14.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
 | pnpm | 11.4.0 (Hermit-pinned) | Required for desktop app commands and `just ci` |
-| Docker | 24+ | For Postgres, Redis, MinIO |
+| Docker | 24+ with Compose v2 | For Postgres, Redis, MinIO; daemon must be running |
+| Python | 3 | Used by the detached source-development launcher |
 | `just` | latest | Task runner — `cargo install just` |
 | `lefthook` | 2.1.3 (Hermit-pinned) | Auto-installed by `just hooks` — no manual install needed |
 | `sqlx` migrations | workspace crate | `just migrate` applies embedded migrations from `migrations/` |
@@ -69,6 +70,25 @@ versions in the table above.
 
 ### First-Time Setup
 
+For the shortest local build/start path, install the system prerequisites from
+the table above and run:
+
+```bash
+git clone https://github.com/lgYanami/Carryforth.git
+cd Carryforth
+./scripts/dev-start.sh
+```
+
+The script checks but never installs Docker, Python, or OS packages. It sources
+Hermit for the repository-pinned build tools, initializes `.env` with mode
+`0600`, and prompts for a missing semantic Provider API key, Base URL, and
+Request Model. Only the API key input is hidden; the URL and model have no
+defaults. It defaults the local semantic Worker and query HTTP process switches
+to enabled. Prompts are unavailable in non-interactive execution, where all
+three values must already be exported or stored in `.env`.
+
+For the split setup/run contributor workflow:
+
 ```bash
 # 1. Clone the repo
 git clone https://github.com/lgYanami/Carryforth.git
@@ -84,11 +104,12 @@ just setup
 just hooks
 ```
 
-`just setup` runs `just bootstrap` first — it copies `.env.example` to `.env`
-if it doesn't already exist, and invokes `cargo`, `node`, and `pnpm` to trigger
-Hermit's lazy tool download (each tool is fetched once on first invocation and
-cached thereafter). You can also run `just bootstrap` independently at any time;
-it is safe to re-run.
+`just setup` runs `just bootstrap` first — it copies `.env.example` to a private
+`.env` if it doesn't already exist, and invokes `cargo`, `node`, and `pnpm` to
+trigger Hermit's lazy project-tool download (each tool is fetched once on first
+invocation and cached thereafter). It never installs external system software.
+You can also run `just bootstrap` independently at any time; it is safe to
+re-run.
 
 `just setup` then starts Docker services (Postgres on `:5432`, Redis on `:6379`,
 Adminer on `:8082`, Keycloak on `:8180` for local OAuth/OIDC testing, MinIO on
@@ -103,7 +124,9 @@ just dev   # starts the relay + desktop app in one command
 
 `just dev` builds all agent tools, starts the relay (`ws://localhost:3000`) in
 the background, and launches the Tauri desktop app. The relay process is
-automatically killed when you quit the app or press Ctrl+C.
+automatically killed when you quit the app or press Ctrl+C. It uses the same
+hidden semantic Provider configuration as `dev-start.sh`. It does not change
+durable per-Community semantic gates or acknowledge Provider problem egress.
 
 For a detached one-command workflow with lifecycle tracking:
 

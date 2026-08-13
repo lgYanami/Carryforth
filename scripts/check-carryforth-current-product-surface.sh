@@ -112,6 +112,8 @@ reject_pattern \
   "a local developer surface still presents Buzz as the current product or CLI" \
   Justfile .env.example scripts/instance-env.sh scripts/dev-start.sh \
   scripts/dev-rebuild-start.sh scripts/dev-stop.sh scripts/dev-setup.sh \
+  scripts/configure-local-semantic.sh scripts/update-local-env.mjs \
+  scripts/test-source-dev-start.sh \
   scripts/dev-reset.sh scripts/reset-desktop-dev-state.sh scripts/grab-emoji.sh \
   scripts/build-sprig.sh deploy/local/README.md
 

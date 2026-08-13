@@ -21,12 +21,11 @@ if [[ -z "${CMAKE:-}" && -x /usr/bin/cmake ]]; then
   export CMAKE=/usr/bin/cmake
 fi
 
-if [[ -f "${REPO_ROOT}/.env" ]]; then
-  set -o allexport
-  # shellcheck disable=SC1091
-  source "${REPO_ROOT}/.env"
-  set +o allexport
-fi
+"${SCRIPT_DIR}/configure-local-semantic.sh"
+set -o allexport
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/.env"
+set +o allexport
 
 log "清理 Carryforth 可执行程序的构建产物（保留依赖缓存）..."
 cargo clean \

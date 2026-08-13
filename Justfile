@@ -22,7 +22,8 @@ default:
 
 # ─── Dev Environment ─────────────────────────────────────────────────────────
 
-# Install required dev tools via Hermit and create .env (safe to re-run)
+# Resolve the repository-pinned toolchain and create .env (safe to re-run).
+# External system software such as Docker is checked, never installed here.
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -40,9 +41,16 @@ bootstrap:
         exit 1
     fi
     if [[ ! -f .env ]]; then
+        umask 077
         cp .env.example .env
+        chmod 600 .env
         echo "Created .env from .env.example — review it before running just dev."
     fi
+
+# Configure local semantic process defaults before any service startup. Values
+# are persisted to the ignored .env; recipe shells source it after this step.
+_configure-local-semantic: bootstrap
+    ./scripts/configure-local-semantic.sh
 
 # Start Docker services, run migrations, install desktop deps
 setup: bootstrap
@@ -104,7 +112,7 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check
+check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test source-dev-start-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check
 
 # Keep contributor-facing product and local-development surfaces on Carryforth.
 current-product-surface-check:
@@ -123,6 +131,10 @@ source-asset-inventory-check:
 # Validate local bootstrap and upgrade safety without starting or deleting data.
 carryforth-local-deployment-test:
     ./scripts/test-carryforth-local-deployment.sh
+
+# Verify first-start local configuration without starting services or touching data.
+source-dev-start-test:
+    ./scripts/test-source-dev-start.sh
 
 # Keep the Agent-first CLI on its one-way Carryforth/cf cutover.
 cf-cli-cutover-check:
@@ -644,26 +656,35 @@ desktop-screenshot *ARGS:
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 # Start the relay server (auto-starts Docker services if needed)
-relay: bootstrap _ensure-migrations
+relay: _configure-local-semantic _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    set -o allexport
+    source .env
+    set +o allexport
     cargo run -p buzz-relay
 
 # Start the relay with the built web UI served from it
-relay-web: bootstrap _ensure-migrations
+relay-web: _configure-local-semantic _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    set -o allexport
+    source .env
+    set +o allexport
     [[ -d node_modules ]] || pnpm install
     pnpm -C web build
     BUZZ_WEB_DIR=./web/dist cargo run -p buzz-relay
 
 # Build and run the private read-only admin dashboard
-admin: bootstrap _ensure-migrations
+admin: _configure-local-semantic _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    set -o allexport
+    source .env
+    set +o allexport
     [[ -d node_modules ]] || pnpm install
     pnpm -C admin-web build
     export BUZZ_ADMIN_HOST="${BUZZ_ADMIN_HOST:-admin.localhost:3000}"
@@ -689,10 +710,13 @@ relay-release: _ensure-migrations
 
 
 # Run the desktop Tauri app in dev mode with a local relay (ports and identity derived from worktree)
-dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
+dev *ARGS: _configure-local-semantic _ensure-sidecar-stubs _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
+    set -o allexport
+    source .env
+    set +o allexport
     bind_addr="${BUZZ_BIND_ADDR:-0.0.0.0:3000}"
     relay_port="${bind_addr##*:}"; [[ -n "$relay_port" ]] || relay_port=3000
     health_port="${BUZZ_HEALTH_PORT:-8080}"

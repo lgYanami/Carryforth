@@ -62,23 +62,48 @@ plane.
 
 ## Build and run from source
 
-The source workflow currently requires Docker and the repository's
-[Hermit](https://cashapp.github.io/hermit/) toolchain. The current Hermit pins
-are Rust 1.95.0, Node.js 24.14.0, and pnpm 11.4.0; activate Hermit rather than
-silently substituting different tool versions.
+The source workflow requires a running Docker 24+ installation with the Docker
+Compose v2 plugin, Python 3, and the native prerequisites required by Tauri on
+your operating system. Carryforth's startup scripts only check those external
+system dependencies; they do not install Docker, Python, OS packages, or other
+third-party system software.
+
+The repository's [Hermit](https://cashapp.github.io/hermit/) environment supplies
+the project toolchain. The current pins are Rust 1.95.0, Node.js 24.14.0, and
+pnpm 11.4.0. Their first use downloads the pinned Carryforth build tools and the
+build installs Carryforth's own package dependencies.
+
+For a fresh clone, the supported one-command local build and startup is:
 
 ```bash
 git clone https://github.com/lgYanami/Carryforth.git
 cd Carryforth
-. ./bin/activate-hermit
-cp .env.example .env
-just setup
-just dev
+./scripts/dev-start.sh
 ```
 
-`just setup` installs dependencies, starts the development infrastructure, and
-applies migrations. `just dev` starts the Relay and Tauri Desktop together.
-The Relay listens on `ws://localhost:3000`.
+The first run checks the external prerequisites, creates a private Git-ignored
+`.env` with mode `0600`, and asks for any missing semantic Provider API key,
+Base URL, and Request Model. The API key uses hidden terminal input; the URL and
+model are visible and have no defaults. Local source startup defaults the
+semantic Worker and semantic query HTTP process switches to enabled and
+generates a stable local Relay signer. It then downloads/builds Carryforth dependencies, starts the
+development infrastructure without deleting volumes, applies pending database
+migrations, builds the Relay/CLI/Desktop, and launches Desktop. The
+Relay listens on `ws://localhost:3000`.
+
+These startup defaults do not silently enable a Community's durable semantic
+index/query gates and do not acknowledge problem egress. Those authorization
+steps remain explicit. To opt out of Provider configuration entirely, set both
+`BUZZ_SEMANTIC_WORKER_ENABLED=false` and
+`BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false` in `.env`.
+
+For a foreground contributor workflow, activate Hermit and run `just dev`; it
+uses the same semantic configuration step:
+
+```bash
+. ./bin/activate-hermit
+just dev
+```
 
 For a detached workflow:
 

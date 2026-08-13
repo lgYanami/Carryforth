@@ -166,6 +166,8 @@ jobs:
         run: scripts/test-release-ref-contract.sh
       - name: Current Carryforth product surface contract
         run: scripts/check-carryforth-current-product-surface.sh
+      - name: Source-development first-start configuration contract
+        run: scripts/test-source-dev-start.sh
       - name: Current source asset provenance contract
         run: node scripts/check-source-asset-inventory.mjs
       - name: Project View release contract

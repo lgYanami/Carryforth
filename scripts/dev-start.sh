@@ -88,6 +88,38 @@ if [[ ! "${START_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
   fail "BUZZ_DEV_START_TIMEOUT_SECONDS 必须是正整数"
 fi
 
+command -v docker >/dev/null 2>&1 ||
+  fail "未找到 Docker；启动脚本只检查系统依赖，不会自动安装 Docker"
+docker compose version >/dev/null 2>&1 ||
+  fail "Docker Compose 插件不可用；启动脚本不会自动安装系统组件"
+command -v python3 >/dev/null 2>&1 ||
+  fail "未找到 Python 3；它只用于创建受管理的后台进程，启动脚本不会自动安装"
+docker info >/dev/null 2>&1 || fail "Docker daemon 未运行"
+
+case "$(uname -s)" in
+  Linux)
+    command -v pkg-config >/dev/null 2>&1 ||
+      fail "未找到 pkg-config；启动脚本不会自动安装 Desktop 原生依赖"
+    missing_packages=()
+    for package in webkit2gtk-4.1 gtk+-3.0 libsoup-3.0 alsa; do
+      pkg-config --exists "${package}" || missing_packages+=("${package}")
+    done
+    if ! pkg-config --exists ayatana-appindicator3-0.1 &&
+      ! pkg-config --exists appindicator3-0.1; then
+      missing_packages+=("ayatana-appindicator3-0.1/appindicator3-0.1")
+    fi
+    if ((${#missing_packages[@]} > 0)); then
+      fail "缺少 Tauri Desktop 原生依赖：${missing_packages[*]}；请先用系统包管理器安装"
+    fi
+    ;;
+  Darwin)
+    if ! command -v xcrun >/dev/null 2>&1 ||
+      ! xcrun --find clang >/dev/null 2>&1; then
+      fail "Xcode Command Line Tools 不可用；启动脚本不会自动安装"
+    fi
+    ;;
+esac
+
 # Use the repository-pinned Rust/Node toolchain. The system CMake avoids an
 # unnecessary Hermit lazy download on Linux machines that already provide it.
 # shellcheck disable=SC1091
@@ -96,15 +128,14 @@ if [[ -z "${CMAKE:-}" && -x /usr/bin/cmake ]]; then
   export CMAKE=/usr/bin/cmake
 fi
 
-if [[ -f "${REPO_ROOT}/.env" ]]; then
-  set -o allexport
-  # shellcheck disable=SC1091
-  source "${REPO_ROOT}/.env"
-  set +o allexport
-fi
-
-command -v docker >/dev/null 2>&1 || fail "未找到 Docker"
-docker info >/dev/null 2>&1 || fail "Docker daemon 未运行"
+# Configure source-development semantic defaults before the background `just`
+# process starts. This closes the fresh-clone gap where bootstrap used to create
+# .env only after the outer launcher had already loaded its environment.
+"${SCRIPT_DIR}/configure-local-semantic.sh"
+set -o allexport
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/.env"
+set +o allexport
 
 mkdir -p "${STATE_DIR}"
 
