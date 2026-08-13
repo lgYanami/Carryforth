@@ -59,7 +59,7 @@ require_literal "- 'scripts/check-project-view-v3-runtime.sh'" .github/workflows
 require_literal "- name: Project View v3-only runtime contract" .github/workflows/ci.yml
 require_literal "run: scripts/check-project-view-v3-runtime.sh" .github/workflows/ci.yml
 require_literal "- 'scripts/meeting-v2-actions-live-acceptance.sh'" .github/workflows/ci.yml
-require_literal "PROJECT_VIEW_PRE_FEATURE_REF: ab3af828714ab699dfc87644d234014987a4fe6b" .github/workflows/ci.yml
+require_literal "PROJECT_VIEW_PRE_FEATURE_REF: aeced53115b2892c557fe54d094070f1071dbb60" .github/workflows/ci.yml
 require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-rollback-smoke.sh
 require_literal "Current additive schema with pre-feature Relay smoke" .github/workflows/ci.yml
 require_literal "version = 48 AND success" scripts/test-project-view-rollback-smoke.sh
