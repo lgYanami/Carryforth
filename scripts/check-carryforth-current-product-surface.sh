@@ -110,7 +110,7 @@ reject_pattern \
 reject_pattern \
   'Buzz Dev|Buzz Backend|real buzz CLI|command -v buzz|Buzz dev environment|local Buzz|Buzz app' \
   "a local developer surface still presents Buzz as the current product or CLI" \
-  Justfile .env.example scripts/instance-env.sh scripts/dev-start.sh \
+  Justfile .env.example start.sh scripts/instance-env.sh scripts/dev-start.sh \
   scripts/dev-rebuild-start.sh scripts/dev-stop.sh scripts/dev-setup.sh \
   scripts/configure-local-semantic.sh scripts/update-local-env.mjs \
   scripts/test-source-dev-start.sh \

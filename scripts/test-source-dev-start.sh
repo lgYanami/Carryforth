@@ -164,6 +164,14 @@ launch = text.index("nohup python3")
 assert configure < compose < launch
 PY
 
+python3 - "${REPO_ROOT}/start.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+assert 'exec "${REPO_ROOT}/scripts/dev-start.sh" "$@"' in text
+PY
+
 rg --quiet '^"\$\{SCRIPT_DIR\}/configure-local-semantic\.sh"$' \
   "${REPO_ROOT}/scripts/dev-rebuild-start.sh"
 rg --quiet '^_configure-local-semantic: bootstrap$' "${REPO_ROOT}/Justfile"
@@ -171,6 +179,7 @@ rg --quiet '^\s*\./scripts/configure-local-semantic\.sh$' "${REPO_ROOT}/Justfile
 grep -Fqx '.env' "${REPO_ROOT}/.gitignore"
 ! rg --ignore-case --quiet \
   '(apt(-get)?|brew|dnf|yum|pacman|snap)[[:space:]]+.*install' \
+  "${REPO_ROOT}/start.sh" \
   "${REPO_ROOT}/scripts/dev-start.sh" \
   "${REPO_ROOT}/scripts/configure-local-semantic.sh"
 ! rg --quiet 'ark\.cn-beijing|doubao-embedding-vision' \

@@ -78,7 +78,7 @@ For a fresh clone, the supported one-command local build and startup is:
 ```bash
 git clone https://github.com/lgYanami/Carryforth.git
 cd Carryforth
-./scripts/dev-start.sh
+./start.sh
 ```
 
 The first run checks the external prerequisites, creates a private Git-ignored
@@ -108,7 +108,7 @@ just dev
 For a detached workflow:
 
 ```bash
-./scripts/dev-start.sh          # start without deleting data
+./start.sh                      # build and start without deleting data
 ./scripts/dev-rebuild-start.sh  # rebuild executables, then start
 ./scripts/dev-stop.sh           # stop processes/containers; preserve data
 ```

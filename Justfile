@@ -58,7 +58,7 @@ setup: bootstrap
 
 # Start Docker services, relay, and desktop in the background
 start:
-    ./scripts/dev-start.sh
+    ./start.sh
 
 # Force-rebuild Carryforth executables, then start the local stack
 rebuild-start:

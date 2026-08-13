@@ -76,7 +76,7 @@ the table above and run:
 ```bash
 git clone https://github.com/lgYanami/Carryforth.git
 cd Carryforth
-./scripts/dev-start.sh
+./start.sh
 ```
 
 The script checks but never installs Docker, Python, or OS packages. It sources
@@ -131,7 +131,7 @@ durable per-Community semantic gates or acknowledge Provider problem egress.
 For a detached one-command workflow with lifecycle tracking:
 
 ```bash
-./scripts/dev-start.sh          # start containers + relay + desktop
+./start.sh                      # build and start containers + relay + desktop
 ./scripts/dev-rebuild-start.sh  # force-rebuild Carryforth executables, then start
 ./scripts/dev-stop.sh           # stop app + containers; preserve all data
 ```
