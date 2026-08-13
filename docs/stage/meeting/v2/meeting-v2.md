@@ -9,10 +9,15 @@
 >
 > 基线：Meeting V2 建立在
 > [Meeting V1：主持式发言权接力协议](../v1/meeting-v1.md) 之上。
+>
+> 后续实现已通过
+> [Meeting Coordinate 与 Community read](../../project-context/meeting-coordinate-implementation-design.md)
+> 将 Meeting 记录的读取范围扩展为独立、受 durable capability 与当前 Community 成员资格控制的
+> 项目读取面。本文中的固定 Roster 现在控制正式参与和行动，不再充当 Meeting 读取 ACL。
 
 ## 1. 文档目的
 
-Meeting V1 已经解决 Human 与 Agent 在同一私有会议中如何表达发言意图、取得唯一发言权、
+Meeting V1 已经解决 Human 与 Agent 在同一有边界会议中如何表达发言意图、取得唯一发言权、
 定向接力、由主持人选择下一位发言者，以及如何在超时和故障后恢复。
 
 V1 不负责表达会议为什么召开、当前讨论到哪里、主持人认为已经形成了什么结论。缺少这些
@@ -79,7 +84,8 @@ Meeting V2 要做到：
 6. 避免看板处理耗时侵占主持人的发言权决策时间；
 7. 由主持人判断目标是否达成、结论是否有效，并据此正常关闭会议；
 8. 允许看板引用 Project View 或其他上下文，但不要求任何外部系统存在；
-9. 保持 V1 已有的私有名单、唯一 Grant、Human 优先、定向接力和恢复语义。
+9. 保持 V1 已有的固定参与名单、唯一 Grant、Human 优先、定向接力和恢复语义；读取范围由
+   后续独立发布的 Community Meeting read 合同控制。
 
 ## 4. 非目标
 
@@ -112,7 +118,8 @@ Meeting V2 初版不提供：
 - Human Floor Request 保持 V1 的下一席优先级；
 - Directed Handoff、Recall、接力深度和强制归还主持人的规则保持不变；
 - Relay 权威校验、确定性 fallback 的候选顺序、幂等和恢复语义保持不变；
-- 会议仍使用私有固定名单，非参会者不能读取会议内容；
+- 会议仍使用固定 Roster 控制正式参与和行动；读取不是 Roster 权限，durable Community read
+  发布启用后由当前 Community 成员资格和安全状态独立控制；
 - End 仍是高于所有 Floor 状态的终态；
 - Community 管理和安全撤权仍可异常终止会议。
 
@@ -200,8 +207,8 @@ Meeting Board 是会议范围内的一份当前共享文档。它是参会者理
 看板采用单写者模型：
 
 - 只有当前主持人可以正式修改看板；
-- 所有当前参会者都可以读取当前看板；
-- 非参会者不能读取；
+- 所有当前参会者都可以读取当前看板；durable Community read 发布启用后，符合当前 Community
+  读取条件的非参会成员也可以读取，但不能因此发言、主持或执行 Meeting action；
 - 看板不是多人协作文档；
 - 参会者同时提出不同建议不会产生看板写冲突，由主持人统一归纳。
 
@@ -475,7 +482,8 @@ Meeting V2 必须始终满足：
 1. 一场会议恰好有一名主持人，初始主持人就是会议发起者；
 2. V2 初版不发生主持权转移；
 3. 看板只有主持人可修改，所有当前参会者可读取；
-4. 看板不向非参会者开放；
+4. durable Community read 发布启用后，符合当前 Community 读取条件的非参会成员也可读取，
+   但 Roster 仍是参与和行动边界；
 5. 看板只提供当前内容，不要求业务版本、历史或变更通知；
 6. 看板更新不属于正式 speech，也不消费 Speech Grant；
 7. 主持人只能在 Control Token 属于自己且没有活动 Offer/Grant 时修改看板；

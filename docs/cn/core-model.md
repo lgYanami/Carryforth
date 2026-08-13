@@ -188,7 +188,9 @@ Project 持续保存 Work、Checkpoint、Handoff 与规范状态
 因此，active Project Member 可以理解为“具备 Community 成员资格，并持有 active Role Assignment
 的成员”。候选 Agent、已连接 Runtime 或加入某个 Channel 本身都不足以形成 active Assignment。
 
-完整设计见 [Role Continuity](../stage/role/role-continuity.md)。
+为什么责任、任期、Work Responsibility、Commitment 与 Runtime 必须分开，以及 Project
+如何在没有前任退出总结时仍支持接续，见[核心设计：Role Continuity](core-design/role-continuity.md)。
+精确领域合同见 [Role Continuity](../stage/role/role-continuity.md)。
 
 ## 4. Members：Human 与 Agent
 
@@ -256,7 +258,9 @@ Edge 与 Context Document 还保持以下生命周期约束：
 Desktop 当前提供只读关系画布、检查器和实时更新；规范的 Edge attach / detach 主要由 `cf`
 和 Agent 操作完成。
 
-完整语义见 [Project Context](../stage/project-context/project-context.md)。
+为什么 Context 必须从稳定对象身份开始，以及坐标、Edge 与 Document 为什么采用这种分工，
+见[核心设计：先有坐标，后有上下文](core-design/coordinate-and-context.md)。完整领域语义见
+[Project Context](../stage/project-context/project-context.md)。
 
 ### 6.1 图语义路径查询
 
@@ -273,6 +277,9 @@ Desktop 当前提供只读关系画布、检查器和实时更新；规范的 Ed
 这项能力需要单独配置语义 Provider、索引 generation、Community index/query gate
 和问题数据出境确认。它目前仍在相关性、资源隔离、长期稳定性和生产部署资格化中；
 “使用了 Role 或 Work 上下文”只表示它会参与召回与排序，不保证每个问题都产生人类预期的唯一答案。
+
+这项能力为什么使用统一 Project Context 图、如何区分上下文环境与上下文路径，以及为什么不建立
+Agent 私有上下文，见[核心设计：上下文环境感知的图语义检索](core-design/context-aware-semantic-graph-retrieval.md)。
 
 运维与启用边界见 [语义 pgvector 运维](../semantic-pgvector-operations.md)。
 
@@ -295,7 +302,9 @@ Action Finalization 只是主持人执行这些普通业务操作并提交 `acti
 Meeting 当前仍是预览能力；创建、direct action 和 Community read 各有独立开关与授权。
 默认可见性和后续扩大读取范围不能仅靠客户端声明改变。
 
-概念与阶段设计见 [Meeting V2](../stage/meeting/v2/meeting-v2.md)。
+Meeting 为什么采用“分布式上下文、共享 Board、显式行动收口”的设计，见
+[核心设计：Meeting](core-design/meeting.md)。精确阶段语义见
+[Meeting V2](../stage/meeting/v2/meeting-v2.md)。
 
 ## 8. 一次典型协作
 

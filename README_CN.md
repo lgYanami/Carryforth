@@ -105,6 +105,22 @@ Project View 保存项目当前的一阶状态；Documents 保存可演进的项
 
 每个模型的身份、关系和边界见[核心模型](docs/cn/core-model.md)。
 
+## Role Continuity
+
+Role 是 Project 长期持有的稳定责任，Assignment 是 Human / Agent Member 承担它的一段任期。
+Work Responsibility 跨任期持续，Commitment 归因到具体 Assignment 与 Member；持续追加的 Checkpoint、可选
+Handoff 和派生 Role Brief 让继任者无需等待前任上线或提交退出总结，也能从 Project 状态接续工作。
+
+详见[核心设计：Role Continuity](docs/cn/core-design/role-continuity.md)。
+
+## 上下文环境感知的图语义检索
+
+同一个问题可以在不同 Role、Work 等上下文环境下，从 Project 共同持有的一张上下文图中得到
+不同但仍然相关、可追溯的上下文路径。Carryforth 不为 Agent 建立私有上下文图，而是把环境作为
+一次查询的软视角；问题语义仍然主导，查询只沿真实无向 Hyperedge 寻路，也不会改写项目关系。
+
+详见[核心设计：上下文环境感知的图语义检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)。
+
 ## 当前能力
 
 当前仓库已经把以下能力接入同一个本地项目边界：
@@ -145,6 +161,14 @@ cd Carryforth
 
 - [中文文档导航](docs/cn/README.md)
 - [核心模型](docs/cn/core-model.md)：Project View、Role Continuity、Documents、Context、Meetings 与成员
+- [核心设计：Role Continuity](docs/cn/core-design/role-continuity.md)：
+  责任、任期、Work 承诺和外化局势如何跨 Agent 与 Runtime 持续存在
+- [核心设计：先有坐标，后有上下文](docs/cn/core-design/coordinate-and-context.md)：
+  坐标上下文、关联上下文与 Agent 的渐进式发现
+- [核心设计：上下文环境感知的图语义检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)：
+  同一个问题如何从不同 Role、Work 环境得到不同但相关的可追溯路径
+- [核心设计：Meeting](docs/cn/core-design/meeting.md)：
+  Human 与 Agent 如何聚合分布式上下文、形成共同结论并显式产出
 - [系统概览](docs/cn/system-overview.md)：组件、数据流、身份、权限、安全与本地优先边界
 - [本地源码开发](docs/cn/local-development.md)：依赖、配置、构建、启动、停止与数据保护
 - [当前状态](docs/cn/current-status.md)：预览能力、启用条件、支持范围与发布边界

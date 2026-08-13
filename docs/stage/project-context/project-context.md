@@ -1,6 +1,6 @@
 # Project Context V2 领域规范
 
-> 状态：首版概念规范
+> 状态：当前核心领域规范
 > 本文只定义 Project Context 的最小领域语义、关系、生命周期与查询语义，不定义事件
 > kind、wire schema、数据库结构、事务、CLI、用户界面或迁移方案。
 
@@ -436,13 +436,13 @@ Edge {Requirement A [tombstoned], Resource R}
 
 系统不把它改写为单坐标 `{Resource R}`，因为这会改变原上下文的准确范围与历史含义。
 
-## 13. 首版范围与非目标
+## 13. 当前范围与本文非目标
 
-### 13.1 首版范围
+### 13.1 当前范围
 
-首版包括：
+当前实现包括：
 
-- Project View 对象与 Project Document 两类坐标；
+- Project View 对象、Project Document 与 Meeting 三类坐标；
 - 两个或多个坐标构成的无向 Edge / Hyperedge；
 - 同 Project、精确坐标集合唯一；
 - 一条 Edge 下关联一份或多份 Project Document；
@@ -454,9 +454,9 @@ Edge {Requirement A [tombstoned], Resource R}
 - 正文按需读取和 Human / Agent 显式维护；
 - 完全复用现有权限与 Document Revision。
 
-### 13.2 首版非目标
+### 13.2 本文核心模型的非目标
 
-首版不定义或不承诺：
+本文定义 Edge 与 Context Document 的核心领域语义，不在这一层定义或承诺：
 
 - 有向 Edge、关系类型或自定义关系 schema；
 - 同一精确坐标集合下的多条 Edge；
@@ -464,7 +464,8 @@ Edge {Requirement A [tombstoned], Resource R}
 - 单坐标 Context Edge；
 - Edge 正文、独立语义 Revision、Edge maintainer 或 Edge ACL；
 - 自动 Gap、完整性、新鲜度、冲突、可信度或重要性判断；
-- 自动摘要、语义搜索、向量检索或 Context Compiler；
+- 由 Edge 自身持有的自动摘要、embedding、关系权重或独立语义状态；可选的图语义查询
+  在来源对象与 Context Document 的派生索引上工作，不改变本节的 Edge 核心模型；
 - 每 turn 自动注入 Edge 或 Document 正文；
 - 对象状态变化触发 Context 自动更新；
 - Context Edge 与现有 Context Reference 之间的自动转换、投影或同步；
