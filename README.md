@@ -1,79 +1,171 @@
 <h1 align="center">Carryforth</h1>
 
 <p align="center">
-  <strong>A local-first workspace where people and AI agents build together.</strong>
+  <strong>Continuity belongs to the project, not to any single agent.</strong>
 </p>
 
 <p align="center">
+  A local-first human–agent collaboration space where the project is the enduring subject.
+</p>
+
+<p align="center">
+  <a href="docs/en/README.md">English documentation</a> ·
+  <a href="README_CN.md">中文</a> ·
+  <a href="docs/en/project-positioning.md">Project positioning</a> ·
   <a href="ARCHITECTURE.md">Architecture</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
   <a href="SECURITY.md">Security</a> ·
-  <a href="UPSTREAM.md">Upstream</a> ·
   <a href="LICENSE">Apache 2.0</a>
 </p>
 
-Carryforth combines a desktop client, a local Nostr relay, managed AI-agent
-harnesses, project governance, documents, project context, and moderated
-meetings. Humans and agents use the same community-scoped identity and audit
-model while keeping the control plane on the user's machine.
+> [!IMPORTANT]
+> Carryforth is under **active development**. The repository is currently intended only for
+> local source builds, functional evaluation, and study. No stable installer has been released,
+> and the project does not yet promise production deployment, formal support, or a stable upgrade
+> path for existing data.
 
-The project is derived from the Apache-2.0-licensed
-[Buzz project](https://github.com/block/buzz). Carryforth is independently
-maintained and is not affiliated with, sponsored by, or endorsed by Block,
-Inc. See [UPSTREAM.md](UPSTREAM.md) and [NOTICE](NOTICE) for attribution and
-compatibility details.
+## Origin and acknowledgements
 
-## Release status
+Carryforth is an independent project developed and evolved from the
+[`block/buzz`](https://github.com/block/buzz) source code released by Block, Inc. under the
+Apache License 2.0. It is **not a from-scratch rewrite**. Buzz's Desktop, local Nostr Relay,
+agent runtime, and collaboration foundations provided Carryforth with a strong engineering
+starting point.
 
-Carryforth is preparing its first independent open-source release. The current
-repository is suitable for source-based development and local evaluation; it
-does **not** yet promise a stable packaged installer or a one-command clean
-machine deployment.
+We thank Block, Inc. and all Buzz contributors for their work in open source. We also recommend
+the original [Buzz project](https://github.com/block/buzz) to readers interested in local-first
+collaboration, Nostr, and agent workspaces.
 
-The first supported release surface is intentionally narrow:
+On that foundation, Carryforth continues to explore what it means for the project—not an
+agent—to be the enduring subject. It adds and reshapes Project View, Role Continuity, Project
+Documents, Project Context, structured Meetings, the local single-Relay boundary, and the
+agent-first `cf` CLI.
 
-- Carryforth Desktop on Linux;
-- a local Relay and its persistent dependencies;
-- ACP-managed agents and their sidecars;
-- the `cf` agent-first CLI;
-- channels, messages, Project View, Documents, Project Context, and Meetings.
+Carryforth is independently maintained and is not affiliated with, sponsored by, or endorsed by
+Block, Inc. The project preserves upstream Git history, licenses, and copyright notices; see
+[LICENSE](LICENSE), [NOTICE](NOTICE), and [UPSTREAM.md](UPSTREAM.md). Existing `buzz-*` names,
+`BUZZ_*` environment variables, and some database, protocol, and bundle coordinates are
+wire/storage/data-continuity compatibility contracts. They do not represent the current product
+identity.
 
-The `web/` tree is currently source-only; its presence in the repository is not
-a release or support commitment. The inherited Mobile, experimental Harbor
-benchmark, Helm/Kubernetes, and hosted Push Gateway sources have been retired
-from the active source tree. Carryforth local-only builds do not use the legacy
-hosted community, account, updater, or push services.
+## What is Carryforth?
 
-The release-readiness work and its data-safety boundaries are tracked in
-[the open-source release surface plan](docs/stage/carryforth/open-source-release-surface-plan.md).
+Today's agents are good at completing a task, but they do not naturally carry a long-running
+project forward. Context often remains inside a conversation, a Leader, or one agent's memory.
+When the session ends, the model changes, the team dissolves, or a member leaves, the project
+often has to explain itself again from the beginning.
 
-## Local-only model
+Carryforth reverses that relationship: the project persists, while humans and agents join it as
+members with roles and responsibilities. Members may enter, leave, recover, or be replaced, but
+the project's understanding, work state, documents, context, decisions, and commitments remain.
 
-Desktop connects to the local Relay at `ws://localhost:3000`. If that Relay is
-unavailable, the client reports a local connectivity error; it does not fall
-back to a hosted service. Carryforth does not require a hosted Carryforth or
-Buzz account.
+The fundamental unit is not a conversation, a code repository, or a temporary agent team. It is
+the **project**. An agent is a member with an independent lifecycle. Even a Leader neither owns
+all project context nor serves as a prerequisite for the project to continue.
 
-Local-only does not mean anonymous. Human and agent identities remain Nostr
-keypairs, Relay operations remain signed, and community membership continues to
-enforce authorization. Model providers selected by a user may make their own
-network requests; those requests are separate from the Carryforth control
-plane.
+Carryforth is not a super-agent that “remembers every chat.” It provides a shared project space
+where humans and agents collaborate through the same identities, permissions, and project state,
+and continuously write back the information that will affect future work.
 
-## Build and run from source
+## Interface preview
 
-The source workflow requires a running Docker 24+ installation with the Docker
-Compose v2 plugin, Python 3, and the native prerequisites required by Tauri on
-your operating system. Carryforth's startup scripts only check those external
-system dependencies; they do not install Docker, Python, OS packages, or other
-third-party system software.
+### Project View
 
-The repository's [Hermit](https://cashapp.github.io/hermit/) environment supplies
-the project toolchain. The current pins are Rust 1.95.0, Node.js 24.14.0, and
-pnpm 11.4.0. Their first use downloads the pinned Carryforth build tools and the
-build installs Carryforth's own package dependencies.
+![Carryforth Project View overview](docs/image/project-view-overview.png)
 
-For a fresh clone, the supported one-command local build and startup is:
+Project View brings together project direction, plans and stages, roles, attention items, and
+resources so that humans and agents can continue from the same verified project state.
+
+### Project Context
+
+![Carryforth Project Context graph](docs/image/project-context.png)
+
+Project Context organizes explicitly preserved relationships among project objects, Documents,
+and Meetings into a browsable context graph. Layout is only for navigation; it does not imply
+ranking or causality.
+
+### Meetings
+
+![Carryforth structured agent Meeting](docs/image/meeting.png)
+
+A structured Meeting puts multi-agent discussion, directed Handoffs, a shared Board, and outcome
+records in one collaboration surface.
+
+## How a project remains continuous
+
+```text
+Project / Community
+│
+├── Project View
+│   ├── Project Profile
+│   ├── Goal
+│   ├── Role
+│   ├── Plan
+│   ├── Stage
+│   ├── Requirement
+│   ├── Issue
+│   ├── Work
+│   └── Resource
+│
+├── Project Documents
+├── Project Context
+├── Meetings
+└── Human / Agent Members
+```
+
+Project View preserves first-order current state. Documents preserve evolving project content.
+Project Context explains why objects are related. Meetings carry formal collaboration. Roles,
+Assignments, Checkpoints, and Handoffs allow responsibility to continue when an agent runtime
+changes.
+
+See the [core model](docs/en/core-model.md) for the identities, relationships, and boundaries of
+each model.
+
+## Role Continuity
+
+A Role is a stable responsibility held by the Project; an Assignment is one tenure in which a
+Human or Agent Member bears that Role. Work Responsibility persists across tenures, while a
+Commitment is attributed to a specific Assignment and Member. Continuously appended Checkpoints,
+optional Handoffs, and a derived Role Brief let a successor resume from Project state without
+waiting for the predecessor to return or provide an exit summary.
+
+See [Core design: Role Continuity](docs/en/core-design/role-continuity.md).
+
+## Context-aware semantic graph retrieval
+
+The same question can produce different yet related, traceable context paths under different
+Role, Work, or other context environments, while querying the single context graph owned by the
+Project. Carryforth does not create a private context graph for each agent. The environment is a
+soft query-time perspective: problem semantics remain dominant, traversal follows only real
+undirected Hyperedges, and the query never rewrites project relationships.
+
+See [Core design: Context-aware semantic graph retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md).
+
+## Current capabilities
+
+The repository currently connects the following capabilities inside one local project boundary:
+
+- Carryforth Desktop: project navigation, Project View, Documents, Project Context, and Meetings;
+- local Relay: Community permissions, signed events, canonical state, queries, and audit boundaries;
+- ACP-managed agents: run as project members with a controlled Carryforth environment;
+- the `cf` CLI: agent-facing messages, project objects, documents, context, meetings, and media;
+- Channels and Messages: everyday collaboration over signed Nostr events;
+- preview Git project collaboration and content-addressed media;
+- optional, gated Project Context semantic graph-path queries.
+
+The Relay is the current canonical state boundary. The system validates and preserves structure,
+but it does not automatically understand the whole project or promote every chat, draft, or
+model inference into project fact.
+
+**Implemented does not mean enabled by default in a new environment.** Project View, Documents,
+Project Context, Meetings, Git Projects, and semantic graph queries still have preview switches,
+Relay readiness checks, durable Community gates, or Owner-signed initialization requirements.
+See [Current status](docs/en/current-status.md) for exact capability and activation boundaries.
+
+## Build from source
+
+The supported workflow today is local development and evaluation from source. Prepare Docker 24+
+with Compose v2, Python 3, and the native dependencies required by Tauri, then run:
 
 ```bash
 git clone https://github.com/lgYanami/Carryforth.git
@@ -81,109 +173,48 @@ cd Carryforth
 ./start.sh
 ```
 
-The first run checks the external prerequisites, creates a private Git-ignored
-`.env` with mode `0600`, and asks for any missing semantic Provider API key,
-Base URL, and Request Model. The API key uses hidden terminal input; the URL and
-model are visible and have no defaults. Local source startup defaults the
-semantic Worker and semantic query HTTP process switches to enabled and
-generates a stable local Relay signer. It then downloads/builds Carryforth dependencies, starts the
-development infrastructure without deleting volumes, applies pending database
-migrations, builds the Relay/CLI/Desktop, and launches Desktop. The
-Relay listens on `ws://localhost:3000`.
+The script only checks external system dependencies. It does not install Docker, Python, or
+operating-system packages. On first run, it creates a private local `.env`. When the semantic
+process switches are enabled, it prompts for a Provider API Key, HTTPS Base URL, and Request
+Model—none of which has a default. Existing Docker volumes and project data are preserved.
 
-These startup defaults do not silently enable a Community's durable semantic
-index/query gates and do not acknowledge problem egress. Those authorization
-steps remain explicit. To opt out of Provider configuration entirely, set both
-`BUZZ_SEMANTIC_WORKER_ENABLED=false` and
-`BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false` in `.env`.
+See [Local development from source](docs/en/local-development.md) for the full lifecycle,
+instructions for disabling semantic configuration, rebuild commands, and stop commands.
 
-For a foreground contributor workflow, activate Hermit and run `just dev`; it
-uses the same semantic configuration step:
+## Continue reading
 
-```bash
-. ./bin/activate-hermit
-just dev
-```
+- [English documentation](docs/en/README.md)
+- [Core model](docs/en/core-model.md): Project View, Role Continuity, Documents, Context, Meetings, and Members
+- [Core design: Role Continuity](docs/en/core-design/role-continuity.md):
+  how responsibility, tenure, Work commitments, and externalized situation survive agents and runtimes
+- [Core design: Coordinates before context](docs/en/core-design/coordinate-and-context.md):
+  coordinate context, relational context, and progressive discovery by agents
+- [Core design: Context-aware semantic graph retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md):
+  how one question produces different yet related paths under different Role and Work environments
+- [Core design: Meeting](docs/en/core-design/meeting.md):
+  how humans and agents aggregate distributed context, form a shared conclusion, and produce explicit outcomes
+- [System overview](docs/en/system-overview.md): components, data flow, identity, permissions, security, and local-first boundaries
+- [Local development](docs/en/local-development.md): prerequisites, configuration, build, start, stop, and data protection
+- [Current status](docs/en/current-status.md): preview capabilities, activation requirements, support surface, and release boundaries
+- [Project positioning](docs/en/project-positioning.md) and the [Project Space Constitution](docs/en/project-space-constitution.md)
 
-For a detached workflow:
+## Current stage
 
-```bash
-./start.sh                      # build and start without deleting data
-./scripts/dev-rebuild-start.sh  # rebuild executables, then start
-./scripts/dev-stop.sh           # stop processes/containers; preserve data
-```
+Carryforth is preparing its first independent open-source release and remains under active
+development. The repository is currently intended only for **local source builds, functional
+evaluation, and study**. It does not yet provide a stable installer or promise production
+deployment, formal support, or a stable upgrade path for existing data.
 
-Do not use destructive reset commands against a development environment whose
-data matters. Migration and destructive integration tests must target a
-separately created scratch database; see [CONTRIBUTING.md](CONTRIBUTING.md).
+The planned initial support surface focuses on Linux Desktop, a local single Relay, ACP-managed
+agents, the `cf` CLI, and Channels, Messages, Project View, Documents, Project Context, and
+Meetings. The Web client is currently a source-only surface. macOS, Windows, automatic updates,
+production multi-instance deployment, and long-term upgrade support are not yet committed.
 
-### Agent CLI
+## Contributing and license
 
-Build the CLI and point it at the local Relay:
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing code. Report vulnerabilities privately
+through [SECURITY.md](SECURITY.md), not through a public issue.
 
-```bash
-cargo build --release -p carryforth-cli
-export CARRYFORTH_RELAY_URL=ws://localhost:3000
-export CARRYFORTH_PRIVATE_KEY=<local-development-key>
-./target/release/cf --help
-```
-
-The ACP harness injects the required `CARRYFORTH_*` variables into managed
-agent subprocesses. Never paste production keys into issues, logs, documents,
-or command examples.
-
-## Architecture at a glance
-
-```text
-┌──────────────────────────────────────────────────────────────────┐
-│ Carryforth Desktop     Managed agents / ACP       cf CLI         │
-└───────────────┬──────────────────┬──────────────────┬────────────┘
-                └──────────────────┼──────────────────┘
-                                   │ signed Nostr events
-                                   ▼
-                         Local Carryforth Relay
-                         (internal: buzz-relay)
-                                   │
-                 ┌─────────────────┼─────────────────┐
-                 ▼                 ▼                 ▼
-              Postgres           Redis           S3/MinIO
-```
-
-The Relay is the canonical state boundary. Messages, governance objects,
-documents, context edges, meeting state, and audit records are community
-scoped. See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol and subsystem
-details.
-
-Many internal crate, database, event-kind, and capability identifiers retain a
-`buzz-*` name for wire/storage compatibility. They are technical coordinates,
-not the current product or repository identity. They will not be mechanically
-renamed without a separately reviewed migration.
-
-## Repository map
-
-```text
-crates/                 Relay, ACP, cf, protocol, storage, and tooling crates
-desktop/                Supported Tauri + React desktop client
-migrations/             Forward-only Relay database migrations
-scripts/                Development and release tooling
-deploy/                 Deployment sources under release-readiness review
-web/                    Source-only browser client
-docs/                   Design, operations, and development records
-```
-
-## Contributing and support
-
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-- Use GitHub issues for reproducible bugs and scoped feature proposals.
-- Do not disclose vulnerabilities in public issues; follow
-  [SECURITY.md](SECURITY.md).
-- Project decisions and maintainer responsibilities are described in
-  [GOVERNANCE.md](GOVERNANCE.md).
-
-## License
-
-Carryforth is distributed under the [Apache License 2.0](LICENSE). The license
-and upstream copyright notices remain intact. Third-party components and assets
-may carry their own licenses; their current audit boundary is recorded in the
-[release asset inventory](release/THIRD_PARTY_ASSETS.md) and must be cleared
-before the first stable binary release.
+Carryforth is distributed under the [Apache License 2.0](LICENSE) and preserves upstream copyright
+and NOTICE material. Third-party dependencies and assets may carry their own licenses; the current
+audit boundary is documented in [release/THIRD_PARTY_ASSETS.md](release/THIRD_PARTY_ASSETS.md).
