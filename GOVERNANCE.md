@@ -45,16 +45,54 @@ Maintainers additionally must:
 - avoid presenting experimental/source-only components as supported releases;
 - publish releases only from clean, reviewable, immutable source.
 
+## Public source repository readiness
+
+Publishing the source repository is distinct from publishing a supported
+binary release. Before pushing or otherwise publishing source history to the
+canonical public repository, the bootstrap maintainer must verify that:
+
+- `LICENSE`, `NOTICE`, and [UPSTREAM.md](UPSTREAM.md) accurately preserve the
+  applicable provenance and attribution;
+- the public source and documented local build do not require private Block
+  infrastructure, credentials, registries, or release systems;
+- repository history and tracked files have been reviewed for credentials and
+  material that is not intended for public distribution;
+- the target repository is made public while empty, GitHub private vulnerability
+  reporting is enabled, and the reporting link in [SECURITY.md](SECURITY.md)
+  works from a non-administrator account before source history is pushed; and
+- contributor-facing documents describe only reporting channels and support
+  commitments that actually exist.
+
+Public source availability does not imply a stable version, production support,
+a response-time SLA, or permission to publish binary artifacts under the
+Carryforth name.
+
 ## Security and conduct
 
 Security vulnerabilities must use the private process in
 [SECURITY.md](SECURITY.md), never a public issue. General conduct reports also
 must not include sensitive personal information in public issues.
 
-The project still needs Human maintainer decisions for a durable private
-conduct contact, security response targets, signing identities and custody,
-and a succession/continuity policy. Those are release blockers and are not
-silently inherited from the upstream project.
+The current GitHub-only conduct path and its limitations are documented in the
+[Code of Conduct](CODE_OF_CONDUCT.md). A project-owned private conduct contact
+is required before opening an official community space outside GitHub. Security
+response targets have not been promised and are not silently inherited from the
+upstream project.
+
+## Future binary release readiness
+
+Carryforth does not currently publish a supported binary release. Before that
+changes, the Human maintainer must separately record at least:
+
+- exact supported versions and security response expectations;
+- release signing identities, key custody, and recovery procedures;
+- dependency, license, SBOM, and packaged-asset provenance evidence;
+- reproducible release inputs and an immutable public release channel; and
+- maintainer succession and project continuity policy.
+
+These are future binary-release gates. They do not prevent publication of an
+accurately described, locally buildable source repository once the public-source
+requirements above are met.
 
 ## Upstream relationship
 

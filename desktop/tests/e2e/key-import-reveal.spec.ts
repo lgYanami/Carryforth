@@ -3,8 +3,10 @@ import { expect, test } from "@playwright/test";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
-const SAMPLE_NSEC =
-  "not-a-real-private-key-test-fixture";
+// This test only exercises masking and layout. Keep the fixture deliberately
+// invalid so neither readers nor secret scanners can mistake it for a private
+// Nostr key.
+const INVALID_PRIVATE_KEY_FIXTURE = "not-a-real-private-key-test-fixture";
 
 // --buzz-onboarding-backup-ink (#717106), the olive key ink shared with the
 // backup step.
@@ -35,7 +37,7 @@ test("key import masks the key with a reveal toggle", async ({ page }) => {
   const widthBefore = await input.evaluate(
     (el) => el.getBoundingClientRect().width,
   );
-  await input.fill(SAMPLE_NSEC);
+  await input.fill(INVALID_PRIVATE_KEY_FIXTURE);
   await expect(toggle).toHaveCSS("opacity", "1");
   const widthAfter = await input.evaluate(
     (el) => el.getBoundingClientRect().width,
@@ -48,7 +50,7 @@ test("key import masks the key with a reveal toggle", async ({ page }) => {
   await expect(input).toHaveAttribute("type", "text");
   await input.fill("");
   await expect(toggle).toHaveCSS("opacity", "0");
-  await input.fill(SAMPLE_NSEC);
+  await input.fill(INVALID_PRIVATE_KEY_FIXTURE);
   await expect(input).toHaveAttribute("type", "password");
 
   // Re-masking via the toggle still works.

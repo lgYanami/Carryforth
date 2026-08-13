@@ -84,9 +84,7 @@ function requestedUpdates() {
   return updates;
 }
 
-function applyUpdates(contents, updates) {
-  if (updates.size === 0) return contents;
-
+function applyUpdates(contents, updates, migrateLegacyBind) {
   const lines = contents.split("\n");
   const written = new Set();
   const output = [];
@@ -95,6 +93,19 @@ function applyUpdates(contents, updates) {
       /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/,
     );
     const name = assignment?.[1];
+    if (
+      migrateLegacyBind &&
+      name === "BUZZ_BIND_ADDR" &&
+      /^\s*(?:export\s+)?BUZZ_BIND_ADDR\s*=\s*(?:["']?)0\.0\.0\.0:3000(?:["']?)\s*$/.test(
+        line,
+      )
+    ) {
+      output.push(
+        "# Carryforth migrated the former source-development wildcard default to loopback.",
+        "BUZZ_BIND_ADDR=127.0.0.1:3000",
+      );
+      continue;
+    }
     if (!name || !updates.has(name)) {
       output.push(line);
       continue;
@@ -167,7 +178,7 @@ if (!assertRegularOrMissing(templateFile, "environment template")) {
 }
 
 const original = fs.readFileSync(envExists ? envFile : templateFile, "utf8");
-const updated = applyUpdates(original, requestedUpdates());
+const updated = applyUpdates(original, requestedUpdates(), envExists);
 if (!envExists || updated !== original) {
   writeAtomically(envFile, updated);
 } else {

@@ -513,7 +513,8 @@ Context、Message、Meeting、日志或测试夹具。它们必须留在受控 s
 `./start.sh` 或 `just start` 只建立本地源码开发栈，不会替 owner 或 operator 初始化 Project View、
 打开 Community gate、确认 Provider 数据出境或授予成员权限。
 
-当前仓库仍处于活跃开发和首次独立开源发布准备阶段，仅供本地源码构建、评估与参考学习。
+当前仓库仍处于活跃开发和首次公开源码快照准备阶段，仅供本地源码构建、评估与参考学习；
+公开源码不等于发布版本或打包制品。
 语义查询、Meeting、Git Projects 和部分 Desktop 表面仍受预览或资格化边界约束。本文不能被用来
 宣称生产就绪、多实例安全、稳定升级或平台支持。
 

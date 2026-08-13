@@ -670,30 +670,43 @@ function validateProvenance(record, label) {
   ) {
     fail(`${label}.provenance.recipe must be a non-empty string`);
   }
+  for (const key of ["created_in_commit", "captured_from_commit"]) {
+    if (
+      provenance[key] !== undefined &&
+      !commitPattern.test(provenance[key])
+    ) {
+      fail(`${label}.provenance.${key} must be a 40-character commit`);
+    }
+  }
+  const hasContentBoundFiles =
+    Array.isArray(record.paths) &&
+    record.paths.length > 0 &&
+    shaPattern.test(record.tree_sha256 ?? "");
   const classification = record.classification;
   if (classification === "project-art") {
-    if (!commitPattern.test(provenance.created_in_commit ?? ""))
-      fail(`${label} project art requires created_in_commit`);
+    if (!hasContentBoundFiles) {
+      fail(`${label} project art requires paths and a content-bound tree_sha256`);
+    }
   } else if (classification === "project-art-rendition") {
     if (
-      !commitPattern.test(provenance.created_in_commit ?? "") ||
+      !hasContentBoundFiles ||
       !Array.isArray(provenance.source) ||
       provenance.source.length === 0
     ) {
       fail(
-        `${label} project-art-rendition requires source evidence and created_in_commit`,
+        `${label} project-art-rendition requires content-bound paths and local source evidence`,
       );
     }
     if (provenance.reproducible !== false)
       fail(`${label} project-art-rendition must not claim reproducibility`);
   } else if (classification === "project-screenshot") {
     if (
-      !commitPattern.test(provenance.captured_from_commit ?? "") ||
+      !hasContentBoundFiles ||
       typeof provenance.toolchain !== "string" ||
       typeof provenance.recipe !== "string"
     ) {
       fail(
-        `${label} project screenshot requires captured_from_commit, toolchain, and recipe`,
+        `${label} project screenshot requires content-bound paths, toolchain, and capture recipe`,
       );
     }
   } else if (classification === "generated") {
@@ -867,12 +880,11 @@ for (const entry of manifest.entries ?? []) {
   if (entry.privacy_review !== undefined) {
     rejectUnknownKeys(
       entry.privacy_review,
-      new Set(["mock_only", "no_real_people", "notes"]),
+      new Set(["reviewed_for_public_documentation", "notes"]),
       `asset entry ${entry.id}.privacy_review`,
     );
     if (
-      entry.privacy_review.mock_only !== true ||
-      entry.privacy_review.no_real_people !== true ||
+      entry.privacy_review.reviewed_for_public_documentation !== true ||
       typeof entry.privacy_review.notes !== "string" ||
       entry.privacy_review.notes.trim() === ""
     ) {

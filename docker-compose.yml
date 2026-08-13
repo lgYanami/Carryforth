@@ -24,7 +24,7 @@ services:
       - -c
       - max_parallel_workers_per_gather=1
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./deploy/postgres/initdb/001-pgvector.sql:/docker-entrypoint-initdb.d/001-pgvector.sql:ro
@@ -46,10 +46,10 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
     container_name: buzz-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     networks:
       - buzz-net
     healthcheck:
@@ -68,10 +68,10 @@ services:
     restart: unless-stopped
 
   adminer:
-    image: adminer:latest
+    image: adminer:latest@sha256:494d4a9461105644222c938679fe58d5e3fd13fb228c76a426e81c16d4ffbaef
     container_name: buzz-adminer
     ports:
-      - "8082:8080"
+      - "127.0.0.1:8082:8080"
     networks:
       - buzz-net
     depends_on:
@@ -89,7 +89,7 @@ services:
     restart: unless-stopped
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    image: quay.io/keycloak/keycloak:26.0@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858
     container_name: buzz-keycloak
     command: start-dev --http-port=8080
     environment:
@@ -98,7 +98,7 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
     ports:
-      - "8180:8080"
+      - "127.0.0.1:8180:8080"
     volumes:
       - keycloak-data:/opt/keycloak/data
     networks:
@@ -123,15 +123,15 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     container_name: buzz-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: buzz_dev
       MINIO_ROOT_PASSWORD: buzz_dev_secret
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/data
     networks:
@@ -152,7 +152,7 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:latest
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     container_name: buzz-minio-init
     depends_on:
       minio:
@@ -171,10 +171,10 @@ services:
     restart: "no"
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:latest@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
     container_name: buzz-prometheus
     ports:
-      - "${BUZZ_PROMETHEUS_PORT:-9091}:9090"
+      - "127.0.0.1:${BUZZ_PROMETHEUS_PORT:-9091}:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus

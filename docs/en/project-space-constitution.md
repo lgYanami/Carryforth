@@ -623,9 +623,10 @@ The following facts must always remain separate:
 the owner or operator in initializing Project View, opening a Community gate, confirming Provider
 data egress, or granting Member authority.
 
-The current repository remains under active development and is preparing for its first independent
-open-source release. It is intended only for local source builds, evaluation, and reference
-learning. Semantic query, Meeting, Git Projects, and some Desktop surfaces remain subject to
+The current repository remains under active development and is preparing its first public source
+snapshot. It is intended only for local source builds, evaluation, and reference learning; public
+source is not a versioned release or a packaged artifact. Semantic query, Meeting, Git Projects,
+and some Desktop surfaces remain subject to
 preview or qualification boundaries. This document cannot be used to claim production readiness,
 multi-instance safety, stable upgrades, or platform support.
 

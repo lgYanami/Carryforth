@@ -58,20 +58,28 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported privately to the Carryforth repository maintainer through an available
-private GitHub profile channel. For conduct occurring on GitHub, reporters may
-also use GitHub's [Report Abuse](https://support.github.com/contact/report-abuse)
-channel. Do not include sensitive personal information in a public issue.
+For abusive, harassing, or otherwise unacceptable conduct on GitHub, use
+GitHub's private [Report Abuse](https://support.github.com/contact/report-abuse)
+process. The maintainer may also moderate violations that are visible in the
+canonical repository. A non-sensitive moderation request may be opened as a
+scoped issue that links to the relevant public content, but it must not include
+private personal information.
 
-Carryforth has not yet published a dedicated private conduct-reporting address.
-Selecting and recording that durable contact is a release-blocking Human
-maintainer decision; no upstream address remains authorized for this project.
+Carryforth does not currently publish a project-owned private conduct mailbox.
+Consequently, the project cannot promise confidential project-specific intake
+for incidents outside GitHub. No upstream contact address is authorized for
+Carryforth. A private conduct contact must be published before the project opens
+an official community space outside GitHub.
 
-All complaints will be reviewed and investigated promptly and fairly.
+If a conduct incident also reveals a vulnerability or a concrete privacy risk
+in Carryforth itself, report that technical risk through the private process in
+[SECURITY.md](SECURITY.md). Do not use the vulnerability channel for ordinary
+moderation disputes.
 
-All community leaders are obligated to respect the privacy and security of the
-reporter of any incident.
+Reports available to the maintainer will be considered consistently and with
+appropriate care, but the project makes no response-time commitment. The
+maintainer will avoid unnecessary disclosure of reporter information within the
+limits of the reporting platform and applicable law.
 
 ## Enforcement Guidelines
 

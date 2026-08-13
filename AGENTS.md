@@ -43,8 +43,8 @@ The main code areas are:
 - `desktop/`: Tauri 2 and React 19 desktop application.
 - `web/` and `admin-web/`: browser clients.
 - `migrations/` and `schema/`: database upgrade and fresh-install paths.
-- `deploy/`, `release/`, and `scripts/`: supported deployment, release,
-  and developer tooling.
+- `deploy/`, `release/`, and `scripts/`: local deployment candidates, deferred
+  packaged-artifact evidence, and developer tooling.
 
 ## Non-negotiable engineering rules
 
@@ -92,7 +92,8 @@ just web-check
 just web-build
 ```
 
-Use `just fix-all` for repository formatting and lint fixes. Hooks are
+Use `just fix-all` for repository formatting and frontend autofixes; it does
+not automatically resolve every Rust clippy diagnostic. Hooks are
 installed by `just setup`; reinstall them with `just hooks` after toolchain
 changes. Let hooks run their repository commands instead of rewriting them to
 work around an unactivated shell.

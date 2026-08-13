@@ -47,6 +47,7 @@ env "${unset_semantic_env[@]}" \
 
 # shellcheck disable=SC1090
 source "${missing_env}"
+[[ "${BUZZ_BIND_ADDR}" == "127.0.0.1:3000" ]]
 [[ "${BUZZ_SEMANTIC_WORKER_ENABLED}" == "true" ]]
 [[ "${BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE}" == "true" ]]
 [[ "${BUZZ_SEMANTIC_API_KEY}" == "synthetic-provider-key" ]]
@@ -67,6 +68,51 @@ source "${missing_env}"
 [[ "$(sha256sum "${missing_env}" | awk '{print $1}')" == "${first_hash}" ]]
 [[ "$(rg -c '^BUZZ_SEMANTIC_API_KEY=' "${missing_env}")" == "1" ]]
 [[ "$(rg -c '^BUZZ_RELAY_PRIVATE_KEY=' "${missing_env}")" == "1" ]]
+
+legacy_bind_env="${TEMP_ROOT}/legacy-bind.env"
+cp "${REPO_ROOT}/.env.example" "${legacy_bind_env}"
+sed -i 's/^BUZZ_BIND_ADDR=127\.0\.0\.1:3000$/BUZZ_BIND_ADDR=0.0.0.0:3000/' \
+  "${legacy_bind_env}"
+node "${SCRIPT_DIR}/update-local-env.mjs" \
+  --target "${legacy_bind_env}" \
+  --source-template "${REPO_ROOT}/.env.example"
+[[ "$(rg -c '^BUZZ_BIND_ADDR=127\.0\.0\.1:3000$' "${legacy_bind_env}")" == "1" ]]
+! rg --quiet '^BUZZ_BIND_ADDR=0\.0\.0\.0:3000$' "${legacy_bind_env}"
+
+custom_bind_env="${TEMP_ROOT}/custom-bind.env"
+cp "${REPO_ROOT}/.env.example" "${custom_bind_env}"
+sed -i 's/^BUZZ_BIND_ADDR=127\.0\.0\.1:3000$/BUZZ_BIND_ADDR=192.0.2.10:3030/' \
+  "${custom_bind_env}"
+node "${SCRIPT_DIR}/update-local-env.mjs" \
+  --target "${custom_bind_env}" \
+  --source-template "${REPO_ROOT}/.env.example"
+rg --quiet '^BUZZ_BIND_ADDR=192\.0\.2\.10:3030$' "${custom_bind_env}"
+
+compose_json="$(docker compose \
+  -f "${REPO_ROOT}/docker-compose.yml" config --format json)"
+for service in postgres redis adminer keycloak minio prometheus; do
+  node -e '
+    const model = JSON.parse(process.argv[1]);
+    const service = model.services[process.argv[2]];
+    if (!service) process.exit(1);
+    if (!/@sha256:[a-f0-9]{64}$/.test(service.image ?? "")) process.exit(1);
+    for (const port of service.ports ?? []) {
+      if (port.host_ip !== "127.0.0.1") process.exit(1);
+    }
+  ' "${compose_json}" "${service}"
+done
+
+python3 - "${REPO_ROOT}/scripts/dev-start.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+curl_preflight = text.index("command -v curl")
+semantic_config = text.index('"${SCRIPT_DIR}/configure-local-semantic.sh"')
+compose_start = text.index("docker compose up -d")
+managed_launch = text.index("nohup python3")
+assert curl_preflight < semantic_config < compose_start < managed_launch
+PY
 
 disabled_env="${TEMP_ROOT}/disabled.env"
 node "${SCRIPT_DIR}/update-local-env.mjs" \
@@ -152,17 +198,6 @@ fi
 rg --quiet 'BUZZ_SEMANTIC_BASE_URL' "${TEMP_ROOT}/partial.log"
 rg --quiet 'BUZZ_SEMANTIC_REQUEST_MODEL' "${TEMP_ROOT}/partial.log"
 ! rg --quiet 'missing:.*BUZZ_SEMANTIC_API_KEY' "${TEMP_ROOT}/partial.log"
-
-python3 - "${REPO_ROOT}/scripts/dev-start.sh" <<'PY'
-from pathlib import Path
-import sys
-
-text = Path(sys.argv[1]).read_text(encoding="utf-8")
-configure = text.index('"${SCRIPT_DIR}/configure-local-semantic.sh"')
-compose = text.index("docker compose up -d")
-launch = text.index("nohup python3")
-assert configure < compose < launch
-PY
 
 python3 - "${REPO_ROOT}/start.sh" <<'PY'
 from pathlib import Path

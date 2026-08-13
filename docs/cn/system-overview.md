@@ -136,13 +136,13 @@ community、updater 或 push 服务。
 “本地优先”不代表：
 
 - 所有网络请求都被禁止；
-- 所有开发端口都只绑定 loopback；
+- 修改仓库中的 loopback 默认绑定不需要单独安全设计；
 - 系统不需要身份和授权；
 - Provider、远程媒体或 Git remote 不会访问网络；
 - 开发 Compose 已达到生产加固标准。
 
-源码开发环境会向宿主机发布多个服务端口，并使用开发配置和开发凭据。
-不要把它直接暴露到不受信任网络。
+源码开发环境会向宿主机 loopback 发布多个服务端口，并使用开发配置和开发凭据。
+未经单独安全设计，不要扩大绑定范围并暴露到不受信任网络。
 
 ## 6. 语义 Provider 边界
 
@@ -150,8 +150,10 @@ Project Context 图语义查询使用用户配置的外部 Provider 生成向量
 索引信息受到合同限制，查询还要经过 Community gate、成员授权、对象 currentness、Provider admission
 和结果签名等检查。
 
-启用查询时，operator 必须明确确认 problem / overview 会离开本地控制面并发送给所配置的 Provider。
-Provider API Key 只应存在于本地私有环境或受控 secret 注入中，不应写入 Project Document、日志或事件。
+启用查询时，operator 必须明确确认 problem 与 overview 文本（来源类型、当前可见标题/名称和
+可选摘要）会离开本地控制面并发送给所配置的 Provider；当前 foundation 不发送 Document 正文
+或 chunk。Provider API Key 只应存在于本地私有环境或受控 secret 注入中，不应写入 Project
+Document、日志或事件。
 
 语义查询是可选能力。关闭 Worker 和 Query HTTP 进程，或关闭 Community query gate，
 不会删除 Project View、Documents、Context Edge 或其他规范项目数据。

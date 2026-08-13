@@ -107,7 +107,7 @@ jq -e --arg obligation_evidence_schema "${release_obligation_evidence_schema}" '
   exit 1
 }
 
-# These obligations are part of the first public release contract, not
+# These obligations are part of a possible future packaged-release contract, not
 # advisory prose. Keeping the list here prevents a manifest edit from silently
 # removing a gate instead of supplying evidence that closes it.
 required_release_obligations=(

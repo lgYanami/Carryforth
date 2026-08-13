@@ -89,14 +89,13 @@
       "file_count": 3,
       "tree_sha256": "1c77bf4f528b17197aaa0d2cb616de1ee31750fafaf0b4331153ee8d1eac3b77",
       "provenance": {
-        "description": "The Carryforth mark was created in the named Carryforth commit; the Admin and Web files are byte-identical source-tree copies of that project artwork.",
+        "description": "Carryforth-owned project artwork in the current source tree. The Admin and Web files are byte-identical copies, and the exact path/byte set is bound by tree_sha256.",
         "license_evidence": [
           {
             "path": "LICENSE",
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
-        ],
-        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063"
+        ]
       }
     },
     {
@@ -112,14 +111,13 @@
       "tree_sha256": "823596553de01c90eca9d05ec4328d07286daacc7d81add259d23efa402a69ab",
       "declared_fonts": ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
       "provenance": {
-        "description": "Carryforth wordmark project artwork. Font-family values are rendering preferences; the SVG embeds no font bytes.",
+        "description": "Carryforth-owned wordmark project artwork in the current source tree. The exact path and bytes are bound by tree_sha256. Font-family values are rendering preferences; the SVG embeds no font bytes.",
         "license_evidence": [
           {
             "path": "LICENSE",
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
-        ],
-        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063"
+        ]
       }
     },
     {
@@ -138,21 +136,19 @@
       "file_count": 3,
       "tree_sha256": "a703623f511f962a1cc8a23f16070497e42788c60a8bdf460ac9d458244019dc",
       "privacy_review": {
-        "mock_only": true,
-        "no_real_people": true,
-        "notes": "Local development fixture content and test Agent identities only; no complete private keys, Provider credentials, personal photographs, private infrastructure coordinates, or production user records. Third-party Agent marks appear only as nominative UI state."
+        "reviewed_for_public_documentation": true,
+        "notes": "Maintainer-selected local development captures intentionally included in public documentation. The exact visible project and identity data is part of the selected image bytes; this record makes no separate claim that the content is synthetic, fixture-only, production user data, or a hosted service."
       },
       "provenance": {
-        "description": "Maintainer-selected screenshots captured from a local Carryforth development build for public product documentation. The images show project fixture data rather than production user content.",
+        "description": "Maintainer-selected captures of the local Carryforth development interface intentionally included in public product documentation. The exact visible project and identity data is part of the selected image bytes, and the current paths and bytes are bound by tree_sha256.",
         "license_evidence": [
           {
             "path": "LICENSE",
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
         ],
-        "captured_from_commit": "5929d562c96e85c4b9e46fc08636515f2747a944",
         "toolchain": "Carryforth Tauri Desktop local development build on Linux",
-        "recipe": "Run the local source stack with development fixture data and capture the Project View, Project Context, and Meeting application windows."
+        "recipe": "Run the local source stack, navigate to the maintainer-selected Project View, Project Context, and Meeting states, and capture those application windows."
       }
     },
     {
@@ -219,14 +215,13 @@
       "file_count": 51,
       "tree_sha256": "6ca0a9a8f75420a5af07c6254f30c0ad42df30b58517c0f325ea2f90c4c11a17",
       "provenance": {
-        "description": "Platform renditions of Carryforth's canonical source SVG. The current ICNS container is provenance-bound but is not falsely claimed to be byte-reproducible with the current Tauri encoder.",
+        "description": "Platform renditions of Carryforth's canonical source SVG. The source SVG is bound by its own SHA-256 and the current rendition set by tree_sha256. The current ICNS container is provenance-bound but is not falsely claimed to be byte-reproducible with the current Tauri encoder.",
         "license_evidence": [
           {
             "path": "LICENSE",
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
         ],
-        "created_in_commit": "8d02a4750e5cf0ac690ffe712341217f1994b063",
         "source": [
           {
             "path": "desktop/src-tauri/icons/carryforth-source.svg",
@@ -321,7 +316,10 @@
             "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
           }
         ],
-        "created_in_commit": "7873135a0bf843116102796a1671bb4141c4ed23",
+        "upstream": {
+          "url": "https://github.com/block/buzz",
+          "ref": "7873135a0bf843116102796a1671bb4141c4ed23"
+        },
         "source": [
           {
             "path": "desktop/scripts/texture-card/generate-card-texture.mjs",

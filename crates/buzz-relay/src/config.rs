@@ -644,7 +644,7 @@ impl Config {
     /// Loads configuration from environment variables, falling back to development defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr_raw =
-            std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+            std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
         let bind_addr = parse_bind_addr(&bind_addr_raw)?;
 
         let database_url = std::env::var("DATABASE_URL")
@@ -2124,6 +2124,19 @@ mod tests {
             parse_bind_addr("not-an-addr"),
             Err(ConfigError::InvalidBindAddr(_))
         ));
+    }
+
+    #[test]
+    fn bind_addr_defaults_to_loopback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_BIND_ADDR");
+        std::env::remove_var("BUZZ_BIND_ADDR");
+        let config = Config::from_env().expect("default config");
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_BIND_ADDR", value);
+        }
+        assert!(config.bind_addr.ip().is_loopback());
+        assert_eq!(config.bind_addr.port(), 3000);
     }
 
     #[test]

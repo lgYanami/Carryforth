@@ -717,7 +717,7 @@ dev *ARGS: _configure-local-semantic _ensure-sidecar-stubs _ensure-migrations
     set -o allexport
     source .env
     set +o allexport
-    bind_addr="${BUZZ_BIND_ADDR:-0.0.0.0:3000}"
+    bind_addr="${BUZZ_BIND_ADDR:-127.0.0.1:3000}"
     relay_port="${bind_addr##*:}"; [[ -n "$relay_port" ]] || relay_port=3000
     health_port="${BUZZ_HEALTH_PORT:-8080}"
     metrics_port="${BUZZ_METRICS_PORT:-9102}"

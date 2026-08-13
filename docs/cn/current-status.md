@@ -1,11 +1,11 @@
 # Carryforth 当前状态与能力边界
 
 > 本文区分代码已经实现、当前本地流程可以评估、需要显式启用、仍在资格化和尚未承诺的能力。
-> 分支名、代码目录或历史 tag 都不能单独作为正式发布证据。
+> 公开源码不等于已发布打包制品或已达到生产就绪。
 
 ## 1. 总体结论
 
-Carryforth 正在准备第一次独立开源发行，仍处于活跃开发阶段。当前仓库仅供：
+Carryforth 是一个活跃开发中的源码项目。当前公开范围仅包括：
 
 - 从源码进行本地构建和开发；
 - 在本地单 Relay 环境评估核心协作；
@@ -21,9 +21,9 @@ Carryforth 正在准备第一次独立开源发行，仍处于活跃开发阶段
 - macOS / Windows 的正式支持矩阵；
 - 完全离线运行。
 
-## 2. 当前计划支持面
+## 2. 当前本地评估范围
 
-第一次独立发行准备聚焦：
+当前从源码进行的本地评估聚焦：
 
 - Linux x86_64 Carryforth Desktop；
 - 本地单 Relay 及持久依赖；
@@ -31,12 +31,12 @@ Carryforth 正在准备第一次独立开源发行，仍处于活跃开发阶段
 - Linux x86_64 `cf` CLI；
 - Channels、Messages、Project View、Documents、Project Context 和 Meetings。
 
-Relay OCI 的 Linux amd64 / arm64 发布仍属于发行准备工作。Desktop community artifact 的签名、
-安装、自动更新和升级体验尚未形成稳定承诺。
+当前公开范围不包含 Desktop 安装包、独立 CLI 归档、Relay OCI 镜像或其他构建制品。
+如果未来考虑发布制品，其签名、安装、自动更新、来源与升级体验需要单独承诺和门禁。
 
 `web/` 当前只是源码中的浏览器客户端，不代表正式发布或支持承诺。
 继承而来的 Mobile、Harbor benchmark、Helm / Kubernetes 和旧 Hosted Push
-已退出当前活动发布面。
+不在当前本地源码评估范围内。
 
 ## 3. 开箱即用与显式启用
 
@@ -146,8 +146,12 @@ Meeting 只有在符合生命周期和 Action Finalization 条件时才能创建
 - production LB / multi-pod；
 - 目标规模、冻结 SLO 和完整故障恢复证据。
 
-源码启动默认打开 Worker / Query HTTP 进程开关，但 Community index/query gate 默认不由此开启。
-启用查询还必须显式确认 problem / overview 会发送给用户配置的 Provider。
+这一机制实现了“Role / Work 环境可以影响返回路径”的设计方向，但不保证两个环境一定
+产生不同或语义正确的结果。源码启动默认打开 Worker / Query HTTP 进程开关，但不会由此
+开启 Community durable index/query gate。语义索引可能将来源类型、当前可见标题/名称和可选摘要
+这些项目文本发送给用户配置的 Provider；当前 foundation 不发送 Document 正文或 chunk。查询会将
+problem 和相关 overview 文本发送给该 Provider。operator 必须单独开启对应 Community gate；启用
+查询还要显式确认 problem 和 overview 文本会跨越该外部 Provider 边界。
 
 ### 4.7 Meetings
 
@@ -183,9 +187,10 @@ Relay 提供内容寻址上传与 MinIO 存储。Desktop 支持图片、视频�
 - 尚无持久化的每用户总存储配额；
 - 大型视频处理不能从 Relay 单文件上限推导出 Desktop 的安全内存保证。
 
-## 5. 发布准备边界
+## 5. 源码公开与延后的制品边界
 
-正式发行门当前仍会失败关闭。未完成项包括但不限于：
+当前源码公开不包含二进制、安装包、容器、不可变发布 tag 或其他打包制品。
+如果 Carryforth 未来发布这些制品，严格制品门当前仍会因以下等前置条件失败关闭：
 
 - 第三方字体和依赖许可证、SBOM 与漏洞证据；
 - Relay runtime / container provenance；
@@ -195,9 +200,9 @@ Relay 提供内容寻址上传与 MinIO 存储。Desktop 支持图片、视频�
 - 已发布制品的 clean-room E2E；
 - 私密安全报告渠道与发行治理。
 
-因此，不能把当前分支名、源码可构建或本地 smoke test 描述成“已经发布”“生产就绪”
-“下载即用”或“稳定升级”。详细计划见
-[开源发行面方案](../stage/carryforth/open-source-release-surface-plan.md)。
+因此，不能把当前分支名、公开源码、源码可构建或本地 smoke test 描述成已发布打包制品、
+“生产就绪”“下载即用”或“稳定升级”。[制品发布规划记录](../stage/carryforth/open-source-release-surface-plan.md)
+记录了延后的前置要求，它不是当前的发布计划。
 
 ## 6. 与本地优先相关的限制
 
@@ -209,7 +214,8 @@ Relay 提供内容寻址上传与 MinIO 存储。Desktop 支持图片、视频�
 - Git remote；
 - 远程媒体、Resource 和外部链接。
 
-源码开发 Compose 使用开发凭据并向宿主机发布多个端口，不是生产加固部署。
+源码开发 Compose 使用开发凭据并向宿主机 loopback 发布多个端口，不是生产加固部署；
+未经单独安全设计，不应扩大这些绑定。
 
 ## 7. 如何阅读“已实现”
 

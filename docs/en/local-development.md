@@ -29,13 +29,14 @@ Prepare these dependencies yourself before starting:
 - the Docker Compose v2 plugin;
 - a running Docker daemon;
 - Python 3;
+- `curl`, used for local readiness checks;
 - the native Tauri dependencies for the current platform.
 
 On Linux, the startup script also checks `pkg-config` and Desktop dependencies such as WebKitGTK,
 GTK, libsoup, ALSA, and appindicator. On macOS, it checks Xcode Command Line Tools.
 
 The startup script only checks these external system dependencies. It **does not** automatically
-install Docker, Python, system packages, or Xcode tools.
+install Docker, Python, `curl`, system packages, or Xcode tools.
 
 The repository uses [Hermit](https://cashapp.github.io/hermit/) for a pinned project toolchain.
 First use downloads the pinned Rust, Node.js, pnpm, and `just` versions. The build also downloads
@@ -51,7 +52,7 @@ cd Carryforth
 
 `start.sh` is a stable root entry point that delegates to `scripts/dev-start.sh`. The startup flow:
 
-1. checks Docker, Compose, Python, the Docker daemon, and platform-native dependencies;
+1. checks Docker, Compose, Python, `curl`, the Docker daemon, and platform-native dependencies;
 2. activates the repository's Hermit toolchain;
 3. creates or updates the Git-ignored local `.env` and sets its mode to `0600`;
 4. checks semantic Provider configuration;
@@ -114,7 +115,9 @@ capabilities. It does not automatically perform:
 - the durable Community semantic-index gate;
 - generation creation, build, verification, or activation;
 - the durable Community semantic-query gate;
-- acknowledgement that problem/overview data leaves the local system for the external Provider.
+- acknowledgement that the problem and overview text (source type, current visible title/name, and
+  optional summary; not Document bodies/chunks in the current foundation) leave the local system
+  for the external Provider.
 
 An operator and Community owner must perform those steps explicitly under the current operations
 contract. See [Semantic pgvector operations](../semantic-pgvector-operations.md).
@@ -168,6 +171,14 @@ The source-development Compose stack runs PostgreSQL/pgvector, Redis, MinIO, Key
 Adminer, and related dependencies. It uses development configuration and publishes several ports
 to the host. It is not a production-hardened deployment.
 
+The checked-in `.env.example` and the raw Relay default both bind the Relay to
+`127.0.0.1`. Keep that loopback boundary for ordinary source development:
+local auth/membership gates are relaxed, and Compose dependency ports use
+development credentials. The checked-in
+Compose file binds those host ports to loopback. This is still not a production
+hardening profile; run it only on a trusted local machine, and do not change the
+bindings to expose it directly to a LAN or the Internet.
+
 Desktop uses the local Relay and does not fall back to a legacy hosted service when that Relay is
 unavailable. “Local-first” is not “fully offline”: Provider calls, toolchain and dependency
 downloads, remote media, and external links may still access the network.
@@ -179,8 +190,10 @@ downloads, remote media, and external links may still access the network.
 - Do not manually rewrite an already-applied migration.
 - Migration, OOM, fault-injection, and destructive integration tests must use a separate scratch
   database and volume.
-- Before stopping or rebuilding, confirm that target processes belong to the current checkout so
-  parallel development instances are not affected.
+- The checked-in development Compose stack is a machine-wide singleton: its project, containers,
+  ports, network, and volumes are fixed and shared across checkouts. Do not run it concurrently
+  from another checkout. Application-process stop logic is checkout-aware, but a normal
+  `dev-stop.sh` also stops these shared Compose dependencies; use `--app-only` when appropriate.
 - Never commit `.env`, private keys, or Provider credentials to Git.
 
 ## 9. Common checks

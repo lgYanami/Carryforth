@@ -27,12 +27,14 @@
 - Docker Compose v2 插件；
 - 正在运行的 Docker daemon；
 - Python 3；
+- `curl`，用于本地 readiness 检查；
 - 当前平台所需的 Tauri 原生依赖。
 
 Linux 上，启动脚本还会检查 `pkg-config` 以及 WebKitGTK、GTK、libsoup、ALSA
 和 appindicator 等 Desktop 依赖。macOS 上会检查 Xcode Command Line Tools。
 
-启动脚本只检查这些外部系统依赖，**不会**自动安装 Docker、Python、系统包或 Xcode 工具。
+启动脚本只检查这些外部系统依赖，**不会**自动安装 Docker、Python、`curl`、系统包或
+Xcode 工具。
 
 仓库使用 [Hermit](https://cashapp.github.io/hermit/) 提供固定项目工具链。
 首次使用会下载当前固定版本的 Rust、Node.js、pnpm 和 `just`；构建还会下载 Rust 与前端依赖。
@@ -48,7 +50,7 @@ cd Carryforth
 `start.sh` 只是稳定的根目录入口，实际调用 `scripts/dev-start.sh`。
 启动流程依次进行：
 
-1. 检查 Docker、Compose、Python、Docker daemon 和平台原生依赖；
+1. 检查 Docker、Compose、Python、`curl`、Docker daemon 和平台原生依赖；
 2. 激活仓库内 Hermit 工具链；
 3. 创建或更新被 Git 忽略的本地 `.env`，并设置为 `0600`；
 4. 检查语义 Provider 配置；
@@ -107,7 +109,8 @@ BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
 - Community 的持久语义索引 gate；
 - generation 创建、构建、验证和激活；
 - Community 的持久语义查询 gate；
-- 将 problem / overview 发往外部 Provider 的出境确认。
+- 将 problem 与 overview 文本（来源类型、当前可见标题/名称和可选摘要；当前 foundation 不含
+  Document 正文/chunk）发往外部 Provider 的出境确认。
 
 这些步骤必须由 operator 和 Community owner 按当前运维合同显式完成。
 详见[语义 pgvector 运维](../semantic-pgvector-operations.md)。
@@ -156,6 +159,11 @@ just dev
 源码开发 Compose 会运行 PostgreSQL / pgvector、Redis、MinIO、Keycloak、Prometheus 和 Adminer
 等依赖。它使用开发配置，并会向宿主机发布多个端口；它不是生产加固部署。
 
+仓库中的 `.env.example` 与 Relay 原始默认值都会把 Relay 绑定到 `127.0.0.1`。日常源码开发
+应保留这一 loopback 边界：本地认证与 membership gate 较宽松，Compose 依赖也使用开发凭据；
+仓库中的 Compose 文件会把这些宿主端口绑定到 loopback。
+这仍不是生产加固配置，因此只能在可信本机运行；不要修改绑定后直接暴露到局域网或 Internet。
+
 Desktop 使用本地 Relay，不会在 Relay 不可用时回退到旧 hosted 服务。
 但“本地优先”不等于“完全离线”：Provider、工具链与依赖下载、远程媒体和外部链接仍可能访问网络。
 
@@ -165,7 +173,9 @@ Desktop 使用本地 Relay，不会在 Relay 不可用时回退到旧 hosted 服
 - 不要执行 `docker compose down -v` 或删除 Carryforth 开发 volume；
 - 不要手工重写已经执行的 migration；
 - migration、OOM、故障注入和破坏性集成测试必须使用单独的 scratch 数据库与 volume；
-- 停止或重建应用前，确认目标进程属于当前 checkout，避免影响并行开发实例；
+- 仓库中的开发 Compose 栈是整台机器共享的单例：project、container、端口、network 和 volume
+  都是固定坐标，不能从另一个 checkout 并行运行。应用进程的停止逻辑会核对 checkout，但普通
+  `dev-stop.sh` 也会停止这些共享 Compose 依赖；需要时使用 `--app-only`；
 - `.env`、私钥和 Provider 凭据不得提交到 Git。
 
 ## 9. 常用检查

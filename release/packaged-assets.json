@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "release_obligation_evidence_schema": "carryforth.release-obligation-evidence/v1",
-  "scope": "First public Carryforth Desktop, Local Relay OCI image, and cf CLI release surface",
+  "scope": "Deferred inventory for a possible future Carryforth Desktop, Local Relay OCI image, and cf CLI artifact surface; not part of the current source-only publication",
   "generated_at_source_date": "2026-08-11",
   "filesystem_assets": [
     {
@@ -12,7 +12,7 @@
       "classification": "Carryforth project artwork",
       "license": "Apache-2.0",
       "release_status": "cleared",
-      "provenance": "Created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063."
+      "provenance": "Carryforth-owned project artwork in the current source tree. The exact path and bytes are bound by this entry's tree_sha256."
     },
     {
       "id": "carryforth-wordmark",
@@ -22,7 +22,7 @@
       "classification": "Carryforth project artwork",
       "license": "Apache-2.0",
       "release_status": "cleared",
-      "provenance": "Created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063. The SVG names Inter as a rendering preference but does not embed a font file."
+      "provenance": "Carryforth-owned project artwork in the current source tree, with the exact path and bytes bound by this entry's tree_sha256. The SVG names Inter as a rendering preference but does not embed a font file."
     },
     {
       "id": "carryforth-generated-platform-icons",
@@ -32,7 +32,7 @@
       "classification": "Carryforth project artwork and generated renditions",
       "license": "Apache-2.0",
       "release_status": "cleared",
-      "provenance": "The preferred source is desktop/src-tauri/icons/carryforth-source.svg, created in Carryforth commit 8d02a4750e5cf0ac690ffe712341217f1994b063. The PNG, ICO, ICNS, Android, and iOS files in this tree are generated renditions of that source."
+      "provenance": "The preferred source is desktop/src-tauri/icons/carryforth-source.svg. The PNG, ICO, ICNS, Android, and iOS files in this tree are renditions of that Carryforth-owned source, and the exact current file set is bound by this entry's tree_sha256."
     },
     {
       "id": "procedural-card-texture",
@@ -42,7 +42,7 @@
       "classification": "Generated project artwork",
       "license": "Apache-2.0",
       "release_status": "cleared",
-      "provenance": "Generated entirely from the procedural SVG recipe in desktop/scripts/texture-card/generate-card-texture.mjs, introduced with the output in upstream Apache-2.0 commit 7873135a0bf843116102796a1671bb4141c4ed23. No external source image is read by the generator."
+      "provenance": "Generated entirely from the procedural SVG recipe in desktop/scripts/texture-card/generate-card-texture.mjs, introduced with the output in public upstream block/buzz commit 7873135a0bf843116102796a1671bb4141c4ed23. No external source image is read by the generator."
     },
     {
       "id": "emerge-tools-pow-effect",
@@ -52,7 +52,7 @@
       "classification": "Third-party animation and sound assets",
       "license": "MIT",
       "release_status": "cleared",
-      "provenance": "Byte-identical copies of poof1@3x.png through poof5@3x.png and Example/Pow Example/Sounds/plop.m4a from EmergeTools/Pow commit 1b4b1dda28c50b95f0872927ee2226fe8b58950e. desktop/public/pow/LICENSE.txt contains the Emerge Tools MIT license and is delivered beside the assets. Introduced upstream in commit d4cd919b8506469f0bfd68100f13cdf16d3e76bc."
+      "provenance": "Byte-identical copies of poof1@3x.png through poof5@3x.png and Example/Pow Example/Sounds/plop.m4a from EmergeTools/Pow commit 1b4b1dda28c50b95f0872927ee2226fe8b58950e. desktop/public/pow/LICENSE.txt contains the Emerge Tools MIT license and is delivered beside the assets. Introduced in public upstream block/buzz commit d4cd919b8506469f0bfd68100f13cdf16d3e76bc."
     },
     {
       "id": "notification-sounds-and-waveforms",

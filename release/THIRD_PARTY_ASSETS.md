@@ -1,29 +1,44 @@
-# Packaged Asset Provenance and License Inventory
+# Source Asset Provenance and Deferred Packaged-Artifact Inventory
 
-Status: release audit in progress  
+Status: source inventory active; packaged-artifact work deferred
 Inventory data: [`packaged-assets.json`](packaged-assets.json)  
-Gate: [`scripts/check-release-asset-inventory.sh`](../../scripts/check-release-asset-inventory.sh)
+Gate: [`scripts/check-release-asset-inventory.sh`](../scripts/check-release-asset-inventory.sh)
 
 The public Git tree has a separate, exhaustive inventory in
 [`source-assets.json`](source-assets.json), enforced by
-[`scripts/check-source-asset-inventory.mjs`](../../scripts/check-source-asset-inventory.mjs).
+[`scripts/check-source-asset-inventory.mjs`](../scripts/check-source-asset-inventory.mjs).
 That inventory covers tracked media files, media bytes embedded in source, and
 explicit data-URI constructors/placeholders. This document remains focused on
 what the future packaged artifacts carry.
 
-This document covers the non-code media, fonts, project binaries, and material
-container inputs on the first public Carryforth release surface:
+The current public scope is source for local builds, evaluation, and study. It
+does not include a Desktop package, standalone CLI archive, Relay container, or
+other published artifact. The packaged inventory and fail-closed obligations
+below are retained as prerequisites in case artifact publication is considered
+later; they do not block publication of the audited source tree.
+
+The README images are maintainer-selected captures of the Carryforth local
+development interface, intentionally included in public documentation. Their
+exact visible project and identity data is part of the selected image bytes;
+this record makes no separate claim that the content is synthetic, fixture-only,
+production user data, or a hosted service. Exact paths, current bytes, and the
+selection review are recorded in `source-assets.json`.
+
+The deferred packaged-artifact section covers the non-code media, fonts,
+project binaries, and material container inputs that would be relevant to a
+possible future Carryforth artifact surface:
 
 - unsigned Linux Carryforth Desktop (`.deb` and AppImage);
 - Desktop-bundled ACP/agent/developer sidecars;
 - standalone `cf`;
 - the Carryforth Local Relay OCI image.
 
-It is an engineering provenance record, not legal advice. A file being present
+None of those artifacts is part of the current source-only publication. This is
+an engineering provenance record, not legal advice. A file being present
 in the Apache-2.0 upstream repository is useful history, but it does not by
 itself establish that an embedded third-party work or trademark can be reused
 in a new product distribution. Entries without source and redistribution
-evidence remain release blockers.
+evidence remain blockers to future packaging, not to source publication.
 
 ## Inventory method
 
@@ -49,8 +64,8 @@ clean release build must regenerate `dist`; it must not treat a stale local
 
 | Asset | Packaged source | Evidence | License/status |
 | --- | --- | --- | --- |
-| Carryforth app glyph and wordmark | `desktop/public/carryforth.svg`, `desktop/public/landing/carryforth-wordmark.svg` | Created in Carryforth commit `8d02a4750e5cf0ac690ffe712341217f1994b063` | Apache-2.0; cleared |
-| Carryforth application icons | `desktop/src-tauri/icons/**` | Preferred source is `carryforth-source.svg`; platform renditions were generated in the same Carryforth commit | Apache-2.0; cleared |
+| Carryforth app glyph and wordmark | `desktop/public/carryforth.svg`, `desktop/public/landing/carryforth-wordmark.svg` | Carryforth-owned project artwork; exact current bytes and paths are bound by the `tree_sha256` values in `source-assets.json` and `packaged-assets.json` | Apache-2.0; cleared |
+| Carryforth application icons | `desktop/src-tauri/icons/**` | Preferred source is `carryforth-source.svg`; its SHA-256 and the current rendition-set `tree_sha256` are recorded in `source-assets.json` | Apache-2.0; cleared |
 | Card texture | `desktop/src/shared/ui/assets/card-texture.png` | Procedural in-repository SVG recipe in `desktop/scripts/texture-card/generate-card-texture.mjs`; current bytes are provenance-bound without claiming cross-browser screenshot reproducibility | Apache-2.0; cleared |
 | Poof animation and sound | `desktop/public/pow/**` | Exact upstream files from [EmergeTools/Pow at `1b4b1dda`](https://github.com/EmergeTools/Pow/tree/1b4b1dda28c50b95f0872927ee2226fe8b58950e); all six media hashes were verified byte-for-byte. The directory ships its copyright and MIT license. | MIT; cleared |
 | Runtime and Starter-Team glyphs | Code-native `RuntimeGlyph` and `StarterPersonaBadge` | Carryforth-owned neutral geometry; the old Provider marks, APNGs, and Rust-embedded character PNGs were removed. Stable runtime/persona IDs and labels remain unchanged. | Apache-2.0; cleared |
@@ -59,16 +74,16 @@ clean release build must regenerate `dist`; it must not treat a stale local
 The Carryforth wordmark refers to Inter by font-family name but does not embed
 font bytes. Inter's separately bundled WOFF2 files are covered below.
 
-## Remaining Desktop asset blocker
+## Deferred Desktop packaging blocker
 
 | Blocker | Files | Known provenance | Missing evidence / required resolution |
 | --- | --- | --- | --- |
 | Inter Variable font | `@fontsource-variable/inter@5.2.8` emitted by Vite | Package license: Copyright 2016 The Inter Project Authors, SIL Open Font License 1.1. | OFL requires the copyright and license to accompany redistributed font software. Stage the OFL text in the installed Desktop/release notices and verify it exists inside both `.deb` and AppImage. |
 
-These entries are blockers for publishing the current Desktop artifact. A
-release job must not merely suppress the gate. Removing an asset is acceptable
-only when its code references and generated output are removed together;
-replacing it requires a new inventory record and hash.
+These entries would block any future Desktop artifact publication. An artifact
+job must not merely suppress the gate. Removing an asset is acceptable only
+when its code references and generated output are removed together; replacing
+it requires a new inventory record and hash.
 
 ## Packaged programs and sidecars
 
@@ -88,8 +103,8 @@ image additionally packages source-built `buzz-relay`, `buzz-admin`, and
 `buzz-pair-relay`, also declared Apache-2.0 through workspace package metadata.
 
 This clears the provenance of Carryforth's own program source, not the whole
-linked binary. Before release, generate a tag-bound third-party license report
-and SPDX or CycloneDX SBOM for:
+linked binary. Before any future artifact publication, generate a tag-bound
+third-party license report and SPDX or CycloneDX SBOM for:
 
 - each Rust program's resolved Cargo dependency closure;
 - the Desktop's pnpm/Vite dependency closure;
@@ -194,7 +209,8 @@ It fails while any inventory entry or release obligation is `blocked`. There
 are currently **8** blockers: the packaged Inter license-notice obligation and
 seven release obligations. The removed Provider, Starter-Team, Sprout, legacy
 Mobile, screenshot, and notification assets are no longer blockers in the
-current tree. Git-history publication remains a separate task.
+current tree. Clean-history construction and publication remain separate from
+this asset gate.
 
 ## Closure checklist
 

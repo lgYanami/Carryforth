@@ -1,16 +1,21 @@
 Carryforth
 
-This distribution includes software originally developed as Buzz by Block,
-Inc. and released under the Apache License, Version 2.0.
+This source distribution includes software originally developed as Buzz by
+Block, Inc. and released under the Apache License, Version 2.0. Carryforth's
+reviewed source import is based on block/buzz commit
+ab3af828714ab699dfc87644d234014987a4fe6b.
 
 Copyright 2026 Block, Inc.
 
-Carryforth preserves the upstream license and copyright notice. Carryforth is
+Carryforth retains the upstream license and applicable copyright notices. This
+NOTICE was added by Carryforth to record provenance; it is not represented as a
+root NOTICE inherited from the exact upstream source anchor. Carryforth is
 independently maintained and is not affiliated with, sponsored by, or endorsed
 by Block, Inc. "Buzz", "Block", and related names and marks belong to their
 respective owners and are used only for attribution or technical compatibility.
 
 Third-party dependencies and assets remain subject to their respective license
-terms. A complete generated dependency and packaged-asset notice inventory is
-required before the first stable binary release; this notice does not replace
-those component-specific terms.
+terms. If Carryforth later distributes any binary, installer, container, or
+other packaged artifact, a complete generated dependency and packaged-asset
+notice inventory is required before that distribution; this notice does not
+replace those component-specific terms.

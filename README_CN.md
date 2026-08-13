@@ -35,9 +35,13 @@ Project View、Role Continuity、Project Documents、Project Context、结构化
 本地单 Relay 运行边界和面向 Agent 的 `cf` CLI 等能力。
 
 Carryforth 由独立维护者维护，与 Block, Inc. 无隶属、赞助或背书关系。
-项目保留上游 Git 历史、许可证和版权通知；详见 [LICENSE](LICENSE)、[NOTICE](NOTICE)
-与 [UPSTREAM.md](UPSTREAM.md)。代码中的 `buzz-*` 名称、`BUZZ_*` 环境变量以及部分数据库、
-协议和 bundle 坐标是既有 wire / storage / 数据连续性的兼容合同，不代表当前产品身份。
+公开源码基线是基于
+[`block/buzz@ab3af828`](https://github.com/block/buzz/commit/ab3af828714ab699dfc87644d234014987a4fe6b)
+审核后导入的压缩快照；Carryforth 仓库不复制 Buzz 的提交祖先链。仓库保留适用的
+上游许可证和版权通知，并以 Carryforth 自有的 [NOTICE](NOTICE) 记录这一归因。
+详见 [LICENSE](LICENSE) 与 [UPSTREAM.md](UPSTREAM.md)。代码中的 `buzz-*` 名称、
+`BUZZ_*` 环境变量以及部分数据库、协议和 bundle 坐标是既有 wire / storage /
+数据连续性的兼容合同，不代表当前产品身份。
 
 ## Carryforth 是什么
 
@@ -46,7 +50,7 @@ Carryforth 由独立维护者维护，与 Block, Inc. 无隶属、赞助或背�
 团队解散或成员离开时，项目往往又要从头解释自己。
 
 Carryforth 把这个关系反过来：项目长期存在，人类与 Agent 以成员、角色和责任加入；
-成员可以进入、离开、恢复或被替换，但项目的认知、工作状态、文档、上下文、决策和承诺继续存在。
+成员可以进入、离开、恢复或被替换，但项目的认知、工作状态、文档、上下文、已记录选择和承诺继存。
 
 这里的基本单位不是一次对话、一个代码仓库或一支临时 Agent Team，而是**项目**。
 Agent 是项目中具有独立生命周期的成员；即使是 Leader，也不拥有项目的全部上下文，
@@ -75,7 +79,9 @@ Project Context 将项目对象、Documents 和 Meetings 之间显式保存的�
 
 ![Carryforth 结构化 Agent Meeting](docs/image/meeting.png)
 
-结构化 Meeting 将多 Agent 讨论、定向 Handoff、共享 Board 和结果记录放在同一协作界面中。
+这张本地开发界面截图展示的是 Meeting 的 action-recording 恢复保护状态：当 action
+materialization 等待恢复时，共享 Board 和已有结果记录仍保持可见。它是恢复状态示例，
+不是理想化的已完成 Meeting。
 
 ## 项目如何保持连续
 
@@ -113,11 +119,20 @@ Handoff 和派生 Role Brief 让继任者无需等待前任上线或提交退出
 
 详见[核心设计：Role Continuity](docs/cn/core-design/role-continuity.md)。
 
-## 上下文环境感知的图语义检索
+## 实验性的上下文环境感知图语义检索
 
-同一个问题可以在不同 Role、Work 等上下文环境下，从 Project 共同持有的一张上下文图中得到
-不同但仍然相关、可追溯的上下文路径。Carryforth 不为 Agent 建立私有上下文图，而是把环境作为
-一次查询的软视角；问题语义仍然主导，查询只沿真实无向 Hyperedge 寻路，也不会改写项目关系。
+这项设计的目标是：同一个问题在不同 Role、Work 等上下文环境下，可以从 Project
+共同持有的一张上下文图中得到不同但仍然相关、可追溯的上下文路径。Carryforth 不为
+Agent 建立私有上下文图，而是把环境作为一次查询的软视角；问题语义仍然主导，查询只沿
+真实无向 Hyperedge 寻路，也不会改写项目关系。当前实现已提供这一实验机制，但不同
+上下文环境下的召回与排序质量仍在资格化中；指定环境不保证一定得到不同或语义正确的结果。
+
+这项能力并非完全本地：语义索引可能将来源类型、当前可见标题/名称和可选摘要这些项目文本
+发往用户配置的 Provider；当前 foundation 不发送 Document 正文或 chunk。语义查询会将 problem
+和相关 overview 文本发往同一 Provider。源码启动默认开启 Worker 与 Query HTTP 的**进程开关**，
+缺少配置时会询问 Provider API Key、HTTPS Base URL 和
+Request Model。这两个进程开关不会开启 Community 的 durable index/query gate。operator 必须
+单独开启相应 gate；启用查询还要显式确认 problem 和 overview 文本会跨越外部 Provider 边界。
 
 详见[核心设计：上下文环境感知的图语义检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)。
 
@@ -142,7 +157,7 @@ Git Projects 和图语义查询仍有预览开关、Relay readiness、Community 
 
 ## 从源码启动
 
-当前支持的是源码开发与本地评估流程。准备好 Docker 24+（含 Compose v2）、Python 3
+当前支持的是源码开发与本地评估流程。准备好 Docker 24+（含 Compose v2）、Python 3、`curl`
 和 Tauri 所需的系统依赖后运行：
 
 ```bash
@@ -151,9 +166,17 @@ cd Carryforth
 ./start.sh
 ```
 
-脚本只检查外部系统依赖，不会安装 Docker、Python 或系统软件包。首次运行会创建私有的本地
-`.env`；语义进程开关启用时，会询问没有默认值的 Provider API Key、HTTPS Base URL
-和 Request Model。启动过程会保留已有 Docker volume 和项目数据。
+脚本只检查外部系统依赖，不会安装 Docker、Python、`curl` 或系统软件包。首次运行会创建私有的本地
+`.env`。源码启动默认开启语义 Worker 和 Query HTTP 进程开关，因此会在缺少时询问
+Provider API Key、HTTPS Base URL 和 Request Model，三者都没有默认值。也可以在启动前显式
+关闭两个进程开关。进程启动不会开启任一 Community 语义 gate，也不代替 Provider 数据出境
+确认。启动过程会保留已有 Docker volume 和项目数据。
+
+> [!WARNING]
+> 这是仅用于可信本机的开发栈。仓库中的 `.env.example` 会把 Relay 绑定到 loopback，
+> Relay 原始二进制的默认绑定也是 loopback，仓库中的 Compose 文件也只把依赖端口发布到
+> loopback；但所有本地服务仍使用开发凭据。只能在可信主机上运行；
+> 未经过独立的安全设计，不要主动把这些端口暴露到局域网或 Internet。
 
 完整流程、关闭语义配置的方法，以及重建和停止命令见[本地源码开发](docs/cn/local-development.md)。
 
@@ -171,24 +194,25 @@ cd Carryforth
   Human 与 Agent 如何聚合分布式上下文、形成共同结论并显式产出
 - [系统概览](docs/cn/system-overview.md)：组件、数据流、身份、权限、安全与本地优先边界
 - [本地源码开发](docs/cn/local-development.md)：依赖、配置、构建、启动、停止与数据保护
-- [当前状态](docs/cn/current-status.md)：预览能力、启用条件、支持范围与发布边界
+- [当前状态](docs/cn/current-status.md)：预览能力、启用条件、本地范围与延后的制品边界
 - [项目定位](docs/project-positioning.md)与[项目空间宪章](docs/project-space-constitution.md)
 
 ## 当前阶段
 
-Carryforth 正在准备第一次独立开源发行，仍处于活跃开发阶段。当前仓库仅供
-**从源码进行本地构建、功能评估和参考学习**，尚未提供稳定安装包，
-也不承诺生产部署、正式支持或既有数据的稳定升级路径。
+Carryforth 是一个活跃开发中的源码项目。当前公开范围仅包括
+**从源码进行本地构建、功能评估和参考学习**，不包含二进制、安装包、容器或其他已打包
+发行物，也不承诺生产部署、正式支持或既有数据的稳定升级路径。
 
-当前计划中的首个支持面聚焦 Linux Desktop、本地单 Relay、ACP 托管 Agent、`cf` CLI，
+当前本地评估范围聚焦 Linux Desktop、本地单 Relay、ACP 托管 Agent、`cf` CLI，
 以及 Channels、Messages、Project View、Documents、Project Context 和 Meetings。
-Web 当前只是源码面；macOS、Windows、自动更新、生产级多实例部署和长期升级仍不属于已承诺能力。
+Web 当前也只是源码面；macOS、Windows、自动更新、生产级多实例部署和长期升级不属于已承诺能力。
 
 ## 贡献与许可证
 
 提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全漏洞请按
 [SECURITY.md](SECURITY.md) 私下报告，不要发布到公开 Issue。
 
-Carryforth 以 [Apache License 2.0](LICENSE) 分发，并保留上游版权与 NOTICE。
-第三方依赖和素材可能适用各自许可证，当前审计边界见
+Carryforth 源码以 [Apache License 2.0](LICENSE) 分发，保留适用的上游版权通知，并在
+[NOTICE](NOTICE) 中独立记录归因。第三方依赖和素材可能适用各自许可证，当前源码审计以及
+延后的未来制品边界见
 [release/THIRD_PARTY_ASSETS.md](release/THIRD_PARTY_ASSETS.md)。

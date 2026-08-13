@@ -2,12 +2,11 @@
 
 > This document distinguishes code that exists, capabilities that can be evaluated locally,
 > features that require explicit activation, work still under qualification, and surfaces not yet
-> promised. A branch name, source directory, or historical tag is not by itself release evidence.
+> promised. Public source availability is not evidence of a packaged or production release.
 
 ## 1. Overall conclusion
 
-Carryforth is preparing its first independent open-source release and remains under active
-development. The current repository is intended only for:
+Carryforth is an actively developed source project. Its current public scope is limited to:
 
 - local builds and development from source;
 - evaluation of core collaboration in a local single-Relay environment;
@@ -23,9 +22,9 @@ The repository does not yet promise:
 - a formal macOS or Windows support matrix;
 - fully offline operation.
 
-## 2. Planned initial support surface
+## 2. Current local evaluation scope
 
-Preparation for the first independent release focuses on:
+Local evaluation from source currently focuses on:
 
 - Linux x86_64 Carryforth Desktop;
 - a local single Relay and persistent dependencies;
@@ -33,13 +32,13 @@ Preparation for the first independent release focuses on:
 - a Linux x86_64 `cf` CLI;
 - Channels, Messages, Project View, Documents, Project Context, and Meetings.
 
-Linux amd64/arm64 Relay OCI publication remains release-preparation work. Signing, installation,
-automatic update, and upgrade experience for Desktop community artifacts do not yet form a stable
-commitment.
+No Desktop package, standalone CLI archive, Relay OCI image, or other built artifact is included in
+the current public scope. If artifact publication is considered later, its signing, installation,
+automatic update, provenance, and upgrade experience will require a separate commitment and gate.
 
 `web/` is currently a browser client in the source tree, not a release or support commitment.
-Inherited Mobile, Harbor benchmark, Helm/Kubernetes, and legacy Hosted Push have left the active
-release surface.
+Inherited Mobile, Harbor benchmark, Helm/Kubernetes, and legacy Hosted Push are outside the current
+local source-evaluation scope.
 
 ## 3. Available foundation and explicit activation
 
@@ -154,9 +153,15 @@ Still under qualification:
 - production load balancers and multi-pod deployment;
 - target scale, frozen SLOs, and complete recovery evidence.
 
-Source startup enables the Worker/Query HTTP process switches by default, but it does not thereby
-enable durable Community index/query gates. Query activation must also explicitly acknowledge that
-problem/overview data is sent to the user-configured Provider.
+This mechanism implements the design direction that Role/Work environments can shape returned
+paths, but it does not guarantee that two environments produce different or semantically correct
+results. Source startup enables the Worker/Query HTTP process switches by default, but it does not
+thereby enable durable Community index/query gates. Semantic indexing can send project text
+consisting of source type, the current visible title/name, and an optional summary to the
+user-configured Provider; the current foundation does not send Document bodies or chunks. A query
+sends its problem and relevant overview text to that Provider. The operator must enable the
+corresponding Community gates separately; query activation additionally requires explicit
+acknowledgement that the problem and overview text will cross that external Provider boundary.
 
 ### 4.7 Meetings
 
@@ -197,9 +202,11 @@ Limitations include:
 - there is no durable per-user total-storage quota;
 - the Relay's per-file limit does not prove a safe Desktop memory bound for large-video handling.
 
-## 5. Release-preparation boundary
+## 5. Source publication and deferred artifact boundary
 
-The formal release gate still fails closed. Outstanding work includes, among other items:
+The current source publication does not include binaries, installers, containers, immutable release
+tags, or other packaged artifacts. If Carryforth later publishes such artifacts, the strict
+artifact gate currently fails closed on prerequisites including:
 
 - third-party font and dependency licenses, SBOM, and vulnerability evidence;
 - Relay runtime/container provenance;
@@ -209,10 +216,10 @@ The formal release gate still fails closed. Outstanding work includes, among oth
 - clean-room E2E against published artifacts;
 - private security reporting and release governance.
 
-The current branch name, a successful source build, or a local smoke test must not be described as
-“released,” “production-ready,” “download and run,” or “stable upgrade.” See the
-[open-source release surface plan](../stage/carryforth/open-source-release-surface-plan.md) for
-details.
+The current branch name, public source, a successful source build, or a local smoke test must not be
+described as a packaged release, “production-ready,” “download and run,” or a “stable upgrade.” The
+[artifact publication planning record](../stage/carryforth/open-source-release-surface-plan.md)
+documents the deferred requirements; it is not the current publication plan.
 
 ## 6. Local-first limitations
 
@@ -224,8 +231,9 @@ use the legacy hosted control plane. These actions may still access the network:
 - Git remotes;
 - remote media, Resources, and external links.
 
-The source-development Compose stack uses development credentials and publishes multiple ports to
-the host. It is not a production-hardened deployment.
+The source-development Compose stack uses development credentials and publishes multiple ports on
+host loopback. It is not a production-hardened deployment, and those bindings must not be widened
+without a separate security design.
 
 ## 7. How to read “implemented”
 

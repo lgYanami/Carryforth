@@ -168,14 +168,14 @@ updater, or push service.
 "Local-first" does not mean:
 
 - all network requests are prohibited;
-- all development ports bind only to loopback;
+- changing the checked-in loopback bindings is safe without a separate design;
 - the system needs no identity or authorization;
 - Providers, remote media, or Git remotes never access the network;
 - development Compose has production-grade hardening.
 
-The source development environment publishes several service ports to the host
-and uses development configuration and credentials. Do not expose it directly
-to an untrusted network.
+The source development environment publishes several service ports on host
+loopback and uses development configuration and credentials. Do not widen those
+bindings to an untrusted network without a separate security design.
 
 ## 6. Semantic Provider boundary
 
@@ -186,8 +186,10 @@ authorization, object currentness, Provider admission, result signing, and
 other checks.
 
 When queries are enabled, the operator must explicitly acknowledge that the
-problem / overview will leave the local control plane and be sent to the
-configured Provider. A Provider API Key should exist only in a private local
+problem and overview text—source type, current visible title/name, and optional
+summary—will leave the local control plane and be sent to the configured
+Provider. The current foundation does not send Document bodies or chunks. A
+Provider API Key should exist only in a private local
 environment or controlled secret injection. It must not be written to a Project
 Document, log, or event.
 

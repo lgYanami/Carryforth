@@ -94,6 +94,8 @@ docker compose version >/dev/null 2>&1 ||
   fail "Docker Compose 插件不可用；启动脚本不会自动安装系统组件"
 command -v python3 >/dev/null 2>&1 ||
   fail "未找到 Python 3；它只用于创建受管理的后台进程，启动脚本不会自动安装"
+command -v curl >/dev/null 2>&1 ||
+  fail "未找到 curl；它用于本地 readiness 检查，启动脚本不会自动安装"
 docker info >/dev/null 2>&1 || fail "Docker daemon 未运行"
 
 case "$(uname -s)" in
@@ -179,7 +181,7 @@ health_port="${BUZZ_HEALTH_PORT:-8080}"
 if curl --silent --fail --max-time 1 "http://127.0.0.1:${health_port}/_readiness" >/dev/null 2>&1; then
   fail "端口 ${health_port} 上已有未受脚本管理的 Carryforth Relay；请先运行 ./scripts/dev-stop.sh"
 fi
-bind_addr="${BUZZ_BIND_ADDR:-0.0.0.0:3000}"
+bind_addr="${BUZZ_BIND_ADDR:-127.0.0.1:3000}"
 relay_port="${bind_addr##*:}"
 
 : >"${LOG_FILE}"

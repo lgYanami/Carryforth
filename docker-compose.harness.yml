@@ -1,15 +1,19 @@
 # =============================================================================
-# Isolated test-relay backing stack — GUI read-model overhaul harness (Dawn).
+# Singleton test-relay backing stack.
 #
-# A SEPARATE Compose project (`buzz-harness`) so the shared :3000 relay and the
-# default `buzz-*` dev stack are never touched. No fixed container_names (they
-# collide across projects) and alternate host ports. Mirrors Eva's evaperf-*
-# isolation pattern.
+# This uses a separate Compose project (`buzz-harness`) and alternate ports, but
+# the project name and ports are fixed. It is therefore isolated from the
+# default development stack, not from another checkout running this harness.
+# `scripts/start-isolated-test-relay.sh` enforces that singleton boundary.
+# Every published port is explicitly loopback-only.
 #
-#   Bring up:  docker compose -p buzz-harness -f docker-compose.harness.yml up -d
+#   Start:     ./scripts/start-isolated-test-relay.sh
 #   Ports:     postgres 5471 · redis 6471 · minio 9471/9472
 #   Relay (run separately by scripts/start-isolated-test-relay.sh):
 #              main 3030 · health 8088 · metrics 9202
+#
+# Direct Compose use starts only the backing services and bypasses the
+# singleton/tooling preflight. Prefer the script above.
 # =============================================================================
 services:
   postgres:
@@ -20,7 +24,7 @@ services:
       POSTGRES_DB: buzz
       PGDATA: /var/lib/postgresql/data
     ports:
-      - "5471:5432"
+      - "127.0.0.1:5471:5432"
     volumes:
       - harness-postgres-data:/var/lib/postgresql/data
       - ./deploy/postgres/initdb/001-pgvector.sql:/docker-entrypoint-initdb.d/001-pgvector.sql:ro
@@ -32,9 +36,9 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
     ports:
-      - "6471:6379"
+      - "127.0.0.1:6471:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -43,14 +47,14 @@ services:
       start_period: 5s
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:latest@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: buzz_dev
       MINIO_ROOT_PASSWORD: buzz_dev_secret
     ports:
-      - "9471:9000"
-      - "9472:9001"
+      - "127.0.0.1:9471:9000"
+      - "127.0.0.1:9472:9001"
     volumes:
       - harness-minio-data:/data
     healthcheck:
@@ -61,7 +65,7 @@ services:
       start_period: 10s
 
   minio-init:
-    image: minio/mc:latest
+    image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       minio:
         condition: service_healthy

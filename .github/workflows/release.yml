@@ -1,8 +1,10 @@
 name: Carryforth Community Release
 
-# The first public release lane intentionally publishes only the supported
-# Linux surface. Desktop packages are community artifacts: they are unsigned,
-# contain no updater configuration, and never contact a legacy release feed.
+# Dormant future-artifact lane. Carryforth currently publishes source only;
+# fail-closed release-source and packaged-asset gates intentionally prevent this
+# workflow from publishing until the deferred artifact requirements are met.
+# If enabled later, the designed scope is Linux-only and Desktop artifacts are
+# unsigned community builds with no updater or legacy release feed.
 on:
   push:
     tags:

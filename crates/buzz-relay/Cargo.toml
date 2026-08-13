@@ -1,9 +1,9 @@
 [package]
 name = "buzz-relay"
 default-run = "buzz-relay"
-# Independent version: buzz-relay is packaged as the Carryforth Relay artifact
-# and released on its own cadence.
-# It does NOT inherit the workspace version.
+# Independent version reserved for a possible future Carryforth Relay artifact.
+# No supported packaged Relay artifact is currently published, and this crate
+# does not inherit the workspace version.
 version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
