@@ -1,0 +1,170 @@
+<h1 align="center">Carryforth</h1>
+
+<p align="center">
+  <strong>连续性属于项目，而不是某个 Agent。</strong>
+</p>
+
+<p align="center">
+  一个本地优先、以项目为持续主体的人类—Agent 协作空间。
+</p>
+
+<p align="center">
+  <a href="docs/cn/README.md">中文文档</a> ·
+  <a href="docs/project-positioning.md">项目定位</a> ·
+  <a href="ARCHITECTURE.md">架构</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a> ·
+  <a href="SECURITY.md">安全</a> ·
+  <a href="LICENSE">Apache 2.0</a>
+</p>
+
+> [!IMPORTANT]
+> Carryforth 仍处于**开发阶段**。当前仓库仅供从源码进行本地构建、功能评估和参考学习；
+> 尚未发布稳定安装包，也不承诺生产部署、正式支持或既有数据的稳定升级路径。
+
+## 来源与致谢
+
+Carryforth 是基于 Block, Inc. 以 Apache License 2.0 发布的
+[`block/buzz`](https://github.com/block/buzz) 源码开发和演进的独立项目，**不是从零重写**。
+Buzz 提供的 Desktop、本地 Nostr Relay、Agent 运行与协作基础，为 Carryforth 提供了坚实的工程起点。
+
+我们感谢 Block, Inc. 和所有 Buzz contributors 对开源社区的贡献，也推荐对本地优先协作、
+Nostr 与 Agent 工作空间感兴趣的读者了解原始 [Buzz 项目](https://github.com/block/buzz)。
+
+Carryforth 在这一基础上继续探索“以项目而不是 Agent 作为持续主体”的方向，加入并重构了
+Project View、Role Continuity、Project Documents、Project Context、结构化 Meetings、
+本地单 Relay 运行边界和面向 Agent 的 `cf` CLI 等能力。
+
+Carryforth 由独立维护者维护，与 Block, Inc. 无隶属、赞助或背书关系。
+项目保留上游 Git 历史、许可证和版权通知；详见 [LICENSE](LICENSE)、[NOTICE](NOTICE)
+与 [UPSTREAM.md](UPSTREAM.md)。代码中的 `buzz-*` 名称、`BUZZ_*` 环境变量以及部分数据库、
+协议和 bundle 坐标是既有 wire / storage / 数据连续性的兼容合同，不代表当前产品身份。
+
+## Carryforth 是什么
+
+今天的 Agent 很擅长完成一项任务，却很难天然地延续一个长期项目。
+上下文通常留在某次对话、某个 Leader、某个 Agent 的记忆里；当会话结束、模型更换、
+团队解散或成员离开时，项目往往又要从头解释自己。
+
+Carryforth 把这个关系反过来：项目长期存在，人类与 Agent 以成员、角色和责任加入；
+成员可以进入、离开、恢复或被替换，但项目的认知、工作状态、文档、上下文、决策和承诺继续存在。
+
+这里的基本单位不是一次对话、一个代码仓库或一支临时 Agent Team，而是**项目**。
+Agent 是项目中具有独立生命周期的成员；即使是 Leader，也不拥有项目的全部上下文，
+更不是项目得以延续的必要条件。
+
+Carryforth 不是一个“记住所有聊天”的超级 Agent。它提供一个共同的项目空间：
+人类和 Agent 在同一套身份、权限和项目状态上协作，并把真正会影响未来工作的内容持续写回项目。
+
+## 界面预览
+
+### Project View
+
+![Carryforth Project View 项目概览](docs/image/project-view-overview.png)
+
+Project View 汇总项目方向、计划与阶段、角色、待关注事项和资源，让人类与 Agent
+从同一份经过验证的项目状态继续工作。
+
+### Project Context
+
+![Carryforth Project Context 关系图](docs/image/project-context.png)
+
+Project Context 将项目对象、Documents 和 Meetings 之间显式保存的关系组织成可浏览的上下文图；
+图中的布局只用于浏览，不表示排名或因果。
+
+### Meetings
+
+![Carryforth 结构化 Agent Meeting](docs/image/meeting.png)
+
+结构化 Meeting 将多 Agent 讨论、定向 Handoff、共享 Board 和结果记录放在同一协作界面中。
+
+## 项目如何保持连续
+
+```text
+Project / Community
+│
+├── Project View
+│   ├── Project Profile
+│   ├── Goal
+│   ├── Role
+│   ├── Plan
+│   ├── Stage
+│   ├── Requirement
+│   ├── Issue
+│   ├── Work
+│   └── Resource
+│
+├── Project Documents
+├── Project Context
+├── Meetings
+└── Human / Agent Members
+```
+
+Project View 保存项目当前的一阶状态；Documents 保存可演进的项目内容；Project Context
+解释对象之间“为什么相关”；Meetings 承载正式协作；Role、Assignment、Checkpoint 和 Handoff
+让责任在 Agent Runtime 更换后仍可继续。
+
+每个模型的身份、关系和边界见[核心模型](docs/cn/core-model.md)。
+
+## 当前能力
+
+当前仓库已经把以下能力接入同一个本地项目边界：
+
+- Carryforth Desktop：项目导航、Project View、Documents、Project Context 和 Meetings；
+- 本地 Relay：Community 权限、签名事件、规范状态、查询和审计边界；
+- ACP 托管 Agent：以项目成员身份运行，并接收受控的 Carryforth 环境；
+- `cf` CLI：面向 Agent 的消息、项目对象、文档、上下文、会议和媒体操作；
+- Channels 与 Messages：基于签名 Nostr 事件的日常协作；
+- Git 项目协作与内容寻址媒体的预览能力；
+- 可选、受门控的 Project Context 图语义路径查询。
+
+Relay 是当前的权威状态边界。系统会校验和保存结构，但不会自动理解整个项目，
+也不会把每段聊天、草稿或模型推理自动提升为项目事实。
+
+**已实现不等于新环境中默认开放。** Project View、Documents、Project Context、Meetings、
+Git Projects 和图语义查询仍有预览开关、Relay readiness、Community durable gate 或 Owner
+签名初始化等要求。具体能力与启用边界见[当前状态](docs/cn/current-status.md)。
+
+## 从源码启动
+
+当前支持的是源码开发与本地评估流程。准备好 Docker 24+（含 Compose v2）、Python 3
+和 Tauri 所需的系统依赖后运行：
+
+```bash
+git clone https://github.com/lgYanami/Carryforth.git
+cd Carryforth
+./start.sh
+```
+
+脚本只检查外部系统依赖，不会安装 Docker、Python 或系统软件包。首次运行会创建私有的本地
+`.env`；语义进程开关启用时，会询问没有默认值的 Provider API Key、HTTPS Base URL
+和 Request Model。启动过程会保留已有 Docker volume 和项目数据。
+
+完整流程、关闭语义配置的方法，以及重建和停止命令见[本地源码开发](docs/cn/local-development.md)。
+
+## 继续阅读
+
+- [中文文档导航](docs/cn/README.md)
+- [核心模型](docs/cn/core-model.md)：Project View、Role Continuity、Documents、Context、Meetings 与成员
+- [系统概览](docs/cn/system-overview.md)：组件、数据流、身份、权限、安全与本地优先边界
+- [本地源码开发](docs/cn/local-development.md)：依赖、配置、构建、启动、停止与数据保护
+- [当前状态](docs/cn/current-status.md)：预览能力、启用条件、支持范围与发布边界
+- [项目定位](docs/project-positioning.md)与[项目空间宪章](docs/project-space-constitution.md)
+
+## 当前阶段
+
+Carryforth 正在准备第一次独立开源发行，仍处于活跃开发阶段。当前仓库仅供
+**从源码进行本地构建、功能评估和参考学习**，尚未提供稳定安装包，
+也不承诺生产部署、正式支持或既有数据的稳定升级路径。
+
+当前计划中的首个支持面聚焦 Linux Desktop、本地单 Relay、ACP 托管 Agent、`cf` CLI，
+以及 Channels、Messages、Project View、Documents、Project Context 和 Meetings。
+Web 当前只是源码面；macOS、Windows、自动更新、生产级多实例部署和长期升级仍不属于已承诺能力。
+
+## 贡献与许可证
+
+提交代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全漏洞请按
+[SECURITY.md](SECURITY.md) 私下报告，不要发布到公开 Issue。
+
+Carryforth 以 [Apache License 2.0](LICENSE) 分发，并保留上游版权与 NOTICE。
+第三方依赖和素材可能适用各自许可证，当前审计边界见
+[release/THIRD_PARTY_ASSETS.md](release/THIRD_PARTY_ASSETS.md)。

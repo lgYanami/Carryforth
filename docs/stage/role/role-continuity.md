@@ -46,7 +46,7 @@ Project View v0 已经能够让 Human 和 Agent 共同查看和修改同一幅�
 - Role 是稳定责任坐标，不拥有一份独立的角色记忆；
 - Community Member 承担 Role；
 - Agent Runtime 代表 Member 执行动作；
-- Work、Issue、决定、Checkpoint 和 Handoff 等状态持续回到 Project；
+- Work、Issue、关键选择及其依据、Checkpoint 和 Handoff 等状态持续回到 Project；
 - Role Brief 只是这些规范状态的派生读取结果，不是新的事实源。
 
 核心关系可以概括为：
@@ -539,7 +539,7 @@ Commitment。
 
 Work 状态和 Commitment 状态相互独立。Assignment 结束时：
 
-- 未完成 Commitment 进入 `interrupted` 或 `replaced` 等明确终态；
+- 未完成 Commitment 进入 `assignment_ended` 或 `replaced` 等明确终态；
 - Work 不自动变为 completed、cancelled 或其他状态；
 - responsible Role 保持不变；
 - 前任的 Commitment、操作和贡献仍归前任；
@@ -566,7 +566,7 @@ Work，或等待后续设计显式的跨 Role 请求和协作关系。
 - 当前承担者已经接受的 Work；
 - Work 的进展、状态和产物证据；
 - 当前阻塞、风险和未决问题；
-- 相关 Issue、决定和项目上下文引用；
+- 相关 Issue、关键选择依据和项目上下文引用；
 - 最新 Role Checkpoint；
 - 历史 Handoff；
 - 当前 Runtime 可用性。
@@ -574,8 +574,9 @@ Work，或等待后续设计显式的跨 Role 请求和协作关系。
 目标、Work、Issue、Resource 和其他 Project View 对象的当前状态仍由各自规范对象
 表达，不复制到 Role 中维护第二份状态。
 
-工作中产生的重要认知、行动意图、责任、进展、风险和决定应持续外化到 Project，
-不能依赖成员退出前的一次总结。
+工作中产生的重要认知、行动意图、责任、进展、风险、关键选择及依据应持续外化到
+Project，不能依赖成员退出前的一次总结。当前没有独立的通用 Project Decision 对象；
+选择依据由 Document 或对应领域对象承载。
 
 ## 14. Role Checkpoint
 
@@ -588,15 +589,15 @@ Role Checkpoint 是对某个 Role 在特定 Project revision 或时间点上的�
 - 当前阻塞与风险；
 - 未决问题；
 - 已知下一步；
-- 相关 Project View、Issue、决定或 Context 引用；
+- 相关 Project View、Issue、关键选择依据或 Context 引用；
 - 由哪个 Assignment 形成；
 - 它基于哪个 revision 或时间点。
 
 Checkpoint 应在工作过程中按重要变化持续形成，而不是只在退出时生成。
 
 新的 Checkpoint 不覆盖历史 Checkpoint。最新 Checkpoint 可以作为当前局势入口，但
-重要事实仍应写回对应的 Work、Issue、决定或 Context；Checkpoint 负责组织和索引局势，
-不替代这些事实源。
+重要事实仍应写回对应的 Work、Issue、Document 或 Context；Checkpoint 负责组织和索引
+局势，不替代这些事实源。
 
 ## 15. Role Brief
 
@@ -611,7 +612,7 @@ Role Brief =
   + active 与待接续 Commitment
   + 最新 Checkpoint
   + 阻塞、风险和未决问题
-  + 相关决定和项目上下文
+  + 相关关键选择依据和项目上下文
   + 最近 Handoff
   + 当前 Community 等级与治理边界
 ```
@@ -788,8 +789,9 @@ Role Continuity 首版不实现或不承诺：
 - 完整的 Project Context 类型、检索和 Context Compiler；
 - 完整的人类组织治理、争议处理和领域 authority。
 
-项目定位中引用的项目空间宪法与运行模型当前未包含在本工作树中。本文只固化当前
-已检入文档和本阶段已经确认的概念，不声称已经完成这些缺失治理约束中的全部设计。
+[项目空间宪章](../../project-space-constitution.md)记录上层治理边界，
+[Carryforth 核心模型](../../cn/core-model.md)记录当前对象关系。本文只固化 Role Continuity
+的精确领域合同；不能据此推断通用 Decision、细粒度领域 ACL 或其他尚未实现的治理模型。
 
 ## 21. 验证清单
 

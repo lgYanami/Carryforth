@@ -495,6 +495,7 @@ const allowedTopLevelKeys = new Set([
 const allowedClassifications = new Set([
   "project-art",
   "project-art-rendition",
+  "project-screenshot",
   "generated",
   "third-party-font",
   "third-party-media",
@@ -513,6 +514,7 @@ const allowedTrademarkStatus = new Set([
   "project-owned",
   "factual-text-only",
   "third-party-cleared",
+  "third-party-nominative",
 ]);
 const allowedMarkerKinds = new Set([
   "runtime-constructor",
@@ -571,6 +573,7 @@ function validateProvenance(record, label) {
     "description",
     "license_evidence",
     "created_in_commit",
+    "captured_from_commit",
     "source",
     "generator",
     "toolchain",
@@ -683,6 +686,16 @@ function validateProvenance(record, label) {
     }
     if (provenance.reproducible !== false)
       fail(`${label} project-art-rendition must not claim reproducibility`);
+  } else if (classification === "project-screenshot") {
+    if (
+      !commitPattern.test(provenance.captured_from_commit ?? "") ||
+      typeof provenance.toolchain !== "string" ||
+      typeof provenance.recipe !== "string"
+    ) {
+      fail(
+        `${label} project screenshot requires captured_from_commit, toolchain, and recipe`,
+      );
+    }
   } else if (classification === "generated") {
     if (
       !provenance.generator ||
@@ -866,7 +879,10 @@ for (const entry of manifest.entries ?? []) {
       fail(`asset entry ${entry.id} has an incomplete privacy_review`);
     }
   }
-  if (screenshotLike && entry.privacy_review === undefined) {
+  if (
+    (screenshotLike || entry.classification === "project-screenshot") &&
+    entry.privacy_review === undefined
+  ) {
     fail(`screenshot-like asset entry ${entry.id} requires privacy_review`);
   }
   let pathsAreReadableAssets = true;

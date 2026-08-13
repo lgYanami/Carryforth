@@ -123,6 +123,39 @@
       }
     },
     {
+      "id": "carryforth-readme-screenshots",
+      "classification": "project-screenshot",
+      "license": "Apache-2.0",
+      "usage": ["source", "docs"],
+      "copyright_holder": "Carryforth contributors",
+      "status": "cleared",
+      "trademark_status": "third-party-nominative",
+      "paths": [
+        "docs/image/meeting.png",
+        "docs/image/project-context.png",
+        "docs/image/project-view-overview.png"
+      ],
+      "file_count": 3,
+      "tree_sha256": "a703623f511f962a1cc8a23f16070497e42788c60a8bdf460ac9d458244019dc",
+      "privacy_review": {
+        "mock_only": true,
+        "no_real_people": true,
+        "notes": "Local development fixture content and test Agent identities only; no complete private keys, Provider credentials, personal photographs, private infrastructure coordinates, or production user records. Third-party Agent marks appear only as nominative UI state."
+      },
+      "provenance": {
+        "description": "Maintainer-selected screenshots captured from a local Carryforth development build for public product documentation. The images show project fixture data rather than production user content.",
+        "license_evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "108cb15997e51b75a8d18b0c1e2c52bd3879d051ab02118973387df1e4aab584"
+          }
+        ],
+        "captured_from_commit": "5929d562c96e85c4b9e46fc08636515f2747a944",
+        "toolchain": "Carryforth Tauri Desktop local development build on Linux",
+        "recipe": "Run the local source stack with development fixture data and capture the Project View, Project Context, and Meeting application windows."
+      }
+    },
+    {
       "id": "carryforth-desktop-icon-renditions",
       "classification": "project-art-rendition",
       "license": "Apache-2.0",
