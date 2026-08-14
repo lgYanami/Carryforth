@@ -383,10 +383,9 @@ test("wide Meeting Board collapse preserves its draft, width, and timeline posit
     .toBe(300);
 });
 
-test("Meeting rooms, drafts, and panel preferences stay Community scoped", async ({
+test("local-only bootstrap removes remote Meeting state without leaking it", async ({
   page,
 }) => {
-  await page.setViewportSize({ width: 1440, height: 900 });
   await page.addInitScript(() => {
     window.localStorage.setItem(
       "buzz-communities",
@@ -418,37 +417,51 @@ test("Meeting rooms, drafts, and panel preferences stay Community scoped", async
     { skipCommunitySeed: true },
   );
   await page.goto("/");
-  await openMeeting(page, MEETING_A);
-
-  await page.getByTestId("meeting-board-editor").fill("# Alpha dirty draft");
-  await page.getByTestId("meeting-board-resize-handle").press("ArrowLeft");
-  await expect(page.getByTestId("meeting-board-wide")).toHaveCSS(
-    "width",
-    "416px",
+  await expect(page.getByTestId("community-rail-button-meeting-b")).toHaveCount(
+    0,
   );
+  await expect(page.getByTestId(`meeting-row-${MEETING_A}`)).toBeVisible();
+  await expect(page.getByTestId(`meeting-row-${MEETING_B}`)).toHaveCount(0);
+  expect(
+    await page.evaluate(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("buzz-communities") ?? "[]",
+      ) as Array<{ id: string; name: string; relayUrl: string }>;
+      return {
+        activeId: window.localStorage.getItem("buzz-active-community-id"),
+        communities: stored.map(({ id, name, relayUrl }) => ({
+          id,
+          name,
+          relayUrl,
+        })),
+      };
+    }),
+  ).toEqual({
+    activeId: "meeting-a",
+    communities: [
+      {
+        id: "meeting-a",
+        name: "Local Dev",
+        relayUrl: RELAY_A,
+      },
+    ],
+  });
 
-  await page.getByTestId("community-rail-button-meeting-b").click();
-  await expect(page.getByTestId(`meeting-row-${MEETING_A}`)).toHaveCount(0);
-  await openMeeting(page, MEETING_B);
+  await openMeeting(page, MEETING_A);
+  await expect(
+    page.getByRole("heading", { name: "Alpha decision" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("meeting-board-editor")).toHaveValue("# Alpha");
   await expect(
     page.getByRole("heading", { name: "Bravo decision" }),
-  ).toBeVisible();
-  await expect(page.getByTestId("meeting-board-editor")).toHaveValue("# Bravo");
+  ).toHaveCount(0);
+  await expect(page.getByText("# Bravo", { exact: true })).toHaveCount(0);
+  await expect(page.getByTestId("community-rail-button-meeting-b")).toHaveCount(
+    0,
+  );
   await expect(page.getByTestId("meeting-board-wide")).toHaveCSS(
     "width",
     "384px",
-  );
-
-  await page.getByTestId("community-rail-button-meeting-a").click();
-  const alphaHeading = page.getByRole("heading", { name: "Alpha decision" });
-  if (!(await alphaHeading.isVisible())) {
-    await openMeeting(page, MEETING_A);
-  }
-  await expect(alphaHeading).toBeVisible();
-  await expect(page.getByTestId("meeting-board-editor")).toHaveValue("# Alpha");
-  await expect(page.getByTestId("meeting-board-wide")).toHaveCSS(
-    "width",
-    "416px",
   );
 });
 

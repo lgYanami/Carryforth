@@ -487,7 +487,7 @@ test.describe("global agent config screenshots", () => {
     );
 
     const harness = defaultsDialog.getByTestId("global-agent-default-harness");
-    await expect(harness).toHaveText("Carryforth Agent");
+    await expect(harness).toHaveText("Built-in Agent");
     const provider = defaultsDialog.getByTestId("global-agent-provider");
     await expect(provider).toBeVisible();
     await waitForAnimations(page);
@@ -562,7 +562,7 @@ test.describe("global agent config screenshots", () => {
     });
   });
 
-  test("unset defaults persist the visible Carryforth Agent fallback", async ({
+  test("unset defaults persist the visible Built-in Agent fallback", async ({
     page,
   }) => {
     await installMockBridge(page);
@@ -575,7 +575,7 @@ test.describe("global agent config screenshots", () => {
     const defaultsDialog = page.getByTestId("agent-ai-defaults-dialog");
     await expect(
       defaultsDialog.getByTestId("global-agent-default-harness"),
-    ).toHaveText("Carryforth Agent");
+    ).toHaveText("Built-in Agent");
 
     await defaultsDialog.getByTestId("global-agent-provider").click();
     await page.getByTestId("global-agent-provider-option-anthropic").click();
@@ -750,7 +750,7 @@ test.describe("global agent config screenshots", () => {
       defaultsSection.getByText("Harness", { exact: true }),
     ).toBeVisible();
     await expect(
-      defaultsSection.getByText("Carryforth Agent", { exact: true }),
+      defaultsSection.getByText("Built-in Agent", { exact: true }),
     ).toBeVisible();
 
     // Global provider satisfies the provider-default rule → submit enabled.

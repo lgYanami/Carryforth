@@ -352,7 +352,7 @@ test("live events only invalidate native reads and never inject their raw body",
   ).toHaveCount(0);
 });
 
-test("Community switching clears Document selection, drafts, and Relay data", async ({
+test("local-only bootstrap removes remote Document state without leaking it", async ({
   page,
 }) => {
   await installMockBridge(
@@ -367,16 +367,43 @@ test("Community switching clears Document selection, drafts, and Relay data", as
   );
   await seedCommunities(page);
   await openDocuments(page);
-  await page.getByTestId(`document-list-item-${DOCUMENT_ID}`).click();
-  await page.getByTestId("document-edit").click();
-  await page.getByTestId("document-content-input").fill("Alpha-only draft");
+  await expect(
+    page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
+  ).toHaveCount(0);
+  await expect(page.getByText("Alpha runbook")).toBeVisible();
+  await expect(page.getByText("Bravo handbook")).toHaveCount(0);
+  expect(
+    await page.evaluate(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("buzz-communities") ?? "[]",
+      ) as Array<{ id: string; name: string; relayUrl: string }>;
+      return {
+        activeId: window.localStorage.getItem("buzz-active-community-id"),
+        communities: stored.map(({ id, name, relayUrl }) => ({
+          id,
+          name,
+          relayUrl,
+        })),
+      };
+    }),
+  ).toEqual({
+    activeId: COMMUNITY_A.id,
+    communities: [
+      {
+        id: COMMUNITY_A.id,
+        name: "Local Dev",
+        relayUrl: COMMUNITY_A.relayUrl,
+      },
+    ],
+  });
 
-  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-  await page.getByTestId("open-documents").click();
-  await expect(page.getByText("Bravo handbook")).toBeVisible();
-  await expect(page.getByText("Alpha runbook")).toHaveCount(0);
-  await expect(page.getByTestId("document-content-input")).toHaveCount(0);
-  await expect(page).not.toHaveURL(/document=/);
+  await page.getByTestId(`document-list-item-${DOCUMENT_ID}`).click();
+  await expect(
+    page
+      .getByTestId("document-viewer")
+      .getByRole("heading", { name: "Alpha runbook" }),
+  ).toBeVisible();
+  await expect(page.getByTestId("document-markdown")).toContainText("just ci");
 });
 
 test("native integrity failures fail closed before any Document body renders", async ({

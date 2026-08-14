@@ -319,6 +319,7 @@ fn tool_error(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 mod tests {
     use super::*;
     use crate::shim::Shim;
+    #[cfg(unix)]
     use tempfile::{tempdir, TempDir};
 
     const MEETING_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
@@ -506,6 +507,7 @@ mod tests {
         (directory, binary)
     }
 
+    #[cfg(unix)]
     fn make_state(directory: &TempDir) -> SharedState {
         let shim = Shim::install().expect("shim install");
         SharedState::new(directory.path().to_path_buf(), shim).expect("state")

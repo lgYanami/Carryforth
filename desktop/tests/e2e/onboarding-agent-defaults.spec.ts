@@ -618,7 +618,11 @@ test("Finish waits for the latest rapid harness choice to persist", async ({
   await expect(finish).toBeDisabled();
   await expect(finish).toBeEnabled({ timeout: 2_000 });
   await finish.click();
-  await expect(page.getByText("Join or create a community")).toBeVisible();
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  await expect(page.getByTestId("onboarding-page-config")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Local Dev Overview" }),
+  ).toBeVisible();
   expect(await readSavedRuntime(page)).toBe("codex");
 });
 

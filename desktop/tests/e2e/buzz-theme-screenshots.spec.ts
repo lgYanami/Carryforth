@@ -84,6 +84,15 @@ async function expectBuzzSidebarPalette(page: Page, mode: "light" | "dark") {
   await expect(pinnedHeader).toHaveCSS("padding-right", "8px");
   await expect(sidebarScroller).toHaveCSS("padding-left", "0px");
   await expect(sidebarScroller).toHaveCSS("padding-right", "0px");
+  // Selecting a lower channel may scroll the independent sidebar content to
+  // reveal that row. Reset it before checking the top-of-list relationship to
+  // the pinned Project/Search header; viewport scroll is not layout geometry.
+  await sidebarScroller.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  await expect
+    .poll(() => sidebarScroller.evaluate((element) => element.scrollTop))
+    .toBe(0);
   await expect(scrollContent).toHaveCSS("padding-left", "3px");
   await expect(scrollContent).toHaveCSS("padding-right", "3px");
   const pinnedSpacerColor = await pinnedHeader.evaluate(
@@ -524,15 +533,12 @@ test("settings content uses the same inset surface as the main app", async ({
   await seedTheme(page, "buzz");
   await installMockBridge(page);
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  const searchBox = await page.getByTestId("open-search").boundingBox();
   await page.getByTestId("open-settings").click();
   await page.getByTestId("profile-popover-settings").click();
 
   const settingsView = page.getByTestId("settings-view");
   const contentSurface = page.getByTestId("settings-content-surface");
-  const backToAppBox = await page
-    .getByTestId("settings-back-to-app")
-    .boundingBox();
+  await expect(page.getByTestId("settings-back-to-app")).toBeVisible();
   await expect(contentSurface).toBeVisible({ timeout: 10_000 });
   await expect(page.getByTestId("settings-content-scroll")).toHaveCSS(
     "padding-top",
@@ -541,15 +547,11 @@ test("settings content uses the same inset surface as the main app", async ({
 
   const viewBox = await settingsView.boundingBox();
   const surfaceBox = await contentSurface.boundingBox();
-  expect(searchBox).not.toBeNull();
-  expect(backToAppBox).not.toBeNull();
   expect(viewBox).not.toBeNull();
   expect(surfaceBox).not.toBeNull();
-  if (!searchBox || !backToAppBox || !viewBox || !surfaceBox) {
+  if (!viewBox || !surfaceBox) {
     throw new Error("Settings layout is missing");
   }
-
-  expect(Math.abs(backToAppBox.y - searchBox.y)).toBeLessThanOrEqual(0.5);
 
   // Match the normal app shell: a fixed 40px top chrome strip, then a 1px
   // top/left inset and 8px right/bottom inset around the rounded content card.

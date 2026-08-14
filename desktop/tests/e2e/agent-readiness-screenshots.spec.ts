@@ -161,7 +161,7 @@ test.describe("agent readiness gate screenshots", () => {
   test("02-create-buzzagent-automatic-model", async ({ page }) => {
     await installMockBridge(page);
     await openCreateDialog(page);
-    await selectProvider(page, "Buzz shared compute");
+    await selectProvider(page, "Carryforth shared compute");
 
     await expect(page.locator("#persona-model")).toContainText("Automatic");
     await expect(page.getByTestId("persona-dialog-submit")).toBeEnabled();
