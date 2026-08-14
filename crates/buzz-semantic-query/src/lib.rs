@@ -13,6 +13,7 @@ mod encoder;
 mod fence;
 mod fleet;
 mod frontier;
+mod one_hop_search;
 mod query_text;
 mod result;
 mod root;
@@ -48,12 +49,13 @@ pub use frontier::{
     ExpansionContinuation, FrontierPathState, IncidentExpansionContinuation, RelationRankCursor,
     TargetExpansionContinuation, TargetRankCursor, TraversalMaterializationCounters,
 };
+pub use one_hop_search::*;
 pub use query_text::{
-    build_query_encoder_inputs, canonical_conditioned_query_text, canonical_problem_query_text,
-    query_contract_digest, ConditionedContextOverview, ConditionedInputOmissionReason,
-    OmittedConditionedInput, SemanticQueryChannelKind, SemanticQueryEncoderInput,
-    SemanticQueryInputBuildOutcome, CONDITIONED_CONTEXT_CONTRACT, PROBLEM_CONTRACT,
-    QUERY_SERIALIZER_CONTRACT,
+    build_problem_query_encoder_input, build_query_encoder_inputs,
+    canonical_conditioned_query_text, canonical_problem_query_text, query_contract_digest,
+    ConditionedContextOverview, ConditionedInputOmissionReason, OmittedConditionedInput,
+    SemanticQueryChannelKind, SemanticQueryEncoderInput, SemanticQueryInputBuildOutcome,
+    CONDITIONED_CONTEXT_CONTRACT, PROBLEM_CONTRACT, QUERY_SERIALIZER_CONTRACT,
 };
 pub use result::*;
 pub use root::{
