@@ -125,7 +125,7 @@ impl SemanticGraphQueryEnableRequirement<'_> {
 /// incompatible change to those contracts must change the dated profile and this
 /// descriptor before a mixed fleet can attest itself ready.
 pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-http-runtime-20260814-a\n",
+    "runtime-contract=semantic-query-http-runtime-20260815-a\n",
     "transport=http-post-query-exclusive-single-filter\n",
     "request=unversioned-closed-request-id-project-id-problem-initial-context-lifecycle-budget\n",
     "result=unversioned-closed-project-request-completion-observations-input-observations-roots-paths-target-lifecycle-typed-basis-path-source-provenance-explicit-provenance-coverage\n",
@@ -136,7 +136,8 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
     "packing=deterministic-single-signed-event-whole-summary-whole-path\n",
     "errors=closed-content-free-400-401-403-409-413-429-503-504\n",
     "ordinary-query=semantic-extension-exclusive-kind-40912-always-denied",
-    "\ncoordinate-search=request-one-natural-language-input-limit-1-to-32;result-kind-40913-coordinate-rank-score-only;extension-carryforth_project_context_coordinate_search;no-floor-no-edge-no-path"
+    "\ncoordinate-search=request-one-natural-language-input-limit-1-to-32;result-kind-40913-coordinate-rank-score-only;extension-carryforth_project_context_coordinate_search;no-floor-no-edge-no-path",
+    "\none-hop-search=request-one-natural-language-q0-input-limit-1-to-32-tagged-incident-edge-or-edge-coordinate-scope;result-kind-40914-canonical-preview-and-typed-read-descriptor;extension-carryforth_project_context_one_hop_semantic_search;direct-cosine-no-floor-no-coherence-no-path"
 );
 
 /// One instance asserted to be in the current HTTP load-balancer inventory.
@@ -381,7 +382,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "855a6169cc40bbb132d76f965a77d3a1b3dc75fbe232bf30e6794e1ca0d01446",
+            "325238245fe41d6e7916fa369c539aa35ac789a0f2d9c8d7c4275fba8f360bbe",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

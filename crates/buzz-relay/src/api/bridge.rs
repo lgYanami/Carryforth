@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::kind::{
-    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
 };
 use buzz_core::TenantContext;
 use buzz_db::project_document::{
@@ -32,8 +33,9 @@ use buzz_sdk::project_view_v3::{
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     budget_profile_digest, derive_http_request_binding, ranking_contract_digest,
-    ProjectContextCoordinateSearchQuery, SemanticGraphQuery, SemanticGraphQueryError,
-    SemanticGraphQueryObservations, MAX_COORDINATE_SEARCH_REQUEST_BYTES,
+    ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery, SemanticGraphQuery,
+    SemanticGraphQueryError, SemanticGraphQueryObservations, MAX_COORDINATE_SEARCH_REQUEST_BYTES,
+    MAX_ONE_HOP_SEMANTIC_EXACT_HTTP_BODY_BYTES, MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES,
 };
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
@@ -370,6 +372,9 @@ enum ProjectDocumentPageRequest {
 
 const SEMANTIC_GRAPH_QUERY_EXTENSION: &str = "buzz_project_context_semantic";
 const COORDINATE_SEARCH_QUERY_EXTENSION: &str = "carryforth_project_context_coordinate_search";
+const ONE_HOP_SEMANTIC_QUERY_EXTENSION: &str = "carryforth_project_context_one_hop_semantic_search";
+const QUOTED_ONE_HOP_SEMANTIC_QUERY_EXTENSION: &[u8] =
+    b"\"carryforth_project_context_one_hop_semantic_search\"";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -381,6 +386,18 @@ struct ProjectContextCoordinateSearchHttpFilter {
     limit: u64,
     #[serde(rename = "carryforth_project_context_coordinate_search")]
     request: ProjectContextCoordinateSearchQuery,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectContextOneHopSemanticHttpFilter {
+    kinds: Vec<u32>,
+    authors: Vec<String>,
+    #[serde(rename = "#p")]
+    recipients: Vec<String>,
+    limit: u64,
+    #[serde(rename = "carryforth_project_context_one_hop_semantic_search")]
+    request: ProjectContextOneHopSemanticQuery,
 }
 
 /// Parse the exclusive HTTP Coordinate-search filter extension.
@@ -462,6 +479,113 @@ fn raw_filter_explicitly_requests_coordinate_search_result(raw: &Value) -> bool 
         .is_some_and(|kinds| {
             kinds.iter().any(|kind| {
                 kind == &serde_json::json!(KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT)
+            })
+        })
+}
+
+/// Parse the exclusive HTTP one-hop semantic filter extension.
+pub(crate) fn parse_project_context_one_hop_semantic_http_query(
+    exact_authenticated_body: &[u8],
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+    authenticated_caller: &nostr::PublicKey,
+) -> Result<Option<ProjectContextOneHopSemanticQuery>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get(ONE_HOP_SEMANTIC_QUERY_EXTENSION).is_some())
+        .count();
+    if extension_count == 0 {
+        if raw_filters
+            .iter()
+            .any(raw_filter_explicitly_requests_one_hop_semantic_result)
+        {
+            return Err(one_hop_http_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported",
+                "One-hop semantic search requires its exclusive HTTP filter",
+                false,
+                None,
+            ));
+        }
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic search requires exactly one filter",
+            false,
+            None,
+        ));
+    }
+    if exact_authenticated_body.len() > MAX_ONE_HOP_SEMANTIC_EXACT_HTTP_BODY_BYTES {
+        return Err(one_hop_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "scope_too_large",
+            "One-hop semantic request exceeds its byte limit",
+            false,
+            None,
+        ));
+    }
+    let mut filters: Vec<ProjectContextOneHopSemanticHttpFilter> =
+        serde_json::from_slice(exact_authenticated_body).map_err(|_| {
+            one_hop_http_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "One-hop semantic request is not valid closed JSON",
+                false,
+                None,
+            )
+        })?;
+    if filters.len() != 1 {
+        return Err(one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic search requires exactly one filter",
+            false,
+            None,
+        ));
+    }
+    let filter = filters.pop().ok_or_else(|| {
+        one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic search requires exactly one filter",
+            false,
+            None,
+        )
+    })?;
+    if filter.kinds != [KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT]
+        || filter.authors != [relay_pubkey.to_hex()]
+        || filter.recipients != [authenticated_caller.to_hex()]
+        || filter.limit != 1
+    {
+        return Err(one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic filter identity is invalid",
+            false,
+            None,
+        ));
+    }
+    let request = filter.request.validate_and_canonicalize().map_err(|_| {
+        one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic request is invalid",
+            false,
+            None,
+        )
+    })?;
+    Ok(Some(request))
+}
+
+fn raw_filter_explicitly_requests_one_hop_semantic_result(raw: &Value) -> bool {
+    raw.get("kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds.iter().any(|kind| {
+                kind == &serde_json::json!(KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT)
             })
         })
 }
@@ -637,6 +761,307 @@ async fn execute_project_context_coordinate_search_http_query(
     let value = serde_json::to_value(event)
         .map_err(|_| internal_error("Coordinate-search result serialization failed"))?;
     Ok(Json(Value::Array(vec![value])))
+}
+
+async fn execute_project_context_one_hop_semantic_http_query(
+    state: &AppState,
+    tenant: &TenantContext,
+    exact_authenticated_body: &[u8],
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    query: ProjectContextOneHopSemanticQuery,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started = std::time::Instant::now();
+    let result = crate::semantic_one_hop_search::execute_project_context_one_hop_semantic_search(
+        state,
+        tenant.community(),
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+    )
+    .await;
+    metrics::histogram!("carryforth_one_hop_semantic_duration_seconds")
+        .record(started.elapsed().as_secs_f64());
+    let event = match result {
+        Ok(event) => {
+            metrics::counter!("carryforth_one_hop_semantic_requests_total", "result" => "success")
+                .increment(1);
+            event
+        }
+        Err(error) => {
+            use crate::semantic_one_hop_search::OneHopSemanticExecutionError as Error;
+            let (status, code, message, retryable, retry_after_seconds, metric) = match error {
+                Error::InvalidRequest | Error::Contract(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                    "One-hop semantic request is invalid",
+                    false,
+                    None,
+                    "invalid",
+                ),
+                Error::Restricted => (
+                    StatusCode::FORBIDDEN,
+                    "restricted",
+                    "One-hop semantic search is restricted",
+                    false,
+                    None,
+                    "restricted",
+                ),
+                Error::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "One-hop semantic scope was not found",
+                    false,
+                    None,
+                    "not_found",
+                ),
+                Error::Busy {
+                    retry_after_seconds,
+                } => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "busy",
+                    "One-hop semantic search is busy",
+                    true,
+                    retry_after_seconds,
+                    "busy",
+                ),
+                Error::Conflict => (
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "One-hop semantic snapshot changed",
+                    false,
+                    None,
+                    "conflict",
+                ),
+                Error::Timeout => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout",
+                    "One-hop semantic search timed out",
+                    true,
+                    None,
+                    "timeout",
+                ),
+                Error::ScopeTooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "scope_too_large",
+                    "One-hop semantic scope exceeds its limit",
+                    false,
+                    None,
+                    "scope_too_large",
+                ),
+                Error::HyperedgeTooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "hyperedge_too_large",
+                    "One-hop semantic Hyperedge exceeds its limit",
+                    false,
+                    None,
+                    "hyperedge_too_large",
+                ),
+                Error::ResponseTooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "response_too_large",
+                    "One-hop semantic response exceeds its limit",
+                    false,
+                    None,
+                    "response_too_large",
+                ),
+                Error::VerificationFailed | Error::Signing => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "verification_failed",
+                    "One-hop semantic result verification failed",
+                    false,
+                    None,
+                    "verification_failed",
+                ),
+                Error::Unavailable | Error::Database(_) | Error::Provider(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "One-hop semantic search is unavailable",
+                    true,
+                    None,
+                    "unavailable",
+                ),
+            };
+            metrics::counter!("carryforth_one_hop_semantic_requests_total", "result" => metric)
+                .increment(1);
+            return Err(one_hop_http_error(
+                status,
+                code,
+                message,
+                retryable,
+                retry_after_seconds,
+            ));
+        }
+    };
+    let exact_array = serde_json::to_vec(std::slice::from_ref(&event)).map_err(|_| {
+        one_hop_http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "One-hop semantic search failed internally",
+            false,
+            None,
+        )
+    })?;
+    if exact_array.len() > MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES {
+        return Err(one_hop_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "response_too_large",
+            "One-hop semantic response exceeds its limit",
+            false,
+            None,
+        ));
+    }
+    let value = serde_json::to_value(event).map_err(|_| {
+        one_hop_http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "One-hop semantic search failed internally",
+            false,
+            None,
+        )
+    })?;
+    Ok(Json(Value::Array(vec![value])))
+}
+
+fn body_has_one_hop_semantic_extension(body: &[u8]) -> bool {
+    body.windows(QUOTED_ONE_HOP_SEMANTIC_QUERY_EXTENSION.len())
+        .enumerate()
+        .any(|(index, window)| {
+            window == QUOTED_ONE_HOP_SEMANTIC_QUERY_EXTENSION
+                && body[index + QUOTED_ONE_HOP_SEMANTIC_QUERY_EXTENSION.len()..]
+                    .iter()
+                    .copied()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    == Some(b':')
+        })
+}
+
+fn normalize_one_hop_http_failure(
+    is_one_hop_semantic_request: bool,
+    error: (StatusCode, Json<Value>),
+) -> (StatusCode, Json<Value>) {
+    let (_, Json(body)) = &error;
+    if !is_one_hop_semantic_request || is_closed_one_hop_http_error(body) {
+        return error;
+    }
+    match error.0 {
+        StatusCode::BAD_REQUEST => one_hop_http_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "One-hop semantic request is invalid",
+            false,
+            None,
+        ),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => one_hop_http_error(
+            StatusCode::FORBIDDEN,
+            "restricted",
+            "One-hop semantic search is restricted",
+            false,
+            None,
+        ),
+        StatusCode::NOT_FOUND => one_hop_http_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "One-hop semantic scope was not found",
+            false,
+            None,
+        ),
+        StatusCode::CONFLICT => one_hop_http_error(
+            StatusCode::CONFLICT,
+            "conflict",
+            "One-hop semantic request conflicted with current state",
+            false,
+            None,
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => one_hop_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "scope_too_large",
+            "One-hop semantic request exceeds its resource limit",
+            false,
+            None,
+        ),
+        StatusCode::TOO_MANY_REQUESTS => one_hop_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+            "One-hop semantic search is busy",
+            true,
+            None,
+        ),
+        StatusCode::GATEWAY_TIMEOUT => one_hop_http_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            "One-hop semantic search timed out",
+            true,
+            None,
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => one_hop_http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "One-hop semantic search is unavailable",
+            true,
+            None,
+        ),
+        _ => one_hop_http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "One-hop semantic search failed internally",
+            false,
+            None,
+        ),
+    }
+}
+
+fn is_closed_one_hop_http_error(body: &Value) -> bool {
+    const CODES: &[&str] = &[
+        "invalid_input",
+        "unsupported",
+        "restricted",
+        "not_found",
+        "busy",
+        "conflict",
+        "timeout",
+        "scope_too_large",
+        "hyperedge_too_large",
+        "response_too_large",
+        "unavailable",
+        "verification_failed",
+        "internal",
+    ];
+    const FIELDS: &[&str] = &["code", "message", "retryable", "retry_after_seconds"];
+    let Some(object) = body.as_object() else {
+        return false;
+    };
+    object.keys().all(|key| FIELDS.contains(&key.as_str()))
+        && object
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| CODES.contains(&code))
+        && object.get("message").and_then(Value::as_str).is_some()
+        && object.get("retryable").and_then(Value::as_bool).is_some()
+        && object.get("retry_after_seconds").is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|seconds| (1..=3_600).contains(&seconds))
+        })
+}
+
+fn one_hop_http_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+    retry_after_seconds: Option<u64>,
+) -> (StatusCode, Json<Value>) {
+    let mut body = serde_json::json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    });
+    if let Some(retry_after_seconds) = retry_after_seconds {
+        body["retry_after_seconds"] = serde_json::json!(retry_after_seconds);
+    }
+    (status, Json(body))
 }
 
 async fn execute_semantic_graph_http_query(
@@ -2574,21 +2999,24 @@ pub async fn query_events(
         .map_err(|error| host_lookup_api_error(&error))?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
+    let one_hop_semantic_request = body_has_one_hop_semantic_extension(&body);
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
         "POST",
         &url,
         Some(&body),
         state.config.require_auth_token,
-    )?;
+    )
+    .map_err(|error| normalize_one_hop_http_failure(one_hop_semantic_request, error))?;
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and filter execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes)
+        .await
+        .map_err(|error| normalize_one_hop_http_failure(one_hop_semantic_request, error));
     match &result {
         Ok(Json(Value::Array(events))) => {
             board_read_observation.completed(events.len());
@@ -2668,6 +3096,17 @@ async fn query_events_authed(
             "too-large:coordinate_search:request",
         ));
     }
+    if body_has_one_hop_semantic_extension(body)
+        && body.len() > MAX_ONE_HOP_SEMANTIC_EXACT_HTTP_BODY_BYTES
+    {
+        return Err(one_hop_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "scope_too_large",
+            "One-hop semantic request exceeds its byte limit",
+            false,
+            None,
+        ));
+    }
 
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
@@ -2684,13 +3123,23 @@ async fn query_events_authed(
     let has_coordinate_search_extension = raw_filters
         .iter()
         .any(|filter| filter.get(COORDINATE_SEARCH_QUERY_EXTENSION).is_some());
-    if has_graph_semantic_extension && has_coordinate_search_extension {
+    let has_one_hop_semantic_extension = raw_filters
+        .iter()
+        .any(|filter| filter.get(ONE_HOP_SEMANTIC_QUERY_EXTENSION).is_some());
+    if usize::from(has_graph_semantic_extension)
+        + usize::from(has_coordinate_search_extension)
+        + usize::from(has_one_hop_semantic_extension)
+        > 1
+    {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid:semantic_query:mixed_extensions",
         ));
     }
-    if has_graph_semantic_extension || has_coordinate_search_extension {
+    if has_graph_semantic_extension
+        || has_coordinate_search_extension
+        || has_one_hop_semantic_extension
+    {
         // This supplement to the already-verified caller auth must precede
         // authorization: an unsigned exact body cannot probe even the
         // content-free Project Context read decision.
@@ -2724,6 +3173,23 @@ async fn query_events_authed(
                 ));
             }
         }
+    }
+
+    if let Some(query) = parse_project_context_one_hop_semantic_http_query(
+        body,
+        &raw_filters,
+        &state.relay_keypair.public_key(),
+        &pubkey,
+    )? {
+        return execute_project_context_one_hop_semantic_http_query(
+            state,
+            tenant,
+            body,
+            pubkey,
+            event_id_bytes,
+            query,
+        )
+        .await;
     }
 
     // Coordinate search remains separate from semantic graph traversal. It is
@@ -4796,6 +5262,44 @@ mod tests {
         parse_project_context_coordinate_search_http_query(&body, filters, relay, caller)
     }
 
+    fn one_hop_semantic_fixture(project_id: uuid::Uuid) -> ProjectContextOneHopSemanticQuery {
+        ProjectContextOneHopSemanticQuery {
+            request_id: uuid::Uuid::new_v4(),
+            project_id,
+            query: "  authorization evidence for this role  ".to_owned(),
+            limit: 8,
+            scope: buzz_semantic_query::OneHopSemanticScope::IncidentEdges {
+                coordinate: buzz_project_context::ProjectContextCoordinate::ProjectViewObject {
+                    object_type: buzz_project_view::ProjectViewObjectType::Role,
+                    object_id: uuid::Uuid::new_v4(),
+                },
+            },
+        }
+    }
+
+    fn one_hop_semantic_filter_fixture(
+        relay: &nostr::PublicKey,
+        caller: &nostr::PublicKey,
+        request: &ProjectContextOneHopSemanticQuery,
+    ) -> Value {
+        serde_json::json!({
+            "kinds": [KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+            ONE_HOP_SEMANTIC_QUERY_EXTENSION: request,
+        })
+    }
+
+    fn parse_one_hop_semantic_filters(
+        filters: &[Value],
+        relay: &nostr::PublicKey,
+        caller: &nostr::PublicKey,
+    ) -> Result<Option<ProjectContextOneHopSemanticQuery>, (StatusCode, Json<Value>)> {
+        let body = serde_json::to_vec(filters).expect("serialize one-hop semantic filter body");
+        parse_project_context_one_hop_semantic_http_query(&body, filters, relay, caller)
+    }
+
     #[test]
     fn coordinate_search_filter_parser_accepts_only_its_exact_closed_envelope() {
         let relay = Keys::generate().public_key();
@@ -4892,6 +5396,110 @@ mod tests {
             &caller,
         )
         .is_err());
+    }
+
+    #[test]
+    fn one_hop_semantic_filter_parser_is_exclusive_closed_and_content_free() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let request = one_hop_semantic_fixture(uuid::Uuid::new_v4());
+        let exact = one_hop_semantic_filter_fixture(&relay, &caller, &request);
+        let parsed = parse_one_hop_semantic_filters(std::slice::from_ref(&exact), &relay, &caller)
+            .expect("parse exact one-hop semantic filter")
+            .expect("one-hop semantic extension");
+        assert_eq!(parsed.query, "authorization evidence for this role");
+
+        let canonical_body =
+            serde_json::to_string(std::slice::from_ref(&exact)).expect("one-hop body");
+        let request_id_field = format!("\"request_id\":\"{}\"", request.request_id);
+        let duplicate_request_id = format!("{request_id_field},{request_id_field}");
+        let duplicate_body = canonical_body.replacen(&request_id_field, &duplicate_request_id, 1);
+        let duplicate_values: Vec<Value> =
+            serde_json::from_str(&duplicate_body).expect("generic JSON permits duplicate key");
+        let (status, body) = parse_project_context_one_hop_semantic_http_query(
+            duplicate_body.as_bytes(),
+            &duplicate_values,
+            &relay,
+            &caller,
+        )
+        .expect_err("duplicate request key must fail closed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "invalid_input");
+        assert!(!body.to_string().contains("authorization evidence"));
+
+        let ordinary_virtual = serde_json::json!({
+            "kinds": [KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+        });
+        let (status, body) = parse_one_hop_semantic_filters(&[ordinary_virtual], &relay, &caller)
+            .expect_err("ordinary 40914 must remain unsupported");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "unsupported");
+
+        let mut wrong_author = exact.clone();
+        wrong_author["authors"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        let mut unknown_inner = exact.clone();
+        unknown_inner[ONE_HOP_SEMANTIC_QUERY_EXTENSION]
+            .as_object_mut()
+            .expect("one-hop request object")
+            .insert("role".to_owned(), serde_json::json!("backend"));
+        for invalid in [wrong_author, unknown_inner] {
+            let (_, body) = parse_one_hop_semantic_filters(&[invalid], &relay, &caller)
+                .expect_err("invalid one-hop envelope");
+            assert_eq!(body["code"], "invalid_input");
+            assert!(!body.to_string().contains("backend"));
+        }
+
+        assert!(parse_one_hop_semantic_filters(
+            &[exact, serde_json::json!({"kinds": [1]})],
+            &relay,
+            &caller,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn one_hop_semantic_preflight_failures_use_the_closed_error_contract() {
+        let request_body = format!("[{{\"{ONE_HOP_SEMANTIC_QUERY_EXTENSION}\":{{}}}}]");
+        assert!(body_has_one_hop_semantic_extension(request_body.as_bytes()));
+        assert!(!body_has_one_hop_semantic_extension(
+            br#"[{"query":"carryforth_project_context_one_hop_semantic_search"}]"#,
+        ));
+
+        let (status, body) = normalize_one_hop_http_failure(
+            true,
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "NIP-98 failure containing untrusted detail",
+            ),
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "restricted");
+        assert_eq!(body["retryable"], false);
+        assert!(is_closed_one_hop_http_error(&body));
+        assert!(!body.to_string().contains("untrusted"));
+
+        let closed = one_hop_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "response_too_large",
+            "One-hop semantic response exceeds its limit",
+            false,
+            None,
+        );
+        let preserved = normalize_one_hop_http_failure(true, closed.clone());
+        assert_eq!(preserved.0, closed.0);
+        let (_, Json(preserved_body)) = preserved;
+        let (_, Json(closed_body)) = closed;
+        assert_eq!(preserved_body, closed_body);
+
+        let generic = api_error(StatusCode::SERVICE_UNAVAILABLE, "database detail");
+        let preserved = normalize_one_hop_http_failure(false, generic.clone());
+        assert_eq!(preserved.0, generic.0);
+        let (_, Json(preserved_body)) = preserved;
+        let (_, Json(generic_body)) = generic;
+        assert_eq!(preserved_body, generic_body);
     }
 
     #[test]

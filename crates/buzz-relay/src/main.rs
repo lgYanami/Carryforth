@@ -539,7 +539,10 @@ async fn main() -> anyhow::Result<()> {
     if (state.config.semantic_graph_query_http_available
         || state
             .config
-            .project_context_coordinate_search_http_available)
+            .project_context_coordinate_search_http_available
+        || state
+            .config
+            .project_context_one_hop_semantic_search_http_available)
         && state.config.semantic_graph_query_fleet_policy
             == buzz_semantic_query::SemanticGraphQueryFleetPolicy::TrustedSingleRelay
     {
@@ -554,6 +557,9 @@ async fn main() -> anyhow::Result<()> {
         || state
             .config
             .project_context_coordinate_search_http_available
+        || state
+            .config
+            .project_context_one_hop_semantic_search_http_available
     {
         let provider = state
             .semantic_provider()
@@ -599,6 +605,15 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE requires migration 0059 query schema"
+        );
+    }
+    if state
+        .config
+        .project_context_one_hop_semantic_search_http_available
+        && !state.db.semantic_graph_query_schema_ready().await?
+    {
+        anyhow::bail!(
+            "CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE requires migration 0060 query schema"
         );
     }
 

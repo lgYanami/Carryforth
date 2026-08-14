@@ -1,10 +1,10 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B4已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
+> 状态：实施中；Phase B0–B5已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
-> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`；B4在本计划内增量交付
+> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`、B4 `538aad9a8`；B5在本计划内增量交付
 >
 > 已交付起点检索：
 > [Agent Project Context 自然语言 Coordinate 起点检索分阶段实现计划](project-context-coordinate-search-implementation-plan.md)
@@ -536,6 +536,8 @@ unavailable / verification_failed / internal
 
 retryable code可带`1..=3600`的`retry_after_seconds`，但CLI仍不得自动retry。所有映射输出content-free固定文案，不把Relay
 body原样打印。`not_found`只允许在粗粒度授权通过后用于不存在、已detach或不属于scope的对象。
+完整authenticated filter body超过64KiB时使用唯一request-side 413映射`scope_too_large`；这里的scope指闭合请求
+资源范围，不表示Relay已枚举或泄漏结构候选数量。
 
 ## 4. One-hop closed result合同
 
@@ -1256,6 +1258,13 @@ p50/p95/p99为376/456/456 ms；10k、9 channels、recall 256 hard-cap时为827/9
 cosine内核与predicate-before-distance，不是目标Community canonical join SLO、Provider或multi-pod资格。
 
 ### Phase B5：Relay execution与feature-off capability
+
+> 实施状态：已交付。新增共享`semantic_one_shot`安全封装，Coordinate start search与one-hop search复用同一
+> process admission、authorized ticket、Provider reservation、等待后的writer-fence egress confirm、绝对deadline与
+> release confirm；one-hop执行只产生一个Q0 input并调用Provider一次，不取得traversal semaphore。独立deployment
+> master默认false，NIP-11 capability、status/admin readiness与fleet runtime digest已接线；40914仍只从exclusive
+> `/query`返回。Bridge把认证后所有早期拒绝归一为closed content-free error，host绑定失败仍保持通用、不可枚举的
+> row-zero 404。
 
 交付：ticket、permit、shared Provider reservation、one-call encoding、RR、release、signed Event、HTTP dispatch、
 NIP-11/fleet/config/status/admin readiness。

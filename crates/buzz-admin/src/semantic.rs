@@ -328,6 +328,7 @@ struct QueryHttpRuntimeObservation {
     deployment_master: bool,
     semantic_graph_deployment_master: bool,
     coordinate_search_deployment_master: bool,
+    one_hop_semantic_search_deployment_master: bool,
     fleet_policy: SemanticGraphQueryFleetPolicy,
     deployment_id: Option<String>,
     instance_id: Option<String>,
@@ -342,13 +343,18 @@ const MAX_RELAY_STATUS_BYTES: usize = 64 * 1024;
 fn query_http_runtime_from_environment() -> Result<QueryHttpRuntimeObservation> {
     let semantic_graph_deployment_master = semantic_graph_http_deployment_master()?;
     let coordinate_search_deployment_master = coordinate_search_http_deployment_master()?;
+    let one_hop_semantic_search_deployment_master =
+        one_hop_semantic_search_http_deployment_master()?;
     Ok(QueryHttpRuntimeObservation {
         source: "admin_process_environment",
         endpoint: None,
         live_relay_observed: false,
-        deployment_master: semantic_graph_deployment_master || coordinate_search_deployment_master,
+        deployment_master: semantic_graph_deployment_master
+            || coordinate_search_deployment_master
+            || one_hop_semantic_search_deployment_master,
         semantic_graph_deployment_master,
         coordinate_search_deployment_master,
+        one_hop_semantic_search_deployment_master,
         fleet_policy: query_http_fleet_policy()?,
         deployment_id: optional_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_DEPLOYMENT_ID")?,
         instance_id: optional_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?,
@@ -445,13 +451,22 @@ fn parse_live_query_http_runtime(
     let coordinate_search_runtime = root
         .get("project_context_coordinate_search_http")
         .and_then(serde_json::Value::as_object);
+    let one_hop_semantic_search_runtime = root
+        .get("project_context_one_hop_semantic_search_http")
+        .and_then(serde_json::Value::as_object);
     let semantic_graph_deployment_master =
         required_status_bool(semantic_graph_runtime, "deployment_master")?;
     let coordinate_search_deployment_master = coordinate_search_runtime
         .map(|runtime| required_status_bool(runtime, "deployment_master"))
         .transpose()?
         .unwrap_or(false);
-    let deployment_master = semantic_graph_deployment_master || coordinate_search_deployment_master;
+    let one_hop_semantic_search_deployment_master = one_hop_semantic_search_runtime
+        .map(|runtime| required_status_bool(runtime, "deployment_master"))
+        .transpose()?
+        .unwrap_or(false);
+    let deployment_master = semantic_graph_deployment_master
+        || coordinate_search_deployment_master
+        || one_hop_semantic_search_deployment_master;
     let semantic_graph_parser_ready = required_status_bool(semantic_graph_runtime, "parser_ready")?;
     let semantic_graph_handler_ready =
         required_status_bool(semantic_graph_runtime, "handler_ready")?;
@@ -463,10 +478,20 @@ fn parse_live_query_http_runtime(
         .map(|runtime| required_status_bool(runtime, "handler_ready"))
         .transpose()?
         .unwrap_or(false);
+    let one_hop_semantic_search_parser_ready = one_hop_semantic_search_runtime
+        .map(|runtime| required_status_bool(runtime, "parser_ready"))
+        .transpose()?
+        .unwrap_or(false);
+    let one_hop_semantic_search_handler_ready = one_hop_semantic_search_runtime
+        .map(|runtime| required_status_bool(runtime, "handler_ready"))
+        .transpose()?
+        .unwrap_or(false);
     let parser_ready = (!semantic_graph_deployment_master || semantic_graph_parser_ready)
-        && (!coordinate_search_deployment_master || coordinate_search_parser_ready);
+        && (!coordinate_search_deployment_master || coordinate_search_parser_ready)
+        && (!one_hop_semantic_search_deployment_master || one_hop_semantic_search_parser_ready);
     let handler_ready = (!semantic_graph_deployment_master || semantic_graph_handler_ready)
-        && (!coordinate_search_deployment_master || coordinate_search_handler_ready);
+        && (!coordinate_search_deployment_master || coordinate_search_handler_ready)
+        && (!one_hop_semantic_search_deployment_master || one_hop_semantic_search_handler_ready);
     let fleet_policy: SemanticGraphQueryFleetPolicy =
         required_status_string(semantic_graph_runtime, "fleet_policy")?
             .parse()
@@ -510,6 +535,20 @@ fn parse_live_query_http_runtime(
             }
         }
     }
+    if let Some(one_hop_runtime) = one_hop_semantic_search_runtime {
+        for field in [
+            "fleet_policy",
+            "fleet_attestation_required",
+            "fleet_attestation_status",
+            "deployment_id",
+            "instance_id",
+            "runtime_digest",
+        ] {
+            if one_hop_runtime.get(field) != semantic_graph_runtime.get(field) {
+                anyhow::bail!("live Relay semantic HTTP surfaces disagree on shared field {field}");
+            }
+        }
+    }
     let compiled_runtime_digest = semantic_graph_http_runtime_digest()?.to_hex();
     if runtime_digest != compiled_runtime_digest {
         anyhow::bail!(
@@ -523,6 +562,7 @@ fn parse_live_query_http_runtime(
         deployment_master,
         semantic_graph_deployment_master,
         coordinate_search_deployment_master,
+        one_hop_semantic_search_deployment_master,
         fleet_policy,
         deployment_id,
         instance_id,
@@ -630,6 +670,8 @@ async fn query_readiness(relay_status_url: Option<&url::Url>) -> Result<i32> {
                 .semantic_graph_deployment_master,
             "coordinate_search_http_deployment_master": runtime
                 .coordinate_search_deployment_master,
+            "one_hop_semantic_search_http_deployment_master": runtime
+                .one_hop_semantic_search_deployment_master,
             "http_deployment_id": runtime.deployment_id.as_deref(),
             "http_instance_id": runtime.instance_id.as_deref(),
             "http_runtime_digest": &runtime.runtime_digest,
@@ -697,7 +739,8 @@ async fn query_enable(acknowledge_problem_egress: bool) -> Result<i32> {
         anyhow::bail!(
             "semantic query-enable requires at least one HTTP surface master: \
              BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true or \
-             CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true"
+             CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true or \
+             CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true"
         );
     }
     let fleet_policy = query_http_fleet_policy()?;
@@ -943,8 +986,14 @@ fn coordinate_search_http_deployment_master() -> Result<bool> {
     bool_environment_setting("CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE")
 }
 
+fn one_hop_semantic_search_http_deployment_master() -> Result<bool> {
+    bool_environment_setting("CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE")
+}
+
 fn query_http_deployment_master() -> Result<bool> {
-    Ok(semantic_graph_http_deployment_master()? || coordinate_search_http_deployment_master()?)
+    Ok(semantic_graph_http_deployment_master()?
+        || coordinate_search_http_deployment_master()?
+        || one_hop_semantic_search_http_deployment_master()?)
 }
 
 fn query_http_deployment_id() -> Result<String> {
@@ -1584,6 +1633,42 @@ mod tests {
         assert!(parsed.deployment_master);
         assert!(!parsed.semantic_graph_deployment_master);
         assert!(parsed.coordinate_search_deployment_master);
+        assert!(!parsed.one_hop_semantic_search_deployment_master);
+        assert_eq!(parsed.parser_ready, Some(true));
+        assert_eq!(parsed.handler_ready, Some(true));
+    }
+
+    #[test]
+    fn live_relay_status_accepts_one_hop_search_as_the_only_enabled_surface() {
+        let url = url::Url::parse("http://127.0.0.1:8080/_status").expect("URL");
+        let digest = buzz_semantic_query::semantic_graph_http_runtime_digest()
+            .expect("runtime digest")
+            .to_hex();
+        let shared = json!({
+            "runtime_digest": digest,
+            "parser_ready": true,
+            "handler_ready": true,
+            "fleet_policy": "trusted-single-relay",
+            "fleet_attestation_required": false,
+            "fleet_attestation_status": "not_required",
+            "deployment_id": null,
+            "instance_id": "one-hop-canary"
+        });
+        let mut graph = shared.clone();
+        graph["deployment_master"] = json!(false);
+        let mut one_hop = shared;
+        one_hop["deployment_master"] = json!(true);
+        let status = json!({
+            "service": "buzz-relay",
+            "semantic_graph_query_http": graph,
+            "project_context_one_hop_semantic_search_http": one_hop
+        });
+
+        let parsed = parse_live_query_http_runtime(&url, &status).expect("one-hop-only status");
+        assert!(parsed.deployment_master);
+        assert!(!parsed.semantic_graph_deployment_master);
+        assert!(!parsed.coordinate_search_deployment_master);
+        assert!(parsed.one_hop_semantic_search_deployment_master);
         assert_eq!(parsed.parser_ready, Some(true));
         assert_eq!(parsed.handler_ready, Some(true));
     }

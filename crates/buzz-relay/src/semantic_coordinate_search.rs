@@ -5,16 +5,8 @@
 //! ranks current active-edge Coordinates in one repeatable-read snapshot, and
 //! signs one response-only Event after current release authorization passes.
 
-use std::future::Future;
-use std::time::{Duration, Instant};
-
 use buzz_db::semantic_coordinate_search::SemanticCoordinateSearchVector;
-use buzz_db::semantic_query::{
-    SemanticGraphQueryEgressConfirmation, SemanticGraphQueryEgressConfirmationRequest,
-    SemanticGraphQueryEgressRequest, SemanticGraphQueryEgressReservation,
-    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleaseRequest,
-    SemanticGraphReadTimeouts,
-};
+use buzz_db::semantic_query::SemanticGraphReadTimeouts;
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     build_coordinate_search_encoder_input, derive_coordinate_search_http_request_binding,
@@ -22,9 +14,9 @@ use buzz_semantic_query::{
     ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult,
     SemanticGraphQueryError, MAX_COORDINATE_SEARCH_WALL_TIME_MS,
 };
-use chrono::Utc;
 use nostr::Event;
 
+use crate::semantic_one_shot::{SemanticOneShotError, SemanticOneShotExecution};
 use crate::state::AppState;
 
 /// Closed, content-free failures for the Coordinate-search HTTP surface.
@@ -74,165 +66,64 @@ pub(crate) async fn execute_project_context_coordinate_search(
         return Err(CoordinateSearchExecutionError::Unavailable);
     }
 
-    let deadline =
-        Instant::now() + Duration::from_millis(u64::from(MAX_COORDINATE_SEARCH_WALL_TIME_MS));
-    let _process_permit = state
-        .semantic_graph_query_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| CoordinateSearchExecutionError::Busy)?;
-    let provider = state
-        .semantic_provider()
-        .ok()
-        .flatten()
-        .ok_or(CoordinateSearchExecutionError::Unavailable)?;
     let reader_pubkey = authenticated_caller.to_bytes();
-    let relay_pubkey = state.relay_keypair.public_key();
-
-    let ticket = before_deadline(
-        deadline,
+    let execution = SemanticOneShotExecution::prepare(
+        state,
+        community_id,
+        &reader_pubkey,
         state
-            .db
-            .semantic_graph_query_ticket(community_id, &reader_pubkey, &relay_pubkey),
+            .config
+            .project_context_coordinate_search_http_available,
+        MAX_COORDINATE_SEARCH_WALL_TIME_MS,
     )
-    .await?
-    .map_err(classify_database)?;
-    if provider.source_contract() != &ticket.generation.model_contract {
-        return Err(CoordinateSearchExecutionError::Unavailable);
-    }
+    .await
+    .map_err(map_one_shot)?;
     let encoder_input = build_coordinate_search_encoder_input(&query)
         .map_err(CoordinateSearchExecutionError::Contract)?;
 
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(CoordinateSearchExecutionError::Timeout)?;
-    let latest_start_at = Utc::now()
-        + chrono::Duration::from_std(remaining)
-            .map_err(|_| CoordinateSearchExecutionError::Timeout)?;
-    let reservation = before_deadline(
-        deadline,
-        state
-            .db
-            .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
-                expected_ticket: &ticket,
-                reader_pubkey: &reader_pubkey,
-                expected_projection_pubkey: &relay_pubkey,
-                expected_contexts: &[],
-                provider: &ticket.generation.model_contract.provider,
-                interval: state.config.semantic_worker.request_interval,
-                latest_start_at,
-            }),
-    )
-    .await?
-    .map_err(classify_database)?;
-    let provider_reservation = match reservation {
-        SemanticGraphQueryEgressReservation::Reserved(reservation) => reservation,
-        SemanticGraphQueryEgressReservation::Busy => {
-            return Err(CoordinateSearchExecutionError::Busy);
-        }
-        SemanticGraphQueryEgressReservation::ContextChanged => {
-            return Err(CoordinateSearchExecutionError::Conflict);
-        }
-        SemanticGraphQueryEgressReservation::Unavailable => {
-            return Err(CoordinateSearchExecutionError::Unavailable);
-        }
-    };
-    let (wait, reserved_generation, reserved_context_digest) = provider_reservation.into_parts();
-    before_deadline(deadline, tokio::time::sleep(wait)).await?;
-
-    let routing_trust = crate::semantic_fleet::semantic_graph_query_routing_trust(state)
-        .map_err(|_| CoordinateSearchExecutionError::Unavailable)?;
-    let egress = before_deadline(
-        deadline,
-        state
-            .db
-            .confirm_semantic_graph_query_egress(SemanticGraphQueryEgressConfirmationRequest {
-                expected_ticket: &ticket,
-                reader_pubkey: &reader_pubkey,
-                expected_projection_pubkey: &relay_pubkey,
-                expected_contexts: &[],
-                routing_trust,
-            }),
-    )
-    .await?
-    .map_err(classify_database)?;
-    let egress_permit = match egress {
-        SemanticGraphQueryEgressConfirmation::Permitted(permit) => permit,
-        SemanticGraphQueryEgressConfirmation::ContextChanged => {
-            return Err(CoordinateSearchExecutionError::Conflict);
-        }
-        SemanticGraphQueryEgressConfirmation::FleetUnavailable
-        | SemanticGraphQueryEgressConfirmation::Unavailable => {
-            return Err(CoordinateSearchExecutionError::Unavailable);
-        }
-    };
-    let (permitted_generation, permitted_context_digest) = egress_permit.into_parts();
-    if permitted_generation != reserved_generation
-        || permitted_context_digest != reserved_context_digest
-    {
-        return Err(CoordinateSearchExecutionError::Conflict);
-    }
-
     metrics::histogram!("carryforth_coordinate_search_provider_input_bytes")
         .record(encoder_input.text().len() as f64);
-    let encoded = before_deadline(deadline, provider.encode_coordinate_search(&encoder_input))
-        .await?
+    let encoded = execution
+        .before_deadline(
+            execution
+                .provider()
+                .encode_coordinate_search(&encoder_input),
+        )
+        .await
+        .map_err(map_one_shot)?
         .map_err(CoordinateSearchExecutionError::Provider)?;
     if encoded.request_id() != query.request_id {
         return Err(CoordinateSearchExecutionError::Conflict);
     }
-    let query_vector =
-        SemanticCoordinateSearchVector::new(&ticket, encoded).map_err(classify_database)?;
-
-    let mut read = before_deadline(
-        deadline,
-        state.db.begin_semantic_graph_read(
-            &ticket,
-            &reader_pubkey,
-            relay_pubkey,
-            SemanticGraphReadTimeouts::default(),
-        ),
-    )
-    .await?
-    .map_err(classify_database)?;
-    let batch = before_deadline(
-        deadline,
-        read.search_coordinate_starts(&query_vector, query.limit),
-    )
-    .await?
-    .map_err(classify_database)?;
-    let snapshot_ticket = read.ticket().clone();
-    let snapshot_projection_generation = snapshot_ticket.projection_generation;
-    before_deadline(deadline, read.commit())
-        .await?
+    let query_vector = SemanticCoordinateSearchVector::new(execution.ticket(), encoded)
         .map_err(classify_database)?;
 
-    let release = before_deadline(
-        deadline,
-        state
-            .db
-            .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
-                community_id,
-                reader_pubkey: &reader_pubkey,
-                expected_projection_pubkey: &relay_pubkey,
-                expected_snapshot: Some(&snapshot_ticket),
-                routing_trust,
-            }),
-    )
-    .await?
-    .map_err(classify_database)?;
-    match release {
-        SemanticGraphQueryReleaseConfirmation::Permitted(_permit) => {}
-        SemanticGraphQueryReleaseConfirmation::Denied => {
-            return Err(CoordinateSearchExecutionError::Restricted);
-        }
-        SemanticGraphQueryReleaseConfirmation::SnapshotChanged => {
-            return Err(CoordinateSearchExecutionError::Conflict);
-        }
-        SemanticGraphQueryReleaseConfirmation::FleetUnavailable => {
-            return Err(CoordinateSearchExecutionError::Unavailable);
-        }
-    }
+    let mut read = execution
+        .before_deadline(state.db.begin_semantic_graph_read(
+            execution.ticket(),
+            &reader_pubkey,
+            execution.relay_pubkey(),
+            SemanticGraphReadTimeouts::default(),
+        ))
+        .await
+        .map_err(map_one_shot)?
+        .map_err(classify_database)?;
+    let batch = execution
+        .before_deadline(read.search_coordinate_starts(&query_vector, query.limit))
+        .await
+        .map_err(map_one_shot)?
+        .map_err(classify_database)?;
+    let snapshot_ticket = read.ticket().clone();
+    let snapshot_projection_generation = snapshot_ticket.projection_generation;
+    execution
+        .before_deadline(read.commit())
+        .await
+        .map_err(map_one_shot)?
+        .map_err(classify_database)?;
+    execution
+        .confirm_release(&snapshot_ticket)
+        .await
+        .map_err(map_one_shot)?;
 
     let request_binding_digest = derive_coordinate_search_http_request_binding(
         query.project_id,
@@ -270,22 +161,22 @@ pub(crate) async fn execute_project_context_coordinate_search(
         .map_err(|_| CoordinateSearchExecutionError::Signing)
 }
 
-async fn before_deadline<T, F>(
-    deadline: Instant,
-    future: F,
-) -> Result<T, CoordinateSearchExecutionError>
-where
-    F: Future<Output = T>,
-{
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
-        .await
-        .map_err(|_| CoordinateSearchExecutionError::Timeout)
-}
-
 fn classify_database(error: buzz_db::DbError) -> CoordinateSearchExecutionError {
     match error {
         buzz_db::DbError::AccessDenied(_) => CoordinateSearchExecutionError::Restricted,
         other => CoordinateSearchExecutionError::Database(other),
+    }
+}
+
+fn map_one_shot(error: SemanticOneShotError) -> CoordinateSearchExecutionError {
+    match error {
+        SemanticOneShotError::Restricted => CoordinateSearchExecutionError::Restricted,
+        SemanticOneShotError::Unavailable => CoordinateSearchExecutionError::Unavailable,
+        SemanticOneShotError::Busy => CoordinateSearchExecutionError::Busy,
+        SemanticOneShotError::Conflict => CoordinateSearchExecutionError::Conflict,
+        SemanticOneShotError::Timeout => CoordinateSearchExecutionError::Timeout,
+        SemanticOneShotError::VerificationFailed => CoordinateSearchExecutionError::Unavailable,
+        SemanticOneShotError::Database(error) => CoordinateSearchExecutionError::Database(error),
     }
 }
 

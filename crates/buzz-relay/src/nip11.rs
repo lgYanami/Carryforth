@@ -28,6 +28,8 @@ pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
     "buzz-project-context-semantic-query-http";
 pub(crate) const PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION: &str =
     "carryforth-project-context-coordinate-search-http";
+pub(crate) const PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION: &str =
+    "carryforth-project-context-one-hop-semantic-search-http";
 pub(crate) const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
 pub(crate) const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
 pub(crate) const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
@@ -365,6 +367,22 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         &mut info,
         PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION,
         coordinate_search_ready.value,
+    );
+    let one_hop_semantic_search_ready = semantic_query_http_ready_for_tenant(
+        state,
+        tenant,
+        project_context_edge_ready.value,
+        state
+            .config
+            .project_context_one_hop_semantic_search_http_available,
+        "one_hop_semantic_search",
+    )
+    .await;
+    observations_complete &= one_hop_semantic_search_ready.complete;
+    append_extension(
+        &mut info,
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
+        one_hop_semantic_search_ready.value,
     );
     let project_document_ready = project_document_ready_for_tenant(state, tenant).await;
     observations_complete &= project_document_ready.complete;
@@ -1114,6 +1132,40 @@ mod tests {
             .iter()
             .any(|value| value == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION));
         assert!(PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION.starts_with("carryforth-"));
+    }
+
+    #[test]
+    fn one_hop_semantic_capability_has_an_independent_public_advertisement() {
+        let mut info = RelayInfo::build(
+            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            None,
+            false,
+            true,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+        );
+        append_extension(&mut info, SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION, false);
+        append_extension(
+            &mut info,
+            PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION,
+            false,
+        );
+        append_extension(
+            &mut info,
+            PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
+            true,
+        );
+        let extensions = info.supported_extensions.unwrap_or_default();
+        assert!(extensions
+            .iter()
+            .any(|value| value == PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION));
+        assert!(!extensions
+            .iter()
+            .any(|value| value == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION));
+        assert!(!extensions
+            .iter()
+            .any(|value| value == PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION));
+        assert!(PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION.starts_with("carryforth-"));
     }
 
     #[test]

@@ -44,6 +44,8 @@ mod semantic_graph_observability;
 mod semantic_graph_query;
 mod semantic_graph_response;
 mod semantic_graph_traversal;
+mod semantic_one_hop_search;
+mod semantic_one_shot;
 /// Approved shared semantic Provider adapters.
 pub mod semantic_provider;
 /// Derived Project Context semantic worker.

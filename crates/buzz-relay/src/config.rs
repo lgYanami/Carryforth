@@ -322,6 +322,11 @@ pub struct Config {
     /// This reuses the Community semantic query gate, Provider admission, and
     /// Fleet policy, but defaults off and advertises a separate capability.
     pub project_context_coordinate_search_http_available: bool,
+    /// Independent deployment master for Carryforth one-hop semantic search.
+    ///
+    /// This reuses the Community semantic query gate, Provider admission, and
+    /// Fleet policy, but defaults off and advertises a separate capability.
+    pub project_context_one_hop_semantic_search_http_available: bool,
     /// Maximum concurrent semantic graph requests admitted by this process.
     pub semantic_graph_query_max_in_flight: usize,
     /// Maximum concurrent Stage C database snapshot/traversal sessions.
@@ -1124,6 +1129,10 @@ impl Config {
             "CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE",
             false,
         )?;
+        let project_context_one_hop_semantic_search_http_available = parse_bool(
+            "CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE",
+            false,
+        )?;
         let semantic_graph_query_max_in_flight = usize::try_from(positive_u64_from_env(
             "BUZZ_SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT",
             8,
@@ -1156,7 +1165,9 @@ impl Config {
         let semantic_graph_query_instance_id =
             parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?;
         require_semantic_query_fleet_identities(
-            semantic_graph_query_http_available || project_context_coordinate_search_http_available,
+            semantic_graph_query_http_available
+                || project_context_coordinate_search_http_available
+                || project_context_one_hop_semantic_search_http_available,
             semantic_graph_query_fleet_policy,
             semantic_graph_query_deployment_id.as_deref(),
             semantic_graph_query_instance_id.as_deref(),
@@ -1240,7 +1251,8 @@ impl Config {
         }
         if (semantic_worker_enabled
             || semantic_graph_query_http_available
-            || project_context_coordinate_search_http_available)
+            || project_context_coordinate_search_http_available
+            || project_context_one_hop_semantic_search_http_available)
             && (semantic_api_key.is_none()
                 || semantic_base_url.is_none()
                 || semantic_request_model.is_none())
@@ -1391,6 +1403,7 @@ impl Config {
             semantic_worker,
             semantic_graph_query_http_available,
             project_context_coordinate_search_http_available,
+            project_context_one_hop_semantic_search_http_available,
             semantic_graph_query_max_in_flight,
             semantic_graph_traversal_max_in_flight,
             semantic_graph_query_fleet_policy,
@@ -1637,6 +1650,10 @@ mod tests {
         assert!(
             !config.project_context_coordinate_search_http_available,
             "Coordinate search must remain deployment feature-off by default"
+        );
+        assert!(
+            !config.project_context_one_hop_semantic_search_http_available,
+            "One-hop semantic search must remain deployment feature-off by default"
         );
         assert!(config.slow_client_grace_limit > 0);
         assert!(

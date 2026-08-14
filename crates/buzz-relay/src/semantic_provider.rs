@@ -454,10 +454,12 @@ mod tests {
     use buzz_project_context::ProjectContextCoordinate;
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic_query::{
-        build_coordinate_search_encoder_input, build_query_encoder_inputs,
-        ConditionedContextOverview, LifecycleFilter, ProjectContextCoordinateSearchQuery,
-        QueryCompatibilityFences, SemanticGraphQuery, SemanticGraphQueryBudget,
-        SemanticGraphQueryError, SemanticQueryEncoder, MAX_QUERY_CHANNELS,
+        build_coordinate_search_encoder_input, build_one_hop_semantic_query_encoder_input,
+        build_query_encoder_inputs, ConditionedContextOverview, LifecycleFilter,
+        OneHopSemanticScope, ProjectContextCoordinateSearchQuery,
+        ProjectContextOneHopSemanticQuery, QueryCompatibilityFences, SemanticGraphQuery,
+        SemanticGraphQueryBudget, SemanticGraphQueryError, SemanticQueryEncoder,
+        MAX_QUERY_CHANNELS,
     };
 
     fn provider_config() -> SemanticWorkerConfig {
@@ -654,6 +656,71 @@ mod tests {
         assert_eq!(provider_inputs[0], input.text());
         assert!(!body.to_string().contains("initial_coordinates"));
         assert!(!body.to_string().contains("context_coordinates"));
+    }
+
+    #[tokio::test]
+    async fn one_hop_adapter_sends_exactly_one_q0_provider_input_once() {
+        let contract = SemanticModelContract::volcengine_overview_v1();
+        let payload = serde_json::json!({
+            "model": contract.model,
+            "data": [{
+                "index": 0,
+                "embedding": vec![0.25_f32; contract.dimensions],
+            }],
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_body = Arc::new(Mutex::new(None));
+        let app = Router::new().route(
+            "/api/embeddings",
+            post({
+                let calls = Arc::clone(&calls);
+                let observed_body = Arc::clone(&observed_body);
+                move |Json(body): Json<serde_json::Value>| {
+                    let calls = Arc::clone(&calls);
+                    let observed_body = Arc::clone(&observed_body);
+                    let payload = payload.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        *observed_body.lock().expect("one-hop body lock") = Some(body);
+                        Json(payload)
+                    }
+                }
+            }),
+        );
+        let (base_url, server) = spawn_provider(app).await;
+        let provider = provider_for_base_url(base_url);
+        let request = ProjectContextOneHopSemanticQuery {
+            request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0021),
+            project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0022),
+            query: "authorization evidence for this role".to_owned(),
+            limit: 8,
+            scope: OneHopSemanticScope::IncidentEdges {
+                coordinate: ProjectContextCoordinate::ProjectViewObject {
+                    object_type: ProjectViewObjectType::Role,
+                    object_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0023),
+                },
+            },
+        };
+        let input = build_one_hop_semantic_query_encoder_input(&request).expect("one-hop Q0");
+
+        let encoded = provider
+            .encode_queries(std::slice::from_ref(&input))
+            .await
+            .expect("one-hop Provider response");
+        server.abort();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(encoded[0].request_id(), request.request_id);
+        let body = observed_body
+            .lock()
+            .expect("one-hop body lock")
+            .clone()
+            .expect("observed one-hop body");
+        let provider_inputs = body["input"].as_array().expect("Provider input array");
+        assert_eq!(provider_inputs, &[serde_json::json!(input.text())]);
+        assert!(!body.to_string().contains("coordinate_type"));
+        assert!(!body.to_string().contains("edge_key"));
     }
 
     #[tokio::test]
