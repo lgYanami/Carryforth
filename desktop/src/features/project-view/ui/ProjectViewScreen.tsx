@@ -4,9 +4,7 @@ import {
   LayoutDashboard,
   PanelRightClose,
   PanelRightOpen,
-  Plus,
   RefreshCw,
-  Settings2,
   ShieldCheck,
   WifiOff,
 } from "lucide-react";
@@ -22,6 +20,7 @@ import {
   buildProjectViewExplorerPage,
   canonicalObjectOccurrenceKey,
   indexProjectDocumentCatalog,
+  projectViewCanonicalParent,
   projectViewExplorerFallbackObjectIds,
   resolveProjectViewExplorerSelection,
   type ProjectViewExplorerSelection,
@@ -37,10 +36,15 @@ import {
   canGovernProjectRole,
   projectRoleGovernanceCapabilities,
 } from "@/features/project-view/projectRoleGovernance";
+import { projectViewRoleLifecycleState } from "@/features/project-view/projectViewRoleLifecycle";
+import { ProjectViewContextManagementDialog } from "@/features/project-view/ui/ProjectViewContextManagementDialog";
 import { ProjectViewCurrentDocument } from "@/features/project-view/ui/ProjectViewCurrentDocument";
 import { ProjectViewCurrentObject } from "@/features/project-view/ui/ProjectViewCurrentObject";
 import { ProjectViewDeleteDialog } from "@/features/project-view/ui/ProjectViewDeleteDialog";
-import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInspector";
+import {
+  ProjectViewObjectActions,
+  ProjectViewObjectMaintenance,
+} from "@/features/project-view/ui/ProjectViewObjectMaintenance";
 import { ProjectViewObjectDialog } from "@/features/project-view/ui/ProjectViewObjectDialog";
 import { ProjectViewOutlinePanel } from "@/features/project-view/ui/ProjectViewOutlinePanel";
 import { ProjectViewV3SetupGuide } from "@/features/project-view/ui/ProjectViewV3SetupGuide";
@@ -121,8 +125,11 @@ function ReadyProjectView({
     | { mode: "edit"; object: ProjectViewObject };
 
   const [editor, setEditor] = React.useState<EditorRequest>();
-  const [deleteTarget, setDeleteTarget] = React.useState<ProjectViewObject>();
-  const [maintenanceOpen, setMaintenanceOpen] = React.useState(false);
+  const [deleteTarget, setDeleteTarget] = React.useState<{
+    object: ProjectViewObject;
+    returnObjectId?: string;
+  }>();
+  const [contextTarget, setContextTarget] = React.useState<ProjectViewObject>();
   const headingRef = React.useRef<HTMLHeadingElement>(null);
   const focusMainAfterNavigation = React.useRef(false);
   const lastValidLocation = React.useRef<
@@ -175,6 +182,14 @@ function ReadyProjectView({
   const selectedRoleCanGovern = selectedRoleDefinition
     ? canGovernProjectRole(roleGovernance, selectedRoleDefinition.level)
     : false;
+  const selectedObjectCanMaintain = Boolean(
+    selectedObject &&
+      (selectedObject.objectType !== "role" || selectedRoleCanGovern),
+  );
+  const selectedRoleLifecycle = React.useMemo(
+    () => projectViewRoleLifecycleState(selectedRoleDefinition, roleContinuity),
+    [roleContinuity, selectedRoleDefinition],
+  );
 
   const commitSelection = React.useCallback(
     (next?: ProjectViewExplorerSelection, options?: { replace?: boolean }) => {
@@ -239,11 +254,12 @@ function ReadyProjectView({
   }, [explorer, page, requestKey, resolvedSelection.resolution]);
 
   React.useEffect(() => {
-    if (outlineOpen) setMaintenanceOpen(false);
-  }, [outlineOpen]);
+    if (contextTarget && contextTarget.id !== selectedObject?.id) {
+      setContextTarget(undefined);
+    }
+  }, [contextTarget, selectedObject?.id]);
 
   React.useEffect(() => {
-    if (page.kind === "document") setMaintenanceOpen(false);
     if (!focusMainAfterNavigation.current) return;
     focusMainAfterNavigation.current = false;
     window.requestAnimationFrame(() => {
@@ -251,11 +267,11 @@ function ReadyProjectView({
         headingRef.current.focus();
       }
     });
-  }, [page.kind, page.occurrenceKey]);
+  }, [page.occurrenceKey]);
 
   const navigateFromMain = React.useCallback(
     (next: ProjectViewExplorerSelection) => {
-      setMaintenanceOpen(false);
+      setContextTarget(undefined);
       focusMainAfterNavigation.current = true;
       commitSelection(next);
     },
@@ -271,25 +287,25 @@ function ReadyProjectView({
     },
     [commitSelection, isOverlay, onOutlineOpenChange],
   );
-  const selectObjectFromMaintenance = React.useCallback(
-    (objectId: string) => commitSelection({ kind: "object", objectId }),
-    [commitSelection],
-  );
-
-  function openMaintenance() {
-    onOutlineOpenChange(false);
-    setMaintenanceOpen(true);
+  function selectObjectFromContext(objectId: string) {
+    setContextTarget(undefined);
+    focusMainAfterNavigation.current = true;
+    commitSelection({ kind: "object", objectId });
   }
 
-  function closeMaintenance() {
-    setMaintenanceOpen(false);
-    onOutlineOpenChange(!isOverlay);
+  function requestDelete(object: ProjectViewObject) {
+    const canonicalParent = projectViewCanonicalParent(explorer, object.id);
+    setDeleteTarget({
+      object,
+      returnObjectId: canonicalParent?.objectId,
+    });
   }
 
   function navigateAfterDelete() {
-    const parent = page.parent;
     commitSelection(
-      parent ? { kind: "object", objectId: parent.objectId } : undefined,
+      deleteTarget?.returnObjectId
+        ? { kind: "object", objectId: deleteTarget.returnObjectId }
+        : undefined,
     );
   }
 
@@ -322,27 +338,19 @@ function ReadyProjectView({
         {page.kind === "object" ? (
           <ProjectViewCurrentObject
             actions={
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  data-testid="project-view-add"
-                  onClick={() => setEditor({ mode: "create" })}
-                  size="sm"
-                  type="button"
-                >
-                  <Plus />
-                  Add
-                </Button>
-                <Button
-                  data-testid="project-view-manage-current"
-                  onClick={openMaintenance}
-                  size="sm"
-                  type="button"
-                  variant="outline"
-                >
-                  <Settings2 />
-                  Manage current object
-                </Button>
-              </div>
+              <ProjectViewObjectActions
+                canCreateRole={roleGovernance.canCreateMemberRole}
+                canMaintain={selectedObjectCanMaintain}
+                lifecycle={selectedRoleLifecycle}
+                object={page.currentObject}
+                onCreate={(initialType, context) =>
+                  setEditor({ mode: "create", initialType, context })
+                }
+                onDelete={requestDelete}
+                onEdit={(object) => setEditor({ mode: "edit", object })}
+                onManageContext={setContextTarget}
+                onShowInProjectContext={onShowInProjectContext}
+              />
             }
             documentsLoading={
               documentMetaQuery.isPending ||
@@ -351,7 +359,18 @@ function ReadyProjectView({
             headingRef={headingRef}
             onNavigate={navigateFromMain}
             page={page}
-          />
+          >
+            <ProjectViewObjectMaintenance
+              actorProfiles={actorProfiles}
+              currentPubkey={currentPubkey}
+              lifecycle={selectedRoleLifecycle}
+              object={page.currentObject}
+              projectionGeneration={projectionGeneration}
+              projectRevision={projectRevision}
+              roleContinuity={roleContinuity}
+              roleDefinition={selectedRoleDefinition}
+            />
+          </ProjectViewCurrentObject>
         ) : (
           <ProjectViewCurrentDocument
             actorProfiles={actorProfiles}
@@ -375,28 +394,7 @@ function ReadyProjectView({
           </footer>
         </div>
       </main>
-      {maintenanceOpen && selectedObject ? (
-        <ProjectViewInspector
-          actorProfiles={actorProfiles}
-          currentPubkey={currentPubkey}
-          contextCapability={contextCapability}
-          object={selectedObject}
-          objectsById={objectsById}
-          onClose={closeMaintenance}
-          onDelete={setDeleteTarget}
-          onEdit={(object) => setEditor({ mode: "edit", object })}
-          onRefresh={onRefresh}
-          onSelectObject={selectObjectFromMaintenance}
-          onShowInProjectContext={onShowInProjectContext}
-          projectionGeneration={projectionGeneration}
-          projectRevision={projectRevision}
-          roleContinuity={roleContinuity}
-          roleDefinition={selectedRoleDefinition}
-          roleGovernance={roleGovernance}
-          view={view}
-        />
-      ) : null}
-      {outlineOpen && !maintenanceOpen ? (
+      {outlineOpen ? (
         <ProjectViewOutlinePanel
           currentOccurrenceKey={page.occurrenceKey}
           model={explorer}
@@ -404,6 +402,24 @@ function ReadyProjectView({
           onNavigate={navigateFromOutline}
         />
       ) : null}
+      <ProjectViewContextManagementDialog
+        actingAssignmentId={
+          contextTarget?.objectType === "role"
+            ? roleGovernance.actingAssignmentId
+            : undefined
+        }
+        canMutate={selectedObjectCanMaintain}
+        contextCapability={contextCapability}
+        object={contextTarget}
+        objectsById={objectsById}
+        onOpenChange={(open) => {
+          if (!open) setContextTarget(undefined);
+        }}
+        onRefresh={onRefresh}
+        onSelectObject={selectObjectFromContext}
+        open={Boolean(contextTarget)}
+        projectRevision={projectRevision}
+      />
       {editor ? (
         <ProjectViewObjectDialog
           canCreateAdminRole={roleGovernance.canCreateAdminRole}
@@ -431,25 +447,13 @@ function ReadyProjectView({
           open
           projectRevision={projectRevision}
           roleHasActiveAssignment={
-            editor.mode === "edit" &&
-            editor.object.objectType === "role" &&
-            Boolean(
-              roleContinuity?.assignments.some(
-                (assignment) =>
-                  assignment.roleId === editor.object.id && !assignment.endedAt,
-              ),
-            )
+            editor.mode === "edit" && selectedRoleLifecycle.hasActiveAssignment
           }
           roleHasOpenProposal={
-            editor.mode === "edit" &&
-            editor.object.objectType === "role" &&
-            Boolean(
-              roleContinuity?.proposals.some(
-                (proposal) =>
-                  proposal.roleId === editor.object.id &&
-                  proposal.status === "open",
-              ),
-            )
+            editor.mode === "edit" && selectedRoleLifecycle.hasOpenProposal
+          }
+          roleHasResponsibleWork={
+            editor.mode === "edit" && selectedRoleLifecycle.hasResponsibleWork
           }
           roleActingAssignmentId={roleGovernance.actingAssignmentId}
           view={view}
@@ -457,7 +461,7 @@ function ReadyProjectView({
       ) : null}
       <ProjectViewDeleteDialog
         actingAssignmentId={roleGovernance.actingAssignmentId}
-        object={deleteTarget}
+        object={deleteTarget?.object}
         onDeleted={navigateAfterDelete}
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(undefined);
@@ -465,7 +469,20 @@ function ReadyProjectView({
         onReviewLatest={onRefresh}
         open={Boolean(deleteTarget)}
         projectRevision={projectRevision}
+        roleLifecycle={
+          deleteTarget?.object.objectType === "role"
+            ? selectedRoleLifecycle
+            : undefined
+        }
         view={view}
+        workHasActiveCommitment={Boolean(
+          deleteTarget?.object.objectType === "work" &&
+            roleContinuity?.commitments.some(
+              (commitment) =>
+                commitment.workId === deleteTarget.object.id &&
+                !commitment.endedAt,
+            ),
+        )}
       />
     </div>
   );

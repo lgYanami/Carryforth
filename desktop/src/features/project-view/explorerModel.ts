@@ -928,3 +928,14 @@ export function projectViewExplorerFallbackObjectIds(
   }
   return objectIds;
 }
+
+/** Resolve the structural parent used after deleting an object from any occurrence. */
+export function projectViewCanonicalParent(
+  model: ProjectViewExplorerModel,
+  objectId: string,
+): ProjectViewExplorerParent | undefined {
+  const occurrence = model.canonicalOccurrenceByObjectId.get(objectId);
+  return occurrence
+    ? model.parentObjectByOccurrence.get(occurrence)
+    : undefined;
+}

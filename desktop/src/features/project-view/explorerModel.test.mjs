@@ -8,6 +8,7 @@ import {
   documentContextOccurrenceKey,
   indexProjectDocumentCatalog,
   issueAboutOccurrenceKey,
+  projectViewCanonicalParent,
   projectViewExplorerFallbackObjectIds,
   resolveProjectViewExplorerSelection,
   resourceGuideOccurrenceKey,
@@ -438,6 +439,10 @@ test("parent navigation follows the selected occurrence instead of object identi
   assert.deepEqual(aliasIssue.parent, {
     objectId: "plan",
     title: "Desktop delivery",
+  });
+  assert.deepEqual(projectViewCanonicalParent(model, "issue-related"), {
+    objectId: "profile",
+    title: "Carryforth",
   });
 
   const unboundPlan = buildProjectViewExplorerPage(model, {

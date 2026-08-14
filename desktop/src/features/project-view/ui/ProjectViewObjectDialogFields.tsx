@@ -38,6 +38,7 @@ export function ProjectViewObjectTextFields({
   guideOptions,
   roleHasActiveAssignment,
   roleHasOpenProposal,
+  roleHasResponsibleWork,
   roleCreation,
   set,
   type,
@@ -47,6 +48,7 @@ export function ProjectViewObjectTextFields({
   guideOptions: Array<{ value: string; label: string }>;
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
+  roleHasResponsibleWork?: boolean;
   roleCreation: boolean;
   set: SetFormField;
   type: ProjectViewObjectType;
@@ -150,13 +152,19 @@ export function ProjectViewObjectTextFields({
                 ? "End or replace the active Assignment before deactivating this Role."
                 : roleHasOpenProposal
                   ? "Resolve or withdraw the open Proposal before deactivating this Role."
-                  : "An active Assignment projects this Role's level into Community membership."}
+                  : roleHasResponsibleWork
+                    ? "Clear or reassign this Role's Work before deactivating this Role."
+                    : "An active Assignment projects this Role's level into Community membership."}
             </div>
           </div>
           <Switch
             aria-label="Active role"
             checked={form.active}
-            disabled={roleHasActiveAssignment || roleHasOpenProposal}
+            disabled={
+              roleHasActiveAssignment ||
+              roleHasOpenProposal ||
+              roleHasResponsibleWork
+            }
             onCheckedChange={(value) => set("active", value)}
           />
         </div>

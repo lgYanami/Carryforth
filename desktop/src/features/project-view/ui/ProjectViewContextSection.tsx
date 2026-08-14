@@ -34,6 +34,13 @@ function contextLabel(
     const resource = objectsById.get(reference.resourceId);
     return resource ? projectViewObjectTitle(resource) : reference.resourceId;
   }
+  if (reference.mode === "pinned") {
+    const shortId =
+      reference.documentId.length > 12
+        ? reference.documentId.slice(0, 8)
+        : reference.documentId;
+    return `Document ${shortId} · pinned revision ${reference.documentRevision ?? "?"}`;
+  }
   return documents.get(reference.documentId) ?? reference.documentId;
 }
 

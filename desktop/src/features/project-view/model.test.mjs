@@ -17,7 +17,13 @@ import {
 const actor = "a".repeat(64);
 const now = "2026-07-27T08:00:00Z";
 
-function objectV3(objectType, id, data, relations = {}) {
+function objectV3(
+  objectType,
+  id,
+  data,
+  relations = {},
+  contextReferences = [],
+) {
   return {
     id,
     object_type: objectType,
@@ -29,7 +35,7 @@ function objectV3(objectType, id, data, relations = {}) {
     updated_by: actor,
     data: { object_type: objectType, data },
     relations,
-    context_references: [],
+    context_references: contextReferences,
   };
 }
 
@@ -97,6 +103,46 @@ test("normalization preserves the canonical hierarchy and camel-cases typed data
     },
     underGoalId: "goal",
   });
+});
+
+test("incoming references include Resource Context coordinates", () => {
+  const profile = objectV3("project_profile", "profile", {
+    name: "Lora",
+    positioning: "Shared context",
+    purpose: "Coordinate",
+    problem: "Fragmentation",
+    scope: "Project context",
+  });
+  const goal = objectV3("goal", "goal", {
+    title: "Ship",
+    desired_outcome: "A legible project",
+    directions: [],
+  });
+  const resource = objectV3("resource", "resource", {
+    name: "Repository",
+    resource_kind: "repository",
+    guide_document_id: "document-1",
+  });
+  const issue = objectV3(
+    "issue",
+    "issue",
+    {
+      title: "Context",
+      description: "Uses the repository",
+      status: "open",
+      priority: "normal",
+    },
+    {},
+    [{ type: "resource", resource_id: "resource" }],
+  );
+  const view = assembleProjectViewV3([profile, goal, resource, issue]);
+
+  assert.deepEqual(
+    projectViewIncomingReferences(view, "resource").map(
+      ({ relation, source }) => [relation, source.id],
+    ),
+    [["context resource", "issue"]],
+  );
 });
 
 test("normalization rejects a mismatched outer and inner object type", () => {

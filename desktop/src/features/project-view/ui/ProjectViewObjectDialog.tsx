@@ -113,6 +113,7 @@ function emptyForm(
     underGoalId: context?.underGoalId ?? "",
     underPlanId: context?.underPlanId ?? "",
     plannedInStageId: context?.plannedInStageId ?? "",
+    aboutId: context?.about?.objectId ?? "",
     handlesId: context?.handles?.objectId ?? "",
   };
 }
@@ -356,6 +357,7 @@ export function ProjectViewObjectDialog({
   projectRevision,
   roleHasActiveAssignment,
   roleHasOpenProposal,
+  roleHasResponsibleWork,
   roleActingAssignmentId,
   view,
 }: {
@@ -373,6 +375,7 @@ export function ProjectViewObjectDialog({
   projectRevision: number;
   roleHasActiveAssignment?: boolean;
   roleHasOpenProposal?: boolean;
+  roleHasResponsibleWork?: boolean;
   roleActingAssignmentId?: string;
   view: ProjectView;
 }) {
@@ -541,14 +544,18 @@ export function ProjectViewObjectDialog({
     let createdGuideForRetry: string | undefined;
     try {
       if (
-        (roleHasActiveAssignment || roleHasOpenProposal) &&
+        (roleHasActiveAssignment ||
+          roleHasOpenProposal ||
+          roleHasResponsibleWork) &&
         objectType === "role" &&
         !form.active
       ) {
         setError(
           roleHasActiveAssignment
             ? "End or replace the active Assignment before deactivating this Role."
-            : "Resolve or withdraw the open Proposal before deactivating this Role.",
+            : roleHasOpenProposal
+              ? "Resolve or withdraw the open Proposal before deactivating this Role."
+              : "Clear or reassign this Role's Work before deactivating this Role.",
         );
         return;
       }
@@ -738,6 +745,7 @@ export function ProjectViewObjectDialog({
               guideOptions={guideOptions}
               roleHasActiveAssignment={roleHasActiveAssignment}
               roleHasOpenProposal={roleHasOpenProposal}
+              roleHasResponsibleWork={roleHasResponsibleWork}
               roleCreation={mode === "create"}
               set={set}
               type={objectType}

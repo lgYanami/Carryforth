@@ -877,7 +877,8 @@ Object 页面上下文：
 - `ProjectViewDeleteDialog.tsx`
   - 保留删除保护。
 - `ProjectRoleInspector.tsx`
-  - 提取为不依赖 Inspector 容器的 `ProjectRoleContinuitySection`；
+  - 作为不依赖 Inspector 容器的 Current Role continuity section 直接复用；
+  - 文件名暂时保留以减少无关重命名，职责不再依赖右侧 Inspector；
   - 保留现有 mutations 和 history paging。
 - `ProjectWorkContinuity.tsx`
   - 作为 Current Work 的内容区保留。
@@ -894,14 +895,18 @@ desktop/src/features/project-view/
 ├── explorerModel.test.mjs
 ├── outlineState.ts
 ├── outlineState.test.mjs
+├── projectViewCreateActions.ts
+├── projectViewRoleLifecycle.ts
 └── ui/
     ├── ProjectViewExplorer.tsx
     ├── ProjectViewOutline.tsx
     ├── ProjectViewOutlineNode.tsx
     ├── ProjectViewCurrentObject.tsx
     ├── ProjectViewCurrentDocument.tsx
+    ├── ProjectViewCreateMenu.tsx
     ├── ProjectViewParentNavigation.tsx
     ├── ProjectViewObjectDetails.tsx
+    ├── ProjectViewObjectMaintenance.tsx
     ├── ProjectViewSummaryGroup.tsx
     ├── ProjectViewSummaryItem.tsx
     ├── ProjectViewRelatedContextItems.tsx

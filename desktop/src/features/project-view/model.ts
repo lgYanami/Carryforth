@@ -20,7 +20,8 @@ export type ProjectViewIncomingReference = {
     | "under plan"
     | "planned in stage"
     | "about"
-    | "handles";
+    | "handles"
+    | "context resource";
   source: ProjectViewObject;
 };
 
@@ -242,6 +243,15 @@ export function projectViewIncomingReferences(
     }
     if (source.relations.handles?.objectId === targetId) {
       references.push({ source, relation: "handles" });
+    }
+    if (
+      source.contextReferences?.some(
+        (reference) =>
+          reference.referenceType === "resource" &&
+          reference.resourceId === targetId,
+      )
+    ) {
+      references.push({ source, relation: "context resource" });
     }
   }
   return references;
