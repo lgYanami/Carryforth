@@ -8,7 +8,6 @@ import {
   X,
 } from "lucide-react";
 import * as React from "react";
-import { Link } from "@tanstack/react-router";
 
 import {
   formatProjectViewTerm,
@@ -25,6 +24,10 @@ import {
   type ProjectRoleGovernanceCapabilities,
 } from "@/features/project-view/projectRoleGovernance";
 import { ProjectViewContextSection } from "@/features/project-view/ui/ProjectViewContextSection";
+import {
+  ProjectViewDetail,
+  ProjectViewObjectDetails,
+} from "@/features/project-view/ui/ProjectViewObjectDetails";
 import { ProjectRoleInspector } from "@/features/project-view/ui/ProjectRoleInspector";
 import { ProjectWorkContinuity } from "@/features/project-view/ui/ProjectWorkContinuity";
 import type {
@@ -72,99 +75,6 @@ const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
 function formatDateTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : dateTimeFormatter.format(date);
-}
-
-function Detail({
-  children,
-  label,
-}: {
-  children: React.ReactNode;
-  label: string;
-}) {
-  return (
-    <div>
-      <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-        {label}
-      </div>
-      <div className="mt-1 text-sm leading-relaxed">{children}</div>
-    </div>
-  );
-}
-
-function StringList({ items }: { items: string[] }) {
-  if (items.length === 0) {
-    return <span className="text-muted-foreground">None</span>;
-  }
-  return (
-    <ul className="space-y-1.5">
-      {items.map((item) => (
-        <li className="flex gap-2" key={item}>
-          <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-muted-foreground" />
-          <span>{item}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ObjectDetails({ object }: { object: ProjectViewObject }) {
-  switch (object.objectType) {
-    case "project_profile":
-      return (
-        <>
-          <Detail label="Positioning">{object.data.positioning}</Detail>
-          <Detail label="Purpose">{object.data.purpose}</Detail>
-          <Detail label="Problem">{object.data.problem}</Detail>
-          <Detail label="Scope">{object.data.scope}</Detail>
-        </>
-      );
-    case "goal":
-      return (
-        <>
-          <Detail label="Desired outcome">{object.data.desiredOutcome}</Detail>
-          <Detail label="Directions">
-            <StringList items={object.data.directions} />
-          </Detail>
-        </>
-      );
-    case "role":
-      return (
-        <>
-          <Detail label="Purpose">{object.data.purpose}</Detail>
-          <Detail label="Responsibilities">
-            <StringList items={object.data.responsibilities} />
-          </Detail>
-          <Detail label="Boundaries">
-            <StringList items={object.data.boundaries} />
-          </Detail>
-        </>
-      );
-    case "resource":
-      return (
-        <>
-          <Detail label="Resource kind">
-            {formatProjectViewTerm(object.data.resourceKind)}
-          </Detail>
-          <Detail label="Guide">
-            <Button asChild size="sm" variant="outline">
-              <Link
-                search={{ document: object.data.guideDocumentId }}
-                to="/documents"
-              >
-                Open verified Guide
-                <ArrowRight />
-              </Link>
-            </Button>
-          </Detail>
-        </>
-      );
-    case "plan":
-    case "stage":
-    case "requirement":
-    case "issue":
-    case "work":
-      return <Detail label="Description">{object.data.description}</Detail>;
-  }
 }
 
 function RelationLink({
@@ -349,9 +259,11 @@ function ProjectViewInspectorContent({
 
         <div className="space-y-4">
           {object.data.summary ? (
-            <Detail label="Retrieval summary">{object.data.summary}</Detail>
+            <ProjectViewDetail label="Retrieval summary">
+              {object.data.summary}
+            </ProjectViewDetail>
           ) : null}
-          <ObjectDetails object={object} />
+          <ProjectViewObjectDetails object={object} />
         </div>
 
         {roleLifecycleBlocked ? (
@@ -434,10 +346,14 @@ function ProjectViewInspectorContent({
             <h3 className="text-xs font-semibold">Verified projection</h3>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <Detail label="Object revision">{object.objectRevision}</Detail>
-            <Detail label="Project revision">{object.projectRevision}</Detail>
+            <ProjectViewDetail label="Object revision">
+              {object.objectRevision}
+            </ProjectViewDetail>
+            <ProjectViewDetail label="Project revision">
+              {object.projectRevision}
+            </ProjectViewDetail>
           </div>
-          <Detail label="Created">
+          <ProjectViewDetail label="Created">
             <span>{formatDateTime(object.createdAt)}</span>
             <span className="mt-1 block text-xs text-muted-foreground">
               by{" "}
@@ -448,8 +364,8 @@ function ProjectViewInspectorContent({
                 pubkeyTestId="project-view-created-by"
               />
             </span>
-          </Detail>
-          <Detail label="Last updated">
+          </ProjectViewDetail>
+          <ProjectViewDetail label="Last updated">
             <span>{formatDateTime(object.updatedAt)}</span>
             <span className="mt-1 block text-xs text-muted-foreground">
               by{" "}
@@ -460,10 +376,10 @@ function ProjectViewInspectorContent({
                 pubkeyTestId="project-view-updated-by"
               />
             </span>
-          </Detail>
-          <Detail label="Object ID">
+          </ProjectViewDetail>
+          <ProjectViewDetail label="Object ID">
             <span className="break-all font-mono text-xs">{object.id}</span>
-          </Detail>
+          </ProjectViewDetail>
         </section>
       </div>
     </>
