@@ -1,6 +1,6 @@
 # Desktop 聚焦式 Full Project View 实现设计
 
-> 状态：已确认，待实现。
+> 状态：已确认，已完成五阶段交付。
 >
 > 日期：2026-08-14；最后更新：2026-08-15。
 >
@@ -10,7 +10,7 @@
 
 ## 1. 文档目的
 
-当前 Desktop 已经交付两种 Project View 阅读密度：
+改造前 Desktop 已经交付两种 Project View 阅读密度：
 
 - `/community` 提供 Community / Project Space 的默认摘要；
 - `/view` 提供完整 Project View、对象维护和 Inspector。
@@ -62,23 +62,21 @@ Project View 把 Goal、Plan、Stage、Requirement、Issue 和 Work 同时展开
 > 右侧目录始终提供全局结构和当前位置；主内容始终只完整展示一个当前项；页面中的其余
 > 对象全部只是类型、标题和 Summary 组成的下一步入口。
 
-## 3. 当前实现与问题
+## 3. 改造前实现与问题
 
-### 3.1 当前页面组成
+### 3.1 改造前页面组成
 
-当前 `/view` 由
+改造前 `/view` 由
 [`ProjectViewScreen.tsx`](../../../../desktop/src/features/project-view/ui/ProjectViewScreen.tsx)
 组织，Ready 状态依次渲染：
 
 - 顶部 Add 操作；
 - Project Profile；
 - Current Focus 四项指标；
-- [`ProjectViewMap.tsx`](../../../../desktop/src/features/project-view/ui/ProjectViewMap.tsx)
-  中的全量对象树；
+- `ProjectViewMap.tsx` 中的全量对象树；
 - Role 和 Resource；
 - 页脚验证信息；
-- 选中对象时的
-  [`ProjectViewInspector.tsx`](../../../../desktop/src/features/project-view/ui/ProjectViewInspector.tsx)。
+- 选中对象时的 `ProjectViewInspector.tsx`。
 
 `ProjectViewMap` 在同一页面递归展开：
 
@@ -887,7 +885,7 @@ Object 页面上下文：
 - `ProjectViewStates.tsx`、`ProjectViewV3SetupGuide.tsx`
   - 保持 loading / unsupported / forbidden / uninitialized / integrity 状态。
 
-### 12.2 新增文件建议
+### 12.2 实际交付文件
 
 ```text
 desktop/src/features/project-view/
@@ -896,11 +894,12 @@ desktop/src/features/project-view/
 ├── outlineState.ts
 ├── outlineState.test.mjs
 ├── projectViewCreateActions.ts
+├── projectViewCreateActions.test.mjs
 ├── projectViewRoleLifecycle.ts
+├── projectViewRoleLifecycle.test.mjs
 └── ui/
-    ├── ProjectViewExplorer.tsx
     ├── ProjectViewOutline.tsx
-    ├── ProjectViewOutlineNode.tsx
+    ├── ProjectViewOutlinePanel.tsx
     ├── ProjectViewCurrentObject.tsx
     ├── ProjectViewCurrentDocument.tsx
     ├── ProjectViewCreateMenu.tsx
@@ -913,15 +912,15 @@ desktop/src/features/project-view/
     └── ProjectViewContextManagementDialog.tsx
 ```
 
-命名可以在实现时按现有文件大小门禁调整，但纯 model、Outline、Current Object 和
-Summary item 的职责不得重新混回一个巨型组件。
+纯 model、Outline、Current Object 和 Summary item 保持独立职责，没有重新混回单一
+巨型组件。
 
 ### 12.3 删除或退役
 
-- `ProjectViewMap.tsx`：退役，不再渲染全量嵌套地图；
-- `ProjectViewInspector.tsx`：删除容器，通用详情提取到 Current Object；
-- `ProjectViewObjectCard.tsx`：不再用于 Full View 的非当前对象；如无其他调用则删除；
-- `keyboardNavigation.ts`：退役旧地图卡片循环导航，逻辑由 Outline 可见节点导航取代；
+- `ProjectViewMap.tsx`：已删除，不再渲染全量嵌套地图；
+- `ProjectViewInspector.tsx`：已删除容器，通用详情已经提取到 Current Object；
+- `ProjectViewObjectCard.tsx`：确认无其他调用后已删除；
+- `keyboardNavigation.ts` 及其测试：已删除，导航逻辑由 Outline 可见节点导航取代；
 - `ProjectRoleCard.tsx`：Community Overview 继续使用，不因 Full View 重做而删除。
 
 ### 12.4 API 与 query 层
@@ -1173,9 +1172,20 @@ just desktop-tauri-test
 本设计本身不要求修改 Rust 或 Relay，因此正常实现应优先保持在 Desktop React / query
 presentation 层。
 
+### 16.5 交付验证记录
+
+2026-08-15 五阶段交付收口时：
+
+- `just desktop-check` 与 `pnpm --dir desktop typecheck` 通过；
+- `just desktop-test` 通过，共 3731 项；
+- `project-view.spec.ts` 的 mock-Tauri smoke 测试通过，共 43 个场景；
+- 按 16.3 的七类状态生成并人工检查截图，七份 SHA-256 均不同；截图测试使用
+  `waitForAnimations(page)`，临时证据代码未作为产品测试提交；
+- 未修改 Tauri、Rust、Relay 或数据库边界，因此没有增加对应后端门禁。
+
 ## 17. 实施顺序
 
-### Slice 1：纯 Explorer model
+### Slice 1：纯 Explorer model（已完成）
 
 - 增加 Current Item、direct children、Issue / Resource alias、Document occurrence 的纯
   model；
@@ -1184,7 +1194,7 @@ presentation 层。
 - 完成模型单元测试；
 - 不改变现有 UI。
 
-### Slice 2：Main 单层页面
+### Slice 2：Main 单层页面（已完成）
 
 - 提取原 Inspector 的 Object Details；
 - 实现 Current Object 页面；
@@ -1194,20 +1204,20 @@ presentation 层。
 - 接入 structural children、Related Issues、Related Resources 和 Documents；
 - 保留原 Inspector 作为短期对照，但不同时交付给用户。
 
-### Slice 3：Project Outline 与路由
+### Slice 3：Project Outline 与路由（已完成）
 
 - 实现右侧 tree、occurrence key、展开状态和高亮；
 - 扩展互斥的 object / document + revision selection 和可选 `via` route search；
 - 完成 Summary / Outline / Parent 双向导航和 Back / Forward；
 - 完成宽 / 窄响应式。
 
-### Slice 4：维护能力迁移
+### Slice 4：维护能力迁移（已完成）
 
 - 把 Edit、Delete、Context、Role Continuity、Work Continuity 移入 Current Object；
 - 拆分 Context 展示和管理；
 - 保持 conflict 草稿、治理和删除保护。
 
-### Slice 5：删除旧投影并收口
+### Slice 5：删除旧投影并收口（已完成）
 
 - 删除 `ProjectViewMap` 和 `ProjectViewInspector` 容器；
 - 移除 Full View 重复的 Current Focus 和 Supporting Objects 平面；
