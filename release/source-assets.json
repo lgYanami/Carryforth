@@ -403,7 +403,7 @@
           },
           {
             "path": "Cargo.lock",
-            "sha256": "354561e299a87661500f87ea20e6da0f7a7dacc13bd726c78d7d2610e710e298"
+            "sha256": "66fc85dc70382c7554188b3d351b7d9f427b8b368cd332a4b85336eec438dcb8"
           }
         ],
         "recipe": "Encode a fixed 2x2 RGB pixel grid (red, red, green, green) with the pinned lossless WebP encoder.",
