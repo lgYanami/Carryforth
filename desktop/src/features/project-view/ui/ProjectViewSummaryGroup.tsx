@@ -3,10 +3,12 @@ import type { ProjectViewSummaryEntry } from "@/features/project-view/ui/Project
 
 /** Render one named direct-child or related-item group without deriving more data. */
 export function ProjectViewSummaryGroup({
+  isItemLoading,
   items,
   label,
   onSelect,
 }: {
+  isItemLoading?: (item: ProjectViewSummaryEntry) => boolean;
   items: ProjectViewSummaryEntry[];
   label: string;
   onSelect: (item: ProjectViewSummaryEntry) => void;
@@ -20,6 +22,7 @@ export function ProjectViewSummaryGroup({
           <ProjectViewSummaryItem
             item={item}
             key={item.occurrenceKey}
+            loading={isItemLoading?.(item)}
             onSelect={onSelect}
           />
         ))}

@@ -968,6 +968,82 @@ test("Community overview keeps its stable shell when Project View preview is dis
   expect(projectViewReads).toBe(0);
 });
 
+test("focused Project View navigates one Main layer with one highlighted Outline occurrence", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: V3_READY_VIEW,
+  });
+  await openFullProjectView(page);
+
+  const main = page.getByTestId("project-view-current-object");
+  const outline = page.getByTestId("project-view-outline");
+  await expect(main).toContainText("Lora");
+  await expect(outline).toBeVisible();
+  await expect(main).toContainText("Make project context legible");
+  await expect(main).not.toContainText("Read-only client");
+
+  await main
+    .getByRole("button", { name: "Open Goal: Make project context legible" })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(main).toContainText("Deliver Project View");
+  await expect(main).not.toContainText("Read-only client");
+  await expect(
+    outline.locator('[role="treeitem"][aria-selected="true"]'),
+  ).toContainText("Make project context legible");
+
+  await main
+    .getByRole("button", { name: "Open Plan: Deliver Project View" })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.plan}$`));
+  await expect(main).toContainText("Read-only client");
+  await expect(main).not.toContainText("Verified snapshot");
+  await expect(
+    main.getByRole("button", {
+      name: "Go to parent: Make project context legible",
+    }),
+  ).toBeVisible();
+
+  await page.goBack();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(main).toContainText("Make project context legible");
+
+  await page.getByTestId("project-view-manage-current").click();
+  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+  await expect(outline).toHaveCount(0);
+  await page.getByRole("button", { name: "Close inspector" }).click();
+  await expect(outline).toBeVisible();
+});
+
+test("narrow Project Outline opens as an overlay and returns focus to Main", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 760, height: 900 });
+  await installMockBridge(page, { projectView: V3_READY_VIEW });
+  await openFullProjectView(page);
+
+  const outline = page.getByTestId("project-view-outline");
+  await expect(outline).toHaveCount(0);
+  await page.getByRole("button", { name: "Show Project Outline" }).click();
+  await expect(outline).toBeVisible();
+
+  await outline.getByRole("treeitem", { name: "Goals", exact: true }).click();
+  await outline
+    .getByRole("treeitem", {
+      name: "Goal: Make project context legible",
+      exact: true,
+    })
+    .click();
+
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(outline).toHaveCount(0);
+  await expect(
+    page.getByTestId("project-view-current-object").locator("h1"),
+  ).toBeFocused();
+});
+
 test("View renders the verified canonical map and object inspector", async ({
   page,
 }) => {

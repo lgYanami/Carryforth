@@ -40,12 +40,14 @@ function selectionForSummary(
 export function ProjectViewCurrentObject({
   actions,
   children,
+  documentsLoading = false,
   headingRef,
   onNavigate,
   page,
 }: {
   actions?: React.ReactNode;
   children?: React.ReactNode;
+  documentsLoading?: boolean;
   headingRef?: React.Ref<HTMLHeadingElement>;
   onNavigate: (selection: ProjectViewExplorerSelection) => void;
   page: ProjectViewObjectPage;
@@ -82,6 +84,7 @@ export function ProjectViewCurrentObject({
             </div>
             <h1
               className="mt-3 break-words text-2xl font-semibold tracking-tight outline-hidden"
+              data-occurrence-key={page.occurrenceKey}
               ref={headingRef}
               tabIndex={-1}
             >
@@ -148,6 +151,7 @@ export function ProjectViewCurrentObject({
 
       <ProjectViewRelatedContextItems
         documents={page.documents}
+        documentsLoading={documentsLoading}
         onSelect={selectSummary}
         relatedIssues={page.relatedIssues}
         relatedResources={page.relatedResources}

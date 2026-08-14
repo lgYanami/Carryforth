@@ -298,8 +298,11 @@ Outline 继续高亮其引用 occurrence。Document 是叶节点，没有下一�
 - `/view?object=<id>`：当前项是该 active Project View 对象；
 - `/view?document=<id>`：当前项是一个 live 或 Guide Document 的只读 current-head 预览；
 - `/view?document=<id>&revision=<n>`：当前项是 pinned Document Revision 的只读预览；
-- object 不存在、已删除或不属于当前 verified snapshot：以 replace 导航回 `/view`；
-- Document coordinate 未被任何 active 对象引用或已经失效：以 replace 导航回 `/view`；
+- 初始深链接中的 object 不存在或不属于当前 verified snapshot：以 replace 导航回 `/view`；
+- 已显示的 object 在 verified refresh 后消失：以 replace 导航到之前 occurrence 的最近有效
+  父对象，父链均失效时回 `/view`；
+- 初始深链接中的 Document coordinate 未被任何 active 对象引用：以 replace 导航回
+  `/view`；已显示的 coordinate 在 refresh 后失效时先回原 owner 的最近有效父链；
 - Community 切换后使用新 Community 的 Project Profile，不复用旧对象 ID。
 
 `object` 与 `document` 是互斥的 discriminated selection。search validator 遇到二者同时

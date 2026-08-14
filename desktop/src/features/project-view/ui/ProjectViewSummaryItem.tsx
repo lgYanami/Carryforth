@@ -6,17 +6,34 @@ import type {
 } from "@/features/project-view/explorerModel";
 import { Badge } from "@/shared/ui/badge";
 import { Markdown } from "@/shared/ui/markdown";
+import { Skeleton } from "@/shared/ui/skeleton";
 
 export type ProjectViewSummaryEntry = ObjectSummaryItem | DocumentSummaryItem;
 
 /** A one-layer navigation card whose visible domain fields stay type/title/summary only. */
 export function ProjectViewSummaryItem({
   item,
+  loading = false,
   onSelect,
 }: {
   item: ProjectViewSummaryEntry;
+  loading?: boolean;
   onSelect: (item: ProjectViewSummaryEntry) => void;
 }) {
+  if (loading) {
+    return (
+      <article
+        aria-busy="true"
+        className="min-h-32 rounded-xl border border-border/70 bg-card/60 p-4"
+        data-testid="project-view-summary-item-loading"
+      >
+        <Skeleton className="h-4 w-20" />
+        <Skeleton className="mt-3 h-4 w-2/3" />
+        <Skeleton className="mt-3 h-3 w-full" />
+        <Skeleton className="mt-2 h-3 w-4/5" />
+      </article>
+    );
+  }
   return (
     <article
       className="group relative min-w-0 overflow-hidden rounded-xl border border-border/70 bg-card/60 p-4 transition-colors hover:bg-muted/30"

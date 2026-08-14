@@ -907,3 +907,24 @@ export function buildProjectViewExplorerPage(
     documents,
   };
 }
+
+/** Return the prior occurrence's nearest-to-farthest object ancestors. */
+export function projectViewExplorerFallbackObjectIds(
+  model: ProjectViewExplorerModel,
+  page: ProjectViewExplorerPage,
+): string[] {
+  const objectIds: string[] = [];
+  const seen = new Set<string>();
+  let parent = page.parent;
+  while (parent && !seen.has(parent.objectId)) {
+    seen.add(parent.objectId);
+    objectIds.push(parent.objectId);
+    const canonicalOccurrence = model.canonicalOccurrenceByObjectId.get(
+      parent.objectId,
+    );
+    parent = canonicalOccurrence
+      ? model.parentObjectByOccurrence.get(canonicalOccurrence)
+      : undefined;
+  }
+  return objectIds;
+}

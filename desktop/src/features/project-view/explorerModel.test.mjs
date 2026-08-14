@@ -8,6 +8,7 @@ import {
   documentContextOccurrenceKey,
   indexProjectDocumentCatalog,
   issueAboutOccurrenceKey,
+  projectViewExplorerFallbackObjectIds,
   resolveProjectViewExplorerSelection,
   resourceGuideOccurrenceKey,
 } from "./explorerModel.ts";
@@ -448,6 +449,30 @@ test("parent navigation follows the selected occurrence instead of object identi
   const root = buildProjectViewExplorerPage(model);
   assert.equal(root.kind, "object");
   assert.equal(root.parent, undefined);
+});
+
+test("refresh fallback walks the prior occurrence's valid parent chain", () => {
+  const { model } = fixture();
+  const aliasIssue = buildProjectViewExplorerPage(model, {
+    kind: "object",
+    objectId: "issue-related",
+    via: issueAboutOccurrenceKey("plan", "issue-related"),
+  });
+  assert.deepEqual(projectViewExplorerFallbackObjectIds(model, aliasIssue), [
+    "plan",
+    "goal",
+    "profile",
+  ]);
+
+  const guide = buildProjectViewExplorerPage(model, {
+    kind: "document",
+    documentId: "doc-guide",
+    via: resourceGuideOccurrenceKey("resource", "doc-guide"),
+  });
+  assert.deepEqual(projectViewExplorerFallbackObjectIds(model, guide), [
+    "resource",
+    "profile",
+  ]);
 });
 
 test("Document selection keeps its exact owner occurrence and Documents route", () => {

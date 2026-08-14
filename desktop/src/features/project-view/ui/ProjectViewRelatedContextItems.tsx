@@ -8,11 +8,13 @@ import type { ProjectViewSummaryEntry } from "@/features/project-view/ui/Project
 /** Read-only Project View Context presentation; mutations live in a separate management surface. */
 export function ProjectViewRelatedContextItems({
   documents,
+  documentsLoading = false,
   onSelect,
   relatedIssues,
   relatedResources,
 }: {
   documents: ProjectViewDocumentSummaryItem[];
+  documentsLoading?: boolean;
   onSelect: (item: ProjectViewSummaryEntry) => void;
   relatedIssues: ProjectViewObjectSummaryItem[];
   relatedResources: ProjectViewObjectSummaryItem[];
@@ -40,6 +42,9 @@ export function ProjectViewRelatedContextItems({
         onSelect={onSelect}
       />
       <ProjectViewSummaryGroup
+        isItemLoading={(item) =>
+          documentsLoading && item.kind === "document" && item.mode !== "pinned"
+        }
         items={documents}
         label="Documents"
         onSelect={onSelect}

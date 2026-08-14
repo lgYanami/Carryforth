@@ -52,6 +52,7 @@ export function ProjectViewCurrentDocument({
   currentPubkey,
   headingRef,
   identity,
+  identityLoading = false,
   onNavigate,
   onOpenInDocuments,
   page,
@@ -60,6 +61,7 @@ export function ProjectViewCurrentDocument({
   currentPubkey?: string;
   headingRef?: React.Ref<HTMLHeadingElement>;
   identity?: ProjectDocumentIdentity;
+  identityLoading?: boolean;
   onNavigate: (selection: ProjectViewExplorerSelection) => void;
   onOpenInDocuments: (search: { document: string; revision?: number }) => void;
   page: ProjectViewDocumentPage;
@@ -97,6 +99,7 @@ export function ProjectViewCurrentDocument({
             </div>
             <h1
               className="mt-3 break-words text-2xl font-semibold tracking-tight outline-hidden"
+              data-occurrence-key={page.occurrenceKey}
               ref={headingRef}
               tabIndex={-1}
             >
@@ -145,7 +148,16 @@ export function ProjectViewCurrentDocument({
         </div>
       </header>
 
-      {!identity ? (
+      {identityLoading ? (
+        <div
+          aria-live="polite"
+          className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/20 p-4 text-sm text-muted-foreground"
+          data-testid="project-view-document-source-loading"
+        >
+          <LoaderCircle className="h-4 w-4 animate-spin" />
+          Verifying the Document source…
+        </div>
+      ) : !identity ? (
         <div
           className="rounded-xl border border-warning/30 bg-warning/10 p-4 text-sm text-muted-foreground"
           data-testid="project-view-document-source-unavailable"
