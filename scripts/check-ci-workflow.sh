@@ -9,4 +9,7 @@ if ! command -v actionlint >/dev/null 2>&1; then
   exit 127
 fi
 
-actionlint "${REPO_ROOT}/.github/workflows/ci.yml"
+# Keep workflow schema/expression validation deterministic across developer and
+# GitHub environments. Inline-shell linting can be re-enabled once ShellCheck
+# is pinned in the repository toolchain.
+actionlint -shellcheck= "${REPO_ROOT}/.github/workflows/ci.yml"
