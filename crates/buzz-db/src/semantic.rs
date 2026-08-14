@@ -6,7 +6,7 @@
 
 use buzz_core::CommunityId;
 use buzz_project_document::{DocumentRevision, DocumentState};
-use buzz_project_view::v3::{ProjectViewEntryV3, ProjectViewObjectDataV3};
+use buzz_project_view::v3::{ProjectContextReference, ProjectViewEntryV3, ProjectViewObjectDataV3};
 use buzz_semantic::{
     CanonicalSemanticSourceObservation, Digest32, EncodedSemanticUnit, IneligibilityReason,
     MeetingSourceBasis, ProjectDocumentSourceBasis, ProjectViewSemanticType,
@@ -2870,8 +2870,8 @@ pub(crate) async fn observe_semantic_source_preview_in_connection(
     let observation = observe_semantic_source_in_connection(connection, identity).await?;
     let description = match identity.kind {
         SemanticSourceKind::ProjectView(expected_subtype) => {
-            let body: serde_json::Value = sqlx::query_scalar(
-                "SELECT body FROM project_view_objects \
+            let (object_type, body): (String, serde_json::Value) = sqlx::query_as(
+                "SELECT object_type, body FROM project_view_objects \
                  WHERE community_id=$1 AND object_id=$2 AND deleted_at IS NULL",
             )
             .bind(identity.community_id)
@@ -2879,17 +2879,7 @@ pub(crate) async fn observe_semantic_source_preview_in_connection(
             .fetch_optional(&mut *connection)
             .await?
             .ok_or_else(|| DbError::NotFound("semantic Project View preview".to_string()))?;
-            let data: buzz_project_view::v3::ProjectViewObjectDataV3 = serde_json::from_value(body)
-                .map_err(|error| {
-                    DbError::InvalidData(format!(
-                        "invalid semantic Project View preview body: {error}"
-                    ))
-                })?;
-            if project_view_semantic_type(data.object_type().as_str())? != expected_subtype {
-                return Err(DbError::InvalidData(
-                    "semantic Project View preview subtype changed".to_string(),
-                ));
-            }
+            let data = project_view_preview_data(expected_subtype, &object_type, body)?;
             project_view_description(&data).map(str::to_owned)
         }
         SemanticSourceKind::ProjectDocument => None,
@@ -2907,6 +2897,44 @@ pub(crate) async fn observe_semantic_source_preview_in_connection(
     Ok(SemanticCanonicalPreviewObservation {
         observation,
         description,
+    })
+}
+
+fn project_view_preview_data(
+    expected_subtype: ProjectViewSemanticType,
+    object_type: &str,
+    mut body: serde_json::Value,
+) -> Result<ProjectViewObjectDataV3> {
+    if project_view_semantic_type(object_type)? != expected_subtype {
+        return Err(DbError::InvalidData(
+            "semantic Project View preview subtype changed".to_string(),
+        ));
+    }
+    let object = body.as_object_mut().ok_or_else(|| {
+        DbError::InvalidData("semantic Project View preview body must be an object".to_string())
+    })?;
+    let context_references = object.remove("context_references").ok_or_else(|| {
+        DbError::InvalidData(
+            "semantic Project View preview body has no context_references".to_string(),
+        )
+    })?;
+    let _: Vec<ProjectContextReference> =
+        serde_json::from_value(context_references).map_err(|error| {
+            DbError::InvalidData(format!(
+                "invalid semantic Project View preview context_references: {error}"
+            ))
+        })?;
+    if object_type == "role" {
+        object.remove("level");
+    }
+    serde_json::from_value(serde_json::json!({
+        "object_type": object_type,
+        "data": body,
+    }))
+    .map_err(|error| {
+        DbError::InvalidData(format!(
+            "invalid semantic Project View preview body: {error}"
+        ))
     })
 }
 
@@ -3745,20 +3773,22 @@ fn vector_version_supported(version: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use buzz_project_view::v3::ProjectViewObjectDataV3;
     use buzz_semantic::{
         extract_overview, CanonicalSemanticSourceObservation, DeterministicFakeEncoder, Digest32,
-        EncodedSemanticUnit, IneligibilityReason, ProjectDocumentSourceBasis, SemanticEligibility,
-        SemanticEncoder, SemanticEncoderInput, SemanticFilterMetadata, SemanticLifecycleClass,
-        SemanticSourceBasis, SemanticSourceIdentity, SemanticSourceKind,
-        OVERVIEW_EXTRACTOR_VERSION,
+        EncodedSemanticUnit, IneligibilityReason, ProjectDocumentSourceBasis,
+        ProjectViewSemanticType, SemanticEligibility, SemanticEncoder, SemanticEncoderInput,
+        SemanticFilterMetadata, SemanticLifecycleClass, SemanticSourceBasis,
+        SemanticSourceIdentity, SemanticSourceKind, OVERVIEW_EXTRACTOR_VERSION,
     };
     use uuid::Uuid;
 
     use super::{
-        vector_version_supported, CreateSemanticGeneration, SemanticActivationOutcome,
-        SemanticClaimObservationOutcome, SemanticJobLease, SemanticPgvectorPreflight,
-        SemanticProviderReservation, SemanticProviderWorkload, SemanticRebuildScope,
-        SemanticRebuildState, SemanticScanFamily, SemanticWorkerEgressConfirmation,
+        project_view_preview_data, vector_version_supported, CreateSemanticGeneration,
+        SemanticActivationOutcome, SemanticClaimObservationOutcome, SemanticJobLease,
+        SemanticPgvectorPreflight, SemanticProviderReservation, SemanticProviderWorkload,
+        SemanticRebuildScope, SemanticRebuildState, SemanticScanFamily,
+        SemanticWorkerEgressConfirmation,
     };
     use crate::{Db, DbConfig};
 
@@ -3787,6 +3817,65 @@ mod tests {
             halfvec_cast_ok: true,
             sqlx_2048_roundtrip_ok: true,
         }
+    }
+
+    #[test]
+    fn project_view_preview_reconstructs_the_canonical_v3_body_shape() {
+        let data = project_view_preview_data(
+            ProjectViewSemanticType::Work,
+            "work",
+            serde_json::json!({
+                "title": "Client interaction work",
+                "description": "Preserve the source-owned description.",
+                "status": "in_progress",
+                "priority": "normal",
+                "summary": "A retrieval summary.",
+                "context_references": [],
+            }),
+        )
+        .expect("valid persisted v3 Work body");
+        let ProjectViewObjectDataV3::Work(work) = data else {
+            panic!("preview body must reconstruct the declared Work variant");
+        };
+        assert_eq!(work.description, "Preserve the source-owned description.");
+
+        let role = project_view_preview_data(
+            ProjectViewSemanticType::Role,
+            "role",
+            serde_json::json!({
+                "name": "Client role",
+                "purpose": "Own client behavior.",
+                "responsibilities": ["Interaction state"],
+                "boundaries": ["No server authorization"],
+                "active": true,
+                "level": "member",
+                "context_references": [],
+            }),
+        )
+        .expect("valid persisted v3 Role body");
+        assert!(matches!(role, ProjectViewObjectDataV3::Role(_)));
+    }
+
+    #[test]
+    fn project_view_preview_rejects_missing_context_references_and_subtype_drift() {
+        let missing_references = project_view_preview_data(
+            ProjectViewSemanticType::Work,
+            "work",
+            serde_json::json!({
+                "title": "Work",
+                "description": "Description",
+                "status": "pending",
+                "priority": "normal",
+            }),
+        );
+        assert!(missing_references.is_err());
+
+        let subtype_drift = project_view_preview_data(
+            ProjectViewSemanticType::Role,
+            "work",
+            serde_json::json!({"context_references": []}),
+        );
+        assert!(subtype_drift.is_err());
     }
 
     fn semantic_test_lease(

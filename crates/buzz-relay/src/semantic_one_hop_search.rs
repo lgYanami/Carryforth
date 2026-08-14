@@ -204,7 +204,7 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
     };
     result
         .validate_for_request(&query)
-        .map_err(|_| OneHopSemanticExecutionError::VerificationFailed)?;
+        .map_err(|_| verification_failed("result_contract"))?;
     let builder =
         buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_search_result(
             &result,
@@ -214,7 +214,7 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
             buzz_sdk::SdkError::ContentTooLarge { .. } => {
                 OneHopSemanticExecutionError::ResponseTooLarge
             }
-            _ => OneHopSemanticExecutionError::VerificationFailed,
+            _ => verification_failed("result_event_builder"),
         })?;
     builder
         .sign_with_keys(&state.relay_keypair)
@@ -227,17 +227,17 @@ fn bind_one_hop_query_vector(
     encoded: Vec<buzz_semantic_query::EncodedSemanticQuery>,
 ) -> Result<SemanticExactQueryVector, OneHopSemanticExecutionError> {
     if encoded.len() != 1 {
-        return Err(OneHopSemanticExecutionError::VerificationFailed);
+        return Err(verification_failed("provider_result_count"));
     }
     let mut encoded = encoded.into_iter();
     let encoded = encoded
         .next()
-        .ok_or(OneHopSemanticExecutionError::VerificationFailed)?;
+        .ok_or_else(|| verification_failed("provider_result_missing"))?;
     if encoded.request_id() != input.request_id()
         || encoded.channel_id() != input.channel_id()
         || encoded.response_model() != ticket.generation.model_contract.model
     {
-        return Err(OneHopSemanticExecutionError::VerificationFailed);
+        return Err(verification_failed("provider_result_identity"));
     }
     let fences = QueryCompatibilityFences {
         source_generation_contract_digest: encoded.source_generation_contract_digest(),
@@ -256,7 +256,7 @@ fn bind_one_hop_query_vector(
 fn classify_database(error: buzz_db::DbError) -> OneHopSemanticExecutionError {
     match error {
         buzz_db::DbError::AccessDenied(_) => OneHopSemanticExecutionError::Restricted,
-        buzz_db::DbError::InvalidData(_) => OneHopSemanticExecutionError::VerificationFailed,
+        buzz_db::DbError::InvalidData(_) => verification_failed("database_result"),
         other => OneHopSemanticExecutionError::Database(other),
     }
 }
@@ -270,9 +270,7 @@ fn map_one_shot(error: SemanticOneShotError) -> OneHopSemanticExecutionError {
         },
         SemanticOneShotError::Conflict => OneHopSemanticExecutionError::Conflict,
         SemanticOneShotError::Timeout => OneHopSemanticExecutionError::Timeout,
-        SemanticOneShotError::VerificationFailed => {
-            OneHopSemanticExecutionError::VerificationFailed
-        }
+        SemanticOneShotError::VerificationFailed => verification_failed("one_shot_fence"),
         SemanticOneShotError::Database(error) => OneHopSemanticExecutionError::Database(error),
     }
 }
@@ -284,11 +282,17 @@ fn map_provider(error: SemanticGraphQueryError) -> OneHopSemanticExecutionError 
         } => OneHopSemanticExecutionError::Busy {
             retry_after_seconds: retry_after_seconds.filter(|value| (1..=3_600).contains(value)),
         },
-        SemanticGraphQueryError::ProviderResponse => {
-            OneHopSemanticExecutionError::VerificationFailed
-        }
+        SemanticGraphQueryError::ProviderResponse => verification_failed("provider_response"),
         other => OneHopSemanticExecutionError::Provider(other),
     }
+}
+
+fn verification_failed(stage: &'static str) -> OneHopSemanticExecutionError {
+    tracing::warn!(
+        verification_stage = stage,
+        "One-hop semantic verification failed"
+    );
+    OneHopSemanticExecutionError::VerificationFailed
 }
 
 #[cfg(test)]

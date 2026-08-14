@@ -1,16 +1,19 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B6已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
+> 状态：Phase B0–B7代码与本地单Relay资格已交付（B3按安全依赖先于B2落地）；one-hop semantic保持feature-off；目标规模SLO与multi-pod资格未完成；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
-> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`、B4 `538aad9a8`、B5 `9f5a73c11`；B6在本计划内增量交付
+> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`、B4 `538aad9a8`、B5 `9f5a73c11`、B6 `03f9fbef7`；B7为本次资格与修复提交
 >
 > 已交付起点检索：
 > [Agent Project Context 自然语言 Coordinate 起点检索分阶段实现计划](project-context-coordinate-search-implementation-plan.md)
 >
 > 起点检索资格：
 > [Coordinate 起点检索资格记录](project-context-coordinate-search-qualification.md)
+>
+> 本计划资格：
+> [渐进观察与一跳语义选择资格记录](project-context-progressive-observation-cli-qualification.md)
 >
 > 已交付有界路径查询：
 > [Project Context 图语义检索分阶段实现计划](../semantic/project-context-graph-semantic-query-implementation-plan.md)
@@ -1284,6 +1287,12 @@ NIP-11/fleet/config/status/admin readiness。
 不得在CLI用未验证数据补齐；variant字段严格隔离。
 
 ### Phase B7：回归、资格与回滚
+
+> 实施状态：本地单Relay真实授权canary与feature-off回滚已交付。真实Project View候选首次暴露出持久化v3
+> body与typed preview envelope不一致的集成缺陷；修复后复用canonical v3重建规则，并由真实当前数据库canary
+> 与四次Provider查询共同验证。前端/后端两组Coordinate→Edge和Edge→Coordinate均把预标注候选排在rank 1，
+> 每次调用恰好一次Provider请求，preview与variant隔离通过。回滚后capability/gate均off、Provider增量为0、
+> 四个结构读取继续可用。目标规模one-hop canonical join SLO与multi-pod仍未完成，因此保持feature-off。
 
 交付：scoped/full tests、真实授权Provider canary、结构/语义 paired fixture、性能证据、feature-off rollback、资格记录。
 
