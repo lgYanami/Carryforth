@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_SOURCE=0
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ripgrep (rg) is required; activate the repository Hermit environment" >&2
+  exit 127
+fi
+
 if [[ "${1:-}" == "--release-source" ]]; then
   RELEASE_SOURCE=1
 elif [[ $# -ne 0 ]]; then

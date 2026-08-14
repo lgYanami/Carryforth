@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ripgrep (rg) is required; activate the repository Hermit environment" >&2
+  exit 127
+fi
+
 failures=()
 
 fail() {
