@@ -11,6 +11,7 @@ export type ProjectViewCreateContext = {
   underPlanId?: string;
   plannedInStageId?: string;
   handles?: ProjectViewObjectRef;
+  about?: ProjectViewObjectRef;
 };
 
 export type ProjectViewIncomingReference = {
@@ -74,6 +75,13 @@ export function projectViewObjectDescription(
     case "resource":
       return object.data.summary ?? object.data.resourceKind;
   }
+}
+
+/** Return only the source-owned summary; never derive one from full fields. */
+export function projectViewObjectSummary(
+  object: ProjectViewObject,
+): string | undefined {
+  return object.data.summary;
 }
 
 export function projectViewObjectStatus(
