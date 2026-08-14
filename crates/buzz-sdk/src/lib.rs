@@ -34,6 +34,8 @@ pub mod role_brief_v3;
 pub mod semantic_coordinate_search;
 /// Semantic Project Context graph virtual-result builder and verifier.
 pub mod semantic_graph;
+/// Project Context one-hop semantic-selection virtual-result builder and verifier.
+pub mod semantic_one_hop_search;
 
 pub use builders::*;
 

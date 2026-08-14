@@ -1,10 +1,10 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B1及B3 storage-deny前置已交付；one-hop semantic仍feature-off；不构成production-ready声明
+> 状态：实施中；Phase B0–B3已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
-> 代码基线：`feat/agent-context-search` @ `596287200`（B0）；B1 结构观察在本计划内增量交付
+> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`；B2在本计划内增量交付
 >
 > 已交付起点检索：
 > [Agent Project Context 自然语言 Coordinate 起点检索分阶段实现计划](project-context-coordinate-search-implementation-plan.md)

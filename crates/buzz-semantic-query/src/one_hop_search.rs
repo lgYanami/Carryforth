@@ -24,8 +24,14 @@ pub const DEFAULT_ONE_HOP_SEMANTIC_LIMIT: u8 = 8;
 pub const MAX_ONE_HOP_SEMANTIC_LIMIT: u8 = 32;
 /// Maximum raw closed inner request bytes.
 pub const MAX_ONE_HOP_SEMANTIC_REQUEST_BYTES: usize = 64 * 1024;
+/// Maximum exact authenticated `/query` filter-array bytes.
+pub const MAX_ONE_HOP_SEMANTIC_EXACT_HTTP_BODY_BYTES: usize = 64 * 1024;
+/// Maximum exact Provider input bytes inherited from the semantic Q0 contract.
+pub const MAX_ONE_HOP_SEMANTIC_PROVIDER_INPUT_BYTES: usize = crate::MAX_PROVIDER_QUERY_INPUT_BYTES;
 /// Maximum final Relay-signed Event-array bytes.
 pub const MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES: usize = 512 * 1024;
+/// Absolute server wall-time budget in milliseconds.
+pub const MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS: u32 = 45_000;
 /// Maximum incident Edge identities materialized before ranking.
 pub const MAX_ONE_HOP_INCIDENT_EDGES: u32 = 1_024;
 /// Maximum relation Document bindings materialized before ranking.
@@ -63,6 +69,9 @@ const EDGE_COORDINATE_RANKING_DESCRIPTOR: &str = concat!(
     "max-coordinates=32\n",
     "max-materialized-coordinates=4096"
 );
+
+const ONE_HOP_HTTP_REQUEST_BINDING_DOMAIN: &[u8] =
+    b"carryforth.project-context-one-hop-semantic-search-http-request\0";
 
 /// Result alias for the pure one-hop semantic contract.
 pub type OneHopSemanticResult<T> = Result<T, OneHopSemanticError>;
@@ -267,6 +276,54 @@ pub fn edge_coordinate_ranking_contract_digest() -> Digest32 {
         b"carryforth.project-context-one-hop-ranking-contract",
         &[EDGE_COORDINATE_RANKING_DESCRIPTOR.as_bytes()],
     )
+}
+
+/// Derive the domain-separated binding for one authenticated exact HTTP request.
+///
+/// The exact body contains the request UUID, scope, query, and exclusive Relay
+/// author filter. The explicit identities prevent the same bytes from being
+/// replayed across a host-derived Project, caller, Relay, or NIP-98 Event.
+pub fn derive_one_hop_semantic_http_request_binding(
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    expected_relay_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> OneHopSemanticResult<Digest32> {
+    validate_uuid_v4(host_project_id, "host_project_id")?;
+    let body_digest: [u8; 32] = Sha256::digest(exact_authenticated_body).into();
+    Ok(hash_domain(
+        ONE_HOP_HTTP_REQUEST_BINDING_DOMAIN,
+        &[
+            host_project_id.as_bytes(),
+            authenticated_caller_pubkey,
+            expected_relay_pubkey,
+            nip98_auth_event_id.as_bytes(),
+            &body_digest,
+        ],
+    ))
+}
+
+/// Verify a returned binding against the exact authenticated HTTP transcript.
+pub fn verify_one_hop_semantic_http_request_binding(
+    observed: Digest32,
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    expected_relay_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> OneHopSemanticResult<()> {
+    let expected = derive_one_hop_semantic_http_request_binding(
+        host_project_id,
+        authenticated_caller_pubkey,
+        expected_relay_pubkey,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+    )?;
+    if observed != expected {
+        return invalid("one-hop semantic HTTP request binding digest mismatch");
+    }
+    Ok(())
 }
 
 /// Exact generation and Project Context snapshot observations.
@@ -1285,5 +1342,67 @@ mod tests {
             incident_edge_ranking_contract_digest(),
             incident_edge_ranking_contract_digest()
         );
+    }
+
+    #[test]
+    fn http_binding_covers_project_caller_relay_auth_and_every_body_byte() {
+        let body = br#"[{"kinds":[40914]}]"#;
+        let binding = derive_one_hop_semantic_http_request_binding(
+            uuid(2),
+            &[3; 32],
+            &[4; 32],
+            digest(5),
+            body,
+        )
+        .expect("binding");
+        verify_one_hop_semantic_http_request_binding(
+            binding,
+            uuid(2),
+            &[3; 32],
+            &[4; 32],
+            digest(5),
+            body,
+        )
+        .expect("binding verifies");
+
+        for changed in [
+            derive_one_hop_semantic_http_request_binding(
+                uuid(6),
+                &[3; 32],
+                &[4; 32],
+                digest(5),
+                body,
+            ),
+            derive_one_hop_semantic_http_request_binding(
+                uuid(2),
+                &[6; 32],
+                &[4; 32],
+                digest(5),
+                body,
+            ),
+            derive_one_hop_semantic_http_request_binding(
+                uuid(2),
+                &[3; 32],
+                &[6; 32],
+                digest(5),
+                body,
+            ),
+            derive_one_hop_semantic_http_request_binding(
+                uuid(2),
+                &[3; 32],
+                &[4; 32],
+                digest(6),
+                body,
+            ),
+            derive_one_hop_semantic_http_request_binding(
+                uuid(2),
+                &[3; 32],
+                &[4; 32],
+                digest(5),
+                br#"[{"kinds":[40914]} ]"#,
+            ),
+        ] {
+            assert_ne!(binding, changed.expect("changed binding"));
+        }
     }
 }
