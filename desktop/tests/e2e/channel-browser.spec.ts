@@ -403,6 +403,13 @@ test("Enter with no matches jumps to create", async ({ page }) => {
 
   await openChannelBrowser(page);
   await page.getByTestId("channel-browser-search").fill(channelName);
+  // Matching is intentionally deferred. Wait until the rendered result set has
+  // consumed this query before pressing Enter; otherwise the key event can
+  // still see the previous channel list and select its first row.
+  await expect(page.getByText("No channels match your search")).toBeVisible();
+  await expect(page.getByTestId("channel-browser-create-row")).toContainText(
+    channelName,
+  );
   await page.keyboard.press("Enter");
 
   await expect(page.getByTestId("create-channel-name")).toHaveValue(

@@ -257,10 +257,16 @@ test("PR creator/owner can toggle draft, request reviews, and approve", async ({
     "project-pull-request-timeline-row",
   );
   await expect(expandedReviewRows).toHaveCount(2);
-  await expect(expandedReviewRows.nth(0)).toContainText(
-    "Requested a review from bob",
-  );
-  await expect(expandedReviewRows.nth(1)).toContainText("requested changes");
+  // Nostr timestamps have whole-second precision. These two independently
+  // signed activities can share a timestamp, in which case the canonical
+  // event-id tiebreak determines their presentation order. Assert the exact
+  // activity set without inventing a stronger causal-order contract.
+  await expect(
+    expandedReviewRows.filter({ hasText: "Requested a review from bob" }),
+  ).toHaveCount(1);
+  await expect(
+    expandedReviewRows.filter({ hasText: "requested changes" }),
+  ).toHaveCount(1);
   await expect(approve).toBeVisible();
   await reviewHistoryToggle.click();
   await expect(reviewHistoryToggle).toContainText("Show 2 earlier activities");

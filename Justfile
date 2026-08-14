@@ -112,7 +112,11 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: current-product-surface-check open-source-release-surface-check carryforth-local-deployment-test source-dev-start-test cf-cli-cutover-check project-view-v3-runtime-check fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check
+check: ci-source-contracts fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check
+
+# Run every source-level CI contract without stopping at the first failure.
+ci-source-contracts:
+    ./scripts/test-ci-source-contracts.sh
 
 # Keep contributor-facing product and local-development surfaces on Carryforth.
 current-product-surface-check:
@@ -250,7 +254,8 @@ desktop-tauri-check: _ensure-sidecar-stubs
 
 # Run desktop Tauri Rust unit tests
 desktop-tauri-test: _ensure-sidecar-stubs
-    cd desktop/src-tauri && cargo test
+    cd desktop/src-tauri && cargo test -- --skip relay_admission::tests
+    cd desktop/src-tauri && cargo test relay_admission::tests -- --test-threads=1
 
 # Verify compiled-flag behavior under both compile states (clean + internal).
 # Runs the observer_archive focused test twice with independently supplied

@@ -164,7 +164,7 @@ test.beforeEach(async ({ page }) => {
   await installMockBridge(page);
 });
 
-test("keeps the saved profile description after a community round trip", async ({
+test("keeps the saved profile description after a local-only settings remount", async ({
   page,
 }) => {
   const communities = [
@@ -187,7 +187,7 @@ test("keeps the saved profile description after a community round trip", async (
   }, communities);
   await page.goto("/");
 
-  const description = "Description that should survive switching";
+  const description = "Description that should survive a settings remount";
   await openSettings(page, "profile");
   await page.getByTestId("profile-metadata-edit").click();
   await page.getByTestId("profile-about").fill(description);
@@ -195,16 +195,34 @@ test("keeps the saved profile description after a community round trip", async (
   await expect(page.getByTestId("profile-about-value")).toHaveText(description);
   await page.getByTestId("settings-back-to-app").click();
 
-  const communityA = page.getByTestId(
-    "community-rail-button-profile-community-a",
-  );
   const communityB = page.getByTestId(
     "community-rail-button-profile-community-b",
   );
-  await communityB.click();
-  await expect(communityB).toHaveAttribute("aria-current", "true");
-  await communityA.click();
-  await expect(communityA).toHaveAttribute("aria-current", "true");
+  await expect(communityB).toHaveCount(0);
+  expect(
+    await page.evaluate(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("buzz-communities") ?? "[]",
+      ) as Array<{ id: string; name: string; relayUrl: string }>;
+      return {
+        activeId: window.localStorage.getItem("buzz-active-community-id"),
+        communities: stored.map(({ id, name, relayUrl }) => ({
+          id,
+          name,
+          relayUrl,
+        })),
+      };
+    }),
+  ).toEqual({
+    activeId: "profile-community-a",
+    communities: [
+      {
+        id: "profile-community-a",
+        name: "Local Dev",
+        relayUrl: "ws://localhost:3000",
+      },
+    ],
+  });
 
   await openSettings(page, "profile");
   await expect(page.getByTestId("profile-about-value")).toHaveText(description);

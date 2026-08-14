@@ -181,11 +181,26 @@ test("focus and split preserve reading context and interaction ownership", async
     .toBe(true);
   await expect(channel).toHaveAttribute("inert", "");
 
-  await body.evaluate((element) => {
-    element.scrollTop = element.scrollHeight * 0.4;
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
-  const anchorId = await topVisibleMessageId(body);
+  const rows = body.locator("[data-message-id]");
+  await expect(rows).toHaveCount(49);
+  const readingRow = rows.nth(20);
+  const readingTargetId = await readingRow.getAttribute("data-message-id");
+  if (!readingTargetId) throw new Error("Missing stable thread reading target");
+  // The initial bottom pin can still be settling while deferred replies land.
+  // Keep placing the same real row at the top until the shared scroll owner has
+  // observed the deliberate move; an arbitrary scrollHeight fraction can race
+  // that settle pass and accidentally capture the thread head instead.
+  await expect
+    .poll(async () => {
+      await body.evaluate((element, messageId) => {
+        const row = element.querySelector<HTMLElement>(
+          `[data-message-id="${CSS.escape(messageId)}"]`,
+        );
+        row?.scrollIntoView({ block: "start", behavior: "auto" });
+      }, readingTargetId);
+      return topVisibleMessageId(body);
+    })
+    .toBe(readingTargetId);
 
   const focusModeToggle = page.getByRole("button", {
     name: "Show thread beside channel",
@@ -194,6 +209,11 @@ test("focus and split preserve reading context and interaction ownership", async
   await expect(
     page.getByRole("tooltip", { name: "Show thread beside channel" }),
   ).toBeVisible();
+  // The shared scroll owner may finish an initial bottom-settle after the
+  // deliberate test scroll. The product preserves the message visible at the
+  // actual mode-switch boundary, so capture that same boundary immediately
+  // before the click instead of asserting an earlier, stale row id.
+  const anchorId = await topVisibleMessageId(body);
   await focusModeToggle.click();
   await expect(drawer).toHaveCount(0);
   await expect(channel).not.toHaveAttribute("inert", "");

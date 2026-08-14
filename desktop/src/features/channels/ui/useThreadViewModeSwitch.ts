@@ -1,4 +1,5 @@
 import * as React from "react";
+import { flushSync } from "react-dom";
 
 import {
   setThreadViewMode,
@@ -35,6 +36,12 @@ type ThreadViewModeSwitchOptions = {
   externalScrollTargetId: string | null;
   onExternalTargetResolved: () => void;
   onModeChange?: (mode: ThreadViewMode) => void;
+  viewMode: ThreadViewMode;
+};
+
+type LayoutScrollTarget = {
+  messageId: string;
+  viewMode: ThreadViewMode;
 };
 
 /** Preserves the reply being read while the thread changes presentation. */
@@ -42,10 +49,14 @@ export function useThreadViewModeSwitch({
   externalScrollTargetId,
   onExternalTargetResolved,
   onModeChange,
+  viewMode,
 }: ThreadViewModeSwitchOptions) {
-  const [layoutScrollTargetId, setLayoutScrollTargetId] = React.useState<
-    string | null
-  >(null);
+  const [layoutScrollTarget, setLayoutScrollTarget] =
+    React.useState<LayoutScrollTarget | null>(null);
+  const layoutScrollTargetId =
+    layoutScrollTarget?.viewMode === viewMode
+      ? layoutScrollTarget.messageId
+      : null;
 
   const changeThreadViewMode = React.useCallback(
     (mode: ThreadViewMode, restoreFocus: boolean) => {
@@ -54,7 +65,14 @@ export function useThreadViewModeSwitch({
       );
       const anchorId = findTopVisibleThreadMessageId(body);
 
-      setLayoutScrollTargetId(anchorId);
+      // The view-mode preference is an external store and notifies its
+      // subscribers synchronously. Commit the captured anchor first so the
+      // replacement surface cannot mount once without its restoration target.
+      flushSync(() => {
+        setLayoutScrollTarget(
+          anchorId === null ? null : { messageId: anchorId, viewMode: mode },
+        );
+      });
       onModeChange?.(mode);
       setThreadViewMode(mode);
       requestAnimationFrame(() => {
@@ -77,7 +95,7 @@ export function useThreadViewModeSwitch({
       externalTargetId: externalScrollTargetId,
       layoutTargetId: layoutScrollTargetId,
     });
-    if (resolution.resolveLayout) setLayoutScrollTargetId(null);
+    if (resolution.resolveLayout) setLayoutScrollTarget(null);
     if (resolution.resolveExternal) onExternalTargetResolved();
   }, [externalScrollTargetId, layoutScrollTargetId, onExternalTargetResolved]);
 

@@ -318,6 +318,7 @@ fn tool_error(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::shim::Shim;
     #[cfg(unix)]
     use tempfile::{tempdir, TempDir};

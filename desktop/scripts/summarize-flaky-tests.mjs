@@ -1,14 +1,4 @@
-import { appendFile, readFile } from "node:fs/promises";
-
-// Playwright's `retries: 2` (desktop/playwright.config.ts) lets a test fail
-// then pass on retry with no durable signal beyond a one-line "N flaky" in
-// the console log — the exact gap that hid the stream.spec.ts membership
-// race (#1798) for months. This walks the JSON reporter's suite tree
-// (recursive: `describe` blocks nest as child `suites`) and appends any
-// `status === "flaky"` test to the job's GitHub Actions summary so retried
-// failures stay visible even when the shard ultimately goes green.
-//
-// Usage: node scripts/summarize-flaky-tests.mjs <report.json> <run-label>
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 
 function collectFlakyTests(suite, out) {
   for (const spec of suite.specs ?? []) {
@@ -26,46 +16,88 @@ function collectFlakyTests(suite, out) {
   }
 }
 
-const [reportPath, runLabel] = process.argv.slice(2);
-if (!reportPath || !runLabel) {
+function usage() {
   console.error(
-    "Usage: node scripts/summarize-flaky-tests.mjs <report.json> <run-label>",
+    "Usage: node scripts/summarize-flaky-tests.mjs <report.json> <run-label> [--strict] [--output <path>]",
   );
-  process.exit(1);
 }
 
-// This step runs `if: !cancelled()` purely to surface flaky tests — it must
-// never fail the job on its own, so a malformed/unexpected report (from a
-// Playwright version bump or a crashed run) is swallowed, not thrown.
+const args = process.argv.slice(2);
+const reportPath = args.shift();
+const runLabel = args.shift();
+let strict = false;
+let outputPath;
+
+while (args.length > 0) {
+  const option = args.shift();
+  if (option === "--strict") {
+    strict = true;
+  } else if (option === "--output") {
+    outputPath = args.shift();
+    if (!outputPath) {
+      usage();
+      process.exit(2);
+    }
+  } else {
+    usage();
+    process.exit(2);
+  }
+}
+
+if (!reportPath || !runLabel) {
+  usage();
+  process.exit(2);
+}
+
 try {
-  const report = JSON.parse(await readFile(reportPath, "utf8"));
+  const raw = await readFile(reportPath, "utf8");
+  if (raw.trim().length === 0) {
+    throw new Error("Playwright JSON report is empty");
+  }
+  const report = JSON.parse(raw);
+  if (
+    report === null ||
+    typeof report !== "object" ||
+    !Array.isArray(report.suites)
+  ) {
+    throw new Error("Playwright JSON report does not contain a suites array");
+  }
 
   const flaky = [];
-  for (const suite of report.suites ?? []) {
+  for (const suite of report.suites) {
     collectFlakyTests(suite, flaky);
   }
 
-  if (flaky.length > 0) {
-    const escapeCell = (value) => String(value).replaceAll("|", "\\|");
+  const escapeCell = (value) => String(value).replaceAll("|", "\\|");
+  let summary = `### Flaky tests — ${runLabel}\n\n`;
+  if (flaky.length === 0) {
+    summary += "No test passed only after a retry.\n";
+  } else {
     const rows = flaky
       .map(
-        (t) =>
-          `| ${escapeCell(t.title)} | ${escapeCell(t.project)} | ${t.attempts} |`,
+        (test) =>
+          `| ${escapeCell(test.title)} | ${escapeCell(test.project)} | ${test.attempts} |`,
       )
       .join("\n");
-    const summary =
-      `### Flaky tests — ${runLabel}\n\n` +
+    summary +=
       `${flaky.length} test(s) failed at least once before passing on retry:\n\n` +
       "| Test | Project | Attempts |\n| --- | --- | --- |\n" +
       `${rows}\n`;
+  }
 
-    console.log(summary);
-
-    const summaryFile = process.env.GITHUB_STEP_SUMMARY;
-    if (summaryFile) {
-      await appendFile(summaryFile, `${summary}\n`);
-    }
+  console.log(summary);
+  if (outputPath) {
+    await writeFile(outputPath, `${summary}\n`, "utf8");
+  }
+  const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryFile) {
+    await appendFile(summaryFile, `${summary}\n`);
   }
 } catch (error) {
-  console.log(`Skipping flaky-test summary: ${error.message}`);
+  const message = `Unable to summarize flaky tests: ${error.message}`;
+  if (strict) {
+    console.error(message);
+    process.exit(1);
+  }
+  console.log(message);
 }

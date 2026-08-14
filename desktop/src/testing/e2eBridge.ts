@@ -1192,6 +1192,7 @@ declare global {
     };
     __BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?: (state: ConnectionState) => void;
     __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => ConnectionState;
+    __BUZZ_E2E_GET_MOCK_WEBSOCKET_CONNECT_ATTEMPTS__?: () => number;
     __BUZZ_E2E_SET_STALL_WEBSOCKET_SENDS__?: (stall: boolean) => void;
     __BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__?: () => number;
     __BUZZ_E2E_RESTART_MOCK_WEBSOCKETS__?: () => number;
@@ -4333,6 +4334,7 @@ const mockUserStatuses: RelayEvent[] = [];
 const mockReminderEvents: RelayEvent[] = [];
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
+let mockWebsocketConnectAttempts = 0;
 let mockAppliedRelayUrl = DEFAULT_RELAY_WS_URL;
 let mockAppliedWorkspaceGeneration = 0;
 let mockWebsocketSendMutexWedged = false;
@@ -10133,6 +10135,7 @@ async function connectRealSocket(args: { url?: string; onMessage: unknown }) {
 }
 
 async function connectMockSocket(args: { onMessage: unknown }) {
+  mockWebsocketConnectAttempts += 1;
   const connectError = getConfig()?.mock?.websocketConnectErrors?.shift();
   if (connectError) {
     throw new Error(connectError);
@@ -10729,6 +10732,7 @@ export function maybeInstallE2eTauriMocks() {
   }
 
   mockClosedChannelLiveSubscription = false;
+  mockWebsocketConnectAttempts = 0;
   mockAppliedRelayUrl = getRelayWsUrl(config);
   mockAppliedWorkspaceGeneration = 0;
   window.__BUZZ_E2E_APPLIED_WORKSPACE__ = undefined;
@@ -11086,6 +11090,8 @@ export function maybeInstallE2eTauriMocks() {
   };
   window.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__ = () =>
     relayClient.getConnectionState();
+  window.__BUZZ_E2E_GET_MOCK_WEBSOCKET_CONNECT_ATTEMPTS__ = () =>
+    mockWebsocketConnectAttempts;
 
   window.__BUZZ_E2E_SEED_MOCK_REMINDERS__ = (reminders) => {
     mockReminderEvents.length = 0;

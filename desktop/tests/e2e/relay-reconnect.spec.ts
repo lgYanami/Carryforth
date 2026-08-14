@@ -107,17 +107,21 @@ test("failed initial relay dial retries automatically", async ({ page }) => {
     .poll(
       () =>
         page.evaluate(() => {
-          const getState = (
-            window as Window & {
-              __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => string;
-            }
-          ).__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__;
-          if (!getState) throw new Error("Relay state seam is not installed.");
-          return getState();
+          const testWindow = window as Window & {
+            __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => string;
+            __BUZZ_E2E_GET_MOCK_WEBSOCKET_CONNECT_ATTEMPTS__?: () => number;
+          };
+          const getState = testWindow.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__;
+          const getAttempts =
+            testWindow.__BUZZ_E2E_GET_MOCK_WEBSOCKET_CONNECT_ATTEMPTS__;
+          return {
+            attempts: getAttempts?.() ?? 0,
+            state: getState?.() ?? "uninstalled",
+          };
         }),
       { timeout: 10_000 },
     )
-    .toBe("connected");
+    .toEqual({ attempts: 2, state: "connected" });
   await expect(page.getByTestId("channel-general")).toBeVisible();
 });
 

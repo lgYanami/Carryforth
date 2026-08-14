@@ -79,6 +79,7 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandReplies: (message: TimelineMessage) => void;
   onScrollTargetResolved: () => void;
+  pinScrollTargetCentered?: boolean;
   scrollTargetHighlights?: boolean;
   onSelectReplyTarget: (message: TimelineMessage) => void;
   onSend: (
@@ -211,6 +212,7 @@ export function MessageThreadPanel({
   onSend,
   onToggleReaction,
   onUnfollowThread,
+  pinScrollTargetCentered = false,
   profiles,
   replyTargetMessage,
   scrollTargetId,
@@ -484,10 +486,14 @@ export function MessageThreadPanel({
     useAnchoredScroll({
       channelId: threadHeadId,
       contentRef: threadContentRef,
-      isLoading: threadRepliesPending || repliesRenderState === "pending",
+      isLoading:
+        threadRepliesPending ||
+        repliesRenderState === "pending" ||
+        (scrollTargetId !== null && isRepliesPending),
       messages: threadMessages,
       highlightTargetMessage: scrollTargetHighlights,
       onTargetReached: onScrollTargetResolved,
+      pinTargetCentered: pinScrollTargetCentered,
       scrollContainerRef: threadBodyRef,
       targetMessageId: scrollTargetId,
     });

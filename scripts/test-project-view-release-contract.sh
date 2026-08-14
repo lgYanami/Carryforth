@@ -52,12 +52,12 @@ require_literal "COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp cf)" scripts/build-s
 require_literal "- \"crates/carryforth-cli/**\"" .github/workflows/sprig.yml
 require_literal "target/ci/cf" .github/workflows/ci.yml
 require_literal "target/ci/buzz-admin" .github/workflows/ci.yml
-require_literal "--test e2e_project_view" .github/workflows/ci.yml
+require_literal "e2e_project_view" scripts/build-ci-relay-artifacts.sh
 require_literal "just test-migrations" .github/workflows/ci.yml
 require_literal "just project-view-test-e2e" .github/workflows/ci.yml
 require_literal "- 'scripts/check-project-view-v3-runtime.sh'" .github/workflows/ci.yml
-require_literal "- name: Project View v3-only runtime contract" .github/workflows/ci.yml
-require_literal "run: scripts/check-project-view-v3-runtime.sh" .github/workflows/ci.yml
+require_literal "scripts/test-ci-source-contracts.sh" .github/workflows/ci.yml
+require_literal "check-project-view-v3-runtime.sh" scripts/test-ci-source-contracts.sh
 require_literal "- 'scripts/meeting-v2-actions-live-acceptance.sh'" .github/workflows/ci.yml
 require_literal "PROJECT_VIEW_PRE_FEATURE_REF: aeced53115b2892c557fe54d094070f1071dbb60" .github/workflows/ci.yml
 require_literal "BUZZ_AUTO_MIGRATE=false" scripts/test-project-view-rollback-smoke.sh

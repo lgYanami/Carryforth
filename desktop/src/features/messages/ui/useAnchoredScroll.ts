@@ -847,6 +847,10 @@ export function useAnchoredScroll({
           highlight: highlightTargetMessage,
         })
       ) {
+        if (mountPinRafIdRef.current !== null) {
+          cancelAnimationFrame(mountPinRafIdRef.current);
+          mountPinRafIdRef.current = null;
+        }
         handledTargetIdRef.current = targetMessageId;
         onTargetReached?.(targetMessageId);
       }
@@ -857,6 +861,14 @@ export function useAnchoredScroll({
       // spliced into `messages` a render or two later; this effect re-runs on
       // each `messages` commit and retries until the row exists.
       return;
+    }
+    // A target that arrives after the surface's first commit supersedes the
+    // settling bottom pin scheduled by the target-less mount. Without this
+    // cancellation, that pending frame can pull the view back to the floor
+    // after the target was centered (notably while switching thread layouts).
+    if (mountPinRafIdRef.current !== null) {
+      cancelAnimationFrame(mountPinRafIdRef.current);
+      mountPinRafIdRef.current = null;
     }
     handledTargetIdRef.current = targetMessageId;
     scrollToMessageImperative(targetMessageId, {

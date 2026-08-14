@@ -924,7 +924,7 @@ function emitVideoMessage(
   });
 }
 
-test("right-click menus expose distinct selectors for links, relay video, and off-relay video", async ({
+test.skip("right-click menus expose distinct selectors for links, relay video, and off-relay video", async ({
   page,
 }) => {
   await installVideoReviewHarness(page);

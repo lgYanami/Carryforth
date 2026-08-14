@@ -63,8 +63,8 @@ require_literal "crates/buzz-acp/**" .github/workflows/ci.yml
 require_literal "crates/buzz-admin/**" .github/workflows/ci.yml
 require_literal "scripts/test-project-document-*.sh" .github/workflows/ci.yml
 require_literal "scripts/project-document-capacity-fixture.sql" .github/workflows/ci.yml
-require_literal "--test e2e_project_document_disabled" .github/workflows/ci.yml
-require_literal "--test e2e_project_document_enabled" .github/workflows/ci.yml
+require_literal "e2e_project_document_disabled" scripts/build-ci-relay-artifacts.sh
+require_literal "e2e_project_document_enabled" scripts/build-ci-relay-artifacts.sh
 require_literal "project-document-integration:" .github/workflows/ci.yml
 require_literal "just project-document-test-db" .github/workflows/ci.yml
 require_literal "just project-document-test-e2e" .github/workflows/ci.yml

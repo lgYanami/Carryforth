@@ -56,7 +56,8 @@ grep -q 'check-open-source-release-surface\.sh --release-source' "$repo_root/.gi
 grep -q 'check-open-source-release-surface\.sh --release-source' "$repo_root/.github/workflows/docker.yml"
 grep -q 'test-carryforth-local-deployment\.sh' "$repo_root/.github/workflows/release.yml"
 grep -q 'test-carryforth-local-deployment\.sh' "$repo_root/.github/workflows/docker.yml"
-grep -q 'test-release-ref-contract\.sh' "$repo_root/.github/workflows/ci.yml"
+grep -q 'scripts/test-ci-source-contracts\.sh' "$repo_root/.github/workflows/ci.yml"
+grep -q 'test-release-ref-contract\.sh' "$repo_root/scripts/test-ci-source-contracts.sh"
 "$repo_root/scripts/test-signed-canary-contract.sh"
 
 release_workflows=(

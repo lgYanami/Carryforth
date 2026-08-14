@@ -68,6 +68,8 @@ export function DroppableSectionBody({
 
   return (
     <div
+      data-dnd-over={isOver || undefined}
+      data-testid={`section-drop-${sectionId}`}
       ref={setNodeRef}
       className={cn(
         "rounded-md transition-all",
@@ -135,7 +137,12 @@ export function SortableSectionShell({
   };
 
   return (
-    <div ref={setNodeRef} style={style}>
+    <div
+      data-dnd-dragging={isDragging || undefined}
+      data-testid={`sortable-section-${sectionId}`}
+      ref={setNodeRef}
+      style={style}
+    >
       {children({
         dragHandleProps: { ...attributes, ...listeners },
         isDragging,
@@ -161,6 +168,7 @@ export function DragOverlaySection({ name }: { name: string }) {
   return (
     <div
       data-buzz-flat
+      data-testid="sidebar-section-drag-overlay"
       className="flex cursor-grabbing items-center gap-1 rounded-md bg-sidebar px-2 py-1 text-xs font-medium uppercase tracking-wider text-sidebar-foreground/60 opacity-90 shadow-lg ring-1 ring-sidebar-border"
     >
       <span>{name}</span>

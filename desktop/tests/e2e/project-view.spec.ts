@@ -930,7 +930,7 @@ test("Community overview presents Project View and Role context before the full 
   await expect(page).toHaveURL(/\/view$/);
   await expect(page.getByTestId("project-view-map")).toBeVisible();
   await expect(page.getByTestId("return-community-overview")).toContainText(
-    "E2E Test",
+    "Local Dev",
   );
 });
 
@@ -945,7 +945,7 @@ test("Community overview keeps its stable shell when Project View preview is dis
   await page.goto("/#/community");
 
   await expect(page.getByTestId("community-space-header")).toContainText(
-    "E2E Test",
+    "Local Dev",
   );
   await expect(page.getByTestId("community-continue-work")).toContainText(
     "Open Inbox",
@@ -2219,7 +2219,7 @@ test("the v3 setup guide stays read-only and refreshes after owner initializatio
   await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
 });
 
-test("Community switching does not carry View data or selection across Relays", async ({
+test("local-only bootstrap never paints a stale alternate-port Project View", async ({
   page,
 }) => {
   await installMockBridge(
@@ -2239,37 +2239,44 @@ test("Community switching does not carry View data or selection across Relays", 
   await page.goto("/");
   await openFullProjectView(page);
   await expect(page.getByTestId("project-view-v3-setup-guide")).toBeVisible();
-
-  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
   await expect(
     page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
-  ).toHaveAttribute("aria-current", "true");
-  await openFullProjectView(page);
-  await expect(page.getByTestId("project-view-profile")).toContainText(
-    "Bravo project",
-  );
+  ).toHaveCount(0);
+  await expect(page.getByText("Bravo project")).toHaveCount(0);
   await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
   await expect(page).not.toHaveURL(/object=/);
-  await page
-    .getByRole("button", { name: "Inspect Project Profile Bravo project" })
-    .click();
-  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
-
-  await page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`).click();
-  await expect(
-    page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`),
-  ).toHaveAttribute("aria-current", "true");
-  await openFullProjectView(page);
   await expect(
     page.getByRole("heading", {
       name: "Project View v3 requires owner initialization",
     }),
   ).toBeVisible();
-  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
-  await expect(page).not.toHaveURL(/object=/);
+  expect(
+    await page.evaluate(() => {
+      const stored = JSON.parse(
+        window.localStorage.getItem("buzz-communities") ?? "[]",
+      ) as Array<{ id: string; name: string; relayUrl: string }>;
+      return {
+        activeId: window.localStorage.getItem("buzz-active-community-id"),
+        communities: stored.map(({ id, name, relayUrl }) => ({
+          id,
+          name,
+          relayUrl,
+        })),
+      };
+    }),
+  ).toEqual({
+    activeId: COMMUNITY_A.id,
+    communities: [
+      {
+        id: COMMUNITY_A.id,
+        name: "Local Dev",
+        relayUrl: COMMUNITY_A.relayUrl,
+      },
+    ],
+  });
 });
 
-test("Community switching does not carry an Assignment into another View", async ({
+test("local-only bootstrap never paints an alternate-port Assignment", async ({
   page,
 }) => {
   await installMockBridge(
@@ -2289,15 +2296,13 @@ test("Community switching does not carry an Assignment into another View", async
   await expect(page.getByTestId(`project-role-card-${IDS.role}`)).toContainText(
     "Assigned",
   );
-
-  await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
   await expect(
     page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
-  ).toHaveAttribute("aria-current", "true");
-  await openFullProjectView(page);
+  ).toHaveCount(0);
   const roleCard = page.getByTestId(`project-role-card-${IDS.role}`);
-  await expect(roleCard).toContainText("Vacant");
-  await expect(roleCard).not.toContainText("Context Agent");
+  await expect(roleCard).toContainText("Assigned");
+  await expect(roleCard).toContainText("Context Agent");
+  await expect(roleCard).not.toContainText("Vacant");
 });
 
 test("a disconnected View keeps its verified snapshot and marks it stale", async ({

@@ -510,12 +510,10 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadHeadMessage,
     videoReviewCommentsByRootId,
   ]);
-
   const isOverlay = useIsThreadPanelOverlay();
   const useSplitAuxiliaryPane = !isSinglePanelView && !isOverlay;
   const threadViewMode = useThreadViewMode();
-  // Focus mode only replaces the wide split thread pane; narrow threads and
-  // other auxiliary panels keep their existing presentation.
+  // Focus mode only replaces the wide split thread pane.
   const useFocusThreadDrawer =
     threadViewMode === "focus" &&
     useSplitAuxiliaryPane &&
@@ -529,6 +527,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       externalScrollTargetId: threadScrollTargetId,
       onExternalTargetResolved: onThreadScrollTargetResolved,
       onModeChange: markExitComplete,
+      viewMode: threadViewMode,
     });
   const selectedAgent = React.useMemo(
     () =>
@@ -884,6 +883,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 onScrollTargetResolved={resolveScrollTarget}
                 onToggleReaction={onToggleReaction}
                 onUnfollowThread={onUnfollowThread}
+                pinScrollTargetCentered={layoutScrollTargetId !== null}
                 profiles={profiles}
                 replyTargetMessage={threadReplyTargetMessage}
                 scrollTargetHighlights={!layoutScrollTargetId}

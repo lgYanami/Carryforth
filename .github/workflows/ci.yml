@@ -17,7 +17,7 @@ jobs:
   changes:
     name: Detect Changed Paths
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
@@ -47,11 +47,19 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - 'deny.toml'
+              - 'Dockerfile'
+              - 'docker-compose.yml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/docker.yml'
               - '.github/workflows/sprig.yml'
               - 'scripts/run-tests.sh'
+              - 'scripts/attach-schema-partitions.sql'
               - 'scripts/build-ci-relay-artifacts.sh'
+              - 'scripts/run-ci-relay-e2e.sh'
+              - 'scripts/check-ci-workflow.sh'
+              - 'scripts/test-ci-source-contracts.sh'
+              - 'scripts/test-ci-relay-artifact-contract.sh'
+              - 'scripts/test-ci-playwright-report-contract.sh'
               - 'scripts/run-meeting-backend-tests.sh'
               - 'scripts/meeting-v2-*.sh'
               - 'scripts/meeting-v2-*.jq'
@@ -62,6 +70,7 @@ jobs:
               - 'scripts/project-document-capacity-fixture.sql'
               - 'scripts/build-sprig.sh'
               - 'docs/stage/document/**'
+              - 'desktop/src/features/agents/ui/effortTable.fixture.json'
               - 'deploy/local/**'
               - 'deploy/compose/**'
               - 'Justfile'
@@ -115,6 +124,8 @@ jobs:
               - 'schema/**'
               - 'scripts/test-project-view-*.sh'
               - 'scripts/check-project-view-v3-runtime.sh'
+              - 'scripts/build-ci-relay-artifacts.sh'
+              - 'scripts/test-ci-relay-artifact-contract.sh'
               - 'scripts/meeting-v2-actions-live-acceptance.sh'
               - 'scripts/build-sprig.sh'
               - 'docs/stage/project-view/**'
@@ -144,6 +155,8 @@ jobs:
               - 'schema/**'
               - 'scripts/test-project-document-*.sh'
               - 'scripts/test-project-context-*.sh'
+              - 'scripts/build-ci-relay-artifacts.sh'
+              - 'scripts/test-ci-relay-artifact-contract.sh'
               - 'scripts/project-document-capacity-fixture.sql'
               - 'scripts/test-project-view-migrations.sh'
               - 'scripts/run-tests.sh'
@@ -157,26 +170,23 @@ jobs:
             desktop:
               - 'desktop/**'
               - '!desktop/src-tauri/**'
+              - 'docker-compose.yml'
+              - 'scripts/attach-schema-partitions.sql'
+              - 'scripts/setup-desktop-test-data.sh'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'patches/**'
               - 'pnpm-lock.yaml'
             desktop-rust:
               - 'desktop/src-tauri/**'
             web:
               - 'web/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'patches/**'
               - 'pnpm-lock.yaml'
-      - name: Release workflow source contract
-        run: scripts/test-release-ref-contract.sh
-      - name: Current Carryforth product surface contract
-        run: scripts/check-carryforth-current-product-surface.sh
-      - name: Source-development first-start configuration contract
-        run: scripts/test-source-dev-start.sh
-      - name: Current source asset provenance contract
-        run: node scripts/check-source-asset-inventory.mjs
-      - name: Project View release contract
-        run: scripts/test-project-view-release-contract.sh
-      - name: Project View v3-only runtime contract
-        run: scripts/check-project-view-v3-runtime.sh
-      - name: Project Document release contract
-        run: scripts/test-project-document-release-contract.sh
+      - name: CI source contracts
+        run: scripts/test-ci-source-contracts.sh
 
   rust-lint:
     name: Rust Lint
@@ -363,21 +373,26 @@ jobs:
           key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Desktop E2E build
         run: pnpm -C desktop build:e2e
+      - name: Prepare Playwright report contract
+        id: playwright-report-ready
+        run: rm -f desktop/playwright-report.json desktop/flaky-summary.md
       - name: Desktop smoke e2e
+        id: playwright-tests
         timeout-minutes: 30
         run: cd desktop && pnpm exec playwright test --project=smoke --shard=${{ matrix.shard }}/4
-      - name: Summarize flaky tests
-        if: ${{ !cancelled() }}
-        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop Smoke E2E (${{ matrix.shard }})"
+      - name: Validate and summarize Playwright report
+        if: ${{ always() && steps.playwright-report-ready.outcome == 'success' }}
+        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop Smoke E2E (${{ matrix.shard }})" --strict --output flaky-summary.md
         working-directory: desktop
       - name: Upload desktop smoke e2e artifacts
-        if: ${{ !cancelled() }}
+        if: ${{ always() && steps.playwright-report-ready.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: desktop-smoke-e2e-artifacts-${{ matrix.shard }}
           path: |
             desktop/playwright-report
             desktop/playwright-report.json
+            desktop/flaky-summary.md
             desktop/test-results
           if-no-files-found: ignore
           retention-days: 7
@@ -387,12 +402,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-core, desktop-smoke-e2e]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
       - name: Check desktop jobs
         run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Detect Changed Paths finished with: ${{ needs.changes.result }}"
+            exit 1
+          fi
           if [ "${{ needs.desktop-core.result }}" != "success" ]; then
             echo "Desktop Core finished with: ${{ needs.desktop-core.result }}"
             exit 1
@@ -406,16 +425,22 @@ jobs:
   desktop-e2e-relay:
     name: Desktop E2E Relay
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.project-view == 'true' || needs.changes.outputs.project-document == 'true'
     permissions:
       contents: read
     env:
-      RELAY_ARTIFACT_CACHE_SCHEMA: v1
+      RELAY_ARTIFACT_CACHE_SCHEMA: v2
+      RELAY_ARTIFACT_NEXTEST_VERSION: 0.9.136
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Compute relay artifact cache key
+        id: relay-artifact-key
+        env:
+          INPUT_HASH: ${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'Dockerfile', 'scripts/build-ci-relay-artifacts.sh', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+        run: echo "key=relay-artifacts-${RELAY_ARTIFACT_CACHE_SCHEMA}-${RUNNER_OS}-${RUNNER_ARCH}-nextest-${RELAY_ARTIFACT_NEXTEST_VERSION}-${INPUT_HASH}" >> "$GITHUB_OUTPUT"
       # Reuse the relay binaries and backend test archive when none of their
       # inputs changed (desktop-only PRs hit this every time). The key covers
       # everything they embed, including migrations via sqlx migrate!.
@@ -429,7 +454,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ env.RELAY_ARTIFACT_CACHE_SCHEMA }}-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/build-ci-relay-artifacts.sh', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: ${{ steps.relay-artifact-key.outputs.key }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -440,14 +465,17 @@ jobs:
             desktop/src-tauri
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install cargo-nextest
-        if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
-          tool: cargo-nextest@0.9.136
+          tool: cargo-nextest@${{ env.RELAY_ARTIFACT_NEXTEST_VERSION }}
       - name: Build relay artifacts
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 65
+        timeout-minutes: 80
         run: bash scripts/build-ci-relay-artifacts.sh
+      - name: Verify relay artifacts
+        run: bash scripts/build-ci-relay-artifacts.sh --verify-only
+      - name: Verify Relay E2E archive selection
+        run: bash scripts/run-ci-relay-e2e.sh --verify-selection-only
       - name: Save relay artifacts cache
         if: steps.relay-artifacts-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -458,7 +486,7 @@ jobs:
             target/ci/buzz-admin
             target/ci/git-credential-nostr
             target/ci/backend-integration-tests.tar.zst
-          key: relay-artifacts-${{ env.RELAY_ARTIFACT_CACHE_SCHEMA }}-${{ runner.os }}-${{ hashFiles('crates/**', 'migrations/**', 'schema/**', 'scripts/build-ci-relay-artifacts.sh', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          key: ${{ steps.relay-artifact-key.outputs.key }}
       - name: Upload relay artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -475,7 +503,7 @@ jobs:
   desktop-e2e-integration-shard:
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     strategy:
@@ -623,20 +651,26 @@ jobs:
           exit 1
       - name: Seed desktop e2e data
         run: bash scripts/setup-desktop-test-data.sh
+      - name: Prepare Playwright report contract
+        id: playwright-report-ready
+        run: rm -f desktop/playwright-report.json desktop/flaky-summary.md
       - name: Desktop relay-backed e2e
+        id: playwright-tests
+        timeout-minutes: 30
         run: cd desktop && pnpm exec playwright test --project=integration --shard=${{ matrix.shard }}/2
-      - name: Summarize flaky tests
-        if: ${{ !cancelled() }}
-        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop E2E Integration (${{ matrix.shard }}/2)"
+      - name: Validate and summarize Playwright report
+        if: ${{ always() && steps.playwright-report-ready.outcome == 'success' }}
+        run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop E2E Integration (${{ matrix.shard }}/2)" --strict --output flaky-summary.md
         working-directory: desktop
       - name: Upload desktop integration artifacts
-        if: ${{ !cancelled() }}
+        if: ${{ always() && steps.playwright-report-ready.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: desktop-e2e-integration-artifacts-${{ matrix.shard }}
           path: |
             desktop/playwright-report
             desktop/playwright-report.json
+            desktop/flaky-summary.md
             desktop/test-results
             /tmp/buzz-relay.log
           if-no-files-found: ignore
@@ -653,12 +687,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-e2e-relay, desktop-e2e-integration-shard]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
       - name: Check integration shards
         run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Detect Changed Paths finished with: ${{ needs.changes.result }}"
+            exit 1
+          fi
           if [ "${{ needs.desktop-e2e-relay.result }}" != "success" ]; then
             echo "Desktop E2E Relay artifacts finished with: ${{ needs.desktop-e2e-relay.result }}"
             exit 1
@@ -1173,9 +1211,10 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          tool: cargo-nextest@0.9.136
       # Reuse the relay + git-credential-nostr built by Desktop E2E Relay
       # instead of compiling them a second time.
       - name: Download relay binary
@@ -1188,10 +1227,7 @@ jobs:
           chmod +x ./target/ci/buzz-relay ./target/ci/git-credential-nostr
           ./scripts/start-relay-for-tests.sh --no-build
       - name: Relay E2E tests
-        run: |
-          cargo test -p buzz-test-client --test e2e_persona --test e2e_nostr_interop -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
+        run: bash scripts/run-ci-relay-e2e.sh
         env:
           RELAY_URL: ws://localhost:3000
           GIT_CREDENTIAL_NOSTR_BIN: ${{ github.workspace }}/target/ci/git-credential-nostr
@@ -1315,7 +1351,7 @@ jobs:
     runs-on: windows-latest
     # Windows runners are slow and this compiles the workspace + Tauri crate
     # cold across four steps; budget generously.
-    timeout-minutes: 45
+    timeout-minutes: 60
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
@@ -1391,7 +1427,10 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       - name: Test (Tauri crate)
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --target $env:TARGET
+        run: |
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --target $env:TARGET -- --skip relay_admission::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --target $env:TARGET relay_admission::tests -- --test-threads=1
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
