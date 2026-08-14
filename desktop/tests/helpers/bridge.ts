@@ -345,6 +345,12 @@ type MockBridgeOptions = {
    */
   observerArchiveDefaultEnabled?: boolean;
   /**
+   * Hold `observer_archive_default_enabled` until the E2E seam explicitly
+   * releases it. This avoids wall-clock races when asserting the unresolved
+   * reconciliation state.
+   */
+  observerArchiveDefaultEnabledDeferred?: boolean;
+  /**
    * Delay (ms) applied to `observer_archive_default_enabled` so specs can
    * assert the pending-reconciliation state (toggle disabled, no
    * `list_save_subscriptions` call yet) before the policy resolves.

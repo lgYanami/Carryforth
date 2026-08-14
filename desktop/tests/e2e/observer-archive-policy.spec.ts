@@ -226,7 +226,7 @@ test.describe("observer archive policy — reconciliation gate", () => {
   }) => {
     await installMockBridge(page, {
       observerArchiveDefaultEnabled: true,
-      observerArchiveDefaultEnabledDelayMs: 500,
+      observerArchiveDefaultEnabledDeferred: true,
       saveSubscriptions: [
         {
           scope_type: "owner_p",
@@ -240,6 +240,9 @@ test.describe("observer archive policy — reconciliation gate", () => {
     await expect(page.getByTestId("channel-general")).toBeVisible({
       timeout: 10_000,
     });
+    await page.waitForFunction(
+      () => window.__BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__ === true,
+    );
 
     // While the policy check is pending, useArchiveSync must not have
     // started — no list_save_subscriptions call, no owner/24200 live
@@ -274,6 +277,10 @@ test.describe("observer archive policy — reconciliation gate", () => {
 
     // After the policy resolves, both the IPC call and the live filter
     // appear.
+    const released = await page.evaluate(
+      () => window.__BUZZ_E2E_RELEASE_OBSERVER_ARCHIVE_POLICY__?.() ?? 0,
+    );
+    expect(released).toBeGreaterThan(0);
     await page.waitForFunction(
       () =>
         ((

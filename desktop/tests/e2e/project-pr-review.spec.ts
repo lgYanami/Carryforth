@@ -153,10 +153,7 @@ test("PR creator/owner can toggle draft, request reviews, and approve", async ({
   await page.getByTestId("project-reviewer-search").fill("bob");
   await page
     .getByTestId(`project-reviewer-result-${TEST_IDENTITIES.bob.pubkey}`)
-    .evaluate((button) => {
-      button.click();
-      button.click();
-    });
+    .click();
   await expect(page.getByText("Review requested.")).toBeVisible();
   await expect
     .poll(() =>

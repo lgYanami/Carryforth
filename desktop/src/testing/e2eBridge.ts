@@ -450,6 +450,8 @@ type E2eConfig = {
     // snake_case wire shape the Rust backend returns so tests can drive the
     // LocalArchiveSettingsCard without a real SQLite database.
     observerArchiveDefaultEnabled?: boolean;
+    /** Hold the policy read until the test explicitly releases the E2E gate. */
+    observerArchiveDefaultEnabledDeferred?: boolean;
     /**
      * Delay (ms) applied to `observer_archive_default_enabled` so E2E tests
      * can observe the pending-reconciliation state (toggle disabled, no
@@ -1110,6 +1112,8 @@ declare global {
       ownerPubkey: string;
       kind: number;
     }) => boolean;
+    __BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__?: boolean;
+    __BUZZ_E2E_RELEASE_OBSERVER_ARCHIVE_POLICY__?: () => number;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
       channelName: string;
       content: string;
@@ -1469,6 +1473,12 @@ type DeferredGetEvent = {
   run: () => Promise<string>;
 };
 let deferredGetEventQueue: DeferredGetEvent[] = [];
+
+// Deterministic observer-policy gate for E2E tests. A fixed delay cannot
+// prove the unresolved state because unrelated startup rendering may consume
+// the delay before the assertion runs.
+let observerArchivePolicyGateOpen = false;
+let deferredObserverArchivePolicyResolvers: Array<() => void> = [];
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -10829,6 +10839,16 @@ export function maybeInstallE2eTauriMocks() {
     ownerPubkey,
     kind,
   }) => hasMockOwnerKindSubscription(ownerPubkey, kind);
+  observerArchivePolicyGateOpen = false;
+  deferredObserverArchivePolicyResolvers = [];
+  window.__BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__ = false;
+  window.__BUZZ_E2E_RELEASE_OBSERVER_ARCHIVE_POLICY__ = () => {
+    observerArchivePolicyGateOpen = true;
+    window.__BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__ = false;
+    const queued = deferredObserverArchivePolicyResolvers.splice(0);
+    for (const resolve of queued) resolve();
+    return queued.length;
+  };
   window.__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__ = (item) => {
     const category = item.category === "mention" ? "mentions" : item.category;
     mockFeedOverrides[category].unshift(item);
@@ -13396,6 +13416,15 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig?.mock?.observerArchiveDefaultEnabledDelayMs;
         if (delayMs && delayMs > 0) {
           await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        if (
+          activeConfig?.mock?.observerArchiveDefaultEnabledDeferred &&
+          !observerArchivePolicyGateOpen
+        ) {
+          window.__BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__ = true;
+          await new Promise<void>((resolve) => {
+            deferredObserverArchivePolicyResolvers.push(resolve);
+          });
         }
         const error = activeConfig?.mock?.observerArchiveDefaultEnabledError;
         if (error) {
