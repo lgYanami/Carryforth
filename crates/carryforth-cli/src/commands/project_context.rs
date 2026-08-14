@@ -2,6 +2,8 @@
 
 #[path = "project_context_observation.rs"]
 mod observation;
+#[path = "project_context_one_hop.rs"]
+mod one_hop;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
@@ -52,7 +54,8 @@ use crate::client::{CarryforthClient, ProjectCommandDelivery};
 use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
-    COORDINATE_SEARCH_HTTP_EXTENSION, SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+    COORDINATE_SEARCH_HTTP_EXTENSION, ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
+    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
 };
 use crate::error::CliError;
 use crate::{
@@ -289,6 +292,13 @@ pub async fn dispatch(
                 )
                 .await
             }
+            ProjectContextCoordinateCmd::EdgeSearch {
+                coordinate,
+                query,
+                limit,
+            } => {
+                one_hop::run_coordinate_edge_search(client, &coordinate, query, limit, format).await
+            }
         },
         ProjectContextCmd::Edge { command } => match command {
             ProjectContextEdgeCmd::Documents {
@@ -316,6 +326,11 @@ pub async fn dispatch(
             ProjectContextEdgeCmd::Coordinates { edge_key } => {
                 observation::run_edge_coordinates(client, &edge_key, format).await
             }
+            ProjectContextEdgeCmd::CoordinateSearch {
+                edge_key,
+                query,
+                limit,
+            } => one_hop::run_edge_coordinate_search(client, &edge_key, query, limit, format).await,
         },
         ProjectContextCmd::CoordinateSearch { query, limit } => {
             run_coordinate_search(client, query, limit, format).await
@@ -2142,6 +2157,7 @@ mod tests {
             document_enabled: true,
             semantic_query_http_enabled: false,
             coordinate_search_http_enabled: false,
+            one_hop_semantic_search_http_enabled: false,
             extensions_temporarily_unavailable: false,
         }
     }

@@ -810,6 +810,21 @@ pub enum ProjectContextCoordinateCmd {
         #[arg(long, requires = "after_edge")]
         expected_projection_generation: Option<u64>,
     },
+    /// Rank this Coordinate's incident Edges from a natural-language query
+    ///
+    /// Each returned Edge includes only its matched canonical relation
+    /// Document previews. It does not return the Edge's Coordinate members.
+    #[command(name = "edge-search")]
+    EdgeSearch {
+        /// Typed `TYPE:<uuid-v4>` Coordinate whose incident Edges form the scope.
+        coordinate: String,
+        /// Natural-language description of the relation evidence to find.
+        #[arg(long)]
+        query: String,
+        /// Maximum ranked Edges to return.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+        limit: u8,
+    },
 }
 
 /// Atomic Edge observations for progressive Project Context traversal.
@@ -862,6 +877,21 @@ pub enum ProjectContextEdgeCmd {
     Coordinates {
         /// Canonical lowercase 64-character EdgeKey.
         edge_key: String,
+    },
+    /// Rank one Edge's member Coordinates from a natural-language query
+    ///
+    /// Each returned Coordinate includes its canonical lightweight source
+    /// preview. It does not return relation Documents or the complete Edge.
+    #[command(name = "coordinate-search")]
+    CoordinateSearch {
+        /// Canonical lowercase 64-character EdgeKey whose members form the scope.
+        edge_key: String,
+        /// Natural-language description of the next Coordinate to find.
+        #[arg(long)]
+        query: String,
+        /// Maximum ranked Coordinates to return.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+        limit: u8,
     },
 }
 
@@ -3634,6 +3664,17 @@ mod tests {
             vec![
                 "cf",
                 "project-context",
+                "coordinate",
+                "edge-search",
+                requirement_a,
+                "--query",
+                "evidence about frontend ownership",
+                "--limit",
+                "12",
+            ],
+            vec![
+                "cf",
+                "project-context",
                 "edge",
                 "documents",
                 edge_key.as_str(),
@@ -3646,6 +3687,17 @@ mod tests {
                 "edge",
                 "coordinates",
                 edge_key.as_str(),
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "edge",
+                "coordinate-search",
+                edge_key.as_str(),
+                "--query",
+                "the work responsible for this incident",
+                "--limit",
+                "12",
             ],
             vec![
                 "cf",
@@ -3760,6 +3812,62 @@ mod tests {
             "starting point",
             "--limit",
             "0",
+        ])
+        .is_err());
+        for args in [
+            vec![
+                "cf",
+                "project-context",
+                "coordinate",
+                "edge-search",
+                requirement_a,
+                "--query",
+                "candidate",
+                "--limit",
+                "0",
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "coordinate",
+                "edge-search",
+                requirement_a,
+                "--query",
+                "candidate",
+                "--limit",
+                "33",
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "edge",
+                "coordinate-search",
+                edge_key.as_str(),
+                "--query",
+                "candidate",
+                "--limit",
+                "0",
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "edge",
+                "coordinate-search",
+                edge_key.as_str(),
+                "--query",
+                "candidate",
+                "--limit",
+                "33",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate",
+            "edge-search",
+            requirement_a,
         ])
         .is_err());
         assert!(Cli::try_parse_from([
@@ -4473,10 +4581,13 @@ mod tests {
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "project-context")
             .expect("project-context command");
-        assert_eq!(names(project_context, "coordinate"), vec!["edges", "show"]);
+        assert_eq!(
+            names(project_context, "coordinate"),
+            vec!["edge-search", "edges", "show"]
+        );
         assert_eq!(
             names(project_context, "edge"),
-            vec!["coordinates", "documents"]
+            vec!["coordinate-search", "coordinates", "documents"]
         );
         let project_view = cmd
             .get_subcommands()

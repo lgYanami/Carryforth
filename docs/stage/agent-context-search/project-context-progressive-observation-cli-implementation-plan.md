@@ -1,10 +1,10 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B5已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
+> 状态：实施中；Phase B0–B6已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
-> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`、B4 `538aad9a8`；B5在本计划内增量交付
+> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`、B4 `538aad9a8`、B5 `9f5a73c11`；B6在本计划内增量交付
 >
 > 已交付起点检索：
 > [Agent Project Context 自然语言 Coordinate 起点检索分阶段实现计划](project-context-coordinate-search-implementation-plan.md)
@@ -1272,6 +1272,11 @@ NIP-11/fleet/config/status/admin readiness。
 退出门：master/gate/fleet/auth拒绝路径Provider egress 0；success/error/churn均至多一次；mixed fleet不广告。
 
 ### Phase B6：Carryforth CLI接线
+
+> 实施状态：已交付。新增两个nested CLI、独立NIP-11 capability preflight、共享的byte-exact no-retry/no-redirect
+> HTTP transport、closed one-hop error解析与固定content-free映射，以及SDK对Relay签名result和exact NIP-98 transcript的
+> 验证。CLI只打印verified result本身，保留其中的canonical candidate previews/read descriptors，不本地补齐、重排或
+> 回显query；两个variant的Edge/Coordinate/Document字段继续严格隔离。
 
 交付：两个semantic CLI、capability preflight、one-shot no-retry transport、SDK parse、JSON/compact打印。
 
