@@ -3226,7 +3226,7 @@ mod tests {
             [ -z "${BUZZ_PRIVATE_KEY+x}" ] || status=env-bad
             [ -z "${BUZZ_AUTH_TAG+x}" ] || status=env-bad
             printf '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"%s"}}}\n' "$status"
-            sleep 1
+            exec sleep 10
         "#;
         let extra_env = vec![
             (
@@ -3269,7 +3269,7 @@ mod tests {
             read -t 2 _REQ
             if [ -z "${CARRYFORTH_AUTH_TAG+x}" ]; then status=auth-absent; else status=auth-leaked; fi
             printf '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"%s"}}}\n' "$status"
-            sleep 1
+            exec sleep 10
         "#;
         let extra_env = vec![
             (
