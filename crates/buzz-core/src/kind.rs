@@ -485,6 +485,12 @@ pub const KIND_SEMANTIC_GRAPH_QUERY_RESULT: u32 = 40912;
 /// accepted from clients, persisted, indexed, queried through ordinary Nostr
 /// filters, or fanned out.
 pub const KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT: u32 = 40913;
+/// Relay-signed Project Context one-hop semantic-selection result.
+///
+/// This is a response-only virtual Event shared by the closed Coordinate-to-
+/// Edge and Edge-to-Coordinate selection variants. It must never be accepted
+/// from clients, persisted, indexed, queried, counted, searched, or fanned out.
+pub const KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT: u32 = 40914;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -732,6 +738,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PROJECT_CONTEXT_META,
     KIND_SEMANTIC_GRAPH_QUERY_RESULT,
     KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -916,7 +923,9 @@ pub const fn is_semantic_graph_virtual_result_kind(kind: u32) -> bool {
 pub const fn is_semantic_query_virtual_result_kind(kind: u32) -> bool {
     matches!(
         kind,
-        KIND_SEMANTIC_GRAPH_QUERY_RESULT | KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+        KIND_SEMANTIC_GRAPH_QUERY_RESULT
+            | KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+            | KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
     )
 }
 
@@ -1004,6 +1013,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_PROJECT_CONTEXT_META
             | KIND_SEMANTIC_GRAPH_QUERY_RESULT
             | KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+            | KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -1123,6 +1133,18 @@ const _: () = assert!(!is_command_kind(
 ));
 const _: () = assert!(is_relay_only_kind(
     KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+));
+const _: () = assert!(is_semantic_query_virtual_result_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(!is_project_context_protocol_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(!is_command_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(is_relay_only_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
 ));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
@@ -1359,6 +1381,7 @@ mod tests {
         let virtual_kinds = [
             KIND_SEMANTIC_GRAPH_QUERY_RESULT,
             KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+            KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
         ];
         for &kind in ALL_KINDS {
             assert_eq!(

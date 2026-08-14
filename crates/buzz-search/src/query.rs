@@ -9,7 +9,10 @@
 //! See conformance row 50.
 
 use buzz_core::{
-    kind::{KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT},
+    kind::{
+        KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+        KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    },
     CommunityId,
 };
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -248,6 +251,7 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     for kind in [
         KIND_SEMANTIC_GRAPH_QUERY_RESULT,
         KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+        KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
     ] {
         qb.push(" AND kind <> ");
         qb.push_bind(kind as i32);

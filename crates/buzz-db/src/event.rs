@@ -12,7 +12,7 @@ use uuid::Uuid;
 use buzz_core::kind::{
     event_kind_i32, has_indexed_d_tag, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER,
     KIND_HUDDLE_STARTED, KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
-    KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -106,7 +106,7 @@ pub struct EventQuery {
     pub persona_reader: Option<Vec<u8>>,
 }
 
-fn semantic_virtual_result_kinds_i32() -> Result<[i32; 2]> {
+fn semantic_virtual_result_kinds_i32() -> Result<[i32; 3]> {
     Ok([
         i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
             DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_owned())
@@ -114,13 +114,16 @@ fn semantic_virtual_result_kinds_i32() -> Result<[i32; 2]> {
         i32::try_from(KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT).map_err(|_| {
             DbError::InvalidData("Coordinate-search virtual result kind exceeds int4".to_owned())
         })?,
+        i32::try_from(KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT).map_err(|_| {
+            DbError::InvalidData("one-hop semantic virtual result kind exceeds int4".to_owned())
+        })?,
     ])
 }
 
 fn push_semantic_virtual_result_exclusions(
     builder: &mut QueryBuilder<Postgres>,
     column: &str,
-    kinds: [i32; 2],
+    kinds: [i32; 3],
 ) {
     for kind in kinds {
         builder.push(format!(" AND {column} <> "));
@@ -1738,12 +1741,13 @@ mod tests {
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
     #[test]
-    fn ordinary_event_reads_exclude_both_semantic_virtual_result_kinds() {
+    fn ordinary_event_reads_exclude_all_semantic_virtual_result_kinds() {
         assert_eq!(
             semantic_virtual_result_kinds_i32().expect("semantic virtual result kinds"),
             [
                 KIND_SEMANTIC_GRAPH_QUERY_RESULT as i32,
                 KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as i32,
+                KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT as i32,
             ]
         );
     }

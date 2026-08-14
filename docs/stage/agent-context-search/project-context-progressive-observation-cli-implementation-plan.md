@@ -1,6 +1,6 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B1 已交付；one-hop semantic 仍 feature-off；不构成 production-ready 声明
+> 状态：实施中；Phase B0–B1及B3 storage-deny前置已交付；one-hop semantic仍feature-off；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
@@ -1222,6 +1222,9 @@ crates/buzz-acp/**
 ### Phase B3：40914 storage deny与readiness
 
 交付：kind classifier、migration、fresh schema、readiness/drift、ordinary query/ingest/fanout deny。
+
+安全实施顺序：B3必须先于B2公开SDK Event builder落地，避免阶段提交期间出现“能够构造40914、但普通
+ingest/storage尚未fail closed”的窗口；该依赖顺序不改变B2/B3各自产品范围。
 
 退出门：40914 persistence count 0；40912/40913全部nonleak回归继续通过。
 

@@ -157,6 +157,12 @@ docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
         )
         AND EXISTS (
           SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'events'::regclass
+            AND conname = 'events_kind_not_project_context_one_hop_semantic_search_result'
+            AND convalidated
+        )
+        AND EXISTS (
+          SELECT 1 FROM pg_constraint
           WHERE conrelid = 'semantic_embeddings'::regclass
             AND conname = 'semantic_embeddings_nonzero_cosine'
             AND convalidated

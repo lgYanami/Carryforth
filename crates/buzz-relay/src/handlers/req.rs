@@ -1803,12 +1803,15 @@ mod tests {
     use nostr::{Alphabet, Filter, Kind, SingleLetterTag};
 
     #[test]
-    fn ordinary_req_rejects_both_semantic_virtual_result_kinds() {
+    fn ordinary_req_rejects_all_semantic_virtual_result_kinds() {
         let graph = Filter::new().kind(Kind::Custom(
             buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT as u16,
         ));
         let coordinate = Filter::new().kind(Kind::Custom(
             buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as u16,
+        ));
+        let one_hop = Filter::new().kind(Kind::Custom(
+            buzz_core::kind::KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT as u16,
         ));
         let mixed = Filter::new().kinds([
             Kind::TextNote,
@@ -1819,6 +1822,7 @@ mod tests {
         assert!(filter_explicitly_requests_semantic_query_result(
             &coordinate
         ));
+        assert!(filter_explicitly_requests_semantic_query_result(&one_hop));
         assert!(filter_explicitly_requests_semantic_query_result(&mixed));
         assert!(!filter_explicitly_requests_semantic_query_result(
             &Filter::new().kind(Kind::TextNote)

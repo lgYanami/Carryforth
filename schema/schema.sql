@@ -11388,6 +11388,13 @@ ALTER TABLE events
     ADD CONSTRAINT events_kind_not_project_context_coordinate_search_result
         CHECK (kind <> 40913);
 
+-- Migration 0060.
+-- Kind 40914 is a signed response-only one-hop semantic-selection Event and
+-- never belongs in canonical Event storage.
+ALTER TABLE events
+    ADD CONSTRAINT events_kind_not_project_context_one_hop_semantic_search_result
+        CHECK (kind <> 40914);
+
 ALTER TABLE semantic_embeddings
     ADD CONSTRAINT semantic_embeddings_nonzero_cosine
         CHECK (vector_norm(embedding) > 0);

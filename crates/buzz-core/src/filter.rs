@@ -313,6 +313,7 @@ mod tests {
         for kind in [
             crate::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT,
             crate::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+            crate::kind::KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
         ] {
             let event = EventBuilder::new(Kind::Custom(kind as u16), "{}")
                 .tags([Tag::parse(["p", caller_hex.as_str()]).expect("p tag")])
