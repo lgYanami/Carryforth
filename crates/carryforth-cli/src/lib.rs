@@ -685,6 +685,19 @@ pub enum DocumentsCmd {
 /// Commands for Project Context Edge discovery and maintenance.
 #[derive(Subcommand)]
 pub enum ProjectContextCmd {
+    /// Find ranked graph Coordinates from one natural-language starting-point query
+    ///
+    /// Returns only the verified signed Coordinate candidates. It does not
+    /// select an Edge or path and does not read source content.
+    #[command(name = "coordinate-search")]
+    CoordinateSearch {
+        /// Natural-language description of the task and desired starting context.
+        #[arg(long)]
+        query: String,
+        /// Maximum candidates to return.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+        limit: u8,
+    },
     /// Retrieve a bounded semantic relevance forest without replaying the Provider request
     ///
     /// Output is `{result,read_commands}`. `result` is the verified signed
@@ -3494,6 +3507,15 @@ mod tests {
             vec![
                 "cf",
                 "project-context",
+                "coordinate-search",
+                "--query",
+                "authorization failure during release",
+                "--limit",
+                "12",
+            ],
+            vec![
+                "cf",
+                "project-context",
                 "semantic-query",
                 "--problem",
                 "why does release fail?",
@@ -3586,6 +3608,27 @@ mod tests {
         ] {
             Cli::try_parse_from(args).expect("parse Project Context command");
         }
+
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate-search",
+            "--query",
+            "starting point",
+            "--limit",
+            "0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate-search",
+            "--query",
+            "starting point",
+            "--limit",
+            "33",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -4232,6 +4275,7 @@ mod tests {
             vec![
                 "attach",
                 "contains-all",
+                "coordinate-search",
                 "detach",
                 "exact",
                 "incident",

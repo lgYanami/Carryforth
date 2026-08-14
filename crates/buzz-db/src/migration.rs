@@ -558,7 +558,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 58);
+        assert_eq!(migrations.len(), 59);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1416,6 +1416,34 @@ mod tests {
             );
         }
 
+        assert_eq!(migrations[58].version, 59);
+        let coordinate_search = migrations[58].sql.as_str();
+        for required in [
+            "events_kind_not_project_context_coordinate_search_result",
+            "CHECK (kind <> 40913) NOT VALID",
+            "VALIDATE CONSTRAINT events_kind_not_project_context_coordinate_search_result",
+        ] {
+            assert!(
+                coordinate_search.contains(required),
+                "migration 0059 must contain {required}"
+            );
+        }
+        for forbidden in [
+            "CREATE EXTENSION",
+            "DROP EXTENSION",
+            "DROP TABLE",
+            "DROP COLUMN",
+            "TRUNCATE",
+            "DELETE FROM",
+            "UPDATE events",
+            "ADD COLUMN semantic_coordinate_search_enabled",
+        ] {
+            assert!(
+                !coordinate_search.contains(forbidden),
+                "migration 0059 must not contain {forbidden}"
+            );
+        }
+
         assert_eq!(migrations[57].version, 58);
         let semantic_query = migrations[57].sql.as_str();
         for required in [
@@ -1475,6 +1503,7 @@ mod tests {
             "semantic_graph_query_enabled BOOLEAN NOT NULL DEFAULT FALSE",
             "communities_semantic_graph_query_requires_index",
             "events_kind_not_semantic_graph_query_result",
+            "events_kind_not_project_context_coordinate_search_result",
             "semantic_embeddings_nonzero_cosine",
             "CHECK (vector_norm(embedding) > 0)",
             "CREATE TABLE semantic_query_provider_admission",
@@ -2092,11 +2121,14 @@ mod tests {
             .expect("close Foundation gate second");
         tx.commit().await.expect("commit atomic semantic disable");
 
-        let constraint_states: (bool, bool) = sqlx::query_as(
+        let constraint_states: (bool, bool, bool) = sqlx::query_as(
             "SELECT \
                  (SELECT convalidated FROM pg_constraint \
                   WHERE conrelid='events'::regclass \
                     AND conname='events_kind_not_semantic_graph_query_result'), \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='events'::regclass \
+                    AND conname='events_kind_not_project_context_coordinate_search_result'), \
                  (SELECT convalidated FROM pg_constraint \
                   WHERE conrelid='semantic_embeddings'::regclass \
                     AND conname='semantic_embeddings_nonzero_cosine')",
@@ -2104,7 +2136,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("inspect upgrade constraint validation state");
-        assert_eq!(constraint_states, (true, false));
+        assert_eq!(constraint_states, (true, true, false));
         let historical_zero_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM semantic_embeddings \
              WHERE community_id=$1 AND vector_norm(embedding)=0",
@@ -2523,11 +2555,14 @@ mod tests {
                 .unwrap_or_else(|error| panic!("inspect {relation}: {error}"));
             assert!(exists, "{relation} must exist in checked-in schema");
         }
-        let query_constraints: (bool, bool) = sqlx::query_as(
+        let query_constraints: (bool, bool, bool) = sqlx::query_as(
             "SELECT \
                  (SELECT convalidated FROM pg_constraint \
                   WHERE conrelid='events'::regclass \
                     AND conname='events_kind_not_semantic_graph_query_result'), \
+                 (SELECT convalidated FROM pg_constraint \
+                  WHERE conrelid='events'::regclass \
+                    AND conname='events_kind_not_project_context_coordinate_search_result'), \
                  (SELECT convalidated FROM pg_constraint \
                   WHERE conrelid='semantic_embeddings'::regclass \
                     AND conname='semantic_embeddings_nonzero_cosine')",
@@ -2535,7 +2570,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("inspect fresh semantic-query constraints");
-        assert_eq!(query_constraints, (true, true));
+        assert_eq!(query_constraints, (true, true, true));
 
         pool.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(

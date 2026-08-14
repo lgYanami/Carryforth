@@ -57,6 +57,8 @@ pub struct SemanticGraphQueryTicket {
     /// Closed source-generation/vector-space/query-template compatibility
     /// fences derived from the active generation.
     pub query_fences: QueryCompatibilityFences,
+    /// Project Context projection generation observed with the ticket.
+    pub projection_generation: u64,
     /// Project Context catalog revision observed with the generation pointer.
     pub project_context_revision: u64,
     /// Database time at which this ticket snapshot was observed.
@@ -993,6 +995,9 @@ pub enum SemanticGraphQueryReleaseConfirmation {
     /// The principal or one of the current query/read prerequisites is no
     /// longer authorized.
     Denied,
+    /// An optional caller-supplied generation/Context snapshot no longer
+    /// matches the current canonical query ticket.
+    SnapshotChanged,
     /// Attested-Fleet mode no longer authorizes this exact serving instance.
     /// This outcome is unreachable in trusted mode.
     FleetUnavailable,
@@ -1006,6 +1011,10 @@ pub struct SemanticGraphQueryReleaseRequest<'a> {
     pub reader_pubkey: &'a [u8],
     /// Relay projection signer required by all canonical read models.
     pub expected_projection_pubkey: &'a PublicKey,
+    /// Optional exact Stage C snapshot that must still own the active
+    /// generation, projection generation, and Context revision. Existing
+    /// graph-query callers may omit this to preserve their snapshot contract.
+    pub expected_snapshot: Option<&'a SemanticGraphQueryTicket>,
     /// Explicit single-Relay or attested-Fleet routing requirement.
     pub routing_trust: SemanticGraphQueryRoutingTrust<'a>,
 }
@@ -1016,10 +1025,10 @@ pub struct SemanticGraphQueryReleaseRequest<'a> {
 /// readiness are checked before this value is returned. Every distance method
 /// additionally binds its SQL to the same principal and expected generation.
 pub struct SemanticGraphReadTx {
-    tx: Transaction<'static, Postgres>,
-    ticket: SemanticGraphQueryTicket,
-    reader_pubkey: Vec<u8>,
-    expected_projection_pubkey: PublicKey,
+    pub(crate) tx: Transaction<'static, Postgres>,
+    pub(crate) ticket: SemanticGraphQueryTicket,
+    pub(crate) reader_pubkey: Vec<u8>,
+    pub(crate) expected_projection_pubkey: PublicKey,
 }
 
 impl std::fmt::Debug for SemanticGraphReadTx {
@@ -1076,6 +1085,7 @@ impl Db {
             community_id,
             reader_pubkey,
             expected_projection_pubkey,
+            expected_snapshot,
             routing_trust,
         } = request;
         validate_pubkey(reader_pubkey)?;
@@ -1088,7 +1098,7 @@ impl Db {
             tx.rollback().await?;
             return Ok(SemanticGraphQueryReleaseConfirmation::Denied);
         }
-        match load_authorized_ticket_in_tx(
+        let current_ticket = match load_authorized_ticket_in_tx(
             &mut tx,
             community_id,
             reader_pubkey,
@@ -1096,12 +1106,18 @@ impl Db {
         )
         .await
         {
-            Ok(_) => {}
+            Ok(ticket) => ticket,
             Err(DbError::AccessDenied(_)) | Err(DbError::NotFound(_)) => {
                 tx.rollback().await?;
                 return Ok(SemanticGraphQueryReleaseConfirmation::Denied);
             }
             Err(error) => return Err(error),
+        };
+        if expected_snapshot
+            .is_some_and(|expected| !same_release_snapshot(&current_ticket, expected))
+        {
+            tx.rollback().await?;
+            return Ok(SemanticGraphQueryReleaseConfirmation::SnapshotChanged);
         }
         if !crate::semantic_fleet::semantic_graph_query_routing_ready_in_tx(
             &mut tx,
@@ -5295,6 +5311,10 @@ async fn load_authorized_ticket_in_tx(
             row.try_get("context_revision")?,
             "project_context_revision",
         )?,
+        projection_generation: positive_u64(
+            row.try_get("projection_generation")?,
+            "project_context_projection_generation",
+        )?,
         observed_at: row.try_get("observed_at")?,
     })
 }
@@ -5306,6 +5326,15 @@ fn same_generation_contract(
     observed.community_id == expected.community_id
         && observed.generation == expected.generation
         && observed.query_fences == expected.query_fences
+}
+
+fn same_release_snapshot(
+    observed: &SemanticGraphQueryTicket,
+    expected: &SemanticGraphQueryTicket,
+) -> bool {
+    same_generation_contract(observed, expected)
+        && observed.projection_generation == expected.projection_generation
+        && observed.project_context_revision == expected.project_context_revision
 }
 
 fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
@@ -5412,7 +5441,8 @@ authorized_reader AS MATERIALIZED (
 authorized_project AS MATERIALIZED (
     SELECT community.id AS community_id,
            community.semantic_active_generation_id AS generation_id,
-           context_state.context_revision
+           context_state.context_revision,
+           context_state.projection_generation
     FROM communities community
     CROSS JOIN authorized_reader
     JOIN project_view_maintenance maintenance
@@ -5441,7 +5471,7 @@ authorized_project AS MATERIALIZED (
       AND context_state.projection_pubkey = $3
       AND community.semantic_active_generation_id IS NOT NULL
 )
-SELECT generation.*, project.context_revision,
+SELECT generation.*, project.context_revision, project.projection_generation,
        clock_timestamp() AS observed_at
 FROM authorized_project project
 JOIN semantic_index_generations generation
@@ -5474,14 +5504,15 @@ mod tests {
     use super::{
         bindings_from_json, canonical_query_coordinates, compare_ranked_relations,
         compare_ranked_targets, context_state_set_digest, current_availability_from_db,
-        edge_keys_from_json, partition_exact_recall, semantic_hyperedge_identity_bytes,
-        semantic_source_identity_for_coordinate, slice_ranked_relations, slice_ranked_targets,
-        source_eligibility_from_db, validate_query_vectors, SemanticContextEgressExpectation,
-        SemanticContextOmissionReason, SemanticCurrentContextOverview, SemanticCurrentHead,
-        SemanticExactQueryVector, SemanticExactRecallExhaustion, SemanticExactSourceScore,
-        SemanticGraphQueryTicket, SemanticGraphStructuralRoles, SemanticOmittedContextEvidence,
-        SemanticRankedRelationOption, SemanticRankedTargetOption, SemanticTraversalSliceExhaustion,
-        AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
+        edge_keys_from_json, partition_exact_recall, same_release_snapshot,
+        semantic_hyperedge_identity_bytes, semantic_source_identity_for_coordinate,
+        slice_ranked_relations, slice_ranked_targets, source_eligibility_from_db,
+        validate_query_vectors, SemanticContextEgressExpectation, SemanticContextOmissionReason,
+        SemanticCurrentContextOverview, SemanticCurrentHead, SemanticExactQueryVector,
+        SemanticExactRecallExhaustion, SemanticExactSourceScore, SemanticGraphQueryTicket,
+        SemanticGraphStructuralRoles, SemanticOmittedContextEvidence, SemanticRankedRelationOption,
+        SemanticRankedTargetOption, SemanticTraversalSliceExhaustion, AUTHORIZED_TICKET_SQL,
+        COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
         CURRENT_SEMANTIC_SOURCE_STATES_SQL, EXACT_SOURCE_SCORES_SQL,
         FINAL_CONFIRMATION_ISOLATION_SQL, INCIDENT_RELATION_REFS_SQL,
         LOCK_EGRESS_CONTEXT_STATE_SQL, LOCK_EGRESS_GENERATION_SQL,
@@ -5507,9 +5538,28 @@ mod tests {
                 created_at: Utc::now(),
             },
             query_fences,
+            projection_generation: 1,
             project_context_revision: 1,
             observed_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn coordinate_release_snapshot_binds_generation_projection_and_context_revision() {
+        let expected = ticket(SemanticModelContract::volcengine_overview_v1());
+        assert!(same_release_snapshot(&expected, &expected));
+
+        let mut projection_changed = expected.clone();
+        projection_changed.projection_generation += 1;
+        assert!(!same_release_snapshot(&projection_changed, &expected));
+
+        let mut context_changed = expected.clone();
+        context_changed.project_context_revision += 1;
+        assert!(!same_release_snapshot(&context_changed, &expected));
+
+        let mut generation_changed = expected.clone();
+        generation_changed.generation.generation_id = Uuid::new_v4();
+        assert!(!same_release_snapshot(&generation_changed, &expected));
     }
 
     fn exact_score(channel_id: Digest32, rank: u32, source_id: Uuid) -> SemanticExactSourceScore {

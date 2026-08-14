@@ -30,6 +30,8 @@ pub mod project_view_v3;
 pub mod role_brief;
 /// Strict Project View v3 snapshot and base Role Brief assembly.
 pub mod role_brief_v3;
+/// Project Context Coordinate-search virtual-result builder and verifier.
+pub mod semantic_coordinate_search;
 /// Semantic Project Context graph virtual-result builder and verifier.
 pub mod semantic_graph;
 

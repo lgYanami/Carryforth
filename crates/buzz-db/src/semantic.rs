@@ -661,6 +661,10 @@ impl Db {
                                AND conname='events_kind_not_semantic_graph_query_result' \
                                AND convalidated) \
                  AND EXISTS (SELECT 1 FROM pg_constraint \
+                             WHERE conrelid=to_regclass('events') \
+                               AND conname='events_kind_not_project_context_coordinate_search_result' \
+                               AND convalidated) \
+                 AND EXISTS (SELECT 1 FROM pg_constraint \
                              WHERE conrelid=to_regclass('semantic_embeddings') \
                                AND conname='semantic_embeddings_nonzero_cosine')",
         )
@@ -730,7 +734,7 @@ impl Db {
                              AND embedding.response_model=generation.model \
                              AND vector_norm(embedding.embedding)>0 \
                        )) AS non_queryable_current_heads, \
-                    (SELECT count(*) FROM events WHERE kind=40912) \
+                    (SELECT count(*) FROM events WHERE kind IN (40912, 40913)) \
                         AS persisted_virtual_events \
              FROM communities community WHERE community.id=$1",
         )

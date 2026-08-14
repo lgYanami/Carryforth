@@ -536,7 +536,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
-    if state.config.semantic_graph_query_http_available
+    if (state.config.semantic_graph_query_http_available
+        || state
+            .config
+            .project_context_coordinate_search_http_available)
         && state.config.semantic_graph_query_fleet_policy
             == buzz_semantic_query::SemanticGraphQueryFleetPolicy::TrustedSingleRelay
     {
@@ -546,7 +549,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    if state.config.semantic_worker.enabled || state.config.semantic_graph_query_http_available {
+    if state.config.semantic_worker.enabled
+        || state.config.semantic_graph_query_http_available
+        || state
+            .config
+            .project_context_coordinate_search_http_available
+    {
         let provider = state
             .semantic_provider()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -582,6 +590,15 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE requires migration 0058 query schema"
+        );
+    }
+    if state
+        .config
+        .project_context_coordinate_search_http_available
+        && !state.db.semantic_graph_query_schema_ready().await?
+    {
+        anyhow::bail!(
+            "CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE requires migration 0059 query schema"
         );
     }
 

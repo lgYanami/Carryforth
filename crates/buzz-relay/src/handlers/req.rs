@@ -7,9 +7,9 @@ use tracing::{debug, warn};
 
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
-    has_indexed_d_tag, is_unshared_persona_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM,
-    KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA, KIND_PROJECT_CONTEXT_EDGE_BINDING,
-    KIND_SEMANTIC_GRAPH_QUERY_RESULT, P_GATED_KINDS, RESULT_GATED_KINDS,
+    has_indexed_d_tag, is_semantic_query_virtual_result_kind, is_unshared_persona_event,
+    AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_PERSONA,
+    KIND_PROJECT_CONTEXT_EDGE_BINDING, P_GATED_KINDS, RESULT_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -41,13 +41,13 @@ pub(crate) const FILTER_QUERY_CONCURRENCY: usize = 4;
 // the range fails the build.
 const _: () = assert!(FILTER_QUERY_CONCURRENCY >= 2 && FILTER_QUERY_CONCURRENCY <= 8);
 
-/// Return whether an ordinary filter explicitly requests the response-only
-/// semantic graph virtual result kind.
-pub(crate) fn filter_explicitly_requests_semantic_graph_result(filter: &Filter) -> bool {
+/// Return whether an ordinary filter explicitly requests a response-only
+/// semantic query virtual result kind.
+pub(crate) fn filter_explicitly_requests_semantic_query_result(filter: &Filter) -> bool {
     filter.kinds.as_ref().is_some_and(|kinds| {
         kinds
             .iter()
-            .any(|kind| u32::from(kind.as_u16()) == KIND_SEMANTIC_GRAPH_QUERY_RESULT)
+            .any(|kind| is_semantic_query_virtual_result_kind(u32::from(kind.as_u16())))
     })
 }
 
@@ -245,12 +245,12 @@ pub async fn handle_req(
         }
     };
 
-    // The semantic graph result kind is a response-only HTTP virtual Event,
+    // Semantic query result kinds are response-only HTTP virtual Events,
     // never an ordinary WS subscription target. Kindless/by-id requests are
     // still protected by the result-level delivery gate.
     if filters
         .iter()
-        .any(filter_explicitly_requests_semantic_graph_result)
+        .any(filter_explicitly_requests_semantic_query_result)
     {
         board_read_observation.failed();
         conn.send(RelayMessage::closed(
@@ -1800,7 +1800,33 @@ fn topic_for_subscription(channel_id: Option<uuid::Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{Alphabet, Filter, SingleLetterTag};
+    use nostr::{Alphabet, Filter, Kind, SingleLetterTag};
+
+    #[test]
+    fn ordinary_req_rejects_both_semantic_virtual_result_kinds() {
+        let graph = Filter::new().kind(Kind::Custom(
+            buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT as u16,
+        ));
+        let coordinate = Filter::new().kind(Kind::Custom(
+            buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as u16,
+        ));
+        let mixed = Filter::new().kinds([
+            Kind::TextNote,
+            Kind::Custom(buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as u16),
+        ]);
+
+        assert!(filter_explicitly_requests_semantic_query_result(&graph));
+        assert!(filter_explicitly_requests_semantic_query_result(
+            &coordinate
+        ));
+        assert!(filter_explicitly_requests_semantic_query_result(&mixed));
+        assert!(!filter_explicitly_requests_semantic_query_result(
+            &Filter::new().kind(Kind::TextNote)
+        ));
+        assert!(!filter_explicitly_requests_semantic_query_result(
+            &Filter::new()
+        ));
+    }
 
     #[test]
     fn global_queries_push_access_scope_before_limit() {

@@ -317,6 +317,11 @@ pub struct Config {
     /// This does not enable any Community and defaults to false. Community DB
     /// readiness and the configured routing policy remain separate gates.
     pub semantic_graph_query_http_available: bool,
+    /// Independent deployment master for Carryforth Coordinate-search HTTP.
+    ///
+    /// This reuses the Community semantic query gate, Provider admission, and
+    /// Fleet policy, but defaults off and advertises a separate capability.
+    pub project_context_coordinate_search_http_available: bool,
     /// Maximum concurrent semantic graph requests admitted by this process.
     pub semantic_graph_query_max_in_flight: usize,
     /// Maximum concurrent Stage C database snapshot/traversal sessions.
@@ -1115,6 +1120,10 @@ impl Config {
         let semantic_worker_enabled = parse_bool("BUZZ_SEMANTIC_WORKER_ENABLED", false)?;
         let semantic_graph_query_http_available =
             parse_bool("BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE", false)?;
+        let project_context_coordinate_search_http_available = parse_bool(
+            "CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE",
+            false,
+        )?;
         let semantic_graph_query_max_in_flight = usize::try_from(positive_u64_from_env(
             "BUZZ_SEMANTIC_GRAPH_QUERY_MAX_IN_FLIGHT",
             8,
@@ -1147,7 +1156,7 @@ impl Config {
         let semantic_graph_query_instance_id =
             parse_semantic_query_identity("BUZZ_SEMANTIC_GRAPH_QUERY_INSTANCE_ID")?;
         require_semantic_query_fleet_identities(
-            semantic_graph_query_http_available,
+            semantic_graph_query_http_available || project_context_coordinate_search_http_available,
             semantic_graph_query_fleet_policy,
             semantic_graph_query_deployment_id.as_deref(),
             semantic_graph_query_instance_id.as_deref(),
@@ -1229,7 +1238,9 @@ impl Config {
                     .to_string(),
             ));
         }
-        if (semantic_worker_enabled || semantic_graph_query_http_available)
+        if (semantic_worker_enabled
+            || semantic_graph_query_http_available
+            || project_context_coordinate_search_http_available)
             && (semantic_api_key.is_none()
                 || semantic_base_url.is_none()
                 || semantic_request_model.is_none())
@@ -1379,6 +1390,7 @@ impl Config {
             runtime_supervision_claim_secs,
             semantic_worker,
             semantic_graph_query_http_available,
+            project_context_coordinate_search_http_available,
             semantic_graph_query_max_in_flight,
             semantic_graph_traversal_max_in_flight,
             semantic_graph_query_fleet_policy,
@@ -1622,6 +1634,10 @@ mod tests {
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        assert!(
+            !config.project_context_coordinate_search_http_available,
+            "Coordinate search must remain deployment feature-off by default"
+        );
         assert!(config.slow_client_grace_limit > 0);
         assert!(
             !config.pubkey_allowlist_enabled,

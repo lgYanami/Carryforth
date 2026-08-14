@@ -44,6 +44,8 @@ const LEGACY_PROJECT_CONTEXT_EDGE_EXTENSION: &str = "buzz-project-context-edge-v
 pub(crate) const PROJECT_DOCUMENT_EXTENSION: &str = "buzz-project-document-v1";
 pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
     "buzz-project-context-semantic-query-http";
+pub(crate) const COORDINATE_SEARCH_HTTP_EXTENSION: &str =
+    "carryforth-project-context-coordinate-search-http";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_OBJECT_PAGE_SIZE: usize = 500;
 const ENTITY_PAGE_SIZE: usize = 500;
@@ -67,6 +69,7 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) context_edge_migration_required: bool,
     pub(crate) document_enabled: bool,
     pub(crate) semantic_query_http_enabled: bool,
+    pub(crate) coordinate_search_http_enabled: bool,
     pub(crate) extensions_temporarily_unavailable: bool,
 }
 
@@ -181,6 +184,10 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION),
+        coordinate_search_http_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == COORDINATE_SEARCH_HTTP_EXTENSION),
         extensions_temporarily_unavailable,
     })
 }

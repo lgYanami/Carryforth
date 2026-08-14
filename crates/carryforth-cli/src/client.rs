@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use buzz_semantic_query::{SemanticGraphQuery, MAX_WALL_TIME_MS};
+use buzz_semantic_query::{
+    ProjectContextCoordinateSearchQuery, SemanticGraphQuery, MAX_COORDINATE_SEARCH_RESPONSE_BYTES,
+    MAX_COORDINATE_SEARCH_WALL_TIME_MS, MAX_WALL_TIME_MS,
+};
 use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest, Sha256};
 
@@ -153,6 +156,8 @@ const RETRY_IN_MAX_SECS: u64 = 30;
 /// execution contract so the Relay, rather than the client, owns graceful
 /// wall-time exhaustion and its signed partial result.
 const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(MAX_WALL_TIME_MS as u64 + 15_000);
+const COORDINATE_SEARCH_TIMEOUT: Duration =
+    Duration::from_millis(MAX_COORDINATE_SEARCH_WALL_TIME_MS as u64 + 15_000);
 
 /// Independent cap for a non-success semantic query response body.
 const SEMANTIC_QUERY_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
@@ -167,6 +172,15 @@ pub(crate) struct SemanticQueryOnceResponse {
     /// Exact bytes signed by NIP-98 and sent to `POST /query`.
     pub(crate) exact_body: Vec<u8>,
     /// Exact successful response body bytes.
+    pub(crate) response_body: Vec<u8>,
+}
+
+/// Byte-exact observation returned by one Coordinate-search HTTP attempt.
+#[derive(Debug)]
+pub(crate) struct CoordinateSearchOnceResponse {
+    pub(crate) request: ProjectContextCoordinateSearchQuery,
+    pub(crate) nip98_auth_event_id: EventId,
+    pub(crate) exact_body: Vec<u8>,
     pub(crate) response_body: Vec<u8>,
 }
 
@@ -633,6 +647,7 @@ fn advance_query_cursor(
 
 pub struct CarryforthClient {
     http: reqwest::Client,
+    semantic_query_http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.cf.place"
     keys: Keys,
     /// Optional NIP-OA auth tag injected into every signed event.
@@ -663,13 +678,22 @@ impl CarryforthClient {
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
     ) -> Result<Self, CliError> {
+        let request_timeout = env_duration_secs("CARRYFORTH_TIMEOUT_SECS", 30);
+        let connect_timeout = env_duration_secs("CARRYFORTH_CONNECT_TIMEOUT_SECS", 15);
         let http = reqwest::Client::builder()
-            .timeout(env_duration_secs("CARRYFORTH_TIMEOUT_SECS", 30))
-            .connect_timeout(env_duration_secs("CARRYFORTH_CONNECT_TIMEOUT_SECS", 15))
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        let semantic_query_http = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CliError::Other(e.to_string()))?;
         Ok(Self {
             http,
+            semantic_query_http,
             relay_url,
             keys,
             auth_tag,
@@ -954,7 +978,7 @@ impl CarryforthClient {
 
         let response = self
             .with_auth_tag(
-                self.http
+                self.semantic_query_http
                     .post(&url)
                     .timeout(SEMANTIC_QUERY_TIMEOUT)
                     .header("Authorization", authorization.header)
@@ -998,6 +1022,82 @@ impl CarryforthClient {
         }
 
         Ok(SemanticQueryOnceResponse {
+            request,
+            nip98_auth_event_id: authorization.event_id,
+            exact_body,
+            response_body,
+        })
+    }
+
+    /// Send one Coordinate starting-point search exactly once.
+    ///
+    /// The canonical filter body is serialized once and used byte-for-byte for
+    /// both NIP-98 authentication and the one non-retried `POST /query` call.
+    pub(crate) async fn coordinate_search_once(
+        &self,
+        relay_pubkey: &PublicKey,
+        request: ProjectContextCoordinateSearchQuery,
+    ) -> Result<CoordinateSearchOnceResponse, CliError> {
+        let prepared = buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_http_query_request(
+            request,
+            relay_pubkey,
+            &self.public_key(),
+        )
+        .map_err(|error| match error {
+            buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
+            other => CliError::Other(format!(
+                "Coordinate-search filter serialization failed: {other}"
+            )),
+        })?;
+        let request = prepared.request;
+        let exact_body = prepared.exact_body;
+        let url = format!("{}/query", self.relay_url);
+        let authorization = sign_nip98_observed(&self.keys, "POST", &url, Some(&exact_body))?;
+        let response = self
+            .with_auth_tag(
+                self.semantic_query_http
+                    .post(&url)
+                    .timeout(COORDINATE_SEARCH_TIMEOUT)
+                    .header("Authorization", authorization.header)
+                    .header("Content-Type", "application/json")
+                    .body(exact_body.clone()),
+            )
+            .send()
+            .await?;
+        let status = response.status();
+        let response_limit = if status.is_success() {
+            MAX_COORDINATE_SEARCH_RESPONSE_BYTES as u64
+        } else {
+            SEMANTIC_QUERY_ERROR_RESPONSE_BYTES
+        };
+        let response_body = read_bounded_semantic_query_response(response, response_limit)
+            .await
+            .map_err(|error| match error {
+                BoundedSemanticResponseError::Network(error) => CliError::Network(error),
+                BoundedSemanticResponseError::TooLarge if status.is_success() => CliError::Other(
+                    "invalid:coordinate_search:success_response_too_large".to_owned(),
+                ),
+                BoundedSemanticResponseError::TooLarge => CliError::Relay {
+                    status: status.as_u16(),
+                    body: "invalid:coordinate_search:error_response_too_large".to_owned(),
+                },
+            })?;
+        if !status.is_success() {
+            let raw = String::from_utf8_lossy(&response_body).into_owned();
+            let mut message = extract_relay_message_field(&raw).unwrap_or(raw);
+            if status == reqwest::StatusCode::FORBIDDEN
+                && std::env::var("CARRYFORTH_AUTH_TAG").is_ok()
+            {
+                message.push_str(
+                    " (CARRYFORTH_AUTH_TAG is set — it may be stale or revoked; try unsetting it)",
+                );
+            }
+            return Err(CliError::Relay {
+                status: status.as_u16(),
+                body: message,
+            });
+        }
+        Ok(CoordinateSearchOnceResponse {
             request,
             nip98_auth_event_id: authorization.event_id,
             exact_body,
@@ -1877,7 +1977,7 @@ mod semantic_query_once_tests {
 
     use axum::body::{Body, Bytes};
     use axum::extract::State;
-    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::{CONTENT_LENGTH, LOCATION};
     use axum::http::{HeaderMap, Response, StatusCode};
     use axum::routing::post;
     use axum::Router;
@@ -1885,8 +1985,10 @@ mod semantic_query_once_tests {
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::Digest32;
     use buzz_semantic_query::{
-        derive_http_request_binding, verify_http_request_binding, LifecycleFilter,
-        SemanticGraphQuery, SemanticGraphQueryBudget,
+        derive_coordinate_search_http_request_binding, derive_http_request_binding,
+        verify_coordinate_search_http_request_binding, verify_http_request_binding,
+        LifecycleFilter, ProjectContextCoordinateSearchQuery, SemanticGraphQuery,
+        SemanticGraphQueryBudget,
     };
     use futures_util::stream;
     use nostr::{Event, JsonUtil, Keys};
@@ -1928,7 +2030,7 @@ mod semantic_query_once_tests {
                     .unwrap_or_default()
                     .to_owned(),
             );
-        let (response, body) = if state.chunked_response {
+        let (mut response, body) = if state.chunked_response {
             let chunks = state
                 .response_body
                 .chunks(3)
@@ -1946,12 +2048,16 @@ mod semantic_query_once_tests {
                 Body::from(state.response_body.as_ref().clone()),
             )
         };
+        if state.status.is_redirection() {
+            response = response.header(LOCATION, "/redirect-target");
+        }
         response.body(body).expect("semantic fixture response")
     }
 
     async fn spawn_server(state: CaptureState) -> String {
         let app = Router::new()
             .route("/query", post(capture_query))
+            .route("/redirect-target", post(capture_query))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1974,6 +2080,15 @@ mod semantic_query_once_tests {
             context_coordinates: Vec::new(),
             lifecycle_filter: LifecycleFilter::AllCurrent,
             budget: SemanticGraphQueryBudget::default(),
+        }
+    }
+
+    fn coordinate_request(project_id: Uuid) -> ProjectContextCoordinateSearchQuery {
+        ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::new_v4(),
+            project_id,
+            query: "authorization failure during release".to_owned(),
+            limit: 8,
         }
     }
 
@@ -2250,6 +2365,79 @@ mod semantic_query_once_tests {
             } if body == "invalid:semantic_graph_query:error_response_too_large"
         ));
         assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinate_search_freezes_one_exact_filter_auth_and_binding_observation() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let response = client
+            .coordinate_search_once(&relay.public_key(), coordinate_request(project_id))
+            .await
+            .expect("one Coordinate-search request");
+
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let bodies = state.bodies.lock().expect("body capture lock");
+        assert_eq!(bodies.as_slice(), [response.exact_body.as_slice()]);
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&response.exact_body)
+            .expect("Coordinate-search filter JSON")
+            .try_into()
+            .expect("one Coordinate-search filter");
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT])
+        );
+        assert_eq!(filter["authors"], json!([relay.public_key().to_hex()]));
+        assert_eq!(filter["#p"], json!([caller.public_key().to_hex()]));
+        assert_eq!(filter["limit"], json!(1));
+        assert_eq!(
+            filter["carryforth_project_context_coordinate_search"],
+            serde_json::to_value(&response.request).expect("request value")
+        );
+        assert!(filter.get("buzz_project_context_semantic").is_none());
+        drop(bodies);
+
+        let binding = derive_coordinate_search_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("derive Coordinate-search binding");
+        verify_coordinate_search_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("verify Coordinate-search binding");
+        assert_eq!(response.response_body, b"[]");
+    }
+
+    #[tokio::test]
+    async fn coordinate_search_neither_retries_nor_follows_redirects() {
+        for status in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let state = state(status);
+            let url = spawn_server(state.clone()).await;
+            let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+            let error = client
+                .coordinate_search_once(
+                    &Keys::generate().public_key(),
+                    coordinate_request(Uuid::new_v4()),
+                )
+                .await
+                .expect_err("non-success must return without replay or redirect");
+            assert!(matches!(error, crate::error::CliError::Relay { .. }));
+            assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

@@ -14,7 +14,9 @@ use base64::Engine;
 use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
-use buzz_core::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT;
+use buzz_core::kind::{
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+};
 use buzz_core::TenantContext;
 use buzz_db::project_document::{
     ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
@@ -30,7 +32,8 @@ use buzz_sdk::project_view_v3::{
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     budget_profile_digest, derive_http_request_binding, ranking_contract_digest,
-    SemanticGraphQuery, SemanticGraphQueryError, SemanticGraphQueryObservations,
+    ProjectContextCoordinateSearchQuery, SemanticGraphQuery, SemanticGraphQueryError,
+    SemanticGraphQueryObservations, MAX_COORDINATE_SEARCH_REQUEST_BYTES,
 };
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
@@ -366,6 +369,102 @@ enum ProjectDocumentPageRequest {
 }
 
 const SEMANTIC_GRAPH_QUERY_EXTENSION: &str = "buzz_project_context_semantic";
+const COORDINATE_SEARCH_QUERY_EXTENSION: &str = "carryforth_project_context_coordinate_search";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectContextCoordinateSearchHttpFilter {
+    kinds: Vec<u32>,
+    authors: Vec<String>,
+    #[serde(rename = "#p")]
+    recipients: Vec<String>,
+    limit: u64,
+    #[serde(rename = "carryforth_project_context_coordinate_search")]
+    request: ProjectContextCoordinateSearchQuery,
+}
+
+/// Parse the exclusive HTTP Coordinate-search filter extension.
+pub(crate) fn parse_project_context_coordinate_search_http_query(
+    exact_authenticated_body: &[u8],
+    raw_filters: &[Value],
+    relay_pubkey: &nostr::PublicKey,
+    authenticated_caller: &nostr::PublicKey,
+) -> Result<Option<ProjectContextCoordinateSearchQuery>, (StatusCode, Json<Value>)> {
+    let extension_count = raw_filters
+        .iter()
+        .filter(|filter| filter.get(COORDINATE_SEARCH_QUERY_EXTENSION).is_some())
+        .count();
+    if extension_count == 0 {
+        if raw_filters
+            .iter()
+            .any(raw_filter_explicitly_requests_coordinate_search_result)
+        {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "unsupported:coordinate_search:exclusive_http_filter_required",
+            ));
+        }
+        return Ok(None);
+    }
+    if extension_count != 1 || raw_filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:coordinate_search:exactly_one_filter_required",
+        ));
+    }
+    if exact_authenticated_body.len() > MAX_COORDINATE_SEARCH_REQUEST_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-large:coordinate_search:request",
+        ));
+    }
+    let mut filters: Vec<ProjectContextCoordinateSearchHttpFilter> =
+        serde_json::from_slice(exact_authenticated_body).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid:coordinate_search:closed_filter",
+            )
+        })?;
+    if filters.len() != 1 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:coordinate_search:exactly_one_filter_required",
+        ));
+    }
+    let filter = filters.pop().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:coordinate_search:exactly_one_filter_required",
+        )
+    })?;
+    if filter.kinds != [KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT]
+        || filter.authors != [relay_pubkey.to_hex()]
+        || filter.recipients != [authenticated_caller.to_hex()]
+        || filter.limit != 1
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:coordinate_search:exact_kind_author_caller_and_limit_required",
+        ));
+    }
+    let request = filter.request.validate_and_canonicalize().map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:coordinate_search:closed_request",
+        )
+    })?;
+    Ok(Some(request))
+}
+
+fn raw_filter_explicitly_requests_coordinate_search_result(raw: &Value) -> bool {
+    raw.get("kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds.iter().any(|kind| {
+                kind == &serde_json::json!(KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT)
+            })
+        })
+}
 
 /// Parse the exclusive HTTP semantic-query filter extension.
 ///
@@ -460,6 +559,84 @@ fn raw_filter_explicitly_requests_semantic_graph_result(raw: &Value) -> bool {
                 .iter()
                 .any(|kind| kind == &serde_json::json!(KIND_SEMANTIC_GRAPH_QUERY_RESULT))
         })
+}
+
+async fn execute_project_context_coordinate_search_http_query(
+    state: &AppState,
+    tenant: &TenantContext,
+    exact_authenticated_body: &[u8],
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    query: ProjectContextCoordinateSearchQuery,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started = std::time::Instant::now();
+    let result = crate::semantic_coordinate_search::execute_project_context_coordinate_search(
+        state,
+        tenant.community(),
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+    )
+    .await;
+    metrics::histogram!("carryforth_coordinate_search_duration_seconds")
+        .record(started.elapsed().as_secs_f64());
+    let event = match result {
+        Ok(event) => {
+            metrics::counter!("carryforth_coordinate_search_requests_total", "result" => "success")
+                .increment(1);
+            event
+        }
+        Err(error) => {
+            use crate::semantic_coordinate_search::CoordinateSearchExecutionError as Error;
+            let (status, code, metric) = match error {
+                Error::InvalidRequest | Error::Contract(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid:coordinate_search:request",
+                    "invalid",
+                ),
+                Error::Restricted => (
+                    StatusCode::FORBIDDEN,
+                    "restricted:coordinate_search:authorization_changed",
+                    "restricted",
+                ),
+                Error::Busy => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "busy:coordinate_search:retry_later",
+                    "busy",
+                ),
+                Error::Conflict => (
+                    StatusCode::CONFLICT,
+                    "conflict:coordinate_search:snapshot_changed",
+                    "conflict",
+                ),
+                Error::Timeout => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "timeout:coordinate_search:deadline",
+                    "timeout",
+                ),
+                Error::Unavailable | Error::Database(_) | Error::Provider(_) | Error::Signing => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable:coordinate_search:runtime",
+                    "unavailable",
+                ),
+            };
+            metrics::counter!("carryforth_coordinate_search_requests_total", "result" => metric)
+                .increment(1);
+            return Err(api_error(status, code));
+        }
+    };
+    let exact_array = serde_json::to_vec(std::slice::from_ref(&event))
+        .map_err(|_| internal_error("Coordinate-search result serialization failed"))?;
+    if exact_array.len() > buzz_semantic_query::MAX_COORDINATE_SEARCH_RESPONSE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-large:coordinate_search:response",
+        ));
+    }
+    let value = serde_json::to_value(event)
+        .map_err(|_| internal_error("Coordinate-search result serialization failed"))?;
+    Ok(Json(Value::Array(vec![value])))
 }
 
 async fn execute_semantic_graph_http_query(
@@ -630,6 +807,7 @@ async fn execute_semantic_graph_http_query_after_routing(
                 community_id: tenant.community(),
                 reader_pubkey: &caller_bytes,
                 expected_projection_pubkey: &state.relay_keypair.public_key(),
+                expected_snapshot: None,
                 routing_trust,
             }),
     )
@@ -661,6 +839,12 @@ async fn execute_semantic_graph_http_query_after_routing(
             return Err(api_error(
                 StatusCode::FORBIDDEN,
                 "restricted:semantic_graph_query:authorization_changed",
+            ));
+        }
+        SemanticGraphQueryReleaseConfirmation::SnapshotChanged => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "conflict:semantic_graph_query:snapshot_changed",
             ));
         }
         SemanticGraphQueryReleaseConfirmation::FleetUnavailable => {
@@ -2471,6 +2655,20 @@ async fn query_events_authed(
         super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
     }
 
+    // Coordinate search has a stricter pre-parse request resource boundary
+    // than the generic bridge. Detect its public extension key without parsing
+    // or logging the natural-language value, then reject oversized raw bytes.
+    if body
+        .windows(COORDINATE_SEARCH_QUERY_EXTENSION.len())
+        .any(|window| window == COORDINATE_SEARCH_QUERY_EXTENSION.as_bytes())
+        && body.len() > MAX_COORDINATE_SEARCH_REQUEST_BYTES
+    {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-large:coordinate_search:request",
+        ));
+    }
+
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
@@ -2480,17 +2678,26 @@ async fn query_events_authed(
     // Context read decision. This prevents an unauthorized caller from using
     // detailed inner-schema failures as a Project semantic-query oracle while
     // still allowing generic malformed JSON to receive the normal bridge 400.
-    if raw_filters
+    let has_graph_semantic_extension = raw_filters
         .iter()
-        .any(|filter| filter.get(SEMANTIC_GRAPH_QUERY_EXTENSION).is_some())
-    {
+        .any(|filter| filter.get(SEMANTIC_GRAPH_QUERY_EXTENSION).is_some());
+    let has_coordinate_search_extension = raw_filters
+        .iter()
+        .any(|filter| filter.get(COORDINATE_SEARCH_QUERY_EXTENSION).is_some());
+    if has_graph_semantic_extension && has_coordinate_search_extension {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid:semantic_query:mixed_extensions",
+        ));
+    }
+    if has_graph_semantic_extension || has_coordinate_search_extension {
         // This supplement to the already-verified caller auth must precede
         // authorization: an unsigned exact body cannot probe even the
         // content-free Project Context read decision.
         if event_id_bytes == [0_u8; 32] || !verified_bridge_nip98_has_payload(headers) {
             return Err(api_error(
                 StatusCode::UNAUTHORIZED,
-                "unauthorized:semantic_graph_query:exact_body_nip98_required",
+                "unauthorized:semantic_query:exact_body_nip98_required",
             ));
         }
         match crate::handlers::community_private::project_context_read_decision(
@@ -2507,16 +2714,36 @@ async fn query_events_authed(
             crate::handlers::community_private::ProjectContextReadDecision::Restricted => {
                 return Err(api_error(
                     StatusCode::FORBIDDEN,
-                    "restricted:semantic_graph_query:authorization_required",
+                    "restricted:semantic_query:authorization_required",
                 ));
             }
             crate::handlers::community_private::ProjectContextReadDecision::Unavailable(_) => {
                 return Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable:semantic_graph_query:readiness",
+                    "unavailable:semantic_query:readiness",
                 ));
             }
         }
+    }
+
+    // Coordinate search remains separate from semantic graph traversal. It is
+    // recognized first only because kind 40913 is also excluded from every
+    // ordinary query path.
+    if let Some(query) = parse_project_context_coordinate_search_http_query(
+        body,
+        &raw_filters,
+        &state.relay_keypair.public_key(),
+        &pubkey,
+    )? {
+        return execute_project_context_coordinate_search_http_query(
+            state,
+            tenant,
+            body,
+            pubkey,
+            event_id_bytes,
+            query,
+        )
+        .await;
     }
 
     // Recognize and execute the exclusive semantic extension before typed
@@ -3408,7 +3635,7 @@ async fn count_events_authed(
 
     if filters
         .iter()
-        .any(crate::handlers::req::filter_explicitly_requests_semantic_graph_result)
+        .any(crate::handlers::req::filter_explicitly_requests_semantic_query_result)
     {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -4535,6 +4762,136 @@ mod tests {
             "limit": 1,
             SEMANTIC_GRAPH_QUERY_EXTENSION: request,
         })
+    }
+
+    fn coordinate_search_fixture(project_id: uuid::Uuid) -> ProjectContextCoordinateSearchQuery {
+        ProjectContextCoordinateSearchQuery {
+            request_id: uuid::Uuid::new_v4(),
+            project_id,
+            query: "  authorization failure during release  ".to_owned(),
+            limit: 8,
+        }
+    }
+
+    fn coordinate_search_filter_fixture(
+        relay: &nostr::PublicKey,
+        caller: &nostr::PublicKey,
+        request: &ProjectContextCoordinateSearchQuery,
+    ) -> Value {
+        serde_json::json!({
+            "kinds": [KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+            COORDINATE_SEARCH_QUERY_EXTENSION: request,
+        })
+    }
+
+    fn parse_coordinate_search_filters(
+        filters: &[Value],
+        relay: &nostr::PublicKey,
+        caller: &nostr::PublicKey,
+    ) -> Result<Option<ProjectContextCoordinateSearchQuery>, (StatusCode, Json<Value>)> {
+        let body = serde_json::to_vec(filters).expect("serialize Coordinate-search filter body");
+        parse_project_context_coordinate_search_http_query(&body, filters, relay, caller)
+    }
+
+    #[test]
+    fn coordinate_search_filter_parser_accepts_only_its_exact_closed_envelope() {
+        let relay = Keys::generate().public_key();
+        let caller = Keys::generate().public_key();
+        let request = coordinate_search_fixture(uuid::Uuid::new_v4());
+        let exact = coordinate_search_filter_fixture(&relay, &caller, &request);
+        let parsed = parse_coordinate_search_filters(std::slice::from_ref(&exact), &relay, &caller)
+            .expect("parse exact Coordinate-search filter")
+            .expect("Coordinate-search extension");
+        assert_eq!(parsed.query, "authorization failure during release");
+        assert_eq!(parsed.limit, 8);
+
+        let pretty_body = serde_json::to_vec_pretty(std::slice::from_ref(&exact))
+            .expect("pretty Coordinate-search body");
+        assert!(parse_project_context_coordinate_search_http_query(
+            &pretty_body,
+            std::slice::from_ref(&exact),
+            &relay,
+            &caller,
+        )
+        .is_ok());
+
+        let canonical_body =
+            serde_json::to_string(std::slice::from_ref(&exact)).expect("Coordinate-search body");
+        let request_id_field = format!("\"request_id\":\"{}\"", request.request_id);
+        let duplicate_request_id = format!("{request_id_field},{request_id_field}");
+        let duplicate_body = canonical_body.replacen(&request_id_field, &duplicate_request_id, 1);
+        let duplicate_values: Vec<Value> =
+            serde_json::from_str(&duplicate_body).expect("generic JSON permits duplicate key");
+        let (status, body) = parse_project_context_coordinate_search_http_query(
+            duplicate_body.as_bytes(),
+            &duplicate_values,
+            &relay,
+            &caller,
+        )
+        .expect_err("duplicate request key must be rejected from exact bytes");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid:coordinate_search:closed_filter");
+
+        let ordinary = serde_json::json!({"kinds": [1], "limit": 1});
+        assert!(
+            parse_coordinate_search_filters(&[ordinary], &relay, &caller,)
+                .expect("ordinary filter")
+                .is_none()
+        );
+
+        let mut wrong_kind = exact.clone();
+        wrong_kind["kinds"] = serde_json::json!([KIND_SEMANTIC_GRAPH_QUERY_RESULT]);
+        let mut wrong_author = exact.clone();
+        wrong_author["authors"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        let mut wrong_caller = exact.clone();
+        wrong_caller["#p"] = serde_json::json!([Keys::generate().public_key().to_hex()]);
+        let mut wrong_limit = exact.clone();
+        wrong_limit["limit"] = serde_json::json!(2);
+        for invalid in [wrong_kind, wrong_author, wrong_caller, wrong_limit] {
+            assert!(parse_coordinate_search_filters(&[invalid], &relay, &caller,).is_err());
+        }
+
+        let mut unknown_outer = exact.clone();
+        unknown_outer
+            .as_object_mut()
+            .expect("Coordinate-search filter object")
+            .insert("search".to_owned(), serde_json::json!("authorization"));
+        assert!(parse_coordinate_search_filters(&[unknown_outer], &relay, &caller,).is_err());
+
+        let mut unknown_inner = exact.clone();
+        unknown_inner[COORDINATE_SEARCH_QUERY_EXTENSION]
+            .as_object_mut()
+            .expect("Coordinate-search request object")
+            .insert("role".to_owned(), serde_json::json!("backend"));
+        let (status, body) = parse_coordinate_search_filters(&[unknown_inner], &relay, &caller)
+            .expect_err("unknown request field must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid:coordinate_search:closed_filter");
+        assert!(!body.to_string().contains("backend"));
+
+        let ordinary_virtual = serde_json::json!({
+            "kinds": [KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT],
+            "authors": [relay.to_hex()],
+            "#p": [caller.to_hex()],
+            "limit": 1,
+        });
+        let (status, body) = parse_coordinate_search_filters(&[ordinary_virtual], &relay, &caller)
+            .expect_err("ordinary kind 40913 must remain unsupported");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "unsupported:coordinate_search:exclusive_http_filter_required"
+        );
+
+        assert!(parse_coordinate_search_filters(
+            &[exact, serde_json::json!({"kinds": [1]})],
+            &relay,
+            &caller,
+        )
+        .is_err());
     }
 
     #[test]

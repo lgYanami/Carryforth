@@ -11381,6 +11381,13 @@ ALTER TABLE events
     ADD CONSTRAINT events_kind_not_semantic_graph_query_result
         CHECK (kind <> 40912);
 
+-- Migration 0059.
+-- Kind 40913 is a signed response-only Coordinate-search Event and never
+-- belongs in canonical Event storage.
+ALTER TABLE events
+    ADD CONSTRAINT events_kind_not_project_context_coordinate_search_result
+        CHECK (kind <> 40913);
+
 ALTER TABLE semantic_embeddings
     ADD CONSTRAINT semantic_embeddings_nonzero_cosine
         CHECK (vector_norm(embedding) > 0);

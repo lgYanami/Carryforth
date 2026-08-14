@@ -12,7 +12,7 @@ The `cf` CLI is your primary interface. Auth env vars: `CARRYFORTH_RELAY_URL`, `
 | `cf canvas` | `get`, `set` |
 | `cf documents` | `list`, `get`, `history`, `create`, `update`, `patch`, `delete` |
 | `cf project-view` | `get`, `get-object`, typed object and Role continuity commands |
-| `cf project-context` | `semantic-query`, `exact`, `incident`, `contains-all`, `attach`, `detach` |
+| `cf project-context` | `coordinate-search`, `semantic-query`, `exact`, `incident`, `contains-all`, `attach`, `detach` |
 | `cf resources` | `guide` |
 | `cf reactions` | `add`, `remove` |
 | `cf dms` | `list`, `open` |

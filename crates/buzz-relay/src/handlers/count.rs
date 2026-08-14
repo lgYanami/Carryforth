@@ -8,7 +8,8 @@ use tracing::warn;
 use crate::connection::{AuthState, ConnectionState};
 use crate::handlers::req::{
     apply_meeting_read_scope, event_visible_to_reader, filter_can_match_persona_shared_kinds,
-    filter_can_match_result_gated_kinds, result_gated_count_safe_for_pushdown,
+    filter_can_match_result_gated_kinds, filter_explicitly_requests_semantic_query_result,
+    result_gated_count_safe_for_pushdown,
 };
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
@@ -54,7 +55,7 @@ pub async fn handle_count(
 
     if filters
         .iter()
-        .any(super::req::filter_explicitly_requests_semantic_graph_result)
+        .any(filter_explicitly_requests_semantic_query_result)
     {
         conn.send(RelayMessage::closed(
             &sub_id,

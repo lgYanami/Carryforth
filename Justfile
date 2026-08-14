@@ -404,6 +404,10 @@ semantic-test: semantic-pgvector-test semantic-migration-test
 semantic-query-qualification:
     ./scripts/qualify-semantic-exact-query.sh
 
+# Measure the production Coordinate-only exact top-K SQL at target scale.
+coordinate-search-qualification:
+    ./scripts/qualify-coordinate-search-exact.sh
+
 # Read-only preflight for the supported local semantic PostgreSQL profile.
 semantic-local-capacity-check:
     ./scripts/check-local-semantic-capacity.sh

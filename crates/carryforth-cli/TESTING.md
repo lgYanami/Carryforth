@@ -561,6 +561,37 @@ Timeout, body loss, 429, 502, 503, or 504 therefore returns an error without an
 automatic replay. A user-initiated rerun creates a new request UUID and auth
 Event.
 
+### 6.15 Project Context Coordinate starting-point search
+
+`coordinate-search` is the Agent self-query entry point when no exact graph
+Coordinate is already known. It requires the independent NIP-11 capability
+`carryforth-project-context-coordinate-search-http`; it does not fall back to
+`semantic-query` when that capability is unavailable.
+
+```bash
+cf project-context coordinate-search \
+  --query "backend authorization failure during release" | jq .
+
+cf --format compact project-context coordinate-search \
+  --query "work relevant to preparing the frontend release meeting" \
+  --limit 12 | jq -c .
+```
+
+The verified output is the Relay-signed result DTO itself. It contains request,
+Project, graph-snapshot, and request-binding observations plus only
+`coordinates: [{rank,coordinate,score}]` and `truncated`. It contains no Edge,
+path, title, summary, preview, source body, or generated read command. A score
+is a direct fixed-point cosine candidate signal, not a fact or authorization;
+an empty result means only that no eligible current indexed active-edge
+Coordinate was available. `truncated` means a K+1 candidate existed in the
+same snapshot.
+
+The CLI sends one canonical natural-language Provider input through one
+NIP-98-bound, non-redirecting, non-retried HTTP attempt with a 60-second client
+timeout (45-second Relay budget plus transport grace). `--limit` is `1..=32`
+and defaults to 8. There are no Role, Work, lifecycle, context, Edge, path,
+weight, floor, or threshold request controls.
+
 ---
 
 ## 7. Error Path Testing

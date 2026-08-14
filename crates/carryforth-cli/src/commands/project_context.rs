@@ -27,11 +27,16 @@ use buzz_sdk::project_document::{
     document_head_coordinate, parse_document_head, parse_document_meta,
     verify_document_head_observation, VerifiedDocumentHead, VerifiedDocumentMeta,
 };
+use buzz_sdk::semantic_coordinate_search::{
+    parse_project_context_coordinate_search_result,
+    ProjectContextCoordinateSearchHttpRequestObservation,
+};
 use buzz_sdk::semantic_graph::{
     parse_semantic_graph_query_result, SemanticGraphHttpRequestObservation,
 };
 use buzz_semantic_query::{
-    LifecycleFilter, RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
+    LifecycleFilter, ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult,
+    RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
     SemanticGraphQueryResult,
 };
 use chrono::{DateTime, Utc};
@@ -44,7 +49,7 @@ use crate::client::{CarryforthClient, ProjectCommandDelivery};
 use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
-    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+    COORDINATE_SEARCH_HTTP_EXTENSION, SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
 };
 use crate::error::CliError;
 use crate::{
@@ -254,6 +259,9 @@ pub async fn dispatch(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     match command {
+        ProjectContextCmd::CoordinateSearch { query, limit } => {
+            run_coordinate_search(client, query, limit, format).await
+        }
         ProjectContextCmd::SemanticQuery {
             problem,
             initial_coordinates,
@@ -315,6 +323,85 @@ pub async fn dispatch(
             .await
         }
     }
+}
+
+async fn run_coordinate_search(
+    client: &CarryforthClient,
+    query: String,
+    limit: u8,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let identity = require_coordinate_search_identity(client).await?;
+    let project = read_verified_v3_snapshot(client, identity)
+        .await
+        .map_err(|error| {
+            integrity_error(format!(
+                "cannot resolve current Project identity for Coordinate search: {error}"
+            ))
+        })?;
+    let project_id = *project.meta().project_id.as_uuid();
+    let request = ProjectContextCoordinateSearchQuery {
+        request_id: Uuid::new_v4(),
+        project_id,
+        query,
+        limit,
+    }
+    .validate_and_canonicalize()
+    .map_err(|error| CliError::Usage(format!("invalid Coordinate search: {error}")))?;
+    let response = client
+        .coordinate_search_once(&identity.relay_pubkey, request)
+        .await?;
+    let event = parse_single_semantic_result_event(&response.response_body)?;
+    let result = parse_project_context_coordinate_search_result(
+        &event,
+        &identity.relay_pubkey,
+        ProjectContextCoordinateSearchHttpRequestObservation {
+            project_id: CommunityId::from_uuid(project_id),
+            authenticated_caller: client.public_key(),
+            request: &response.request,
+            nip98_auth_event_id: response.nip98_auth_event_id,
+            exact_authenticated_body: &response.exact_body,
+        },
+    )
+    .map_err(|error| integrity_error(format!("invalid Coordinate-search result: {error}")))?;
+    print_coordinate_search_result(&result, format)
+}
+
+async fn require_coordinate_search_identity(
+    client: &CarryforthClient,
+) -> Result<ProjectViewIdentity, CliError> {
+    let identity = read_identity(client).await?.ok_or_else(|| {
+        CliError::Other("unavailable:coordinate_search:project_view_v3_not_ready".to_owned())
+    })?;
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err(CliError::Other(
+            "unsupported:coordinate_search:project_view_v3_required".to_owned(),
+        ));
+    }
+    if !identity.coordinate_search_http_enabled {
+        if identity.extensions_temporarily_unavailable {
+            return Err(CliError::Unavailable(
+                "Relay Coordinate-search capability observation could not be completed".to_owned(),
+            ));
+        }
+        return Err(CliError::Other(format!(
+            "unsupported:coordinate_search:relay_does_not_advertise_{COORDINATE_SEARCH_HTTP_EXTENSION}"
+        )));
+    }
+    Ok(identity)
+}
+
+fn print_coordinate_search_result(
+    result: &ProjectContextCoordinateSearchResult,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let serialized = match format {
+        OutputFormat::Json => serde_json::to_string_pretty(result),
+        OutputFormat::Compact => serde_json::to_string(result),
+    }
+    .map_err(|error| CliError::Other(format!("failed to serialize output: {error}")))?;
+    println!("{serialized}");
+    Ok(())
 }
 
 async fn run_semantic_query(
@@ -1983,6 +2070,7 @@ mod tests {
             context_edge_migration_required: false,
             document_enabled: true,
             semantic_query_http_enabled: false,
+            coordinate_search_http_enabled: false,
             extensions_temporarily_unavailable: false,
         }
     }

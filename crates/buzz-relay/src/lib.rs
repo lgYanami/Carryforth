@@ -38,6 +38,7 @@ pub mod protocol;
 pub mod router;
 /// Trusted managed-runtime recovery scheduler.
 pub mod runtime_supervision;
+mod semantic_coordinate_search;
 mod semantic_fleet;
 mod semantic_graph_observability;
 mod semantic_graph_query;
