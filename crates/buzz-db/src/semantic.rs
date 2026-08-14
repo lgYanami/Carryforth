@@ -2849,6 +2849,83 @@ pub(crate) async fn observe_semantic_source_in_connection(
     }
 }
 
+/// Source-owned fields needed by a signed one-hop candidate preview.
+///
+/// The semantic observation remains the existing Foundation currentness
+/// contract. `description` is read separately from the same canonical writer
+/// snapshot and never enters the extractor or embedding text.
+pub(crate) struct SemanticCanonicalPreviewObservation {
+    /// Existing typed Foundation observation.
+    pub observation: CanonicalSemanticSourceObservation,
+    /// Canonical description when this source family owns one.
+    pub description: Option<String>,
+}
+
+/// Reconstruct one current semantic observation plus its source-owned optional
+/// description through the caller's existing database snapshot.
+pub(crate) async fn observe_semantic_source_preview_in_connection(
+    connection: &mut PgConnection,
+    identity: &SemanticSourceIdentity,
+) -> Result<SemanticCanonicalPreviewObservation> {
+    let observation = observe_semantic_source_in_connection(connection, identity).await?;
+    let description = match identity.kind {
+        SemanticSourceKind::ProjectView(expected_subtype) => {
+            let body: serde_json::Value = sqlx::query_scalar(
+                "SELECT body FROM project_view_objects \
+                 WHERE community_id=$1 AND object_id=$2 AND deleted_at IS NULL",
+            )
+            .bind(identity.community_id)
+            .bind(identity.source_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or_else(|| DbError::NotFound("semantic Project View preview".to_string()))?;
+            let data: buzz_project_view::v3::ProjectViewObjectDataV3 = serde_json::from_value(body)
+                .map_err(|error| {
+                    DbError::InvalidData(format!(
+                        "invalid semantic Project View preview body: {error}"
+                    ))
+                })?;
+            if project_view_semantic_type(data.object_type().as_str())? != expected_subtype {
+                return Err(DbError::InvalidData(
+                    "semantic Project View preview subtype changed".to_string(),
+                ));
+            }
+            project_view_description(&data).map(str::to_owned)
+        }
+        SemanticSourceKind::ProjectDocument => None,
+        SemanticSourceKind::Meeting => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT description FROM channels \
+             WHERE community_id=$1 AND id=$2 AND room_kind='meeting' AND deleted_at IS NULL",
+        )
+        .bind(identity.community_id)
+        .bind(identity.source_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| DbError::NotFound("semantic Meeting preview".to_string()))?
+        .filter(|value| !value.trim().is_empty()),
+    };
+    Ok(SemanticCanonicalPreviewObservation {
+        observation,
+        description,
+    })
+}
+
+fn project_view_description(data: &buzz_project_view::v3::ProjectViewObjectDataV3) -> Option<&str> {
+    use buzz_project_view::v3::ProjectViewObjectDataV3;
+
+    match data {
+        ProjectViewObjectDataV3::Plan(value) => Some(&value.description),
+        ProjectViewObjectDataV3::Stage(value) => Some(&value.description),
+        ProjectViewObjectDataV3::Requirement(value) => Some(&value.description),
+        ProjectViewObjectDataV3::Issue(value) => Some(&value.description),
+        ProjectViewObjectDataV3::Work(value) => Some(&value.description),
+        ProjectViewObjectDataV3::ProjectProfile(_)
+        | ProjectViewObjectDataV3::Goal(_)
+        | ProjectViewObjectDataV3::Role(_)
+        | ProjectViewObjectDataV3::Resource(_) => None,
+    }
+}
+
 async fn observe_project_view_source_in_connection(
     connection: &mut PgConnection,
     identity: &SemanticSourceIdentity,

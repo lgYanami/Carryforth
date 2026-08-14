@@ -1,10 +1,10 @@
 # Agent Project Context 渐进观察与一跳语义选择分阶段实现计划
 
-> 状态：实施中；Phase B0–B3已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
+> 状态：实施中；Phase B0–B4已交付（B3按安全依赖先于B2落地）；one-hop semantic仍feature-off；不构成production-ready声明
 >
 > 日期：2026-08-14
 >
-> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`；B2在本计划内增量交付
+> 代码基线：`feat/agent-context-search`；B0 `596287200`、B1 `7937ec9f1`、B3 `8c654228d`、B2 `24bebd0f9`；B4在本计划内增量交付
 >
 > 已交付起点检索：
 > [Agent Project Context 自然语言 Coordinate 起点检索分阶段实现计划](project-context-coordinate-search-implementation-plan.md)
@@ -1230,6 +1230,12 @@ ingest/storage尚未fail closed”的窗口；该依赖顺序不改变B2/B3各�
 
 ### Phase B4：DB scoped exact ranking
 
+> 实施状态：已交付。新增独立`semantic_query/scoped_search.rs`，仅复用verified ticket、
+> current-head exact scorer、canonical structure loader与typed source hydration；未调用root fusion、coherence、
+> floor、transition、beam或path packing。真实一次性PG17/pgvector 0.8.5 fixture已验证
+> Coordinate→Edge的全量binding评分后分Edge、Edge→Coordinate的complete-member评分、K+1、
+> missing-head coverage与same-RR canonical preview hydration。
+
 交付：
 
 - incident relation Docs direct Q0 scoring + Edge grouping；
@@ -1240,6 +1246,14 @@ ingest/storage尚未fail closed”的窗口；该依赖顺序不改变B2/B3各�
 - target-scale EXPLAIN与statement timeout。
 
 退出门：不调用coherence/floor/transition/path代码；相同fixture纯公式可重算；scope外候选为0。
+
+本阶段的本地合成exact-kernel规模证据为：10k eligible sources、4 channels、recall 64时
+p50/p95/p99为376/456/456 ms；10k、9 channels、recall 256 hard-cap时为827/912/912 ms；
+4-client的baseline与concurrent VACUUM短soak均0 failure，1 ms statement cancellation后残留session为0。
+本地artifact为
+`test-results/semantic-exact-query-qualification/20260814T174724Z-1191821/qualification.json`，SHA-256为
+`121551a09294fc93239d416c0b8967966790d6d408e126131955e10006bc1b38`。该证据只测量共享exact
+cosine内核与predicate-before-distance，不是目标Community canonical join SLO、Provider或multi-pod资格。
 
 ### Phase B5：Relay execution与feature-off capability
 

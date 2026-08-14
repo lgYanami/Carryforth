@@ -5,6 +5,10 @@
 //! observations to the Relay query orchestrator. Raw source vectors never
 //! cross this API.
 
+mod scoped_search;
+
+pub use scoped_search::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
@@ -683,6 +687,7 @@ pub enum SemanticGraphEmbeddingCoverageClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentSemanticAvailabilityClass {
     Current,
+    NonQueryableZeroVector,
     Missing,
     Building,
     Failed,
@@ -1607,6 +1612,9 @@ impl SemanticGraphReadTx {
                 CurrentSemanticAvailabilityClass::Missing => SemanticInitialHeadState::Missing,
                 CurrentSemanticAvailabilityClass::Building => SemanticInitialHeadState::Building,
                 CurrentSemanticAvailabilityClass::Failed => SemanticInitialHeadState::Failed,
+                CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+                    SemanticInitialHeadState::Failed
+                }
                 CurrentSemanticAvailabilityClass::Unsupported => {
                     SemanticInitialHeadState::Unsupported
                 }
@@ -1695,6 +1703,9 @@ impl SemanticGraphReadTx {
                     Some(SemanticContextOmissionReason::SemanticHeadBuilding)
                 }
                 CurrentSemanticAvailabilityClass::Failed => {
+                    Some(SemanticContextOmissionReason::SemanticHeadFailed)
+                }
+                CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
                     Some(SemanticContextOmissionReason::SemanticHeadFailed)
                 }
                 CurrentSemanticAvailabilityClass::Unsupported => {
@@ -2910,6 +2921,9 @@ fn traversal_omission_reason(
         CurrentSemanticAvailabilityClass::Failed => {
             SemanticTraversalSourceOmissionReason::SemanticHeadFailed
         }
+        CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+            SemanticTraversalSourceOmissionReason::SemanticHeadFailed
+        }
         CurrentSemanticAvailabilityClass::Unsupported => {
             SemanticTraversalSourceOmissionReason::SemanticHeadUnsupported
         }
@@ -3330,6 +3344,7 @@ const fn initial_omission_reason(reason: IneligibilityReason) -> SemanticInitial
 fn current_availability_from_db(value: &str) -> Result<CurrentSemanticAvailabilityClass> {
     match value {
         "current" => Ok(CurrentSemanticAvailabilityClass::Current),
+        "non_queryable_zero_vector" => Ok(CurrentSemanticAvailabilityClass::NonQueryableZeroVector),
         "missing" => Ok(CurrentSemanticAvailabilityClass::Missing),
         "building" => Ok(CurrentSemanticAvailabilityClass::Building),
         "failed" => Ok(CurrentSemanticAvailabilityClass::Failed),
@@ -3346,6 +3361,12 @@ fn source_eligibility_from_db(
 ) -> Result<Option<SemanticEligibility>> {
     match (eligibility, reason) {
         (None, None) => Ok(None),
+        // `unknown` is the normal pre-observation state after a canonical
+        // source change. It is not an ineligibility verdict: callers still
+        // classify the source through its missing/building/failed head state,
+        // and no score or hydrated candidate can be produced until the worker
+        // publishes an exact eligible current head.
+        (Some("unknown"), None) => Ok(Some(SemanticEligibility::Eligible)),
         (Some("eligible"), None) => Ok(Some(SemanticEligibility::Eligible)),
         (Some("ineligible"), Some("tombstone")) => Ok(Some(SemanticEligibility::Ineligible(
             IneligibilityReason::Tombstone,
@@ -4150,7 +4171,10 @@ SELECT generation.community_id,
        current_head.summary_coverage,
        current_head.semantic_text,
        CASE
-         WHEN current_head.unit_set_id IS NOT NULL THEN 'current'
+         WHEN current_head.unit_set_id IS NOT NULL AND current_head.queryable_vector
+           THEN 'current'
+         WHEN current_head.unit_set_id IS NOT NULL
+           THEN 'non_queryable_zero_vector'
          WHEN job.state = 'poison'
            OR (job.state = 'succeeded' AND current_head.unit_set_id IS NULL)
            OR source.coverage_state = 'failed'
@@ -4184,7 +4208,8 @@ LEFT JOIN LATERAL (
            unit.unit_key,
            unit.semantic_text_digest,
            unit.summary_coverage,
-           unit.semantic_text
+           unit.semantic_text,
+           vector_norm(embedding.embedding) > 0 AS queryable_vector
     FROM semantic_source_generation_heads head
     JOIN semantic_unit_sets unit_set
       ON unit_set.community_id = head.community_id
@@ -4211,7 +4236,6 @@ LEFT JOIN LATERAL (
      AND embedding.dimensions = generation.dimensions
      AND embedding.response_model = generation.model
      AND vector_dims(embedding.embedding) = generation.dimensions
-     AND vector_norm(embedding.embedding) > 0
     WHERE head.community_id = source.community_id
       AND head.generation_id = generation.generation_id
       AND head.source_family = source.source_family
@@ -5136,6 +5160,9 @@ fn context_egress_expectation(
         CurrentSemanticAvailabilityClass::Failed => {
             Some(SemanticContextOmissionReason::SemanticHeadFailed)
         }
+        CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+            Some(SemanticContextOmissionReason::SemanticHeadFailed)
+        }
         CurrentSemanticAvailabilityClass::Unsupported => {
             Some(SemanticContextOmissionReason::SourceIneligible)
         }
@@ -5507,12 +5534,12 @@ mod tests {
         edge_keys_from_json, partition_exact_recall, same_release_snapshot,
         semantic_hyperedge_identity_bytes, semantic_source_identity_for_coordinate,
         slice_ranked_relations, slice_ranked_targets, source_eligibility_from_db,
-        validate_query_vectors, SemanticContextEgressExpectation, SemanticContextOmissionReason,
-        SemanticCurrentContextOverview, SemanticCurrentHead, SemanticExactQueryVector,
-        SemanticExactRecallExhaustion, SemanticExactSourceScore, SemanticGraphQueryTicket,
-        SemanticGraphStructuralRoles, SemanticOmittedContextEvidence, SemanticRankedRelationOption,
-        SemanticRankedTargetOption, SemanticTraversalSliceExhaustion, AUTHORIZED_TICKET_SQL,
-        COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
+        validate_query_vectors, CurrentSemanticAvailabilityClass, SemanticContextEgressExpectation,
+        SemanticContextOmissionReason, SemanticCurrentContextOverview, SemanticCurrentHead,
+        SemanticExactQueryVector, SemanticExactRecallExhaustion, SemanticExactSourceScore,
+        SemanticGraphQueryTicket, SemanticGraphStructuralRoles, SemanticOmittedContextEvidence,
+        SemanticRankedRelationOption, SemanticRankedTargetOption, SemanticTraversalSliceExhaustion,
+        AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
         CURRENT_SEMANTIC_SOURCE_STATES_SQL, EXACT_SOURCE_SCORES_SQL,
         FINAL_CONFIRMATION_ISOLATION_SQL, INCIDENT_RELATION_REFS_SQL,
         LOCK_EGRESS_CONTEXT_STATE_SQL, LOCK_EGRESS_GENERATION_SQL,
@@ -5801,12 +5828,22 @@ mod tests {
             "head.source_snapshot_digest = source.snapshot_digest",
             "embedding.response_model = generation.model",
             "vector_norm(embedding.embedding) > 0",
+            "THEN 'non_queryable_zero_vector'",
             "job.desired_invalidation_epoch = source.invalidation_epoch",
         ] {
             assert!(CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains(marker));
         }
         assert!(!CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains("content_markdown"));
         assert!(!CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains("project_view_projection"));
+        assert_eq!(
+            current_availability_from_db("non_queryable_zero_vector")
+                .expect("zero-vector availability"),
+            CurrentSemanticAvailabilityClass::NonQueryableZeroVector
+        );
+        assert_eq!(
+            source_eligibility_from_db(Some("unknown"), None).expect("pending source eligibility"),
+            Some(SemanticEligibility::Eligible)
+        );
         assert!(current_availability_from_db("unknown").is_err());
     }
 

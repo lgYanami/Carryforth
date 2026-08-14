@@ -9,7 +9,7 @@ use std::{cmp::Ordering, collections::BTreeSet};
 use buzz_project_context::{EdgeKey, ProjectContextCoordinate, MAX_SAFE_REVISION};
 use buzz_semantic::{Digest32, SemanticLifecycleClass, SemanticSourceBasis};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -355,8 +355,18 @@ pub struct OneHopCandidatePreview {
     /// Current canonical title or name.
     pub title: String,
     /// Current canonical description when the source family owns one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
     pub description: Option<String>,
     /// Complete source-owned summary when one exists.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
     pub summary: Option<String>,
 }
 
@@ -409,6 +419,11 @@ pub enum OneHopCanonicalRead {
         /// Create Event represented by this observation.
         expected_create_event_id: Digest32,
         /// Terminal End Event represented by this observation when present.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_optional_non_null"
+        )]
         expected_end_event_id: Option<Digest32>,
     },
 }
@@ -436,6 +451,11 @@ pub struct OneHopCanonicalCandidateObservation {
     /// Cross-family current lifecycle.
     pub lifecycle: SemanticLifecycleClass,
     /// Optional current source-native status.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
     pub source_status: Option<String>,
     /// Canonical candidate content available for immediate context filtering.
     pub preview: OneHopCandidatePreview,
@@ -1011,6 +1031,14 @@ fn validate_optional_text(field: &'static str, value: Option<&str>) -> OneHopSem
     Ok(())
 }
 
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 fn validate_uuid_v4(value: Uuid, field: &'static str) -> OneHopSemanticResult<()> {
     if value.is_nil() || value.get_version_num() != 4 {
         return Err(OneHopSemanticError::InvalidUuid { field });
@@ -1272,7 +1300,20 @@ mod tests {
                 ["preview"]["title"],
             "Authorization relation"
         );
+        assert!(
+            json["selection"]["edges"][0]["ranked_documents"][0]["canonical_observation"]
+                ["preview"]
+                .get("description")
+                .is_none()
+        );
         assert!(json["selection"]["edges"][0].get("coordinates").is_none());
+
+        let mut forged_null = json;
+        forged_null["selection"]["edges"][0]["ranked_documents"][0]["canonical_observation"]
+            ["preview"]["description"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<ProjectContextOneHopSemanticQueryResult>(forged_null).is_err()
+        );
     }
 
     #[test]

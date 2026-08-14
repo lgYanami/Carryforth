@@ -60,6 +60,10 @@ BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.
     -- --nocapture
 BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
 BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
+  cargo test -p buzz-db one_hop_scoped_search_real_pgvector_is_direct_complete_and_hydrated \
+    -- --nocapture
+BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
+BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
   cargo test -p buzz-db semantic_fleet::tests:: -- --ignored --nocapture
 
 # Upgraded databases intentionally retain the zero-vector constraint as NOT
