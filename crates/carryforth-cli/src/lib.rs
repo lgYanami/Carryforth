@@ -685,6 +685,16 @@ pub enum DocumentsCmd {
 /// Commands for Project Context Edge discovery and maintenance.
 #[derive(Subcommand)]
 pub enum ProjectContextCmd {
+    /// Observe one Coordinate or its incident Edge identities
+    Coordinate {
+        #[command(subcommand)]
+        command: ProjectContextCoordinateCmd,
+    },
+    /// Observe one Edge's relation Documents or complete Coordinate members
+    Edge {
+        #[command(subcommand)]
+        command: ProjectContextEdgeCmd,
+    },
     /// Find ranked graph Coordinates from one natural-language starting-point query
     ///
     /// Returns only the verified signed Coordinate candidates. It does not
@@ -762,6 +772,96 @@ pub enum ProjectContextCmd {
         coordinates: Vec<String>,
         #[command(flatten)]
         attribution: ProjectContextAttributionArgs,
+    },
+}
+
+/// Atomic Coordinate observations for progressive Project Context traversal.
+#[derive(Subcommand)]
+pub enum ProjectContextCoordinateCmd {
+    /// Show one current in-graph Coordinate and its lightweight source observation
+    Show {
+        /// Typed `TYPE:<uuid-v4>` Coordinate token.
+        coordinate: String,
+    },
+    /// List current active Edge identities incident to one Coordinate
+    Edges {
+        /// Typed `TYPE:<uuid-v4>` Coordinate token.
+        coordinate: String,
+        /// Maximum Edge identities returned on this page; defaults to 32.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=32))]
+        limit: Option<u8>,
+        /// Exclusive Edge cursor from the preceding page.
+        #[arg(
+            long,
+            requires_all = [
+                "expected_context_meta_event_id",
+                "expected_context_revision",
+                "expected_projection_generation"
+            ]
+        )]
+        after_edge: Option<String>,
+        /// Exact Context metadata Event observed on the preceding page.
+        #[arg(long, requires = "after_edge")]
+        expected_context_meta_event_id: Option<String>,
+        /// Exact Context revision observed on the preceding page.
+        #[arg(long, requires = "after_edge")]
+        expected_context_revision: Option<u64>,
+        /// Exact projection generation observed on the preceding page.
+        #[arg(long, requires = "after_edge")]
+        expected_projection_generation: Option<u64>,
+    },
+}
+
+/// Atomic Edge observations for progressive Project Context traversal.
+#[derive(Subcommand)]
+pub enum ProjectContextEdgeCmd {
+    /// List or read the canonical Context Documents bound to one Edge
+    Documents {
+        /// Canonical lowercase 64-character EdgeKey.
+        edge_key: String,
+        /// Read one exact bound Document instead of a page.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "limit",
+                "after_document",
+                "expected_context_meta_event_id",
+                "expected_context_revision",
+                "expected_projection_generation"
+            ]
+        )]
+        document: Option<Uuid>,
+        /// Maximum Documents returned on this page; defaults to 32.
+        #[arg(
+            long,
+            conflicts_with = "document",
+            value_parser = clap::value_parser!(u8).range(1..=32)
+        )]
+        limit: Option<u8>,
+        /// Exclusive Document UUID cursor from the preceding page.
+        #[arg(
+            long,
+            requires_all = [
+                "expected_context_meta_event_id",
+                "expected_context_revision",
+                "expected_projection_generation"
+            ]
+        )]
+        after_document: Option<Uuid>,
+        /// Exact Context metadata Event observed on the preceding page.
+        #[arg(long, requires = "after_document")]
+        expected_context_meta_event_id: Option<String>,
+        /// Exact Context revision observed on the preceding page.
+        #[arg(long, requires = "after_document")]
+        expected_context_revision: Option<u64>,
+        /// Exact projection generation observed on the preceding page.
+        #[arg(long, requires = "after_document")]
+        expected_projection_generation: Option<u64>,
+    },
+    /// Return the complete canonical Coordinate set of one current active Edge
+    Coordinates {
+        /// Canonical lowercase 64-character EdgeKey.
+        edge_key: String,
     },
 }
 
@@ -3500,10 +3600,53 @@ mod tests {
         let requirement_a = "10000000-0000-4000-8000-000000000001";
         let requirement_b = "10000000-0000-4000-8000-000000000002";
         let document = "20000000-0000-4000-8000-000000000001";
+        let edge_key = "11".repeat(32);
+        let meta_event_id = "22".repeat(32);
         let assignment = "30000000-0000-4000-8000-000000000001";
         let runtime = "40000000-0000-4000-8000-000000000001";
 
         for args in [
+            vec!["cf", "project-context", "coordinate", "show", requirement_a],
+            vec![
+                "cf",
+                "project-context",
+                "coordinate",
+                "edges",
+                requirement_a,
+                "--limit",
+                "16",
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "coordinate",
+                "edges",
+                requirement_a,
+                "--after-edge",
+                edge_key.as_str(),
+                "--expected-context-meta-event-id",
+                meta_event_id.as_str(),
+                "--expected-context-revision",
+                "7",
+                "--expected-projection-generation",
+                "9",
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "edge",
+                "documents",
+                edge_key.as_str(),
+                "--document",
+                document,
+            ],
+            vec![
+                "cf",
+                "project-context",
+                "edge",
+                "coordinates",
+                edge_key.as_str(),
+            ],
             vec![
                 "cf",
                 "project-context",
@@ -3625,6 +3768,48 @@ mod tests {
             "coordinate-search",
             "--query",
             "starting point",
+            "--limit",
+            "33",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate",
+            "edges",
+            requirement_a,
+            "--after-edge",
+            edge_key.as_str(),
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "edge",
+            "documents",
+            edge_key.as_str(),
+            "--document",
+            document,
+            "--limit",
+            "8",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate",
+            "edges",
+            requirement_a,
+            "--limit",
+            "0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "edge",
+            "documents",
+            edge_key.as_str(),
             "--limit",
             "33",
         ])
@@ -4275,12 +4460,23 @@ mod tests {
             vec![
                 "attach",
                 "contains-all",
+                "coordinate",
                 "coordinate-search",
                 "detach",
+                "edge",
                 "exact",
                 "incident",
                 "semantic-query",
             ]
+        );
+        let project_context = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "project-context")
+            .expect("project-context command");
+        assert_eq!(names(project_context, "coordinate"), vec!["edges", "show"]);
+        assert_eq!(
+            names(project_context, "edge"),
+            vec!["coordinates", "documents"]
         );
         let project_view = cmd
             .get_subcommands()
