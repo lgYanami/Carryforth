@@ -90,8 +90,8 @@ jobs:
         id: mesh_rev
         run: |
           set -euo pipefail
-          rev=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
-          [[ -n "$rev" ]] || { echo "::error::could not resolve mesh-llm revision"; exit 1; }
+          rev=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          [[ -n "$rev" ]] || { echo "::error::could not resolve mesh-llm revision from desktop/src-tauri/Cargo.lock"; exit 1; }
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
           echo "short=${rev:0:7}" >> "$GITHUB_OUTPUT"
 

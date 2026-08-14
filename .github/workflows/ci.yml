@@ -1431,14 +1431,15 @@ jobs:
           touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
           touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
           touch "desktop/src-tauri/binaries/cf-$TARGET"
-      # Mesh rev is derived from Cargo.lock so a dependency bump needs no
-      # lockstep edit here; the cache key tracks it automatically.
+      # Mesh rev is derived from the Tauri lockfile so a dependency bump needs
+      # no lockstep edit here; the cache key tracks the dependency actually
+      # fetched and built by the Desktop crate.
       - name: Resolve mesh-llm rev
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
-          [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
+          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from desktop/src-tauri/Cargo.lock"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
       - name: Restore mesh llama build cache
@@ -1453,7 +1454,7 @@ jobs:
           MESH_REV_SHORT: ${{ steps.mesh_rev.outputs.short }}
         run: |
           set -euo pipefail
-          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
+          cargo fetch --locked --manifest-path desktop/src-tauri/Cargo.toml
           SHORT="$MESH_REV_SHORT"
           MESH_ROOT=$(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -path "*/$SHORT" -type d -name "$SHORT" | head -1)
           if [[ -z "$MESH_ROOT" ]]; then
