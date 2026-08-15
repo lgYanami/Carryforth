@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0–U6已交付，待进入U7资格关闭
+> 状态：兼容基线与第一阶段统一语义计算已交付；待设计第二阶段统一可靠性运行时
 >
 > 更新日期：2026-08-16
 >
@@ -25,7 +25,10 @@
 > bounded complete path现以专属closed Q0/Qi bundle驱动共同root/relation/target scorer，并保持原有
 > traversal、packing、retry与release语义；同快照root差分和路径差分已通过。U6已把四个operation切换为
 > 同一compiled migrated profile，并通过新fleet runtime digest拒绝旧/新profile混跑。legacy Coordinate SQL与
-> graph adapter只保留到2026-09-16的profile rollback窗口。下一步进入U7资格与阶段关闭。
+> graph adapter只保留到2026-09-16的profile rollback窗口。U7 deterministic、disposable pgvector、
+> target-scale、feature/gate/fleet与全量单元资格已经关闭；真实Provider canary因缺少受支持的
+> `BUZZ_SEMANTIC_*`配置明确记录为外部阻断。第一阶段完成，下一步是单独设计统一可靠性运行时；统一
+> 资源治理仍排在其后。
 
 ### 背景
 

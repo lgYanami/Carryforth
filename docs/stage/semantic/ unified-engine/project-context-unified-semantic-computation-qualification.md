@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U6 已通过；U7 待交付
+> 状态：U0–U7 已通过；第一阶段统一语义计算资格完成；真实Provider canary外部阻断
 >
 > 日期：2026-08-16
 >
@@ -18,7 +18,7 @@
 | U4 whole-graph Coordinate | 通过 | Coordinate v1 接入共同 scorer；同 snapshot 精确差分与10k性能门通过 |
 | U5 bounded complete path | 通过 | Q0/Qi closed bundle、root/relation/target scorer与path retention零行为迁移通过 |
 | U6 默认切换与 legacy 收口 | 通过 | 四个operation默认Migrated；新fleet digest拒绝旧profile；rollback源保留到2026-09-16 |
-| U7 最终资格与文档关闭 | 待执行 | — |
+| U7 最终资格与文档关闭 | 通过（1项外部阻断） | deterministic、service DB、target-scale、全量单元与文档关闭；真实Provider配置缺失 |
 
 ## 2. U0 证据
 
@@ -322,3 +322,47 @@ cargo check -p buzz-db -p buzz-relay
   cancellation无残留session，soak无失败事务；
 - 以上为本地合成测量，未冻结生产SLO。真实Provider canary仍留给U7，并且只接受受支持的
   `BUZZ_SEMANTIC_*`配置。
+
+## 9. U7 最终资格与阶段关闭
+
+U7在最终四项全`Migrated` compiled profile上重新执行了分层资格：
+
+~~~text
+just semantic-retrieval-computation
+just semantic-test
+just coordinate-search-qualification
+just semantic-query-qualification
+cargo clippy -p buzz-semantic-query -p buzz-db -p buzz-relay --all-targets -- -D warnings
+just test-unit
+just ci
+~~~
+
+结果摘要：
+
+- compatibility v1与Phase 1 differential两个tracked manifest/hash均保持原值，四operation/三surface的
+  deterministic gate通过；
+- `semantic-test`验证PostgreSQL 17.10、pgvector 0.8.5、fresh/upgrade schema、Coordinate/one-hop/完整路径
+  scorer与fleet release矩阵；
+- 两个target-scale runner均通过，详细content-free数值记录在§8；它们是本地测量而非生产SLO；
+- feature/process master/Community gate/capability/fleet关闭路径继续在Provider前fail closed；旧U4 runtime
+  inventory不能通过U6 compiled runtime验证；
+- `just test-unit`的28组全仓单元套件全部通过；strict Clippy、format、diff与最终`just ci`通过；
+- 三个公开surface的Event kind、extension、capability、CLI/SDK、query text、ranking、budget、result、错误与
+  release语义未发生未批准变化。
+
+真实Provider canary未运行。资格前只检查配置是否存在，不读取或输出值；当前进程与`.env`都没有
+`BUZZ_SEMANTIC_API_KEY`、`BUZZ_SEMANTIC_BASE_URL`或`BUZZ_SEMANTIC_REQUEST_MODEL`。按照计划，这是一项明确
+外部阻断，不得由`LLM_API_KEY`、`LLM_BASE_URL`或`LLM_MODEL`替代。整个U7没有打开Community semantic gate，
+Provider egress为0。
+
+## 10. 最终结论与后续边界
+
+第一阶段统一语义计算资格通过：四个逻辑operation共同使用closed input/vector、一次bounded Provider encoding
+能力与current-head exact scorer，并继续保持各自closed scope、policy和public result。legacy Coordinate SQL与
+完整路径compatibility adapter只作为profile rollback源保留至`2026-09-16`；若使用，必须按gate off、drain、
+整fleet部署与重新attestation流程执行，不能动态fallback。
+
+上位spec、历史baseline、实现计划与Stage TODO已同步。中英文current-status仍准确描述公开能力为实验性、
+受门控且非production-ready，因此没有为了内部重构改写产品状态。下一阶段是**单独设计统一可靠性运行时**；
+retry、backoff、circuit、snapshot recovery与统一错误生命周期尚未交付。统一资源治理与跨operation production
+容量资格仍排在其后。

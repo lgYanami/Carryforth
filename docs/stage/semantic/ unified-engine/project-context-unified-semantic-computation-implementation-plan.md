@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0–U6 已交付；U7 待交付
+> 状态：U0–U7 已交付；第一阶段统一语义计算完成
 >
 > 日期：2026-08-16
 >
@@ -617,7 +617,7 @@ Phase 1并另开兼容迁移。
 | U4 whole-graph Coordinate | 已完成 | 独立模板进入 shared scorer；同 snapshot legacy/shared 精确相等，10k closed physical plan 无性能退化 |
 | U5 bounded complete path | 已完成 | Q0/Qi closed bundle进入root与traversal scorer；同快照/同向量与路径差分通过 |
 | U6 默认切换与 legacy 收口 | 已完成 | 四个operation统一切到compiled migrated profile；旧实现仅保留到profile rollback截止日 |
-| U7 | 待交付 | 最终资格、全仓门禁与文档关闭 |
+| U7 资格与阶段关闭 | 已完成 | deterministic、service-backed、target-scale、全量单元与文档状态关闭；真实Provider外部阻断已记录 |
 
 ### U0：设计与差分门
 
@@ -764,6 +764,18 @@ exact kernel为381.208ms，hard-cap 10k×9为822.103ms；取消、currentness、
 - feature-off/gate-off/capability-off零新增egress；
 - content-free资格记录与rollback状态；
 - 更新上位spec、baseline、TODO和current-status，但不宣称后续runtime/governance完成。
+
+交付复核：历史compatibility manifest与Phase 1 differential manifest保持不变，aggregate gate在四项全
+`Migrated` profile上继续通过。disposable PostgreSQL/pgvector矩阵、10k Coordinate与10k graph exact-kernel
+资格、feature/gate/capability/fleet fail-closed、SDK/CLI/Relay合同和全量单元门均通过。真实Provider所需的
+`BUZZ_SEMANTIC_API_KEY`、`BUZZ_SEMANTIC_BASE_URL`与`BUZZ_SEMANTIC_REQUEST_MODEL`在环境和`.env`中均缺失，
+因此canary按既定规则记为外部阻断；没有读取或挪用`LLM_*`，没有打开任何Community gate或产生Provider
+egress。
+
+上位规范、历史baseline、TODO和本资格记录已同步。`docs/{cn,en}/current-status.md`经复核无需改写：公开
+能力、实验性/受门控/非production-ready状态与Provider数据边界均未改变；本阶段只是内部零行为迁移。第一
+阶段可以声明“统一语义计算已交付”，但不能声明统一可靠性运行时、统一资源治理、完整统一引擎或production
+SLO已经完成。
 
 ## 11. 差分策略
 

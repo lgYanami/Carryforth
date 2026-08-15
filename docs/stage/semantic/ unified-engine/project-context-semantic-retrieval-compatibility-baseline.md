@@ -285,10 +285,10 @@ just semantic-retrieval-compatibility-baseline
 
 ## 13. 下一步
 
-兼容基线已经冻结。下一阶段已经形成
-[统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)，按零行为迁移共同
-query input/encoding、generation-bound query vector与current-head exact scorer。真实Provider统一canary、
-跨surface取消对照和production容量资格继续作为后续资格项，不得被描述为本轮已通过。
+兼容基线作为不可改写的历史v1 oracle继续保留。第一阶段
+[统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)已经完成，并由独立
+[资格记录](project-context-unified-semantic-computation-qualification.md)维护当前route、差分、数据库与
+target-scale证据；本记录不回填新profile或重写历史golden。
 
-统一语义计算计划已经完成代码、兼容性与安全边界复核，U0差分门也已独立交付；下一步进入U1共同类型，
-不跨阶段直接替换production scorer。
+真实Provider统一canary仍因缺少受支持的`BUZZ_SEMANTIC_*`配置而未运行；跨surface生产容量与完整故障恢复
+仍不属于第一阶段结论。下一阶段应单独设计统一可靠性运行时，不得借更新本基线引入retry或资源治理行为。

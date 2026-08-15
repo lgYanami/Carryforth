@@ -1,8 +1,8 @@
 # Project Context 统一语义检索引擎规范
 
-> 状态：概念规范，设计已确认，待单独编写实现设计
+> 状态：概念规范已确认；兼容基线与第一阶段统一语义计算已交付；第二阶段可靠性运行时待设计
 >
-> 日期：2026-08-15
+> 日期：2026-08-16
 >
 > 范围：Project Context 语义检索的统一语义计算、可靠性运行时、资源治理，以及公开
 > closed operation 的边界
@@ -15,6 +15,7 @@
 > [Project Context 图语义查询实现计划](../project-context-graph-semantic-query-implementation-plan.md)、
 > [语义检索兼容基线交付计划](project-context-semantic-retrieval-compatibility-baseline-plan.md)、
 > [统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)、
+> [统一语义计算资格记录](project-context-unified-semantic-computation-qualification.md)、
 > [Stage TODO](../../TODO.md)
 
 ## 1. 文档目的
@@ -466,6 +467,11 @@ Provider 实际输入或排名语义的事项，必须在共同计算原语稳�
 - 哪些失败可以安全重试；
 - 哪些 snapshot 恢复可以复用 query vector；
 - 哪些变化必须重新编码或 fail closed。
+
+交付状态：第一阶段已经完成。四个逻辑operation现在共同使用closed semantic input、Provider encoding
+primitive、Community/generation-bound query vector以及current-head exact scorer；公开surface、scope、
+ranking、budget、result、error、snapshot与release合同保持兼容。该结论不包含新的retry、queue、circuit、
+fairness或production SLO；这些仍属于后续阶段。
 
 ### 10.3 第二阶段：统一可靠性运行时
 
