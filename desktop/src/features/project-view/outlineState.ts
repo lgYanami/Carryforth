@@ -67,6 +67,25 @@ export function expandProjectViewOutlineAncestors(
   return next;
 }
 
+/** Expand every live outline node that currently owns children. */
+export function expandAllProjectViewOutline(
+  index: ProjectViewOutlineIndex,
+): Set<string> {
+  return new Set(
+    [...index.nodesByKey.entries()]
+      .filter(([, node]) => projectViewOutlineChildren(node).length > 0)
+      .map(([key]) => key),
+  );
+}
+
+/** Collapse unrelated branches while keeping the current occurrence visible. */
+export function collapseProjectViewOutlineToCurrent(
+  index: ProjectViewOutlineIndex,
+  currentOccurrenceKey: string,
+): Set<string> {
+  return expandProjectViewOutlineAncestors(index, currentOccurrenceKey);
+}
+
 export function visibleProjectViewOutlineNodes(
   index: ProjectViewOutlineIndex,
   expandedKeys: ReadonlySet<string>,

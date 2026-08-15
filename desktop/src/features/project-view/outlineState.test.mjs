@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  collapseProjectViewOutlineToCurrent,
+  expandAllProjectViewOutline,
   expandProjectViewOutlineAncestors,
   indexProjectViewOutline,
   navigateProjectViewOutline,
@@ -57,6 +59,35 @@ test("ancestor expansion preserves valid user branches and drops stale keys", ()
       nodes.roles.occurrenceKey,
       nodes.root.occurrenceKey,
     ].sort(),
+  );
+});
+
+test("expand all includes every expandable branch and no leaves", () => {
+  const nodes = fixture();
+  const index = indexProjectViewOutline(nodes.root);
+  assert.deepEqual(
+    [...expandAllProjectViewOutline(index)].sort(),
+    [
+      nodes.goal.occurrenceKey,
+      nodes.goals.occurrenceKey,
+      nodes.plans.occurrenceKey,
+      nodes.roles.occurrenceKey,
+      nodes.root.occurrenceKey,
+    ].sort(),
+  );
+});
+
+test("collapse all preserves only the path that reveals the current item", () => {
+  const nodes = fixture();
+  const index = indexProjectViewOutline(nodes.root);
+  assert.deepEqual(
+    [...collapseProjectViewOutlineToCurrent(index, nodes.plan.occurrenceKey)],
+    [
+      nodes.plans.occurrenceKey,
+      nodes.goal.occurrenceKey,
+      nodes.goals.occurrenceKey,
+      nodes.root.occurrenceKey,
+    ],
   );
 });
 

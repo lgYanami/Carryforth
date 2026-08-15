@@ -483,6 +483,9 @@ Plan；节点位置只投影 `under_goal_id`、`under_plan_id`、`planned_in_sta
 - 初次进入只展开 Project Profile 和当前路径；
 - 切换 Current Item 时只保证其祖先展开，不自动展开其全部后代；
 - 已由用户展开且在新 snapshot 中仍有效的其他分支保持展开；
+- Header 提供一键全部展开和一键收起；全部展开只展开现有 read model 中拥有 children 的
+  节点，不触发额外读取；一键收起关闭无关分支，但保留 Current occurrence 的祖先路径，
+  使唯一的位置高亮始终可见；
 - 折叠祖先不会改变 Current Item；若当前高亮被折叠，最近可见祖先显示“包含当前
   选择”的视觉状态，但 Current Item 不跳转；
 - 重新展开后恢复精确高亮。
@@ -989,12 +992,24 @@ announcement 告知 Main 已更新；窄窗口选择后关闭 Sheet 并聚焦新
 - 窄窗口中按钮仍位于 Current Item header 右侧，并设置合理最大宽度，不能造成页面横向
   溢出。
 
-### 13.4 Outline 折叠按钮
+### 13.4 Outline 面板折叠按钮
 
 - 必须有可读的 `Show Project Outline` / `Hide Project Outline` 名称；
 - 折叠只是 presentation state，不改变路由和 Current Item；
 - 首版不要求持久化；宽窗口默认打开，窄窗口默认关闭；
 - 如果未来持久化，只能使用明确 Community-scoped 或纯全局显示偏好，不得保存对象数据。
+
+### 13.5 目录批量展开与收起
+
+- Project Outline Header 提供相邻的“全部展开”和“全部收起”图标按钮，两者都有独立、
+  可读的 accessible name 和 tooltip，不与关闭整个 Outline 面板的按钮混淆；
+- 全部展开只改变本地 presentation state，把当前 Outline read model 中所有可展开节点加入
+  expanded set；Document 和引用叶节点不会被错误加入；
+- 全部收起清除无关分支，但保留 Current occurrence 的完整祖先链，并让 Current row 成为
+  roving tree focus 的目标；它不改变 selection、URL 或 Main；
+- 两个操作都不读取 Document 正文、不重新请求 snapshot、不写 history，也不持久化到 Relay；
+- snapshot 更新后继续执行通常的 expanded-key reconciliation；批量展开是一次性操作，
+  不会把后续新增节点隐式保持为自动展开模式。
 
 ## 14. Live、刷新和异常状态
 
@@ -1096,6 +1111,7 @@ Community。
 - alias 失效后回退 canonical；
 - Back / Forward 恢复 occurrence；
 - Home / End / Arrow 键只遍历可见节点。
+- 全部展开只包含 live expandable nodes；全部收起只保留 Current occurrence 的祖先链。
 
 ### 16.2 组件与 E2E
 
@@ -1244,22 +1260,24 @@ presentation 层。
 9. 导航后 Current occurrence 有非纯颜色的明确高亮且祖先自动展开；用户主动折叠其祖先
    时，最近可见祖先显示非纯颜色的“包含当前项”状态。
 10. Outline 可以折叠，折叠不改变 Current Item。
-11. 原 Object Inspector 已删除，其查看和维护能力没有丢失。
-12. `/view`、`/view?object=<id>`、Document / revision / via search、Back / Forward 和
+11. Outline Header 可以一键展开所有目录分支，也可以一键收起无关分支；收起后 Current
+    occurrence 仍然可见并保持高亮。
+12. 原 Object Inspector 已删除，其查看和维护能力没有丢失。
+13. `/view`、`/view?object=<id>`、Document / revision / via search、Back / Forward 和
     Community Overview 深入入口继续工作。
-13. Human 与 Agent 仍读取和修改同一 verified Project View。
-14. Refreshing / offline 保留最后 verified 内容；integrity failure 不展示部分树。
-15. Community 切换不会泄漏对象、目录或 Document 状态。
-16. Role / Work continuity、revision conflict、删除保护和 Context capability 行为保持正确。
-17. Desktop 键盘、窄窗口和命名字体门禁通过。
-18. 所有引用 occurrence 都是叶节点，循环 `about` / Context 不会递归复制子树。
-19. Pinned Document 在成为 Current Item 前不借用 current metadata，也不预读 exact Revision
+14. Human 与 Agent 仍读取和修改同一 verified Project View。
+15. Refreshing / offline 保留最后 verified 内容；integrity failure 不展示部分树。
+16. Community 切换不会泄漏对象、目录或 Document 状态。
+17. Role / Work continuity、revision conflict、删除保护和 Context capability 行为保持正确。
+18. Desktop 键盘、窄窗口和命名字体门禁通过。
+19. 所有引用 occurrence 都是叶节点，循环 `about` / Context 不会递归复制子树。
+20. Pinned Document 在成为 Current Item 前不借用 current metadata，也不预读 exact Revision
     正文；成为 Current Item 后才显示 verified 历史预览。
-20. 除 Project Profile 外，Current Item header 右上角提供向上箭头和 occurrence-based 父级
+21. 除 Project Profile 外，Current Item header 右上角提供向上箭头和 occurrence-based 父级
     Title；不显示父级 Summary、Type 或完整卡片。
-21. canonical、`about`、Resource Context、Document Context 和 Guide occurrence 均解析到
+22. canonical、`about`、Resource Context、Document Context 和 Guide occurrence 均解析到
     正确父级；group 节点不被当作父级对象。
-22. 父级跳转使用 push，Back 恢复原 Current Item 和 occurrence；该按钮不构成 breadcrumb
+23. 父级跳转使用 push，Back 恢复原 Current Item 和 occurrence；该按钮不构成 breadcrumb
     或第二套当前位置组件。
 
 ## 19. 最终实现模型

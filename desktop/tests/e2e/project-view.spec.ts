@@ -2094,6 +2094,38 @@ test("arrow keys traverse and activate the visible Project Outline tree", async 
   await expect(goalItem).toHaveAttribute("aria-selected", "true");
 });
 
+test("Project Outline header expands every branch and collapses back to the current path", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await openProjectViewObject(page, IDS.plan);
+
+  const outline = page.getByTestId("project-view-outline");
+  const currentPlan = outline.getByRole("treeitem", {
+    name: "Plan: Deliver Project View",
+    exact: true,
+  });
+  await page.getByTestId("project-view-outline-expand-all").click();
+
+  const expandableRows = outline.locator('[role="treeitem"][aria-expanded]');
+  expect(await expandableRows.count()).toBeGreaterThan(0);
+  const allExpandableRowsAreOpen = await expandableRows.evaluateAll((rows) =>
+    rows.every((row) => row.getAttribute("aria-expanded") === "true"),
+  );
+  expect(allExpandableRowsAreOpen).toBe(true);
+
+  await page.getByTestId("project-view-outline-collapse-all").click();
+  await expect(currentPlan).toBeVisible();
+  await expect(currentPlan).toHaveAttribute("aria-selected", "true");
+  await expect(currentPlan).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    IDS.plan,
+  );
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.plan}$`));
+});
+
 test("a narrow Main keeps the Outline in a dismissible overlay", async ({
   page,
 }) => {

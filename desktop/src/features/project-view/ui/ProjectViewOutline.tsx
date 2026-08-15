@@ -16,6 +16,8 @@ import type {
 } from "@/features/project-view/explorerModel";
 import { projectViewObjectTypeLabel } from "@/features/project-view/model";
 import {
+  collapseProjectViewOutlineToCurrent,
+  expandAllProjectViewOutline,
   expandProjectViewOutlineAncestors,
   indexProjectViewOutline,
   navigateProjectViewOutline,
@@ -25,6 +27,18 @@ import {
   type ProjectViewOutlineNavigationKey,
 } from "@/features/project-view/outlineState";
 import { cn } from "@/shared/lib/cn";
+
+export type ProjectViewOutlineHandle = {
+  collapseAll: () => void;
+  expandAll: () => void;
+};
+
+type ProjectViewOutlineProps = {
+  currentOccurrenceKey: string;
+  model: ProjectViewExplorerModel;
+  onEscape?: () => void;
+  onNavigate: (selection: ProjectViewExplorerSelection) => void;
+};
 
 function outlineNodeLabel(node: ProjectViewOutlineNode): string {
   return node.kind === "group" ? node.label : node.title;
@@ -79,17 +93,13 @@ function selectionForOutlineNode(
 }
 
 /** Accessible, occurrence-aware Project View tree with independent expansion state. */
-export function ProjectViewOutline({
-  currentOccurrenceKey,
-  model,
-  onEscape,
-  onNavigate,
-}: {
-  currentOccurrenceKey: string;
-  model: ProjectViewExplorerModel;
-  onEscape?: () => void;
-  onNavigate: (selection: ProjectViewExplorerSelection) => void;
-}) {
+export const ProjectViewOutline = React.forwardRef<
+  ProjectViewOutlineHandle,
+  ProjectViewOutlineProps
+>(function ProjectViewOutline(
+  { currentOccurrenceKey, model, onEscape, onNavigate },
+  ref,
+) {
   const index = React.useMemo(
     () => indexProjectViewOutline(model.root),
     [model.root],
@@ -104,6 +114,22 @@ export function ProjectViewOutline({
   const [focusedKey, setFocusedKey] = React.useState(currentOccurrenceKey);
   const previousCurrentKey = React.useRef(currentOccurrenceKey);
   const rowRefs = React.useRef(new Map<string, HTMLDivElement>());
+
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      collapseAll() {
+        setExpandedKeys(
+          collapseProjectViewOutlineToCurrent(index, currentOccurrenceKey),
+        );
+        setFocusedKey(currentOccurrenceKey);
+      },
+      expandAll() {
+        setExpandedKeys(expandAllProjectViewOutline(index));
+      },
+    }),
+    [currentOccurrenceKey, index],
+  );
 
   React.useEffect(() => {
     const currentChanged = previousCurrentKey.current !== currentOccurrenceKey;
@@ -300,4 +326,4 @@ export function ProjectViewOutline({
       {renderNode(model.root)}
     </div>
   );
-}
+});
