@@ -119,22 +119,24 @@ Handoff 和派生 Role Brief 让继任者无需等待前任上线或提交退出
 
 详见[核心设计：Role Continuity](docs/cn/core-design/role-continuity.md)。
 
-## 实验性的上下文环境感知图语义检索
+## 实验性的上下文环境感知 Agent 图检索
 
-这项设计的目标是：同一个问题在不同 Role、Work 等上下文环境下，可以从 Project
-共同持有的一张上下文图中得到不同但仍然相关、可追溯的上下文路径。Carryforth 不为
-Agent 建立私有上下文图，而是把环境作为一次查询的软视角；问题语义仍然主导，查询只沿
-真实无向 Hyperedge 寻路，也不会改写项目关系。当前实现已提供这一实验机制，但不同
-上下文环境下的召回与排序质量仍在资格化中；指定环境不保证一定得到不同或语义正确的结果。
+Agent 可以结合当前 Role，以及与问题有关的 Work、Issue、Meeting 目的等已验证任务事实，渐进检索
+Project Context。通常直接从当前工作已经明确的 Coordinate 开始；没有可靠起点时，才用全图语义
+检索提出候选并由 Agent 自己观察筛选。随后 Agent 按 `Coordinate → Edge → Coordinate` 逐跳前进：
+语义排名缩小每一步的候选范围，canonical 轻量观察帮助排除误匹配，relation Document 保留为什么
+能够经过这条关系的依据，完整正文只在实际任务需要时按需读取。
 
-这项能力并非完全本地：语义索引可能将来源类型、当前可见标题/名称和可选摘要这些项目文本
-发往用户配置的 Provider；当前 foundation 不发送 Document 正文或 chunk。语义查询会将 problem
-和相关 overview 文本发往同一 Provider。源码启动默认开启 Worker 与 Query HTTP 的**进程开关**，
-缺少配置时会询问 Provider API Key、HTTPS Base URL 和
-Request Model。这两个进程开关不会开启 Community 的 durable index/query gate。operator 必须
-单独开启相应 gate；启用查询还要显式确认 problem 和 overview 文本会跨越外部 Provider 边界。
+因此，同一个问题可以让处于不同上下文环境的 Agent 取得不同但相关、可追溯的上下文路径。
+所有 Agent 仍读取 Project 共同持有的一张 Context Graph，不为 Role 或 Agent 建立私有图；语义排名
+不会替 Agent 自动选择路径，遍历只沿真实无向 Hyperedge 进行，也不会创建或改写项目关系。
 
-详见[核心设计：上下文环境感知的图语义检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)。
+其中的语义能力并非完全本地：索引可能将来源类型、当前可见标题/名称和可选摘要发送给用户配置的
+Provider；当前 foundation 不发送 Document 正文或 chunk。自然语言起点与一跳检索会把 query 文本
+发送给同一 Provider。源码启动可以准备语义进程和 Provider 配置，但 operator 仍须单独开启 Community
+durable gate，并明确确认这项 Provider 数据出境。
+
+详见[核心设计：Agent 自主的上下文环境感知 Project Context 图检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)。
 
 ## 当前能力
 
@@ -146,13 +148,13 @@ Request Model。这两个进程开关不会开启 Community 的 durable index/qu
 - `cf` CLI：面向 Agent 的消息、项目对象、文档、上下文、会议和媒体操作；
 - Channels 与 Messages：基于签名 Nostr 事件的日常协作；
 - Git 项目协作与内容寻址媒体的预览能力；
-- 可选、受门控的 Project Context 图语义路径查询。
+- 可选、受门控的语义候选发现与 Agent 渐进式 Project Context 图检索。
 
 Relay 是当前的权威状态边界。系统会校验和保存结构，但不会自动理解整个项目，
 也不会把每段聊天、草稿或模型推理自动提升为项目事实。
 
 **已实现不等于新环境中默认开放。** Project View、Documents、Project Context、Meetings、
-Git Projects 和图语义查询仍有预览开关、Relay readiness、Community durable gate 或 Owner
+Git Projects 和语义检索面仍有预览开关、Relay readiness、Community durable gate 或 Owner
 签名初始化等要求。具体能力与启用边界见[当前状态](docs/cn/current-status.md)。
 
 ## 从源码启动
@@ -169,8 +171,9 @@ cd Carryforth
 脚本只检查外部系统依赖，不会安装 Docker、Python、`curl` 或系统软件包。首次运行会创建私有的本地
 `.env`。源码启动默认开启语义 Worker 和 Query HTTP 进程开关，因此会在缺少时询问
 Provider API Key、HTTPS Base URL 和 Request Model，三者都没有默认值。也可以在启动前显式
-关闭两个进程开关。进程启动不会开启任一 Community 语义 gate，也不代替 Provider 数据出境
-确认。启动过程会保留已有 Docker volume 和项目数据。
+关闭这两个默认开启的进程开关；Agent 起点发现与一跳语义 process master 仍默认关闭。进程启动不会
+开启任一 Community 语义 gate，也不代替 Provider 数据出境确认。启动过程会保留已有 Docker volume
+和项目数据。
 
 > [!WARNING]
 > 这是仅用于可信本机的开发栈。仓库中的 `.env.example` 会把 Relay 绑定到 loopback，
@@ -188,8 +191,8 @@ Provider API Key、HTTPS Base URL 和 Request Model，三者都没有默认值�
   责任、任期、Work 承诺和外化局势如何跨 Agent 与 Runtime 持续存在
 - [核心设计：先有坐标，后有上下文](docs/cn/core-design/coordinate-and-context.md)：
   坐标上下文、关联上下文与 Agent 的渐进式发现
-- [核心设计：上下文环境感知的图语义检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)：
-  同一个问题如何从不同 Role、Work 环境得到不同但相关的可追溯路径
+- [核心设计：Agent 自主的上下文环境感知 Project Context 图检索](docs/cn/core-design/context-aware-semantic-graph-retrieval.md)：
+  Agent 如何结合 Role 与工作环境，从一张共同图中选择不同但相关的路径
 - [核心设计：Meeting](docs/cn/core-design/meeting.md)：
   Human 与 Agent 如何聚合分布式上下文、形成共同结论并显式产出
 - [系统概览](docs/cn/system-overview.md)：组件、数据流、身份、权限、安全与本地优先边界

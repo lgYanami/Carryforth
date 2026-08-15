@@ -111,8 +111,8 @@ Carryforth distinguishes canonical project state from derived read results:
   and some UI caches are read surfaces derived from canonical state;
 - derived state cannot overwrite authoritative Relay objects when they
   conflict;
-- semantic query results are not written back to canonical history as new
-  virtual Events.
+- semantic candidate results and Agent retrieval paths are not written back to canonical history
+  as new virtual Events.
 
 This distinction prevents an Agent summary, one query, or a client cache from
 silently becoming a new source of project truth.
@@ -179,23 +179,27 @@ bindings to an untrusted network without a separate security design.
 
 ## 6. Semantic Provider boundary
 
-Project Context semantic graph queries use a user-configured external Provider
-to generate vectors. The contract limits which indexed information may enter a
-Provider request, and a query must also pass the Community gate, member
-authorization, object currentness, Provider admission, result signing, and
-other checks.
+Project Context semantic discovery uses a user-configured external Provider to generate vectors.
+The semantic index covers eligible current Coordinates and relation Documents. Managed Agents can
+use that index to discover a starting Coordinate, rank incident Edges by their relation Documents,
+and rank members inside one chosen Edge. The Agent—not the Provider—combines those candidates with
+its current Role and relevant work environment to build a progressive reading path.
 
-When queries are enabled, the operator must explicitly acknowledge that the
-problem and overview text—source type, current visible title/name, and optional
-summary—will leave the local control plane and be sent to the configured
-Provider. The current foundation does not send Document bodies or chunks. A
-Provider API Key should exist only in a private local
-environment or controlled secret injection. It must not be written to a Project
-Document, log, or event.
+The contract limits which indexed information may enter a Provider request, and every query must
+also pass the Community gate, member authorization, object currentness, Provider admission, result
+signing, and other checks.
 
-Semantic query is an optional capability. Stopping the Worker and Query HTTP
-processes, or closing the Community query gate, does not delete Project View,
-Documents, Context Edges, or other canonical project data.
+When semantic retrieval is enabled, the operator must explicitly acknowledge that natural-language
+query text and indexed overview text—source type, current visible title/name, and optional summary—
+will leave the local control plane and be sent to the configured Provider. The current foundation
+does not send Document bodies or chunks. A Provider API Key should exist only in a private local
+environment or controlled secret injection. It must not be written to a Project Document, log, or
+event.
+
+Semantic retrieval is optional. Stopping the Worker and semantic HTTP processes, or closing the
+Community query gate, does not delete Project View, Documents, Context Edges, or other canonical
+Project data. The retained bounded complete-path `semantic-query` uses the same derived foundation
+but is supplementary to Agent-directed progressive retrieval.
 
 ## 7. Media and external content
 

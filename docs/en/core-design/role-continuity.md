@@ -653,7 +653,7 @@ Role Continuity ultimately answers:
 
 - [Carryforth Core Model](../core-model.md)
 - [Core Design: Coordinates Before Context](coordinate-and-context.md)
-- [Core Design: Context-Aware Semantic Graph Retrieval](context-aware-semantic-graph-retrieval.md)
+- [Core Design: Agent-Directed Context-Aware Project Context Retrieval](context-aware-semantic-graph-retrieval.md)
 - [Core Design: Meeting](meeting.md)
 - [Role Continuity Domain Contract](../../stage/role/role-continuity.md)
 - [Role Continuity Implementation Design](../../stage/role/implementation-design.md)

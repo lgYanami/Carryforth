@@ -126,32 +126,38 @@ Document 是项目记录，不是 secret store。它依赖已就绪的 Project V
 Desktop 当前主要是可信只读关系面；规范 attach / detach 主要通过 CLI。
 Meeting 只有在符合生命周期和 Action Finalization 条件时才能创建新的 Context binding。
 
-### 4.6 图语义路径查询
+### 4.6 语义候选发现与 Agent 自主图检索
 
 状态：**实验性、可选、受门控，尚未生产就绪**。
 
 已经实现：
 
 - 语义 Provider 适配与 pgvector 索引；
-- 自然语言 problem、可选起始坐标与查询上下文；
-- 图根和路径返回；
-- NIP-98 请求绑定、Relay 签名结果和 canonical read command；
+- 全图自然语言 Coordinate 候选发现；
+- 以 relation Documents 为依据的 Coordinate-to-Edge 局部语义排名；
+- 在完整 Hyperedge 成员内的 Edge-to-Coordinate 局部语义排名；
+- Coordinate、incident Edge、relation Document 与 Edge member 的结构观察；
+- 用于 Agent 渐进遍历的 `search-project-context` Skill 与 Project Space 路由；
+- NIP-98 请求绑定、Relay 签名语义结果和 canonical read descriptor；
+- 作为补充产品保留的有界完整路径型 `semantic-query`；
 - 本地单 Relay 的受控真实请求链路。
 
-仍需资格化：
+仍不属于当前 production-ready 声明：
 
-- 不同 Role / Work context 下的相关性与排序质量；
-- known-negative 与 relevance floor 校准；
+- Provider / model 相关的候选质量与漂移；
 - PostgreSQL 资源隔离、并发阶梯和长期 soak；
 - production LB / multi-pod；
 - 目标规模、冻结 SLO 和完整故障恢复证据。
 
-这一机制实现了“Role / Work 环境可以影响返回路径”的设计方向，但不保证两个环境一定
-产生不同或语义正确的结果。源码启动默认打开 Worker / Query HTTP 进程开关，但不会由此
-开启 Community durable index/query gate。语义索引可能将来源类型、当前可见标题/名称和可选摘要
-这些项目文本发送给用户配置的 Provider；当前 foundation 不发送 Document 正文或 chunk。查询会将
-problem 和相关 overview 文本发送给该 Provider。operator 必须单独开启对应 Community gate；启用
-查询还要显式确认 problem 和 overview 文本会跨越该外部 Provider 边界。
+当前上下文环境感知行为主要由 Agent 完成：它结合经过验证的 Role 与相关任务环境，选择已知或语义
+发现的起点，再依据 canonical 轻量观察和关系证据渐进选择 `Coordinate → Edge → Coordinate`。
+score 只排列候选，不自动选择路径，也不产生权限。不同环境不保证得到完全不重叠的路径；真实的
+跨 Role 依赖也可能是正确结果。
+
+源码启动可以开启语义进程开关，但不会由此开启 Community durable index/query gate。语义索引可能
+将来源类型、当前可见标题/名称和可选摘要发送给用户配置的 Provider；自然语言起点与一跳查询也会
+发送 query 文本。当前 foundation 不发送 Document 正文或 chunk。operator 必须单独开启对应 Community
+gate，并明确确认这项 Provider 数据出境。
 
 ### 4.7 Meetings
 

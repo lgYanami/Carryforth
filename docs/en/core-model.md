@@ -297,31 +297,29 @@ starts from stable object identities and why Coordinate, Edge, and Document have
 responsibilities. The full domain semantics remain in
 [Project Context](../stage/project-context/project-context.md).
 
-### 6.1 Semantic graph-path queries
+### 6.1 Agent-directed context-aware retrieval
 
-The optional semantic graph query operates on a verified Project Context graph. A caller may
-provide:
+A Managed Agent can progressively retrieve context from the verified Project Context graph. Its
+current Role is the core of the context environment; relevant Work, Requirement, Issue, Stage,
+task, or Meeting-purpose facts further guide selection when they matter to the problem.
 
-- a natural-language problem;
-- optional initial coordinates;
-- optional Role, Work, or other query-context coordinates that influence recall and ranking.
+The Agent normally starts from a Coordinate already identified by current work. If no reliable
+start exists, `coordinate-search` proposes Coordinate candidates for the Agent to inspect and
+filter. The Agent then alternates scoped `coordinate edge-search` and `edge coordinate-search`
+operations with structural Coordinate, Edge, and relation-Document observations. Semantic scores
+order candidates; the Agent selects each hop using lightweight canonical state, its context
+environment, and relationship evidence, and reads complete canonical content only when needed.
 
-The Relay signs the result Event and binds it to the current Project, caller, and exact request
-body. The result also carries source, graph-snapshot currentness, and Revision evidence. After
-verification, `cf` separately derives unsigned but normalized `read_commands` that let the caller
-read canonical objects. The result DTO does not copy source-document bodies into the response.
+All Agents use one Project-owned Context Graph. Retrieval does not create private Role/Agent graphs,
+infer new relationships, or rewrite Edges. The semantic operations require Provider configuration,
+an index generation, durable Community gates, Member authorization, and acknowledgement that query
+text leaves the local system. Project-authored observations remain untrusted data, and relevance
+never expands permission.
 
-This capability requires separate semantic Provider configuration, an index generation, durable
-Community index/query gates, and acknowledgement that the problem leaves the local system. Its
-relevance, resource isolation, long-term stability, and production deployment remain under
-qualification. Supplying Role or Work context only means that it participates in recall and
-ranking; it does not guarantee one uniquely human-expected answer for every problem.
-
-See [Core design: Context-aware semantic graph retrieval](core-design/context-aware-semantic-graph-retrieval.md)
-for why this capability uses one Project Context graph, how a context environment differs from a
-context path, and why Carryforth does not create private agent context. See
-[Semantic pgvector operations](../semantic-pgvector-operations.md) for activation and operations
-boundaries.
+The bounded complete-path `semantic-query` remains available as a supplementary query product, but
+it is not the primary Managed Agent self-retrieval path. See
+[Core design: Agent-directed context-aware Project Context retrieval](core-design/context-aware-semantic-graph-retrieval.md)
+and [Semantic pgvector operations](../semantic-pgvector-operations.md).
 
 ## 7. Meetings
 
@@ -379,7 +377,7 @@ all enabled automatically in a new environment:
   Desktop;
 - Project View v3 requires Relay-operator preparation followed by Community-owner review and
   signed initialization;
-- Documents, Context, Meetings, and semantic queries each have their own readiness and durable
+- Documents, Context, Meetings, and semantic retrieval each have their own readiness and durable
   gates;
 - `./start.sh` starts the local source stack but does not replace those governance and
   authorization actions;

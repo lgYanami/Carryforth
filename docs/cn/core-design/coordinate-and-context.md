@@ -278,15 +278,13 @@ Human 或 Agent 可能先在实践中发现一段上下文，再意识到项目�
 “先有坐标”只表示：当关系要进入项目规范状态时，真正的参与对象应先取得稳定身份，
 再建立 Edge。不能为了满足 Edge 形式而强造虚假对象；只关于单个对象的说明，也不应制造 self-edge。
 
-### 7.2 不是查询前必须知道坐标
+### 7.2 不是检索前必须知道坐标
 
-图语义查询允许只提供自然语言问题。`initial_coordinates` 和 `context_coordinates` 都是可选的：
+Agent 通常从当前 Work、Requirement、Issue、Stage 或 Meeting 已经给出的可靠 Coordinate 起步。
+如果没有，`coordinate-search` 可以把自然语言需要映射为 ranked Coordinate 候选。候选不是已经选定的
+起点；Agent 要先观察其 canonical 轻量状态，再结合当前 Role 和其他相关上下文环境事实筛选。
 
-- `initial_coordinates` 是显式遍历起点；
-- `context_coordinates` 是影响召回与排序的软语义环境；
-- problem-only 查询可以在调用者不知道坐标时先发现候选根。
-
-因此，“先有坐标”是持久关联成立的条件，不是用户开始检索的条件。
+因此，“先有坐标”是持久关联成立的条件，不是 Agent 开始发现前必须已经知道坐标。
 
 ### 7.3 不是坐标永远有效
 
@@ -352,13 +350,17 @@ Edge {R, Work B, Role B, Resource API}
 从 Work F 执行精确 `incident` 查询，Agent 会确定性发现前端局部关系；从 Work B 出发，
 会发现后端局部关系。这种差异来自显式坐标与 Edge，不依赖模型猜测。
 
-可选的图语义查询可以进一步把 Role、Work 等坐标作为查询环境，影响召回和排序。但必须区分：
+上下文环境感知的 Agent 检索可以直接从 Work F 或 Work B 起步。在每个 Coordinate 上，语义选边只按
+relation Documents 排列其 incident 关系；选定 Edge 后，语义排 Coordinate 只在完整成员集合内工作。
+Agent 结合当前 Role 与相关工作环境观察和选择，而不是自动采用最高分。
 
-- 精确图查询保证返回符合坐标集合条件的 Edge；
-- 语义查询提供有来源证据的派生路径，不保证每个问题都得到人类预期的唯一答案；
-- context coordinate 不是 ACL、硬过滤器、必经起点或新的持久 Edge；
-- 相似度、conditioned score 和 environment gain 不是事实置信度、因果证明或项目优先级；
-- Relay 签名证明结果来源和请求绑定，不证明语义结论天然正确或完整。
+必须区分：
+
+- 精确和结构读取回答其声明范围内的完整集合问题；
+- 语义操作排列候选，但不替 Agent 选择对象或路径；
+- Role 和工作环境不是 ACL、硬过滤器或新的持久 Edge；
+- 相似度分数不是事实置信度、因果证明或项目优先级；
+- Relay 签名证明结果来源和请求绑定，不证明语义候选天然正确或完整。
 
 ## 10. Agent 如何读取和维护上下文
 
@@ -367,11 +369,11 @@ Edge {R, Work B, Role B, Resource API}
 1. 确认当前 Project 和调用者身份；
 2. 从当前 Role、Work、Requirement、Document 或 Meeting 取得稳定坐标；
 3. 回读坐标当前的规范内容、Revision 与生命周期；
-4. 使用 `exact`、`incident` 或 `contains-all` 发现显式关联；
-5. 先检查 Edge 的精确坐标集合和 Context Document 元数据；
-6. 只按需读取必要正文，并保留来源证据；
-7. 需要更开放的发现时，再使用受门控的语义路径查询；
-8. 对语义结果返回的坐标执行 canonical readback，而不是把派生结果直接当作事实。
+4. 没有相关起点时只执行一次 `coordinate-search`，观察候选后再选择；
+5. 使用 `coordinate edge-search` 或 `coordinate edges` 观察 incident 关系；
+6. 把 relation Documents作为轻量依据，只读取任务真正需要的正文；
+7. 使用 `edge coordinate-search` 或 `edge coordinates` 选择或枚举下一成员；
+8. 在循环、快照和预算边界内渐进继续，把每个语义结果视为候选而不是规范事实。
 
 ### 10.2 写入
 
@@ -403,16 +405,18 @@ Edge {R, Work B, Role B, Resource API}
 这让后来者不仅能读到“现在认为怎样”，还能知道解释曾对应哪些对象，以及历史关系为什么
 没有随着对象删除而被无痕改写。
 
-## 12. 三种容易混淆的 Context
+## 12. 容易混淆的几种 Context
 
 | 概念 | 是否持久 | 作用 |
 |---|---:|---|
 | Project View Context Reference | 是 | 单个 Project View 对象直接引用 Resource 或 Document |
 | Project Context Edge | 是 | 保存两个或更多坐标之间的精确、显式关联范围 |
-| 语义查询 `context_coordinates` | 否 | 单次查询中的软召回与排序环境 |
+| Agent 上下文环境 | 否 | 当前 Role 与相关任务事实，用来让 Agent 选择候选和路径 |
+| Agent 检索路径 | 否 | 带 relation 依据的临时 `Coordinate → Edge → Coordinate` 阅读轨迹 |
+| 完整路径型 semantic-query context | 否 | 保留的有界查询产品中的可选软召回与排序输入 |
 
-此外，语义查询返回的路径也是派生读取，不是新的持久关系。只有显式写入并通过 Relay 验证的
-Project View、Document、Context Edge 或其他领域状态，才成为项目规范事实。
+Agent 检索路径和完整路径型语义结果都是派生读取，不是新的持久关系。只有显式写入并通过 Relay
+验证的 Project View、Document、Context Edge 或其他领域状态，才成为 Project 的规范事实。
 
 ## 13. 设计边界
 
@@ -450,7 +454,7 @@ Project View、Document、Context Edge 或其他领域状态，才成为项目�
 
 - [Carryforth 核心模型](../core-model.md)
 - [核心设计：Role Continuity](role-continuity.md)
-- [核心设计：上下文环境感知的图语义检索](context-aware-semantic-graph-retrieval.md)
+- [核心设计：Agent 自主的上下文环境感知 Project Context 图检索](context-aware-semantic-graph-retrieval.md)
 - [核心设计：Meeting](meeting.md)
 - [Project View 定义](../../stage/project-view/project-view.md)
 - [Project Document](../../stage/document/document.md)

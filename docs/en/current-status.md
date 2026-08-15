@@ -133,35 +133,42 @@ Desktop is currently primarily a trusted read surface. Canonical attach/detach i
 operation. A Meeting may create a new Context binding only when its lifecycle and Action
 Finalization conditions are satisfied.
 
-### 4.6 Semantic graph-path queries
+### 4.6 Semantic discovery and Agent-directed graph retrieval
 
 Status: **experimental, optional, gated, and not production-ready**.
 
 Implemented:
 
 - semantic Provider integration and a pgvector index;
-- natural-language problem, optional initial coordinates, and query context;
-- graph-root and path results;
-- NIP-98 request binding, Relay-signed results, and canonical read commands;
-- a controlled real-request path on a local single Relay.
+- whole-graph natural-language Coordinate candidate discovery;
+- scoped Coordinate-to-Edge semantic ranking over relation Documents;
+- scoped Edge-to-Coordinate semantic ranking over complete Hyperedge membership;
+- structural Coordinate, incident-Edge, relation-Document, and Edge-member observations;
+- the `search-project-context` Skill and Project Space routing for progressive Agent traversal;
+- NIP-98 request binding, Relay-signed semantic results, and canonical read descriptors;
+- the retained bounded complete-path `semantic-query` as a supplementary product;
+- controlled real-request paths on a local single Relay.
 
-Still under qualification:
+Still outside the current production-ready claim:
 
-- relevance and ranking quality under different Role/Work contexts;
-- known-negative and relevance-floor calibration;
+- Provider/model-dependent candidate quality and drift;
 - PostgreSQL resource isolation, concurrency ladders, and long-running soak;
 - production load balancers and multi-pod deployment;
 - target scale, frozen SLOs, and complete recovery evidence.
 
-This mechanism implements the design direction that Role/Work environments can shape returned
-paths, but it does not guarantee that two environments produce different or semantically correct
-results. Source startup enables the Worker/Query HTTP process switches by default, but it does not
-thereby enable durable Community index/query gates. Semantic indexing can send project text
-consisting of source type, the current visible title/name, and an optional summary to the
-user-configured Provider; the current foundation does not send Document bodies or chunks. A query
-sends its problem and relevant overview text to that Provider. The operator must enable the
-corresponding Community gates separately; query activation additionally requires explicit
-acknowledgement that the problem and overview text will cross that external Provider boundary.
+The primary context-aware behavior now comes from an Agent using its verified Role and relevant
+task environment to choose a known or semantically discovered start, then progressively select
+`Coordinate → Edge → Coordinate` hops from lightweight canonical observations and relationship
+evidence. Scores order candidates; they do not select the path or grant permission. Different
+environments are not guaranteed to produce disjoint paths, and a real cross-Role dependency may be
+the correct result.
+
+Source startup can enable semantic process switches, but it does not thereby enable durable
+Community index/query gates. Semantic indexing can send source type, current visible title/name,
+and an optional summary to the user-configured Provider; natural-language start and one-hop queries
+also send query text. The current foundation does not send Document bodies or chunks. The operator
+must enable the corresponding Community gates separately and explicitly acknowledge this Provider
+egress.
 
 ### 4.7 Meetings
 

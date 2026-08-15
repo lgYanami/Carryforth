@@ -136,28 +136,28 @@ waiting for the predecessor to return or provide an exit summary.
 
 See [Core design: Role Continuity](docs/en/core-design/role-continuity.md).
 
-## Experimental context-aware semantic graph retrieval
+## Experimental context-aware Agent graph retrieval
 
-The design goal is for the same question to produce different yet related, traceable context paths
-under different Role, Work, or other context environments while querying the single context graph
-owned by the Project. Carryforth does not create a private context graph for each agent. The
-environment is a soft query-time perspective: problem semantics remain dominant, traversal follows
-only real undirected Hyperedges, and the query never rewrites project relationships. The current
-implementation exposes this experimental mechanism, but context-sensitive recall and ranking are
-still under qualification; a context environment does not guarantee a different or semantically
-correct result.
+An Agent can use its current Role and relevant Work, Issue, Meeting purpose, or other verified task
+facts to progressively retrieve Project Context. It normally starts from a Coordinate already
+identified by current work; when no reliable start exists, semantic Coordinate discovery proposes
+candidates for the Agent to inspect. The Agent then alternates `Coordinate → Edge → Coordinate`,
+using semantic ranking to narrow each local choice, lightweight canonical observations to reject
+misleading matches, relation Documents to preserve why a hop is valid, and complete canonical reads
+only when the task actually needs them.
 
-This feature is not fully local: semantic indexing can send project text consisting of source type,
-the current visible title/name, and an optional summary to the Provider configured by the user; the
-current foundation does not send Document bodies or chunks. A semantic query sends its problem and
-relevant overview text to the same Provider. Source startup defaults the Worker and Query HTTP
-**process switches** to enabled and asks for
-the Provider API key, HTTPS base URL, and request model when they are missing. Those switches do not
-enable a Community's durable index/query gates. The operator must enable those gates separately;
-query activation additionally requires explicit acknowledgement that the problem and overview text
-will cross the external Provider boundary.
+This is how the same question can lead Agents in different context environments to different but
+related, traceable context paths. All Agents still read one Project-owned Context Graph—there is no
+private graph per Role or Agent. Semantic ranking does not select a path by itself, traversal follows
+only real undirected Hyperedges, and retrieval never creates or rewrites Project relationships.
 
-See [Core design: Context-aware semantic graph retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md).
+The semantic parts are not fully local. Indexing may send source type, current visible title/name,
+and an optional summary to the user-configured Provider; the current foundation does not send
+Document bodies or chunks. Natural-language start and one-hop searches send their query text to the
+same Provider. Source startup can prepare the semantic processes and Provider configuration, but an
+operator must separately enable the durable Community gates and acknowledge this Provider egress.
+
+See [Core design: Agent-directed context-aware Project Context retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md).
 
 ## Current capabilities
 
@@ -169,14 +169,14 @@ The repository currently connects the following capabilities inside one local pr
 - the `cf` CLI: agent-facing messages, project objects, documents, context, meetings, and media;
 - Channels and Messages: everyday collaboration over signed Nostr events;
 - preview Git project collaboration and content-addressed media;
-- optional, gated Project Context semantic graph-path queries.
+- optional, gated semantic discovery and Agent-directed progressive Project Context retrieval.
 
 The Relay is the current canonical state boundary. The system validates and preserves structure,
 but it does not automatically understand the whole project or promote every chat, draft, or
 model inference into project fact.
 
 **Implemented does not mean enabled by default in a new environment.** Project View, Documents,
-Project Context, Meetings, Git Projects, and semantic graph queries still have preview switches,
+Project Context, Meetings, Git Projects, and semantic retrieval surfaces still have preview switches,
 Relay readiness checks, durable Community gates, or Owner-signed initialization requirements.
 See [Current status](docs/en/current-status.md) for exact capability and activation boundaries.
 
@@ -195,8 +195,9 @@ The script only checks external system dependencies. It does not install Docker,
 operating-system packages. On first run, it creates a private local `.env`. Source startup defaults
 the semantic Worker and Query HTTP process switches to enabled, so it prompts for a Provider API
 Key, HTTPS Base URL, and Request Model when they are missing—none has a default. You can explicitly
-disable both switches before startup. Process startup does not enable either Community semantic
-gate or acknowledge Provider egress. Existing Docker volumes and project data are preserved.
+disable both default-on switches before startup; the Agent start-discovery and one-hop semantic
+process masters remain default-off. Process startup does not enable either Community semantic gate
+or acknowledge Provider egress. Existing Docker volumes and project data are preserved.
 
 > [!WARNING]
 > This is a trusted-machine development stack. The checked-in `.env.example` binds the Relay to
@@ -216,8 +217,8 @@ instructions for disabling semantic configuration, rebuild commands, and stop co
   how responsibility, tenure, Work commitments, and externalized situation survive agents and runtimes
 - [Core design: Coordinates before context](docs/en/core-design/coordinate-and-context.md):
   coordinate context, relational context, and progressive discovery by agents
-- [Core design: Context-aware semantic graph retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md):
-  how one question produces different yet related paths under different Role and Work environments
+- [Core design: Agent-directed context-aware Project Context retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md):
+  how Agents use Role and work context to choose different but related paths through one shared graph
 - [Core design: Meeting](docs/en/core-design/meeting.md):
   how humans and agents aggregate distributed context, form a shared conclusion, and produce explicit outcomes
 - [System overview](docs/en/system-overview.md): components, data flow, identity, permissions, security, and local-first boundaries

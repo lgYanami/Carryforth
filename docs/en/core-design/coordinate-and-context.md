@@ -315,17 +315,16 @@ participants must first have stable identities and only then be connected by an 
 fake objects merely to satisfy the Edge shape. An explanation about only one object should not create
 a self-edge either.
 
-### 7.2 It does not require knowing a Coordinate before querying
+### 7.2 It does not require knowing a Coordinate before retrieval
 
-Graph semantic queries can provide only a natural-language problem. Both `initial_coordinates` and
-`context_coordinates` are optional:
+An Agent normally starts from a reliable Coordinate already supplied by its current Work,
+Requirement, Issue, Stage, or Meeting. When none exists, `coordinate-search` can map a natural-
+language need to ranked Coordinate candidates. The candidates are not selected starting points:
+the Agent inspects their lightweight canonical state and filters them using its current Role and
+other relevant context-environment facts.
 
-- `initial_coordinates` are explicit traversal starting points;
-- `context_coordinates` are a soft semantic environment that influences recall and ranking;
-- a problem-only query can discover candidate roots before the caller knows any Coordinates.
-
-“Coordinates first” is therefore a condition for persistent relationships, not a condition for a
-user to begin retrieval.
+“Coordinates first” is therefore a condition for persistent relationships, not a requirement that
+the Agent already know a Coordinate before it can begin discovery.
 
 ### 7.3 It does not mean a Coordinate remains valid forever
 
@@ -399,17 +398,20 @@ An exact `incident` query from Work F deterministically discovers the frontend-l
 starting from Work B discovers the backend-local relationship. This difference comes from explicit
 Coordinates and Edges, not from model inference.
 
-An optional graph semantic query can further use Role, Work, and other Coordinates as the query
-environment to influence recall and ranking. The following distinctions must remain clear:
+Context-aware Agent retrieval can use Work F or Work B directly as the start. At each Coordinate,
+semantic Edge search ranks only its incident relationships by their relation Documents; inside a
+chosen Edge, semantic Coordinate search ranks only the complete member set. The Agent uses its
+current Role and relevant work environment to inspect and choose rather than accepting the highest
+score automatically.
 
-- exact graph queries guarantee Edges that satisfy the coordinate-set condition;
-- semantic queries provide derived paths with source evidence, but do not guarantee a unique answer
-  matching human expectations for every problem;
-- a context Coordinate is not an ACL, hard filter, mandatory starting point, or new persistent Edge;
-- similarity, conditioned score, and environment gain are not fact confidence, causal proof, or
-  project priority;
-- a Relay signature proves result provenance and request binding, not that the semantic conclusion
-  is inherently correct or complete.
+The following distinctions must remain clear:
+
+- exact and structural reads answer complete-set questions inside their stated scope;
+- semantic operations rank candidates but do not choose an object or path for the Agent;
+- Role and work context are not ACLs, hard filters, or new persistent Edges;
+- similarity scores are not fact confidence, causal proof, or Project priority;
+- Relay signatures prove response provenance and request binding, not that a semantic candidate is
+  inherently correct or complete.
 
 ## 10. How Agents read and maintain context
 
@@ -418,12 +420,12 @@ environment to influence recall and ranking. The following distinctions must rem
 1. Confirm the current Project and caller identity.
 2. Obtain a stable Coordinate from the current Role, Work, Requirement, Document, or Meeting.
 3. Read back the Coordinate’s current canonical content, Revision, and lifecycle.
-4. Use `exact`, `incident`, or `contains-all` to discover explicit relationships.
-5. First inspect the Edge’s exact Coordinate set and Context Document metadata.
-6. Read only the bodies needed for the current task, preserving source evidence.
-7. When more open-ended discovery is needed, use the gated semantic path query.
-8. Perform canonical readback for Coordinates returned by semantic results instead of treating the
-   derived result itself as fact.
+4. If no relevant start exists, use `coordinate-search` once and inspect candidates before choosing.
+5. Use `coordinate edge-search` or `coordinate edges` to observe incident relationships.
+6. Inspect relation Documents as lightweight evidence and read only the bodies needed by the task.
+7. Use `edge coordinate-search` or `edge coordinates` to choose or enumerate the next members.
+8. Continue progressively with cycle, snapshot, and budget boundaries; treat every semantic result
+   as a candidate rather than canonical fact.
 
 ### 10.2 Writing
 
@@ -463,17 +465,19 @@ Later readers can therefore see not only “what is believed now,” but also wh
 explanation once applied to and why object deletion did not silently rewrite historical
 relationships.
 
-## 12. Three easily confused forms of Context
+## 12. Easily confused forms of Context
 
 | Concept | Persistent? | Purpose |
 |---|---:|---|
 | Project View Context Reference | Yes | Direct reference from one Project View object to a Resource or Document |
 | Project Context Edge | Yes | Preserves the exact, explicit relationship scope between two or more Coordinates |
-| Semantic-query `context_coordinates` | No | Soft recall and ranking environment for one query |
+| Agent context environment | No | Current Role plus relevant task facts used by the Agent to choose candidates and paths |
+| Agent retrieval path | No | Temporary `Coordinate → Edge → Coordinate` reading trace with relation evidence |
+| Complete-path semantic-query context | No | Optional soft recall and ranking input for the retained bounded query product |
 
-Semantic-query paths are also derived reads, not new persistent relationships. Only Project View,
-Documents, Context Edges, or other domain state explicitly written and validated by the Relay become
-canonical Project facts.
+Agent retrieval paths and complete-path semantic results are derived reads, not new persistent
+relationships. Only Project View, Documents, Context Edges, or other domain state explicitly
+written and validated by the Relay become canonical Project facts.
 
 ## 13. Design boundaries
 
@@ -522,7 +526,7 @@ history.
 
 - [Carryforth Core Model](../core-model.md)
 - [Core Design: Role Continuity](role-continuity.md)
-- [Core Design: Context-Aware Semantic Graph Retrieval](context-aware-semantic-graph-retrieval.md)
+- [Core Design: Agent-Directed Context-Aware Project Context Retrieval](context-aware-semantic-graph-retrieval.md)
 - [Core Design: Meeting](meeting.md)
 - [Project View definition](../../stage/project-view/project-view.md)
 - [Project Document](../../stage/document/document.md)

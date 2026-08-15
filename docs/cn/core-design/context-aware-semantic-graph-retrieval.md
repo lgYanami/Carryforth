@@ -1,478 +1,414 @@
-# 上下文环境感知的 Project Context 图语义检索
+# Agent 自主的上下文环境感知 Project Context 图检索
 
-> 本文解释 Carryforth 的一项核心设计：如何让同一个问题在不同 Role、Work 等上下文环境下，
-> 从 Project 持有的同一张上下文图中得到不同但仍然相关、可追溯的上下文路径。
+> 本文说明 Carryforth 的一项核心能力：Agent 如何结合自身所处的上下文环境，
+> 从 Project 共同持有的一张 Context Graph 中渐进检索上下文。
 >
-> 本文讨论产品心智模型，不重新定义查询协议、评分常量、数据库结构或 Provider 运维合同。
-> 精确实现边界见
-> [Project Context 图语义检索分阶段实现计划](../../stage/semantic/project-context-graph-semantic-query-implementation-plan.md)。
+> 这项能力已经接入 `cf` CLI、Project Space 提示与 `search-project-context` Skill。
+> 语义索引和语义查询仍是需要显式启用的外部 Provider 能力；它们不是新的项目事实源。
 
-## 1. 核心判断
+核心目标是：
 
-> 上下文图检索的本质，是根据当前上下文环境，为同一个问题选择不同的项目阅读路径，
-> 从而取得不同但相关的上下文；它不是为不同 Agent 分别保存不同版本的项目知识。
+> **让处于不同上下文环境的 Agent 围绕同一个问题，能够选择不同的相关图路径，
+> 从而取得同一个问题下不同但相关、可追溯的上下文。**
 
-Project Context 是 Project 共同持有的上下文图。Role、Work 等环境坐标是观察这张图的软视角：
-它们可以改变哪些内容更值得先看、哪些真实关系更值得展开，但不会切割项目上下文、扩大权限，
-也不会创建一张属于某个 Agent 的私有图。
+这里的“不同”来自 Agent 在每一步结合当前 Role、工作处境、对象状态和关系依据进行选择，
+不是系统为每个 Agent 拆出一份私有知识，也不是通过调高某个 Role 的向量权重强制制造差异。
 
-```text
-                  同一个 Project Context 图
-                            │
-                       同一个问题 Q
-                            │
-             ┌──────────────┴──────────────┐
-             │                             │
-       前端 Role / Work              后端 Role / Work
-       上下文环境 E1                  上下文环境 E2
-             │                             │
-       上下文路径 P1                  上下文路径 P2
-             │                             │
-       前端相关上下文 C1              后端相关上下文 C2
-```
+## 1. 一张图，不同的阅读路线
 
-设计希望得到 `P1 != P2` 和 `C1 != C2`，前提是 Project 中确实存在能够区分两种环境的对象、
-关系说明和语义证据。系统不会为了制造差异而伪造路径；如果同一条路径对两个环境都最相关，
-或者现有项目内容不足以表达差异，两次查询也可以得到相同结果。
-
-## 2. 先区分三个概念
-
-“上下文”“上下文环境”和“上下文路径”相互关联，但不是同一件事。
-
-### 2.1 什么是上下文
-
-这里的上下文，是 Human 或 Agent 为理解当前问题并继续行动，需要装入有限上下文窗口的项目内容。
-
-它由两类内容共同构成：
-
-1. **坐标上下文**：Role、Work、Requirement、Issue、Resource、Document、Meeting 等稳定坐标
-   所指向的当前项目内容，回答“这个对象是什么、现在处于什么状态”；
-2. **关联上下文**：真实 Edge / Hyperedge 及其 Context Document 所保存的原因、依赖、影响、
-   例外和边界，回答“这些对象为什么需要共同理解”。
+Project Context 保存 Project 对象、Documents 和 Meetings 之间由项目成员明确建立的关系。
+所有 Agent 读取同一张 Project-owned Context Graph：
 
 ```text
-Coordinate ──回到来源领域──> 对象当前内容
-     │
-     └──进入真实 Hyperedge──> Context Document ──> 其他相关 Coordinate
+                         同一个问题
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+      前端 Role / 当前 Work             后端 Role / 当前 Work
+              │                               │
+         选择相关起点                     选择相关起点
+              │                               │
+       Coordinate → Edge               Coordinate → Edge
+              │                               │
+       relation Document               relation Document
+              │                               │
+         next Coordinate                  next Coordinate
+              │                               │
+         前端相关上下文                    后端相关上下文
 ```
 
-因此，上下文不是一个脱离项目对象的大文本块，也不是向量数据库中若干“相似内容”的集合。
-最终可行动的上下文必须能够回到 Project 中的稳定对象、当前 Revision 和显式关系范围。
+两条路线可以共享真实的 Issue、Stage、Requirement 或跨端约束。目标不是让结果为了形式差异而
+完全不重叠，而是在真正有区别价值的地方选择不同关系，并取得适合当前责任和工作的上下文。
 
-关于这两类上下文为什么先从稳定坐标开始，见
-[核心设计：先有坐标，后有上下文](coordinate-and-context.md)。
-
-### 2.2 什么是上下文环境
-
-上下文环境描述的是：
-
-> 这一次提出问题时，Human 或 Agent 当前站在 Project 的什么位置、承担什么责任、正在处理什么工作。
-
-它可以由一个或多个稳定坐标表达，例如：
-
-- 当前承担的 Role；
-- 当前处理的 Work；
-- 正在解决的 Requirement 或 Issue；
-- 当前参考的 Document；
-- 某次 Meeting 形成的协作现场。
-
-上下文环境属于**这一次查询**，不属于 Agent 身份。同一个 Agent 可以切换不同环境，不同 Agent
-也可以从同一个 Role 或 Work 环境观察项目。
-
-环境坐标只声明本次检索的软视角。它不是：
-
-- Agent 私有知识库的名字；
-- 持久化的新 Project Context 对象；
-- 必须经过的检索起点；
-- 只允许访问的子图；
-- ACL、成员资格或行动权限；
-- 对某个 Role 的 Assignment、全部 Work、图邻域和 Runtime 记忆的自动展开。
-
-当前实现从环境坐标的 current canonical overview 构造有界的查询信号，而不是把该对象全文、
-全部相邻对象或 Agent 的私有 Runtime Context 全量注入 Provider。
-
-### 2.3 什么是上下文路径
-
-上下文路径是从统一 Project Context 图中得到的一条可追溯阅读路线。它可以从以下入口开始：
-
-- 被问题语义召回的 Coordinate；
-- 被问题语义召回的 Context Document；
-- 调用者显式指定的 initial Coordinate。
-
-路径随后只沿 Project 中已经存在的真实关系展开：
+最终需要的是路径上的上下文；路径本身提供导航和关系依据：
 
 ```text
-Coordinate root
-  └── current incident Edge / Hyperedge
-        ├── Context Document：这组坐标为什么相关
-        └── complete coordinate set
-              └── related Coordinate
-
-Context Document root
-  └── its current active binding
-        └── exact Edge / Hyperedge
-              └── related Coordinate
+上下文环境决定当前应如何选择
+图结构决定真实允许走到哪里
+Coordinate 内容与 relation Documents 构成 Agent 实际使用的上下文
 ```
 
-上下文路径同时回答两个问题：
+## 2. 什么是上下文环境
 
-1. 接下来值得读取哪些项目对象；
-2. 为什么可以从当前对象走到这些对象。
+上下文环境是 Agent 在开始本次检索前已经掌握的、经过验证的当前任务处境。
 
-路径不是新的项目事实，也不是复制出来的一份上下文。它是取得上下文的导航和关系证据：
+当前有效 Role 始终是语义检索环境的核心。它说明 Agent 现在承担什么责任。除此之外，只有在会影响
+本次选择时，Agent 才加入其他环境事实，例如：
+
+- 正在承担的 Work；
+- 正在处理的 Requirement、Issue 或 Stage；
+- 当前任务状态、目标、边界和期望输出；
+- 正在参与的 Meeting、参与身份与本次参与目的；
+- 用户明确给出的关注点、排除条件或相关 Coordinate。
+
+上下文环境不要求 Context Graph 另外表达“Agent 属于哪个 Role”或“Role 负责哪些 Work”。
+这些事实已经来自 current Role Brief、Assignment、当前任务、Meeting Turn 和相应 owning surface。
+图只需要保存项目对象之间真实存在的关系。
+
+上下文环境也不是：
+
+- Agent persona、模型、Session 或 Runtime；
+- 一个 Agent 私有知识库或私有子图；
+- 从语义候选、标题、摘要或分数反向推断出的身份；
+- ACL、Community membership、Assignment 或行动权限；
+- 自动排除其他 Role 和跨 Role 关系的硬过滤器；
+- 需要持久化到 Project 的新对象。
+
+如果 current Role Brief 为 candidate、unavailable 或 `Role: none`，Agent 不猜测 Role，也不复用旧 Role
+执行自然语言语义检索。已经知道可靠 Coordinate 时，仍可使用不发送自然语言的结构观察和 canonical
+读取；没有可靠起点时则停止这次检索。
+
+## 3. 为什么由 Agent 控制检索
+
+纯语言相似度无法完整理解“当前上下文环境”。前端和后端文档可能描述同一个授权问题，使用大量相同
+术语，并共享同一个 Issue 或 Stage。向量模型可以找到语言相关对象，却不能仅凭分数决定哪个关系更适合
+当前 Agent 的责任、Work、任务状态或 Meeting 目的。
+
+因此 Carryforth 把职责分开：
+
+- 语义检索负责在明确范围内排列可能相关的候选；
+- canonical 轻量观察提供对象和关系的 current 信息；
+- Project Context Edge 约束真实可以经过的关系；
+- relation Document 解释这些 Coordinate 为什么共同相关；
+- Agent 根据自己的上下文环境决定采用、拒绝、分支、回退或停止。
+
+这种方式不要求语义模型把全部环境压缩进一个向量，也不依赖一套固定融合权重替 Agent 作出最终选择。
+同一个候选可以在两个 Role 下都有较高语言相关性，但两个 Agent 可以根据对象类型、current 状态、
+relation Document 和自己的任务责任走向不同的下一步。
+
+上下文环境也不是硬隔离。真实的跨 Role 依赖应当被保留：如果前端 Work 依赖后端鉴权契约，且
+relation Document 明确证明这一关系，前端 Agent 可以选择后端 Work，而不是只因为 Role 不同就拒绝它。
+
+## 4. 图提供什么
+
+Agent 渐进遍历依赖三个相互独立的 Project Context 元素：
+
+### 4.1 Coordinate
+
+Coordinate 是 Project 中可稳定引用的对象身份，例如 Role、Work、Requirement、Issue、Stage、
+Resource、Document 或可附着的 Meeting。对象内容继续由其 owning surface 和 Revision 管理。
+
+### 4.2 Edge / Hyperedge
+
+Edge 保存两个或更多 Coordinate 的精确、无序集合：
 
 ```text
-上下文环境决定从什么视角观察
-上下文路径决定沿哪些真实关系读取
-坐标内容与关联文档构成最终装入窗口的上下文
+E = {C1, C2, ..., Cn}
 ```
 
-## 3. 为什么始终使用一张统一图
+它是无向 Hyperedge。Agent 的 `Coordinate → Edge → Coordinate` 只是本次阅读顺序，不表示领域中的
+因果、依赖或时间方向。三元 Edge `{A, B, C}` 也不会自动变成三个二元关系。
 
-### 3.1 Agent 的上下文需要外置，但不需要私有化
+### 4.3 Context Document
 
-Agent 的上下文窗口有限，Session 和 Runtime 也会结束、压缩或替换。因此，长期项目上下文不能只
-存在于某个模型进程的窗口中，必须外置到 Project。
+一条 Edge 可以绑定一个或多个 Project Documents，用开放文本解释这组 Coordinate 为什么相关。
+Edge 决定关系范围，Document 提供关系依据。语义相似度不会自动创建、拆分、补全或改写任何 Edge。
 
-但“外置”不等于“为每个 Agent 建立私有上下文”。真正需要解决的是：
+## 5. 渐进检索循环
 
-> 这一次应该从 Project 中选择并装入哪些内容？
+Agent 不要求一次查询直接返回完整路径，而是反复执行一个有界循环：
 
-而不是：
+```text
+整理需要什么上下文
+        │
+确认 current Role 与相关环境事实
+        │
+选择起始 Coordinate
+        │
+Coordinate ──选择 incident Edge──▶ Edge
+        ▲                              │
+        │                      观察 relation Documents
+        │                              │
+        └────选择下一 Coordinate───────┘
+```
 
-> 哪些 Project 内容属于这个 Agent？
+每一步都遵循相同顺序：
 
-为 Agent、Role 或 Runtime 建立私有上下文，本质上是先隔离原本共同的项目上下文，再增加一层抽象
-去管理这种隔离。这绕开了检索问题，却没有解决检索问题。
+1. 获得当前范围内的候选 identity；
+2. 先读取 title / name、description、summary、status、Revision 和 provenance 等轻量观察；
+3. 根据上下文需要和上下文环境筛选候选；
+4. 只有轻量信息不足，或后续工作确实依赖某项事实时，才读取完整 canonical 内容；
+5. 继续当前分支、切换分支、回退或停止。
 
-系统随后还需要处理：
+这使 Agent 能在有限上下文窗口中逐步装入真正需要的内容，而不是把整张图、所有关系文档和所有对象
+正文一次性放进 Prompt。
 
-- 公共上下文与私有上下文之间的复制和提升；
-- 多个私有空间之间的同步、合并与冲突；
-- Assignment、Role、Session 或 Runtime 替换时的迁移；
-- 一段项目关系究竟在哪个空间才是当前版本；
-- Agent 每次行动前应该先查询哪个上下文空间。
+## 6. 起点选择本身就是检索
 
-这些机制既增加系统维护成本，也增加 Agent 的认知负担。更重要的是，它们会把原本跨 Role 存在的
-真实项目约束隐藏在人工建立的隔离边界之后。
+### 6.1 优先使用当前工作中已经明确的 Coordinate
 
-### 3.2 统一的是项目身份、来源和关系
+大多数检索都应从 Agent 当前工作或 Meeting 已经给出的对象开始，例如正在承担的 Work、正在处理的
+Requirement / Issue、相关 Stage，或 Meeting 明确引用的 Project View 对象。
 
-Carryforth 因此只维护一张 Project-owned Context Graph：
+这些对象如果与当前上下文需要相关，就直接作为起点。Agent 不为了追随更高的全局语义分数而重新搜索。
+需要确认 current 轻量状态时可以执行：
 
-- Requirement、Issue、Work、Resource、Document、Meeting 等对象各自保持一个稳定身份；
-- 对象内容继续由来源领域和 Revision 管理；
-- 跨对象语义继续由精确 Edge / Hyperedge 和版本化 Context Document 承载；
-- 不同查询通过不同环境视角选择不同路径，而不是复制对象或关系。
+```bash
+cf project-context coordinate show <TYPE:UUID>
+```
 
-统一图不表示把全部项目内容塞进每次 Prompt，也不表示所有成员无条件读取全部内容。
-查询仍受 Project / Community、调用者身份、来源领域、生命周期和能力门约束，只把当前查询获准且
-真正需要的内容逐步暴露给调用者。
+### 6.2 没有可靠起点时才做全图语义发现
 
-Agent 仍然可以有本地临时状态、草稿或 Runtime Memory；它们只是该 Agent 的工作材料，
-不是 Project 连续性的权威载体。会影响其他成员、后续责任或未来工作的内容，需要显式写回共同的
-Project View、Document、Context、Meeting、Checkpoint 或其他规范对象。
+只有当前任务、Meeting 和环境中都没有明确相关 Coordinate 时，Agent 执行一次：
 
-### 3.3 隔离观察视角，而不是隔离项目上下文
+```bash
+cf project-context coordinate-search \
+  --query "<当前 Role，以及缺失、相关或想进一步了解的上下文>" \
+  --limit 8
+```
 
-最终选择可以概括为：
+该命令只返回 Coordinate identity、rank 和 score。返回的是待观察候选，不是已经选定的起点。
+Agent 按排名安排 `coordinate show` 的观察顺序，然后根据上下文环境判断：
 
-> 不为 Agent 隔离项目上下文，而是为每一次查询指定一个上下文环境。
+- 该对象是否与真正需要的上下文相关；
+- 它是否符合当前 Role、Work、任务或 Meeting 目的；
+- 它是否只是语言相似但对象、责任、阶段或状态不合适；
+- 它是否提供了一个值得继续观察关系的入口。
 
-前端与后端得到不同内容，不是因为它们各自拥有一份知识，而是因为它们从同一份项目知识中，
-沿不同观察视角选择了不同阅读路线。
+Agent 可以选择低排名候选，也可以拒绝全部候选。score 不是事实、置信概率、相关性阈值、授权或硬范围。
 
-## 4. 问题、起点和环境是三个正交输入
+## 7. 两个一跳语义选择与四个结构观察
 
-一次图语义查询可以包含三类输入：
+CLI 把每一步拆成原子操作，避免一个命令替 Agent 同时选择 Edge 和下一 Coordinate：
 
-| 输入 | 回答的问题 | 语义 |
+| 目的 | 命令 | 返回内容 |
 |---|---|---|
-| `problem` | “我现在要解决什么？” | 必填，始终主导召回 |
-| `initial_coordinates` | “我明确要从哪里开始？” | 可选的结构起点 |
-| `context_coordinates` | “我现在站在什么环境中观察？” | 可选的软召回与排序视角 |
+| 全图发现起点 | `coordinate-search` | ranked Coordinate identity 与 score |
+| 观察一个 Coordinate | `coordinate show` | canonical 轻量观察 |
+| 在一个 Coordinate 的邻域中语义选 Edge | `coordinate edge-search` | ranked Edge 与匹配 relation Document 的轻量观察；不返回成员 Coordinate |
+| 查看一个 Coordinate 的全部 incident Edges | `coordinate edges` | 结构化 Edge identity 与 binding 计数 |
+| 查看一条 Edge 的关系依据 | `edge documents` | relation Documents 的 canonical 轻量观察与按需读取入口 |
+| 在一条 Edge 内语义排成员 | `edge coordinate-search` | ranked Coordinate 与 canonical 轻量观察；不返回 relation Documents |
+| 查看一条 Edge 的完整成员集合 | `edge coordinates` | 完整 Hyperedge membership 的轻量观察 |
 
-这三者不能互相替代。
+语义命令负责缩小观察范围；结构命令负责回答完整集合问题。二者不能互相冒充。
 
-### 4.1 Problem 决定寻找什么
+### 7.1 从 Coordinate 选择 Edge
 
-自然语言问题是主信号。没有任何 initial 或 context Coordinate 的 problem-only 查询是合法入口，
-适合调用者尚不知道图中有哪些坐标时先发现候选根。
-
-更换上下文环境不应把问题改写成另一个问题。无论使用前端还是后端 Role，“召回与用户控制体验
-现在是怎么设计的？”仍然是同一个问题。
-
-### 4.2 Initial Coordinate 决定从哪里走
-
-initial Coordinate 是调用者明确选择的结构根。它适合表达“必须从这个 Work 或 Role 开始看”。
-
-它不是上下文环境的同义词，也不会把全局候选召回限制为该坐标的私有子图。一个 Coordinate
-可以同时作为 initial 和 context：前者表达行走起点，后者表达观察视角。
-
-### 4.3 Context Coordinate 决定什么更值得先看
-
-context Coordinate 参与相关性判断，但不会自动成为 root、硬过滤器或必经点。
-
-如果产品需要确定地检查某个 Role / Work 的直接关系，应使用 initial Coordinate 或精确的
-incident / contains-all 结构查询；不能把确定性结构要求交给软语义视角。
-
-## 5. 如何让环境影响结果而不吞掉问题
-
-### 5.1 Neutral 与 Conditioned 两种观察
-
-当前实现先形成 problem-only 的 neutral 查询，再为每个环境坐标分别形成 conditioned 查询：
-
-```text
-Q0 = problem
-Qi = problem + context_coordinate_i 的 current canonical overview
+```bash
+cf project-context coordinate edge-search <TYPE:UUID> \
+  --query "<当前 Role，以及这一跳需要的关系或依据>" \
+  --limit 8
 ```
 
-统一语义索引中的 Coordinate 和 Context Document 候选会分别取得：
+查询只在输入 Coordinate 的 active incident Edges 范围内排名，并通过各 Edge 当前绑定的 relation
+Documents 判断相关性。Agent 先观察返回的标题、摘要、状态和 provenance，再决定哪条 Edge 真正解释了
+当前需要的关系。
 
-- 它与 `Q0` 的 problem relevance；
-- 它与每个 `Qi` 的 conditioned relevance；
-- conditioned relevance 相对 problem relevance 的正向 environment gain。
+需要完整 incident 集合时使用：
 
-环境只贡献“因为站在这个位置，所以这个候选额外值得关注”的增量。它不能用一个低 problem
-relevance 的环境相似项完全改写问题，也不能把负增益包装成环境证据。
-
-### 5.2 环境影响是有界的
-
-当前评分结构让 problem 信号占主导，environment 只占有界部分，显式 initial anchor 只提供更小的
-结构补充。多个环境中也只有最强和次强的一小部分继续贡献，避免堆叠许多 context Coordinate
-把问题本身淹没。
-
-自动 root 还保持两项 neutral 保护：
-
-- 最强 problem-only root 被保留；
-- 至少一部分 root 配额留给 neutral 候选。
-
-这些限制意味着环境可以改变候选集合、排序和最终路径，却不能形成“只准从某个 Role 的世界里找”
-的检索隧道。
-
-### 5.3 不强制制造差异
-
-“不同上下文环境得到不同上下文路径”是这项设计要达到的能力，而不是对每一次输入强制制造差异。
-
-两次查询可能返回相同路径，常见原因包括：
-
-- 这条路径确实同时是两个环境下最相关的共同上下文；
-- Role / Work 的 overview 区分度不足；
-- 对应 Work、Document 或 Edge 尚未被项目显式建立；
-- 相关来源还没有 current semantic head；
-- 候选虽然得到 environment gain，但在 root 或路径预算内仍未胜出；
-- 关系说明本身不足以支持更细的语义区分。
-
-系统不能为了满足“结果必须不同”而虚构关系、放宽权限或忽略问题相关性。正确修复方向是改善项目
-建模、语义输入、候选召回和有界排序，而不是拆分上下文图。
-
-## 6. 语义只选择路径，真实图决定能走到哪里
-
-语义相似度只负责选择和排序已有候选。它不能创建相邻关系。
-
-一次 Coordinate hop 的结构是：
-
-```text
-当前 Coordinate U
-  → U 所在的真实无向 Hyperedge E
-  → E 当前绑定的一份 Context Document D
-  → E 完整坐标集合中的另一个 Coordinate V
+```bash
+cf project-context coordinate edges <TYPE:UUID>
 ```
 
-每份 Context Document 独立提供一份关系语义。系统先判断哪份关系说明与问题和环境更相关，
-再在这条完整 Hyperedge 的真实成员中选择后续坐标。
+### 7.2 观察关系依据
 
-必须保持以下边界：
+```bash
+cf project-context edge documents <EDGE_KEY>
+```
 
-- Edge / Hyperedge 是无向的；
-- `U → E → V` 只是本次查询的行走顺序，不是领域中的因果、依赖或时序方向；
-- `{A, B, C}` 是一个精确三元关系范围，不自动产生 `{A, B}`、`{A, C}` 或 `{B, C}`；
-- 返回某份 relation Document 不表示它概括了整条 Edge 的所有含义；
-- 生命周期和 readiness 可以阻止某个目标继续展开，但不能从结果中的完整 Edge 身份里删除成员；
-- 查询不会自动创建、补全、拆分或修改任何 Edge。
+该命令分页返回轻量 Document 观察；沿 continuation 读取后得到完整 binding 集合，而不是所有正文。
+Agent 不逐个执行所有 `fetch_command`。只有某份 Document 会影响 Edge 选择，或其事实将被后续工作
+使用时，才通过经过 SDK 验证的 revision-pinned descriptor 从 Documents owning surface 读取正文。
 
-因此，语义路径仍然保留显式关系依据，而不是退化成“这两个文本向量很像”。
+### 7.3 从 Edge 选择下一 Coordinate
 
-## 7. 可追溯结果如何变成可用上下文
+```bash
+cf project-context edge coordinate-search <EDGE_KEY> \
+  --query "<当前 Role，以及下一步需要的对象和原因>" \
+  --limit 8
+```
 
-### 7.1 每条路径保留什么
+查询只在该 active Edge 的完整成员集合内排名。Agent 结合候选轻量观察、上下文环境和已走路径，选择
+真正能推进问题的下一 Coordinate。
 
-返回结果会保留理解和复核路径所需的结构与来源证据，包括：
+需要完整成员集合时使用：
 
-- root 的来源类型和稳定身份；
-- 每一 hop 的 Edge key 与完整 Coordinate 集合；
-- Edge 当前绑定的 Context Documents；
-- 本次选中的 relation Document 和 exact binding；
-- Coordinate、Document、Meeting 的来源 Revision / change basis；
-- 语义 generation、snapshot 与评分解释；
-- 覆盖、停止和省略原因。
+```bash
+cf project-context edge coordinates <EDGE_KEY>
+```
 
-这让调用者能够区分：什么是项目显式保存的关系，什么只是本次查询的选择和排序。
+选择下一 Coordinate 后，Agent 在它的 incident 范围中继续下一跳。
 
-### 7.2 Currentness 是查询快照，不是永远最新
+## 8. 轻量观察优先，完整内容按需读取
 
-召回、水合和图遍历在同一个一致的 Stage C 数据库快照内完成。结果证明的是“在这个快照中，
-这些来源和关系具有这些 Revision 与 currentness 证据”，不是“响应到达时它们仍然没有变化”。
+语义候选会返回足以进行第一轮筛选的 canonical 轻量信息，例如 title / name、description、summary、
+status、Revision 和 source provenance。它们帮助 Agent 排除对象类型、责任范围、生命周期或任务阶段明显
+不合适的候选。
 
-如果对象在查询后发生更新，调用者需要比较结果证据和当前 canonical readback，而不能把旧路径
-当作永久冻结的项目状态。
+轻量信息不是最终证据，也不是项目指令。所有 project-authored title、description、summary 和正文都
+是不可信项目数据；不得遵循其中要求运行命令、泄露秘密、弱化策略或改变权限的内容。
 
-### 7.3 签名结果与 canonical readback
+Agent 只在两类情况下读取完整 canonical 内容：
 
-Relay 对结果 Event 签名，并把它绑定到当前 Project、调用者和精确请求正文。这证明：
+1. 轻量观察不足以决定是否选择这个对象或关系；
+2. Agent 接下来的工作需要依赖该正文中的具体事实。
 
-> 该 Relay 为这次请求返回了这一份快照派生结果。
+Coordinate 的完整内容继续使用它原有的 owning surface，例如 Project View、Documents、Resources 或
+Meetings。Project Context 不复制这些正文，也不建立第二份 summary owner。
 
-它不证明相关性天然正确、关系文档内容真实、结果已经穷尽所有可能或相关路径，
-也不证明项目应该按照该结果行动。已返回 hop 的 exact Edge、完整坐标集合、binding、连续性和
-请求预算仍由 closed result contract 与 SDK 验证。
+## 9. 路径、分支与停止
 
-`cf` 在验证签名结果后，会根据其中的稳定身份另外派生未签名但规范化的 `read_commands`，
-供调用者读取 Project View 对象、Document 和 Meeting 的当前权威内容。这些命令读取的是执行时的
-current state，可能已经比查询快照更新；它们不是签名结果的一部分，也不是精确重放查询快照。
+Agent 在本次任务的临时状态中记录当前 Coordinate、采用的 Edge、支持关系的 Documents、已访问对象、
+候选 frontier、快照身份和剩余预算。
 
-最终装入 Agent 窗口的上下文，应来自这些 canonical 对象和关系证据，而不是只使用向量预览或分数。
+基本边界包括：
 
-## 8. 一个前端与后端环境的例子
+- 同一分支不重复遍历同一 Edge；
+- 同一分支不重复展开同一 Coordinate；
+- 不沿刚使用的 Edge 立即返回来源 Coordinate；
+- 分支汇合时可以保留新的关系依据，但通常不再次展开共同 Coordinate；
+- 第二条到达同一对象的路径只有在 relation provenance 会实质改变理解时才保留；
+- Project Context revision、projection generation 或其他快照身份变化时，不把新旧观察拼成一条已验证路径；
+- 取得足够上下文、候选均不适合、出现循环、快照无法稳定或预算耗尽时停止。
 
-假设 Project 中有同一个授权 Issue，以及两组真实关系：
+如果当前分支失败而 frontier 中还有有依据的候选，Agent 回退到最近的选择点。所有有界候选都被拒绝时，
+结论是“当前图没有提供足够依据”，而不是强行生成一条路径。
+
+## 10. 检索结果默认由 Agent 自己使用
+
+Agent 发起检索通常是为了继续实现、判断、写作或参加 Meeting，并不意味着用户要求查看检索过程。
+检索结束时，Agent 应先为自己整理：
+
+- 哪些已验证环境事实影响了选择；
+- 采用了哪条 `Coordinate → Edge → Coordinate` 轨迹；
+- 哪些 relation Documents 支持每一步；
+- 哪些事实已经通过 canonical full read 核对；
+- 存在哪些 truncation、coverage omission、快照变化、歧义或预算限制。
+
+然后把这些上下文用于后续任务。只有用户明确要求查看、总结或解释检索到的上下文、路径或依据时，
+Agent 才输出简洁证据轨迹。用户只说“查找上下文”不自动等于要求命令日志、候选列表或完整路径报告。
+
+路径是本次任务的派生阅读轨迹，不会自动持久化为 Agent Context、Memory、Project View、Document 或
+Edge。真正会影响其他成员或未来工作的内容，仍要通过普通、显式、授权的领域操作写回 Project。
+
+## 11. 安全、权限与 Provider 边界
+
+语义索引和查询不是完全本地的。当前语义索引可以把来源类型、当前可见 title / name 和可选 summary
+发送给用户配置的 Provider；它不发送 Document 正文或 chunk。`coordinate-search`、
+`coordinate edge-search` 和 `edge coordinate-search` 会把本次自然语言 query 发送给同一 Provider，
+因此 Agent 只发送完成当前选择所需的非秘密文本。
+
+不得把私钥、token、凭据、未经授权的正文、个人敏感数据或无关的大段内容放入 query。
+
+所有操作继续受以下边界约束：
+
+- host-derived Project / Community；
+- current caller identity 与 membership；
+- 来源可见性、生命周期和 currentness；
+- semantic index、Community query gate、process capability 和 Provider readiness；
+- Relay-signed response、exact request binding 与 SDK closed-result 验证。
+
+Relay 签名证明响应完整性和请求绑定，不证明候选文本为真或相关性天然正确。语义分数、图相邻关系、
+Agent 当前 Role 和 Skill 都不会扩大读写权限。
+
+## 12. 同一问题、两个上下文环境
+
+假设 Project 中有一个共同的发布 Issue，以及两条真实 Edge：
 
 ```text
 Edge F = {
-  授权 Issue,
+  发布 Issue,
   前端 Role,
   Desktop Work,
-  前端交互 Document
+  前端重试关系 Document
 }
 
 Edge B = {
-  授权 Issue,
+  发布 Issue,
   后端 Role,
   Relay Work,
-  后端授权 Document
+  鉴权预检关系 Document
 }
 ```
 
-两条 Edge 各自绑定 Context Document，解释对应坐标为什么需要共同理解。
+两个 Agent 都在处理“为什么发布问题反复出现？”：
 
-对于同一个问题“召回与用户控制体验现在是怎么设计的？”：
+- 前端 Agent 已知自己正在承担 Desktop Work，因此直接以该 Work 为起点；它在 incident Edges 中选择
+  能解释客户端重试责任的关系，并按需走向共同 Issue 或 Stage；
+- 后端 Agent 已知自己正在承担 Relay Work，因此直接以该 Work 为起点；它选择鉴权预检关系，并按需
+  走向同一个 Issue 或相关 Requirement；
+- 如果某一步确实涉及前后端契约，两条路径可以交叉或汇合；
+- 两个 Agent 都先观察 relation Document 摘要，只在具体条款影响工作时读取完整正文。
 
-- problem-only 查询应先发现项目中整体最相关的入口；
-- 前端 Role / Desktop Work 环境应提高前端对象和关系说明成为 root 或路径材料的机会；
-- 后端 Role / Relay Work 环境应提高后端对象和关系说明的机会；
-- 两次结果仍可以共享授权 Issue、共同 Requirement 或跨端约束，因为它们来自同一 Project；
-- 每条路径都必须沿 `Edge F` 或 `Edge B` 的真实完整集合，而不能根据“前端”“后端”文本临时造边。
+同一个问题保持不变；上下文环境影响起点和逐跳选择。最终得到的是不同但相关的项目上下文，而不是
+两个隔离、漂移的知识空间。
 
-期望不是得到两份互不相干的答案，而是得到**不同但相关**的项目上下文：共同问题仍然可见，
-当前责任和工作环境决定哪些关系更值得优先展开。
+## 13. Agent 运行时如何获得这项能力
 
-如果必须从 `Desktop Work` 确定出发，应把它同时或单独作为 initial Coordinate；如果只是希望它影响
-优先级，则把它作为 context Coordinate。
+Project Space System Prompt 只承担两件事：
 
-## 9. Agent 应如何使用这项能力
+1. 简洁定义上下文环境；
+2. 在 Agent 需要查找、关联或进一步了解 Project Context 时，引导其加载
+   `search-project-context` Skill。
 
-一个典型使用流程是：
+Skill 保存完整的检索流程、CLI 选择、安全边界、预算、循环控制、失败处理和案例。Carryforth Desktop
+的 Managed Agent Nest 安装 canonical Skill，并为支持的 Agent runtime 建立发现入口。基础提示只列出
+相关 `cf project-context` 命令，不把整套工作流复制到每个 Turn。
 
-1. 明确当前自然语言问题；
-2. 从已经验证的 current Role、Work 或其他项目对象中选择本次上下文环境；
-3. 如果已知必须从某个对象开始，另外提供 initial Coordinate；
-4. 执行查询，检查 neutral 与 conditioned evidence、coverage 和停止原因；
-5. 沿返回路径对稳定对象执行 canonical readback；
-6. 用对象当前内容和 Context Documents 组装实际工作窗口；
-7. 如果发现项目缺少真实关系，使用普通领域操作显式创建或修订 Document / Edge；
-8. 不把本次 retrieval path、分数或模型判断直接写成项目事实。
+这种拆分让 Agent 只在真正需要检索时加载详细指导，也让检索策略可以独立演进，而不膨胀稳定的
+Project Space 合同。
 
-Managed Agent 的 Harness 不应仅凭进程身份猜测当前 Role 或 Work。上层调用者应从 current Project
-状态取得并明确传入合适的环境坐标；错误或过时的环境也不能因此获得额外权限。
+## 14. 保留的完整路径型语义查询
 
-## 10. 不改写 Project 规范事实与关系
+`cf project-context semantic-query` 仍作为可选的、有界完整路径查询功能存在。它可以接收自然语言
+problem、可选 initial Coordinates 和软 context Coordinates，并由 Relay 在一次请求中返回经过验证的
+路径结果。
 
-图语义查询对 Project 规范状态是派生读取。它不会：
+它适合调用者明确需要一次有界路径结果、进行产品可视化或诊断的场景。但它不再是 Managed Agent
+自主检索 Project Context 的主要入口，也不替代 `search-project-context` 的逐步观察和选择。
 
-- 创建、更新或删除 Project Context Edge；
-- 创建、修订或 tombstone Project Document；
-- 修改 Project View、Meeting、Role、Assignment、Work 或 Commitment；
-- 持久化问题、query vector 或 retrieval path；
-- 把相似度升级为关系、事实、责任或权限；
-- 把某个 Role / Agent 变成上下文所有者。
+完整路径查询中的 context Coordinates 只对召回与排序施加有界软影响；它不能像 Agent 一样在每一跳
+读取对象状态和关系摘要、结合当前任务作出判断、主动回退或决定何时读取正文。因此，Carryforth 的
+主要上下文环境感知图检索能力是 Agent 自主的渐进遍历，完整路径型查询是保留的补充能力。
 
-Embedding 与 semantic generation 是可删除、可重建的派生索引，不是新的 Project 事实源。
-Provider admission、限流配额和运行指标可以更新派生运营状态；这些记录不包含问题正文，也不构成
-Project View、Document、Context、Meeting 或 retrieval path 的持久写回。
+## 15. 设计原则与非目标
 
-权限验证独立于相关性评分。Community membership、调用者身份、来源可见性、query gate、生命周期
-和 currentness 在 Provider 出域、候选召回和结果释放的相应边界继续生效。环境坐标、图相邻、
-相似命中和 Relay 签名都不能扩大读写、Runtime、Sandbox、Secret 或外部系统权限。
+1. **Project 拥有上下文。** Agent 读取共同项目状态，不拥有私有权威图。
+2. **Role 是环境核心。** 其他 Work、Issue、Meeting 等事实只在与当前问题相关时加入。
+3. **已知坐标优先。** 当前工作已经提供起点时，不做全图语义搜索。
+4. **语义排列候选，Agent 作出选择。** score 不是事实、权限或自动路径。
+5. **轻量观察优先。** 完整正文只在影响选择或实际工作需要时读取。
+6. **语义不创建关系。** 遍历只沿真实、完整、无向 Hyperedge 进行。
+7. **每一步保留关系依据。** relation Document 解释为什么可以从当前对象走向下一对象。
+8. **不同不等于隔离。** 路径可以共享真实对象和跨 Role 依赖。
+9. **检索是派生读取。** 只有显式领域写入才能改变 Project。
+10. **相关性不产生权限。** 身份、可见性、gate 和 owning surface 始终独立验证。
 
-## 11. 当前实现与资格边界
-
-当前代码已经具备以下机制：
-
-- problem-only、explicit initial 和 context lens 三类输入；
-- 每个 context Coordinate 独立产生 conditioned evidence；
-- problem 主导、environment 有界的候选评分；
-- neutral root 保留；
-- 沿真实无向 Hyperedge 的多跳遍历；
-- 完整 Edge / binding / source / semantic provenance；
-- Relay-signed exact request binding；
-- `cf` 验证与 canonical readback 导航；
-- 查询不改写任何 Project 关系。
-
-但“机制已实现”不等于“相关性目标已经完成资格化”。现有验收已经证明后端 Role / Work 环境可以
-提升后端 Work 和对应 Edge，也证明前端环境能够产生 conditioned gain；它尚未证明前端与后端等
-所有具有区分度的环境都能在默认 root / path 预算内稳定返回人类预期的不同路径。
-
-因此，当前准确结论是：
-
-> 统一图上的上下文环境 lens 已经能够影响召回和排序；“不同环境稳定得到语义正确的不同路径”
-> 仍是需要继续校准和验收的产品目标。
-
-这项能力还需要 Provider、语义索引、Community index/query gate 和问题数据出境确认；相关性、
-资源隔离、长期运行和生产部署仍在资格化中。不能把它描述为生产就绪，也不能把 environment gain
-解释为事实置信度、因果证明或项目优先级。
-
-## 12. 非目标
-
-这项设计不试图：
-
-- 为每个 Agent、Role 或 Work 建立私有知识图；
-- 保证更换环境后结果必然不同、互斥、唯一或完整；
-- 让 context Coordinate 成为 ACL、硬过滤器或自动 root；
-- 用向量相似度自动发现并保存 Project Context Edge；
-- 把 Hyperedge 拆成若干隐含二元关系；
-- 判断 Context Document 的内容天然正确、充分、无冲突或未过期；
-- 用 Relay 签名为语义相关性背书；
-- 把 retrieval path 当成新的长期 Agent Memory；
-- 取代 Human / Agent 对 Project Context 的显式维护。
-
-## 13. 由此得到的设计原则
-
-1. **Project 拥有上下文，Agent 只按需读取。** 连续性不依赖某个窗口、Session 或 Runtime。
-2. **外置不等于私有化。** 有限窗口需要检索，不需要人为拆分项目知识。
-3. **环境属于查询，不属于身份。** Role / Work 是观察位置，不是上下文所有者。
-4. **问题始终主导。** 环境只提供可解释、有界的边际影响。
-5. **不同路径来自真实差异。** 不为制造差异而伪造关系或牺牲共同问题语义。
-6. **语义选择路径，图结构约束路径。** 只沿真实、完整、无向 Hyperedge 寻路。
-7. **路径必须可追溯。** 每一步都保留 Coordinate、Edge、Document、Revision 和来源依据。
-8. **派生读取必须回到规范事实。** 签名结果和分数不替代 canonical readback。
-9. **检索绝不隐式写回。** 只有显式、授权的普通领域操作才能改变 Project。
-10. **相关性不产生权限。** 环境、相似度、相邻关系与签名都不能扩大授权。
-
-上下文环境感知的图语义检索最终解决的是：
-
-> 当 Human 或 Agent 只能在有限窗口中工作时，如何根据当前 Role、Work 和问题，从 Project 共同持有的
-> 上下文图中选择一条有依据的阅读路线，获得适合当前行动的上下文，同时不把 Project 拆成彼此漂移的
-> 私有记忆空间。
+这项设计不试图自动理解整个 Project，不保证不同环境下的路径必然不同、唯一或完整，也不把 Agent 的
+检索轨迹升级为项目事实。它解决的是：在有限上下文窗口中，让 Agent 根据自己真实的任务处境，从一张
+共同、可验证的 Project Context 图中选择足以继续工作的相关上下文。
 
 ## 继续阅读
 
 - [Carryforth 核心模型](../core-model.md)
-- [核心设计：Role Continuity](role-continuity.md)
 - [核心设计：先有坐标，后有上下文](coordinate-and-context.md)
+- [核心设计：Role Continuity](role-continuity.md)
 - [核心设计：Meeting](meeting.md)
 - [Project Context 领域规范](../../stage/project-context/project-context.md)
-- [Project Context 图语义化基础规范](../../stage/semantic/project-context-graph-semantic-foundation-spec.md)
+- [自然语言 Coordinate 起点检索实现计划](../../stage/agent-context-search/project-context-coordinate-search-implementation-plan.md)
+- [渐进观察与一跳语义 CLI 实现计划](../../stage/agent-context-search/project-context-progressive-observation-cli-implementation-plan.md)
+- [`search-project-context` Runtime Skill](../../../desktop/src-tauri/src/managed_agents/search_project_context_skill.md)
 - [Project Context 图语义检索实现计划](../../stage/semantic/project-context-graph-semantic-query-implementation-plan.md)
-- [Project Context Desktop 图语义查询资格记录](../../stage/semantic/desktop/project-context-semantic-query-desktop-qualification.md)
 - [语义 pgvector 运维](../../semantic-pgvector-operations.md)
 - [当前状态与能力边界](../current-status.md)
