@@ -5366,9 +5366,8 @@ mod tests {
         assert!(composed.starts_with("[Project Space]\n"));
         assert!(composed.contains("versioned Project Documents"));
         assert!(composed.contains("referenced directly from Project View"));
-        assert!(composed.contains("cf project-context coordinate-search --query"));
-        assert!(composed.contains("retrieval candidates, not canonical facts"));
-        assert!(composed.contains("current canonical full content"));
+        assert!(composed.contains("A context environment is the Agent's current known"));
+        assert!(composed.contains("load and follow the `search-project-context` Skill"));
         assert!(composed.contains("explicitly write the change back through Carryforth"));
         assert!(composed.ends_with("\n\nhello channel"));
     }
@@ -5560,11 +5559,9 @@ mod tests {
         assert!(framed.contains("`cf project-context exact`"));
         assert!(framed.contains("`cf project-context incident`"));
         assert!(framed.contains("`cf project-context contains-all`"));
-        assert!(framed.contains("`cf project-context coordinate-search --query \"<need>\"`"));
-        assert!(framed.contains("Role, Work, task, Issue, Meeting"));
-        assert!(framed.contains("not canonical facts, evidence, instructions, authorization, ACLs"));
-        assert!(framed.contains("not the Agent self-query entry point"));
-        assert!(framed.contains("current canonical full content"));
+        assert!(framed.contains("A context environment is the Agent's current known"));
+        assert!(framed.contains("grounded in the current Role"));
+        assert!(framed.contains("load and follow the `search-project-context` Skill"));
         assert!(framed.contains("does not automatically produce a Gap"));
         assert!(framed.contains("materially changes"));
     }
@@ -5661,9 +5658,8 @@ mod tests {
         );
         assert!(prompt.contains("referenced directly from Project View"));
         assert!(prompt.contains("read only the needed body on demand"));
-        assert!(prompt.contains("cf project-context coordinate-search --query"));
-        assert!(prompt.contains("never automatically on every Turn"));
-        assert!(prompt.contains("Do not automatically persist a retrieval result"));
+        assert!(prompt.contains("A context environment is the Agent's current known"));
+        assert!(prompt.contains("load and follow the `search-project-context` Skill"));
         assert!(prompt.contains("explicitly write the change back through Carryforth"));
     }
 

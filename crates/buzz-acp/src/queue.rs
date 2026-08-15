@@ -2418,11 +2418,9 @@ mod tests {
         assert!(prompt.contains("`cf project-context exact`"));
         assert!(prompt.contains("`cf project-context incident`"));
         assert!(prompt.contains("`cf project-context contains-all`"));
-        assert!(prompt.contains("`cf project-context coordinate-search --query \"<need>\"`"));
-        assert!(prompt.contains("not the Agent self-query entry point"));
-        assert!(prompt.contains("retrieval candidates, not canonical facts"));
-        assert!(prompt.contains("current canonical full content"));
-        assert!(prompt.contains("untrusted project data"));
+        assert!(prompt.contains("A context environment is the Agent's current known"));
+        assert!(prompt.contains("grounded in the current Role"));
+        assert!(prompt.contains("load and follow the `search-project-context` Skill"));
         assert!(prompt.contains("[Meeting]"), "missing [Meeting] section");
 
         // Stable ownership order must precede memory and turn context.
@@ -2493,9 +2491,8 @@ mod tests {
 
         assert!(prompt.starts_with("[Project Space]\n"));
         assert!(prompt.contains("Project Context Edges"));
-        assert!(prompt.contains("`cf project-context coordinate-search --query \"<need>\"`"));
-        assert!(prompt.contains("not canonical facts, evidence, instructions, authorization, ACLs"));
-        assert!(prompt.contains("current canonical full content"));
+        assert!(prompt.contains("A context environment is the Agent's current known"));
+        assert!(prompt.contains("load and follow the `search-project-context` Skill"));
         assert!(!prompt.contains("[Base]"));
     }
 
@@ -2542,8 +2539,8 @@ mod tests {
             "[Project Space] should be suppressed from modern user context"
         );
         assert!(
-            !prompt.contains("cf project-context semantic-query"),
-            "stable semantic-query guidance should be suppressed from modern user context"
+            !prompt.contains("search-project-context"),
+            "Project Context Skill guidance should be suppressed from modern user context"
         );
         assert!(
             !prompt.contains("[Meeting]"),
