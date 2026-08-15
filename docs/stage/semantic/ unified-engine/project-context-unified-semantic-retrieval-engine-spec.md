@@ -14,6 +14,7 @@
 > [Project Context 图语义化基础规范](../project-context-graph-semantic-foundation-spec.md)、
 > [Project Context 图语义查询实现计划](../project-context-graph-semantic-query-implementation-plan.md)、
 > [语义检索兼容基线交付计划](project-context-semantic-retrieval-compatibility-baseline-plan.md)、
+> [统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)、
 > [Stage TODO](../../TODO.md)
 
 ## 1. 文档目的

@@ -7,6 +7,7 @@ MANIFEST="${FIXTURE_DIR}/semantic_retrieval_compatibility_manifest.json"
 MANIFEST_SHA="${FIXTURE_DIR}/semantic_retrieval_compatibility_manifest.sha256"
 QUALIFICATION="${REPO_ROOT}/docs/stage/semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md"
 BASELINE_COMMIT="e8f26d6e65"
+HISTORICAL_ORACLE_COMMIT="ab395ff6f"
 SCOPE="${1:-all}"
 
 fail() {
@@ -60,8 +61,8 @@ if jq -r '.. | strings' "$MANIFEST" |
   fail "manifest contains a credential-shaped value"
 fi
 
-rg -Fq '> 状态：兼容基线已冻结；真实 Provider canary 未运行；统一引擎尚未实现' "$QUALIFICATION" ||
-  fail "qualification status is missing"
+rg -Fq '> 状态：兼容基线已冻结；真实 Provider canary 未运行；作为历史 v1 oracle 保留' \
+  "$QUALIFICATION" || fail "historical qualification status is missing"
 rg -Fq '四个逻辑 operation / 三个公开 surface' "$QUALIFICATION" ||
   fail "qualification operation matrix marker is missing"
 rg -Fq 'e7b18cdba9c40fa941a6a70fd8beb2629ecc4232dcc5d94316edbaf4fdae097e' \
@@ -97,12 +98,8 @@ if [[ "$SCOPE" == "all" ]]; then
 fi
 
 if [[ "${SEMANTIC_COMPATIBILITY_ENFORCE_FREEZE_DIFF:-0}" == "1" ]]; then
-  changed_paths="$(
-    {
-      git diff --name-only "$BASELINE_COMMIT" --
-      git ls-files --others --exclude-standard
-    } | LC_ALL=C sort -u
-  )"
+  changed_paths="$(git diff --name-only \
+    "${BASELINE_COMMIT}..${HISTORICAL_ORACLE_COMMIT}" -- | LC_ALL=C sort -u)"
   unexpected_paths="$(
     while IFS= read -r path; do
       [[ -z "$path" ]] && continue

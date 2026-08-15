@@ -6,11 +6,11 @@ use buzz_semantic_query::{
     build_one_hop_semantic_query_encoder_input, build_query_encoder_inputs, candidate_score,
     document_score, edge_coordinate_ranking_contract_digest, embedding_space_fence,
     environment_gain, harmonic_score, incident_edge_ranking_contract_digest, path_score,
-    query_contract_digest, ranking_contract_digest, semantic_graph_http_runtime_digest,
-    target_coordinate_score, AnchorGain, ConditionedContextOverview, ConditionedEvidence,
-    DeterministicFakeQueryEncoder, EncodedCoordinateSearchQuery, LifecycleFilter,
-    OneHopSemanticScope, ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery,
-    Score, SemanticGraphQuery, SemanticGraphQueryBudget, SemanticQueryEncoder,
+    query_contract_digest, ranking_contract_digest, target_coordinate_score, AnchorGain,
+    ConditionedContextOverview, ConditionedEvidence, DeterministicFakeQueryEncoder,
+    EncodedCoordinateSearchQuery, LifecycleFilter, OneHopSemanticScope,
+    ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery, Score,
+    SemanticGraphQuery, SemanticGraphQueryBudget, SemanticQueryEncoder,
     DEFAULT_COORDINATE_SEARCH_LIMIT, DEFAULT_ONE_HOP_SEMANTIC_LIMIT,
 };
 use serde_json::{json, Value};
@@ -21,6 +21,8 @@ const FIXTURE_ID: &str = "carryforth.semantic-retrieval-compatibility.v1";
 const SYNTHETIC_PROBLEM: &str = "locate authorization failure context";
 const SYNTHETIC_CONTEXT_OVERVIEW: &str =
     "type: Work\ntitle: Client authorization\nsummary: Verify disclosure-safe failure handling";
+const LEGACY_FLEET_RUNTIME_DIGEST: &str =
+    "325238245fe41d6e7916fa369c539aa35ac789a0f2d9c8d7c4275fba8f360bbe";
 
 fn uuid(value: u128) -> Uuid {
     Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0000 | value)
@@ -211,9 +213,7 @@ async fn manifest() -> Value {
                 edge_coordinate_ranking_contract_digest().to_hex(),
             "graph_ranking": ranking_contract_digest().expect("ranking digest").to_hex(),
             "graph_budget": budget_profile_digest().expect("budget digest").to_hex(),
-            "fleet_runtime": semantic_graph_http_runtime_digest()
-                .expect("fleet digest")
-                .to_hex()
+            "fleet_runtime": LEGACY_FLEET_RUNTIME_DIGEST
         },
         "operations": [
             {

@@ -1,0 +1,99 @@
+{
+  "differential_outcome": {
+    "failure": "closed_error_exact_equality",
+    "mismatch_action": "stop_migration_without_request_fallback",
+    "success": "typed_normalized_result_exact_equality"
+  },
+  "execution_seam": {
+    "legacy_and_migrated_provider_calls": 1,
+    "legacy_and_migrated_read_transactions": 1,
+    "ordered_input_bundle_shared": true,
+    "ordered_vector_bundle_shared": true,
+    "production_compare_mode": "not_compiled_by_default",
+    "production_default_route": "legacy",
+    "provider_encoding": "once_per_attempt",
+    "repeatable_read_snapshot_shared": true
+  },
+  "fixture_id": "carryforth.semantic-retrieval-computation-differential.v1",
+  "historical_oracle": {
+    "fixture_id": "carryforth.semantic-retrieval-compatibility.v1",
+    "sha256": "e7b18cdba9c40fa941a6a70fd8beb2629ecc4232dcc5d94316edbaf4fdae097e"
+  },
+  "operations": [
+    {
+      "comparator": {
+        "closed_error": ["http_status", "code", "retryable", "cli_exit_category"],
+        "normalized_result": ["request_binding", "snapshot", "coordinates", "truncated"],
+        "ordered_item": ["rank", "coordinate", "score"]
+      },
+      "execution_lifecycle": "one_shot",
+      "input_bundle": {
+        "canonical_inputs": ["{\"contract\":\"carryforth.project-context-coordinate-search.query\",\"query\":\"locate authorization failure context\"}"],
+        "input_digests": ["ff7743466bf7ebf45c1506f1fd7425a3ffe9ab95dd2c1b755165b2c97d89defd"],
+        "query_vector_digests": ["587437c1741c8c8b65165d9e258ecea66a6575dc86ea3e48cba107df9688e7cd"]
+      },
+      "logical_operation": "whole_graph_coordinate_discovery",
+      "result_kind": 40913,
+      "surface": "coordinate_search"
+    },
+    {
+      "comparator": {
+        "closed_error": ["http_status", "code", "retryable", "cli_exit_category"],
+        "normalized_result": ["request_binding", "snapshot", "scope", "edges", "coverage", "truncated"],
+        "ordered_item": ["rank", "edge_key", "score", "matched_documents"]
+      },
+      "execution_lifecycle": "one_shot",
+      "input_bundle": {
+        "canonical_inputs": ["{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}"],
+        "input_digests": ["d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1"],
+        "query_vector_digests": ["9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095"]
+      },
+      "logical_operation": "coordinate_incident_edge",
+      "result_kind": 40914,
+      "surface": "one_hop_tagged_family"
+    },
+    {
+      "comparator": {
+        "closed_error": ["http_status", "code", "retryable", "cli_exit_category"],
+        "normalized_result": ["request_binding", "snapshot", "scope", "coordinates", "coverage", "truncated"],
+        "ordered_item": ["rank", "coordinate", "score", "observation"]
+      },
+      "execution_lifecycle": "one_shot",
+      "input_bundle": {
+        "canonical_inputs": ["{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}"],
+        "input_digests": ["d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1"],
+        "query_vector_digests": ["9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095"]
+      },
+      "logical_operation": "edge_member_coordinate",
+      "result_kind": 40914,
+      "surface": "one_hop_tagged_family"
+    },
+    {
+      "comparator": {
+        "closed_error": ["http_status", "code", "retryable", "cli_exit_category"],
+        "normalized_result": ["request_binding", "snapshot", "roots", "paths", "coverage", "completion"],
+        "ordered_item": ["rank", "stable_identity", "score", "provenance"]
+      },
+      "execution_lifecycle": "multi_stage_traversal",
+      "input_bundle": {
+        "canonical_inputs": [
+          "{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}",
+          "{\"contract\":\"semantic-graph-query.conditioned-context\",\"problem\":\"locate authorization failure context\",\"context_overview\":\"type: Work\\ntitle: Client authorization\\nsummary: Verify disclosure-safe failure handling\"}"
+        ],
+        "input_digests": [
+          "d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1",
+          "7a2a689b90f287551e9c705b63e2750ed52b62af9d1e14577267bc7a941e55ab"
+        ],
+        "query_vector_digests": [
+          "9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095",
+          "9b622f19c99c93426d35ea92f2121ae5a97998a1e2d556c866d770c4e3ad85a8"
+        ]
+      },
+      "logical_operation": "bounded_complete_path",
+      "result_kind": 40912,
+      "surface": "semantic_graph_query"
+    }
+  ],
+  "phase_base_commit": "ab395ff6f",
+  "schema_version": 1
+}

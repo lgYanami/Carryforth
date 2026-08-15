@@ -2,9 +2,9 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：概念规范与兼容基线已冻结；统一语义计算实现设计待单独交付
+> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0差分门已交付，待进入U1
 >
-> 更新日期：2026-08-15
+> 更新日期：2026-08-16
 >
 > 概念规范：
 > [Project Context 统一语义检索引擎规范](semantic/ unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
@@ -12,8 +12,13 @@
 > 兼容基线：
 > [Project Context 语义检索兼容基线记录](semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md)
 >
+> 第一阶段实现设计：
+> [Project Context 统一语义计算实现计划](semantic/ unified-engine/project-context-unified-semantic-computation-implementation-plan.md)
+>
 > 当前进展：四个逻辑operation、三个公开surface的deterministic与真实数据库兼容基线已冻结；真实
-> Provider统一canary因缺少受支持配置未运行。下一步是统一语义计算的零行为迁移设计。
+> Provider统一canary因缺少受支持配置未运行。统一语义计算的零行为迁移设计已通过代码、currentness、
+> lifecycle与兼容性复核；历史v1 oracle和独立Phase 1差分/受保护surface门已同时闭合，下一步进入U1共同
+> input、fence与vector类型。
 
 ### 背景
 

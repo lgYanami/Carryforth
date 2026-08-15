@@ -1,6 +1,6 @@
 # Project Context 语义检索兼容基线记录
 
-> 状态：兼容基线已冻结；真实 Provider canary 未运行；统一引擎尚未实现
+> 状态：兼容基线已冻结；真实 Provider canary 未运行；作为历史 v1 oracle 保留
 >
 > 日期：2026-08-15
 >
@@ -41,7 +41,8 @@ characterization oracle。
 - 多Pod、长期Provider故障、公平性和production SLO仍不在本阶段关闭。
 
 真实 Provider 未运行是计划允许的外部资格阻断，不否定 deterministic 与真实数据库兼容基线。本文不是
-production qualification，也不表示统一语义检索引擎已经开始迁移。
+production qualification。统一语义计算的迁移状态由独立实现计划与资格记录维护；本文只保留开始迁移前
+已经冻结的历史 v1 oracle，不随新实现改写。
 
 ## 2. Source-of-truth 矩阵
 
@@ -284,8 +285,10 @@ just semantic-retrieval-compatibility-baseline
 
 ## 13. 下一步
 
-兼容基线已经冻结。下一阶段是单独设计“统一语义计算”的零行为迁移：共同query encoding、
-generation-bound query vector与current-head exact scorer。真实 Provider统一canary、跨surface取消对照和
-production容量资格继续作为后续资格项，不得被描述为本轮已通过。
+兼容基线已经冻结。下一阶段已经形成
+[统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)，按零行为迁移共同
+query input/encoding、generation-bound query vector与current-head exact scorer。真实Provider统一canary、
+跨surface取消对照和production容量资格继续作为后续资格项，不得被描述为本轮已通过。
 
-在第6步完成前，不进入统一语义计算实现。
+统一语义计算计划已经完成代码、兼容性与安全边界复核，U0差分门也已独立交付；下一步进入U1共同类型，
+不跨阶段直接替换production scorer。
