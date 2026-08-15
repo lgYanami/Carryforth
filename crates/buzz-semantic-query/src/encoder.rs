@@ -8,23 +8,175 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     QueryCompatibilityFences, QueryContractResult, SemanticGraphQueryError,
-    SemanticQueryEncoderInput,
+    SemanticModelSpaceFences, SemanticQueryEncoderInput, SemanticQueryInput,
+    SemanticQueryInputBundle, SemanticQueryInputKind,
 };
 
 /// Heap-allocated async query-encoder result without an async-trait dependency.
 pub type SemanticQueryEncoderFuture<'a> =
     Pin<Box<dyn Future<Output = QueryContractResult<Vec<EncodedSemanticQuery>>> + Send + 'a>>;
 
-/// One validated ephemeral query vector bound to its channel and all three
-/// compatibility fences.
-pub struct EncodedSemanticQuery {
+/// One Provider result bound to exact closed input bytes and one model space.
+///
+/// It deliberately carries no active generation UUID. Only a current,
+/// authorized writer-DB ticket may add that identity.
+#[derive(Clone, PartialEq)]
+pub struct ProviderEncodedSemanticInput {
     request_id: uuid::Uuid,
     channel_id: Digest32,
-    source_generation_contract_digest: Digest32,
-    embedding_space_fence: Digest32,
-    query_contract_digest: Digest32,
+    channel_kind: SemanticQueryInputKind,
+    model_space: SemanticModelSpaceFences,
+    encoding_contract_digest: Digest32,
+    input_digest: Digest32,
     response_model: String,
     embedding: EmbeddingVector,
+}
+
+impl std::fmt::Debug for ProviderEncodedSemanticInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderEncodedSemanticInput")
+            .field("channel_kind", &self.channel_kind)
+            .field("response_model", &self.response_model)
+            .field("dimensions", &self.embedding.as_slice().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderEncodedSemanticInput {
+    /// Bind one raw Provider vector to the exact input and validated model space.
+    pub fn new(
+        input: &SemanticQueryInput,
+        response_model: String,
+        values: Vec<f32>,
+        source_contract: &SemanticModelContract,
+    ) -> QueryContractResult<Self> {
+        input.validate().map_err(|error| {
+            SemanticGraphQueryError::InvalidState(format!("common semantic input: {error}"))
+        })?;
+        if response_model != source_contract.model {
+            return Err(SemanticGraphQueryError::ProviderResponse);
+        }
+        let model_space = SemanticModelSpaceFences::for_source_contract(source_contract)?;
+        let embedding = EmbeddingVector::new(values, source_contract)
+            .map_err(|_| SemanticGraphQueryError::ProviderResponse)?;
+        Ok(Self {
+            request_id: input.request_id(),
+            channel_id: input.channel_id(),
+            channel_kind: input.channel_kind().clone(),
+            model_space,
+            encoding_contract_digest: input.encoding_contract_digest(),
+            input_digest: input.input_digest(),
+            response_model,
+            embedding,
+        })
+    }
+
+    /// Owning request identity.
+    pub const fn request_id(&self) -> uuid::Uuid {
+        self.request_id
+    }
+
+    /// Stable request-local branch identity.
+    pub const fn channel_id(&self) -> Digest32 {
+        self.channel_id
+    }
+
+    /// Closed Coordinate, Q0, or Qi identity.
+    pub const fn channel_kind(&self) -> &SemanticQueryInputKind {
+        &self.channel_kind
+    }
+
+    /// Validated source model-space fences, excluding generation UUID.
+    pub const fn model_space(&self) -> &SemanticModelSpaceFences {
+        &self.model_space
+    }
+
+    /// Closed serializer/template digest.
+    pub const fn encoding_contract_digest(&self) -> Digest32 {
+        self.encoding_contract_digest
+    }
+
+    /// Digest of the exact Provider input bytes.
+    pub const fn input_digest(&self) -> Digest32 {
+        self.input_digest
+    }
+
+    /// Exact Provider response model.
+    pub fn response_model(&self) -> &str {
+        &self.response_model
+    }
+
+    /// Validated finite, dimensioned, non-zero query vector.
+    pub fn embedding(&self) -> &EmbeddingVector {
+        &self.embedding
+    }
+
+    /// Consume the binding and return its validated embedding.
+    pub fn into_embedding(self) -> EmbeddingVector {
+        self.embedding
+    }
+}
+
+/// Ordered Provider outputs corresponding one-for-one with one input bundle.
+#[derive(Clone, PartialEq)]
+pub struct ProviderEncodedSemanticInputBundle {
+    inputs: Vec<ProviderEncodedSemanticInput>,
+}
+
+impl std::fmt::Debug for ProviderEncodedSemanticInputBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderEncodedSemanticInputBundle")
+            .field("input_count", &self.inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderEncodedSemanticInputBundle {
+    /// Validate and bind an entire Provider response in input order.
+    pub fn new(
+        input_bundle: &SemanticQueryInputBundle,
+        response_model: String,
+        values: Vec<Vec<f32>>,
+        source_contract: &SemanticModelContract,
+    ) -> QueryContractResult<Self> {
+        input_bundle.validate().map_err(|error| {
+            SemanticGraphQueryError::InvalidState(format!("common semantic input bundle: {error}"))
+        })?;
+        if values.len() != input_bundle.len() {
+            return Err(SemanticGraphQueryError::ProviderResponse);
+        }
+        let inputs = input_bundle
+            .inputs()
+            .iter()
+            .zip(values)
+            .map(|(input, values)| {
+                ProviderEncodedSemanticInput::new(
+                    input,
+                    response_model.clone(),
+                    values,
+                    source_contract,
+                )
+            })
+            .collect::<QueryContractResult<Vec<_>>>()?;
+        Ok(Self { inputs })
+    }
+
+    /// Ordered Provider-bound inputs.
+    pub fn inputs(&self) -> &[ProviderEncodedSemanticInput] {
+        &self.inputs
+    }
+
+    /// Consume the bundle without changing input order.
+    pub fn into_inputs(self) -> Vec<ProviderEncodedSemanticInput> {
+        self.inputs
+    }
+}
+
+/// Compatibility wrapper for one graph Q0/Qi Provider result.
+pub struct EncodedSemanticQuery {
+    inner: ProviderEncodedSemanticInput,
 }
 
 impl EncodedSemanticQuery {
@@ -46,52 +198,72 @@ impl EncodedSemanticQuery {
                 "query encoder input contract fence mismatch".to_owned(),
             ));
         }
-        let embedding = EmbeddingVector::new(values, source_contract)
-            .map_err(|_| SemanticGraphQueryError::ProviderResponse)?;
-        Ok(Self {
-            request_id: input.request_id(),
-            channel_id: input.channel_id(),
-            source_generation_contract_digest: fences.source_generation_contract_digest,
-            embedding_space_fence: fences.embedding_space_fence,
-            query_contract_digest: fences.query_contract_digest,
+        let inner = ProviderEncodedSemanticInput::new(
+            input.semantic_input(),
             response_model,
-            embedding,
-        })
+            values,
+            source_contract,
+        )?;
+        if inner.model_space.source_generation_contract_digest
+            != fences.source_generation_contract_digest
+            || inner.model_space.embedding_space_fence != fences.embedding_space_fence
+            || inner.encoding_contract_digest != fences.query_contract_digest
+        {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "graph query Provider binding mismatch".to_owned(),
+            ));
+        }
+        Ok(Self { inner })
     }
 
     /// Owning request identity.
     pub const fn request_id(&self) -> uuid::Uuid {
-        self.request_id
+        self.inner.request_id()
     }
 
     /// Query-vector branch identity.
     pub const fn channel_id(&self) -> Digest32 {
-        self.channel_id
+        self.inner.channel_id()
     }
 
     /// Complete active Foundation generation contract digest.
     pub const fn source_generation_contract_digest(&self) -> Digest32 {
-        self.source_generation_contract_digest
+        self.inner.model_space().source_generation_contract_digest
     }
 
     /// Comparable model-space fence.
     pub const fn embedding_space_fence(&self) -> Digest32 {
-        self.embedding_space_fence
+        self.inner.model_space().embedding_space_fence
     }
 
     /// Query template/serializer/input-limit digest.
     pub const fn query_contract_digest(&self) -> Digest32 {
-        self.query_contract_digest
+        self.inner.encoding_contract_digest()
+    }
+
+    /// Digest of the exact Provider input bytes.
+    pub const fn query_input_digest(&self) -> Digest32 {
+        self.inner.input_digest()
     }
 
     /// Exact model version returned by the Provider.
     pub fn response_model(&self) -> &str {
-        &self.response_model
+        self.inner.response_model()
     }
 
     /// Validated finite, dimensioned, non-zero query vector.
     pub fn embedding(&self) -> &EmbeddingVector {
-        &self.embedding
+        self.inner.embedding()
+    }
+
+    /// Common Provider-bound representation used by the DB ticket binder.
+    pub const fn provider_encoded(&self) -> &ProviderEncodedSemanticInput {
+        &self.inner
+    }
+
+    /// Consume this compatibility wrapper.
+    pub fn into_provider_encoded(self) -> ProviderEncodedSemanticInput {
+        self.inner
     }
 }
 
@@ -180,7 +352,9 @@ mod tests {
     use buzz_project_view::ProjectViewObjectType;
     use uuid::Uuid;
 
-    use super::{DeterministicFakeQueryEncoder, SemanticQueryEncoder};
+    use super::{
+        DeterministicFakeQueryEncoder, ProviderEncodedSemanticInputBundle, SemanticQueryEncoder,
+    };
     use crate::{
         build_query_encoder_inputs, ConditionedContextOverview, LifecycleFilter,
         SemanticGraphQuery, SemanticGraphQueryBudget,
@@ -219,9 +393,61 @@ mod tests {
         let second = encoder.encode_queries(&inputs).await.expect("second");
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].channel_id(), inputs[0].channel_id());
+        assert_eq!(first[0].query_input_digest(), inputs[0].text_digest());
         assert_eq!(
             first[0].embedding().as_slice(),
             second[0].embedding().as_slice()
         );
+    }
+
+    #[test]
+    fn common_provider_bundle_preserves_order_input_digest_and_redaction() {
+        let coordinate = ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Work,
+            object_id: uuid(4),
+        };
+        let query = SemanticGraphQuery {
+            request_id: uuid(1),
+            project_id: uuid(2),
+            problem: "CONFIDENTIAL-PROBLEM".to_owned(),
+            initial_coordinates: Vec::new(),
+            context_coordinates: vec![coordinate.clone()],
+            lifecycle_filter: LifecycleFilter::AllCurrent,
+            budget: SemanticGraphQueryBudget::default(),
+        };
+        let outcome = build_query_encoder_inputs(
+            &query,
+            &[ConditionedContextOverview {
+                coordinate,
+                current_overview_semantic_text: "CONFIDENTIAL-OVERVIEW".to_owned(),
+            }],
+        )
+        .expect("inputs");
+        let bundle = outcome.semantic_input_bundle().expect("common bundle");
+        let encoder = DeterministicFakeQueryEncoder::new(3).expect("encoder");
+        let encoded = ProviderEncodedSemanticInputBundle::new(
+            &bundle,
+            encoder.source_contract().model.clone(),
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            encoder.source_contract(),
+        )
+        .expect("Provider result bundle");
+
+        assert_eq!(encoded.inputs().len(), 2);
+        assert_eq!(
+            encoded.inputs()[1].input_digest(),
+            bundle.inputs()[1].input_digest()
+        );
+        let debug = format!("{encoded:?}");
+        assert!(!debug.contains("CONFIDENTIAL"));
+        assert!(!debug.contains(&query.request_id.to_string()));
+
+        assert!(ProviderEncodedSemanticInputBundle::new(
+            &bundle,
+            "wrong-model".to_owned(),
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            encoder.source_contract(),
+        )
+        .is_err());
     }
 }

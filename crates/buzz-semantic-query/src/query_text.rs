@@ -5,7 +5,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    QueryContractResult, SemanticGraphQuery, SemanticGraphQueryError, MAX_PROBLEM_BYTES,
+    QueryContractResult, SemanticGraphQuery, SemanticGraphQueryError, SemanticQueryInput,
+    SemanticQueryInputBundle, SemanticQueryInputKind, MAX_PROBLEM_BYTES,
     MAX_PROVIDER_QUERY_INPUT_BYTES,
 };
 
@@ -109,6 +110,21 @@ pub struct SemanticQueryInputBuildOutcome {
     pub omitted_contexts: Vec<OmittedConditionedInput>,
 }
 
+impl SemanticQueryInputBuildOutcome {
+    /// Project the existing Q0/Qi adapters into one common ordered bundle.
+    pub fn semantic_input_bundle(&self) -> QueryContractResult<SemanticQueryInputBundle> {
+        SemanticQueryInputBundle::from_closed_inputs(
+            self.inputs
+                .iter()
+                .map(|input| input.semantic_input.clone())
+                .collect(),
+        )
+        .map_err(|error| {
+            SemanticGraphQueryError::InvalidState(format!("common semantic input bundle: {error}"))
+        })
+    }
+}
+
 impl std::fmt::Debug for SemanticQueryInputBuildOutcome {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -122,12 +138,8 @@ impl std::fmt::Debug for SemanticQueryInputBuildOutcome {
 /// One immutable, digest-bound Provider query input.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SemanticQueryEncoderInput {
-    request_id: Uuid,
-    channel_id: Digest32,
+    semantic_input: SemanticQueryInput,
     channel_kind: SemanticQueryChannelKind,
-    query_contract_digest: Digest32,
-    text_digest: Digest32,
-    text: String,
 }
 
 impl std::fmt::Debug for SemanticQueryEncoderInput {
@@ -140,7 +152,7 @@ impl std::fmt::Debug for SemanticQueryEncoderInput {
             .debug_struct("SemanticQueryEncoderInput")
             .field("channel_kind", &channel_kind)
             .field("text", &"<redacted>")
-            .field("text_bytes", &self.text.len())
+            .field("text_bytes", &self.text().len())
             .finish_non_exhaustive()
     }
 }
@@ -148,12 +160,12 @@ impl std::fmt::Debug for SemanticQueryEncoderInput {
 impl SemanticQueryEncoderInput {
     /// Query request that owns the ephemeral input.
     pub const fn request_id(&self) -> Uuid {
-        self.request_id
+        self.semantic_input.request_id()
     }
 
     /// Stable channel identity independent of input array order.
     pub const fn channel_id(&self) -> Digest32 {
-        self.channel_id
+        self.semantic_input.channel_id()
     }
 
     /// Closed problem-only or one-Coordinate-conditioned channel kind.
@@ -163,32 +175,50 @@ impl SemanticQueryEncoderInput {
 
     /// Digest of the canonical query serializer, templates, and input limit.
     pub const fn query_contract_digest(&self) -> Digest32 {
-        self.query_contract_digest
+        self.semantic_input.encoding_contract_digest()
     }
 
     /// Domain-separated digest of the exact canonical Provider input bytes.
     pub const fn text_digest(&self) -> Digest32 {
-        self.text_digest
+        self.semantic_input.input_digest()
     }
 
     /// Exact canonical UTF-8 Provider input.
     pub fn text(&self) -> &str {
-        &self.text
+        self.semantic_input.exact_utf8_text()
+    }
+
+    /// Common closed input shared by every semantic Provider adapter.
+    pub const fn semantic_input(&self) -> &SemanticQueryInput {
+        &self.semantic_input
     }
 
     /// Revalidate immutable digests before crossing a Provider boundary.
     pub fn validate(&self) -> QueryContractResult<()> {
-        if self.query_contract_digest != query_contract_digest() {
+        let expected_kind = match &self.channel_kind {
+            SemanticQueryChannelKind::Problem => SemanticQueryInputKind::Problem,
+            SemanticQueryChannelKind::ConditionedContext { context_coordinate } => {
+                SemanticQueryInputKind::ConditionedContext {
+                    context_coordinate: context_coordinate.clone(),
+                }
+            }
+        };
+        if self.semantic_input.channel_kind() != &expected_kind
+            || self.query_contract_digest() != query_contract_digest()
+        {
             return Err(SemanticGraphQueryError::InvalidState(
                 "query contract digest mismatch".to_owned(),
             ));
         }
-        if self.text_digest != query_text_digest(self.text.as_bytes()) {
+        if self.text_digest() != query_text_digest(self.text().as_bytes()) {
             return Err(SemanticGraphQueryError::InvalidState(
                 "query text digest mismatch".to_owned(),
             ));
         }
-        validate_provider_size(&self.text)
+        self.semantic_input.validate().map_err(|error| {
+            SemanticGraphQueryError::InvalidState(format!("common semantic input: {error}"))
+        })?;
+        validate_provider_size(self.text())
     }
 }
 
@@ -225,13 +255,13 @@ pub fn build_problem_query_encoder_input(
     problem: &str,
 ) -> QueryContractResult<SemanticQueryEncoderInput> {
     let text = canonical_problem_query_text(problem)?;
-    Ok(make_input(
+    make_input(
         request_id,
         problem_channel_id(request_id),
         SemanticQueryChannelKind::Problem,
         query_contract_digest(),
         text,
-    ))
+    )
 }
 
 /// Serialize one problem plus one current Coordinate overview Qi Provider
@@ -327,7 +357,7 @@ pub fn build_query_encoder_inputs(
             },
             contract_digest,
             text,
-        ));
+        )?);
     }
     Ok(SemanticQueryInputBuildOutcome {
         inputs,
@@ -341,16 +371,31 @@ fn make_input(
     channel_kind: SemanticQueryChannelKind,
     contract_digest: Digest32,
     text: String,
-) -> SemanticQueryEncoderInput {
+) -> QueryContractResult<SemanticQueryEncoderInput> {
     let text_digest = query_text_digest(text.as_bytes());
-    SemanticQueryEncoderInput {
+    let common_kind = match &channel_kind {
+        SemanticQueryChannelKind::Problem => SemanticQueryInputKind::Problem,
+        SemanticQueryChannelKind::ConditionedContext { context_coordinate } => {
+            SemanticQueryInputKind::ConditionedContext {
+                context_coordinate: context_coordinate.clone(),
+            }
+        }
+    };
+    let semantic_input = SemanticQueryInput::new_closed(
         request_id,
         channel_id,
-        channel_kind,
-        query_contract_digest: contract_digest,
+        common_kind,
+        contract_digest,
         text_digest,
         text,
-    }
+    )
+    .map_err(|error| {
+        SemanticGraphQueryError::InvalidState(format!("common semantic input: {error}"))
+    })?;
+    Ok(SemanticQueryEncoderInput {
+        semantic_input,
+        channel_kind,
+    })
 }
 
 fn problem_channel_id(request_id: Uuid) -> Digest32 {
@@ -376,7 +421,7 @@ fn conditioned_channel_id(
     )
 }
 
-fn query_text_digest(text: &[u8]) -> Digest32 {
+pub(crate) fn query_text_digest(text: &[u8]) -> Digest32 {
     hash_domain(b"buzz.semantic-graph-query-text", &[text])
 }
 

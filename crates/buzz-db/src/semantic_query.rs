@@ -5,8 +5,10 @@
 //! observations to the Relay query orchestrator. Raw source vectors never
 //! cross this API.
 
+mod exact_scoring;
 mod scoped_search;
 
+pub use exact_scoring::*;
 pub use scoped_search::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -16,18 +18,19 @@ use buzz_core::{CommunityId, PublicKey};
 use buzz_project_context::{EdgeKey, ProjectContextCoordinate};
 use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic::{
-    CanonicalSemanticSourceObservation, Digest32, EmbeddingVector, IneligibilityReason,
-    ProjectViewSemanticType, SemanticCoverage, SemanticEligibility, SemanticLifecycleClass,
-    SemanticSourceBasis, SemanticSourceIdentity, SemanticSourceKind,
+    CanonicalSemanticSourceObservation, Digest32, IneligibilityReason, ProjectViewSemanticType,
+    SemanticCoverage, SemanticEligibility, SemanticLifecycleClass, SemanticSourceBasis,
+    SemanticSourceIdentity, SemanticSourceKind,
 };
 use buzz_semantic_query::{
     document_score, environment_gain, harmonic_score, target_coordinate_score, ConditionedEvidence,
     ContextDocumentBindingObservation, LifecycleFilter, ProjectContextBindingProvenance,
     ProjectContextEdgeProvenance, QueryCompatibilityFences, RelationRankCursor, Score,
-    SemanticEdgeObservation, SemanticGraphQueryRoutingTrust, TargetRankCursor,
-    MAX_CONTEXT_COORDINATES, MAX_HYPEREDGE_IDENTITY_BYTES, MAX_INITIAL_COORDINATES,
-    MAX_QUERY_CHANNELS, MAX_RECALL_PER_CHANNEL, MAX_RELATION_OPTIONS_MATERIALIZED,
-    MAX_TARGET_OPTIONS_MATERIALIZED, RELATION_FLOOR, TARGET_FLOOR, TRANSITION_FLOOR,
+    SemanticEdgeObservation, SemanticGraphQueryRoutingTrust, SemanticQueryInputKind,
+    TargetRankCursor, MAX_CONTEXT_COORDINATES, MAX_HYPEREDGE_IDENTITY_BYTES,
+    MAX_INITIAL_COORDINATES, MAX_QUERY_CHANNELS, MAX_RECALL_PER_CHANNEL,
+    MAX_RELATION_OPTIONS_MATERIALIZED, MAX_TARGET_OPTIONS_MATERIALIZED, RELATION_FLOOR,
+    TARGET_FLOOR, TRANSITION_FLOOR,
 };
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
@@ -69,6 +72,13 @@ pub struct SemanticGraphQueryTicket {
     pub observed_at: DateTime<Utc>,
 }
 
+impl SemanticGraphQueryTicket {
+    /// Project this authorized ticket into the scorer-facing generation view.
+    pub fn generation_fences(&self) -> Result<SemanticGenerationFences> {
+        SemanticGenerationFences::from_ticket(self)
+    }
+}
+
 /// Server-owned transaction timeouts for one Stage C exact read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticGraphReadTimeouts {
@@ -87,41 +97,6 @@ impl Default for SemanticGraphReadTimeouts {
             lock: Duration::from_millis(250),
             idle_in_transaction: Duration::from_secs(10),
         }
-    }
-}
-
-/// One validated query vector branch supplied by the query encoder.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SemanticExactQueryVector {
-    /// Stable, request-local branch identity.
-    channel_id: Digest32,
-    /// Three compatibility fences observed by the query encoder.
-    query_fences: QueryCompatibilityFences,
-    /// Finite vector already validated against the ticket model contract.
-    embedding: EmbeddingVector,
-}
-
-impl SemanticExactQueryVector {
-    /// Bind one encoded branch to the exact ticket and closed compatibility
-    /// fences before it can reach SQL.
-    pub fn new(
-        ticket: &SemanticGraphQueryTicket,
-        channel_id: Digest32,
-        query_fences: QueryCompatibilityFences,
-        embedding: EmbeddingVector,
-    ) -> Result<Self> {
-        let vector = Self {
-            channel_id,
-            query_fences,
-            embedding,
-        };
-        validate_query_vectors(ticket, std::slice::from_ref(&vector))?;
-        Ok(vector)
-    }
-
-    /// Stable request-local branch identity.
-    pub const fn channel_id(&self) -> Digest32 {
-        self.channel_id
     }
 }
 
@@ -1786,7 +1761,7 @@ impl SemanticGraphReadTx {
             .await?;
         let channel_ids: Vec<Digest32> = query_vectors
             .iter()
-            .map(|channel| channel.channel_id)
+            .map(SemanticExactQueryVector::channel_id)
             .collect();
         partition_exact_recall(&channel_ids, observed, recall_per_channel)
     }
@@ -2456,11 +2431,11 @@ impl SemanticGraphReadTx {
         let candidates = source_key_arrays(candidates.unwrap_or_default());
         let channel_ids: Vec<Vec<u8>> = query_vectors
             .iter()
-            .map(|channel| channel.channel_id.as_bytes().to_vec())
+            .map(|channel| channel.channel_id().as_bytes().to_vec())
             .collect();
         let vectors: Vec<Vector> = query_vectors
             .iter()
-            .map(|channel| Vector::from(channel.embedding.as_slice().to_vec()))
+            .map(|channel| Vector::from(channel.embedding().as_slice().to_vec()))
             .collect();
         let dimensions = i32::try_from(self.ticket.generation.model_contract.dimensions)
             .map_err(|_| DbError::InvalidData("semantic dimensions exceed int4".to_string()))?;
@@ -3496,46 +3471,42 @@ fn validate_query_vectors(
             "semantic query vector count is outside the server bound".to_string(),
         ));
     }
-    let dimensions = ticket.generation.model_contract.dimensions;
+    validate_generation_bound_vectors(
+        ticket,
+        query_vectors
+            .iter()
+            .map(SemanticExactQueryVector::generation_bound),
+        query_vectors.len(),
+    )?;
+    let mut previous_context: Option<&ProjectContextCoordinate> = None;
     for (index, channel) in query_vectors.iter().enumerate() {
-        QueryCompatibilityFences::validate_observed(
-            &ticket.generation.model_contract,
-            channel.query_fences.source_generation_contract_digest,
-            channel.query_fences.embedding_space_fence,
-            channel.query_fences.query_contract_digest,
-        )
-        .map_err(|error| {
-            DbError::InvalidData(format!(
-                "semantic query vector {index} compatibility fence mismatch: {error}"
-            ))
-        })?;
-        if channel.query_fences != ticket.query_fences {
+        let channel = channel.generation_bound();
+        if channel.encoding_contract_digest() != ticket.query_fences.query_contract_digest {
             return Err(DbError::InvalidData(format!(
-                "semantic query vector {index} does not match the Stage C ticket"
+                "semantic query vector {index} does not match the graph input contract"
             )));
         }
-        if channel.embedding.as_slice().len() != dimensions
-            || channel
-                .embedding
-                .as_slice()
-                .iter()
-                .any(|value| !value.is_finite())
-            || vector_norm_squared(channel.embedding.as_slice()) <= 0.0
-        {
-            return Err(DbError::InvalidData(format!(
-                "semantic query vector {index} is not a finite non-zero ticket-space vector"
-            )));
+        match (index, channel.channel_kind()) {
+            (0, SemanticQueryInputKind::Problem) => {}
+            (0, _) => {
+                return Err(DbError::InvalidData(
+                    "semantic query vector bundle must begin with Q0".to_owned(),
+                ));
+            }
+            (_, SemanticQueryInputKind::ConditionedContext { context_coordinate }) => {
+                if previous_context.is_some_and(|previous| previous >= context_coordinate) {
+                    return Err(DbError::InvalidData(
+                        "semantic conditioned vector order is not canonical".to_owned(),
+                    ));
+                }
+                previous_context = Some(context_coordinate);
+            }
+            (_, _) => {
+                return Err(DbError::InvalidData(
+                    "semantic query vector bundle contains a non-Qi tail".to_owned(),
+                ));
+            }
         }
-    }
-    let mut ids: Vec<Digest32> = query_vectors
-        .iter()
-        .map(|channel| channel.channel_id)
-        .collect();
-    ids.sort_unstable();
-    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(DbError::InvalidData(
-            "semantic query channel ids must be unique".to_string(),
-        ));
     }
     Ok(())
 }
@@ -5519,8 +5490,10 @@ mod tests {
         SemanticSourceKind,
     };
     use buzz_semantic_query::{
+        build_coordinate_search_encoder_input, build_problem_query_encoder_input,
         ContextDocumentBindingObservation, ProjectContextBindingProvenance,
-        ProjectContextEdgeProvenance, QueryCompatibilityFences, RelationRankCursor, Score,
+        ProjectContextCoordinateSearchQuery, ProjectContextEdgeProvenance,
+        ProviderEncodedSemanticInput, QueryCompatibilityFences, RelationRankCursor, Score,
         SemanticEdgeObservation, TargetRankCursor,
     };
     use chrono::Utc;
@@ -5569,6 +5542,23 @@ mod tests {
             project_context_revision: 1,
             observed_at: Utc::now(),
         }
+    }
+
+    fn problem_vector(
+        ticket: &SemanticGraphQueryTicket,
+        request_id: Uuid,
+        values: Vec<f32>,
+    ) -> SemanticExactQueryVector {
+        let input = build_problem_query_encoder_input(request_id, "exact score fixture")
+            .expect("problem input");
+        let encoded = ProviderEncodedSemanticInput::new(
+            input.semantic_input(),
+            ticket.generation.model_contract.model.clone(),
+            values,
+            &ticket.generation.model_contract,
+        )
+        .expect("Provider-bound input");
+        SemanticExactQueryVector::new(ticket, encoded).expect("generation-bound vector")
     }
 
     #[test]
@@ -5704,24 +5694,38 @@ mod tests {
     #[test]
     fn query_vectors_require_nonzero_values_unique_channels_and_three_fences() {
         let encoder = DeterministicFakeEncoder::new(3).expect("fake encoder");
-        let ticket = ticket(encoder.contract().clone());
-        let vector = SemanticExactQueryVector {
-            channel_id: Digest32::from_bytes([1; 32]),
-            query_fences: ticket.query_fences,
-            embedding: EmbeddingVector::new(vec![1.0, 0.0, 0.0], &ticket.generation.model_contract)
-                .expect("embedding"),
-        };
-        assert!(validate_query_vectors(&ticket, std::slice::from_ref(&vector)).is_ok());
+        let first_ticket = ticket(encoder.contract().clone());
+        let vector = problem_vector(&first_ticket, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
+        assert!(validate_query_vectors(&first_ticket, std::slice::from_ref(&vector)).is_ok());
 
         let duplicate = vec![vector.clone(), vector.clone()];
-        assert!(validate_query_vectors(&ticket, &duplicate).is_err());
+        assert!(validate_query_vectors(&first_ticket, &duplicate).is_err());
 
-        let mut wrong_fence = vector.clone();
-        wrong_fence.query_fences.query_contract_digest = Digest32::from_bytes([9; 32]);
-        assert!(validate_query_vectors(&ticket, &[wrong_fence]).is_err());
+        let coordinate_request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            query: "exact score fixture".to_owned(),
+            limit: 8,
+        };
+        let coordinate_input =
+            build_coordinate_search_encoder_input(&coordinate_request).expect("Coordinate input");
+        let wrong_contract = ProviderEncodedSemanticInput::new(
+            coordinate_input.semantic_input(),
+            first_ticket.generation.model_contract.model.clone(),
+            vec![1.0, 0.0, 0.0],
+            &first_ticket.generation.model_contract,
+        )
+        .expect("Provider-bound Coordinate input");
+        assert!(SemanticExactQueryVector::new(&first_ticket, wrong_contract).is_err());
+
+        let mut other_community = ticket(encoder.contract().clone());
+        other_community.generation.generation_id = first_ticket.generation.generation_id;
+        assert_ne!(other_community.community_id, first_ticket.community_id);
+        assert!(validate_query_vectors(&other_community, &[vector]).is_err());
 
         assert!(
-            EmbeddingVector::new(vec![0.0, 0.0, 0.0], &ticket.generation.model_contract).is_err()
+            EmbeddingVector::new(vec![0.0, 0.0, 0.0], &first_ticket.generation.model_contract)
+                .is_err()
         );
     }
 

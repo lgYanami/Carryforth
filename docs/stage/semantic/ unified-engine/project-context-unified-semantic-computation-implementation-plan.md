@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0 差分门已交付；U1–U7 待交付
+> 状态：实现设计已冻结；U0–U1 已交付；U2–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -611,7 +611,8 @@ Phase 1并另开兼容迁移。
 | 阶段 | 状态 | 独立退出证据 |
 | --- | --- | --- |
 | U0 设计与差分门 | 已完成 | 历史 v1 oracle 与 Phase 1 differential/protected-surface gate 同时通过 |
-| U1–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
+| U1 共同 input、fence 与 vector | 已完成 | 冻结 bytes/digest 不变；共同 Provider 结果只由 writer DB 绑定 tenant-scoped generation |
+| U2–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
 
 ### U0：设计与差分门
 

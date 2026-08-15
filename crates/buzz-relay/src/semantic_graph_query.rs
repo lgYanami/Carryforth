@@ -38,13 +38,13 @@ use buzz_semantic_query::{
     OmittedContextChannelCounts, OmittedContextCoordinateObservation,
     OmittedContextCoordinateReason, OmittedForResponseBudgetCounts,
     OmittedInitialCoordinateObservation, OmittedInitialCoordinateReason,
-    ProjectContextBindingProvenance, ProjectContextEdgeProvenance, QueryCompatibilityFences,
-    RootDiscoveryChannel, RootStructuralEntrypoint, Score, ScoreExplanation, SelectedAutomaticRoot,
-    SemanticGraphQuery, SemanticGraphQueryCoverage, SemanticGraphQueryError,
-    SemanticGraphQueryInputObservations, SemanticHeadProvenance, SemanticHeadState,
-    SemanticProvenance, SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderInput,
-    SemanticScoreRole, SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR,
-    RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS, SNAPSHOT_CLOSE_RESERVE_MS,
+    ProjectContextBindingProvenance, ProjectContextEdgeProvenance, RootDiscoveryChannel,
+    RootStructuralEntrypoint, Score, ScoreExplanation, SelectedAutomaticRoot, SemanticGraphQuery,
+    SemanticGraphQueryCoverage, SemanticGraphQueryError, SemanticGraphQueryInputObservations,
+    SemanticHeadProvenance, SemanticHeadState, SemanticProvenance, SemanticQueryChannelKind,
+    SemanticQueryEncoder, SemanticQueryEncoderInput, SemanticScoreRole, SemanticSourcePreview,
+    TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS,
+    SNAPSHOT_CLOSE_RESERVE_MS,
 };
 use chrono::Utc;
 use tokio::sync::OwnedSemaphorePermit;
@@ -1860,16 +1860,9 @@ fn bind_exact_query_vectors(
                     "query Provider result does not preserve its request/channel/model binding",
                 ));
             }
-            let fences = QueryCompatibilityFences {
-                source_generation_contract_digest: encoded.source_generation_contract_digest(),
-                embedding_space_fence: encoded.embedding_space_fence(),
-                query_contract_digest: encoded.query_contract_digest(),
-            };
             Ok(SemanticExactQueryVector::new(
                 ticket,
-                encoded.channel_id(),
-                fences,
-                encoded.embedding().clone(),
+                encoded.into_provider_encoded(),
             )?)
         })
         .collect()

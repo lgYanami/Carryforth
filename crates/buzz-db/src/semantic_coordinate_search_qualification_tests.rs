@@ -596,7 +596,9 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         .bind(ticket.generation.extractor_version.as_str())
         .bind(ticket.generation.model_contract.model.as_str())
         .bind(i32::try_from(DIMENSIONS).expect("dimensions"))
-        .bind(Vector::from(query_vector.embedding.as_slice().to_vec()))
+        .bind(Vector::from(
+            query_vector.inner.embedding().as_slice().to_vec(),
+        ))
         .bind(33_i64)
         .fetch_one(db.writer())
         .await

@@ -2353,17 +2353,18 @@ mod tests {
     use buzz_project_context::canonicalize_coordinates;
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::{
-        DeterministicFakeEncoder, EmbeddingVector, ProjectDocumentSourceBasis,
-        ProjectViewSemanticType, ProjectViewSourceBasis, SemanticCoverage, SemanticEncoder,
-        SemanticLifecycleClass, SemanticSourceBasis,
+        DeterministicFakeEncoder, ProjectDocumentSourceBasis, ProjectViewSemanticType,
+        ProjectViewSourceBasis, SemanticCoverage, SemanticEncoder, SemanticLifecycleClass,
+        SemanticSourceBasis,
     };
     use buzz_semantic_query::{
-        budget_profile_digest, candidate_score, derive_root_id, query_contract_digest,
-        ranking_contract_digest, CanonicalSourceProvenance, DegradedModeCounts,
-        EmbeddingCoverageCounts, OmittedContextChannelCounts, OmittedForResponseBudgetCounts,
-        ProjectContextEdgeProvenance, RootDiscoveryChannel, SemanticGraphQuery,
-        SemanticGraphQueryCoverage, SemanticGraphQueryInputObservations,
-        SemanticGraphQueryObservations, TruncationCountsByDimension,
+        budget_profile_digest, build_problem_query_encoder_input, candidate_score, derive_root_id,
+        query_contract_digest, ranking_contract_digest, CanonicalSourceProvenance,
+        DegradedModeCounts, EmbeddingCoverageCounts, OmittedContextChannelCounts,
+        OmittedForResponseBudgetCounts, ProjectContextEdgeProvenance, ProviderEncodedSemanticInput,
+        RootDiscoveryChannel, SemanticGraphQuery, SemanticGraphQueryCoverage,
+        SemanticGraphQueryInputObservations, SemanticGraphQueryObservations,
+        TruncationCountsByDimension,
     };
     use chrono::Utc;
     use nostr::Keys;
@@ -2858,14 +2859,17 @@ mod tests {
             project_context_revision: 7,
             observed_at,
         };
-        let problem_channel_id = digest(1);
-        let vector = SemanticExactQueryVector::new(
-            &ticket,
-            problem_channel_id,
-            query_fences,
-            EmbeddingVector::new(vec![1.0, 0.0, 0.0], &contract).expect("query vector"),
+        let input = build_problem_query_encoder_input(fixture_uuid(3), "linear traversal")
+            .expect("problem input");
+        let problem_channel_id = input.channel_id();
+        let encoded = ProviderEncodedSemanticInput::new(
+            input.semantic_input(),
+            contract.model.clone(),
+            vec![1.0, 0.0, 0.0],
+            &contract,
         )
-        .expect("bound query vector");
+        .expect("Provider-bound input");
+        let vector = SemanticExactQueryVector::new(&ticket, encoded).expect("bound query vector");
         (ticket, vector, problem_channel_id)
     }
 

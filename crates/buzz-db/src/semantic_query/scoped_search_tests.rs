@@ -2,13 +2,12 @@ use buzz_core::{CommunityId, Keys, PublicKey};
 use buzz_project_context::{EdgeKey, ProjectContextCoordinate};
 use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic::{
-    Digest32, EmbeddingVector, SemanticCoverage, SemanticDistanceMetric, SemanticEligibility,
-    SemanticModelContract, SemanticNormalization, SemanticProviderBoundary, SemanticSourceBasis,
-    SemanticSourceIdentity,
+    Digest32, SemanticCoverage, SemanticDistanceMetric, SemanticEligibility, SemanticModelContract,
+    SemanticNormalization, SemanticProviderBoundary, SemanticSourceBasis, SemanticSourceIdentity,
 };
 use buzz_semantic_query::{
-    OneHopCanonicalRead, OneHopOmittedCandidateCounts, OneHopSemanticSelection,
-    QueryCompatibilityFences, Score,
+    build_problem_query_encoder_input, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
+    OneHopSemanticSelection, ProviderEncodedSemanticInput, QueryCompatibilityFences, Score,
 };
 use chrono::Utc;
 use pgvector::Vector;
@@ -19,6 +18,23 @@ use super::*;
 use crate::semantic::{observe_semantic_source_in_connection, SemanticGenerationRecord};
 use crate::semantic_query::{SemanticCurrentHead, SemanticGraphStructuralRoles};
 use crate::{Db, DbConfig};
+
+fn problem_vector(
+    ticket: &super::super::SemanticGraphQueryTicket,
+    request_id: Uuid,
+    values: Vec<f32>,
+) -> SemanticExactQueryVector {
+    let input =
+        build_problem_query_encoder_input(request_id, "one-hop fixture").expect("problem input");
+    let encoded = ProviderEncodedSemanticInput::new(
+        input.semantic_input(),
+        ticket.generation.model_contract.model.clone(),
+        values,
+        &ticket.generation.model_contract,
+    )
+    .expect("Provider-bound input");
+    SemanticExactQueryVector::new(ticket, encoded).expect("generation-bound query vector")
+}
 
 #[test]
 fn scoped_sql_is_revision_bound_and_has_no_semantic_ranking_policy() {
@@ -360,13 +376,7 @@ async fn one_hop_scoped_search_real_pgvector_is_direct_complete_and_hydrated() {
         project_context_revision: 9,
         observed_at,
     };
-    let vector = SemanticExactQueryVector::new(
-        &ticket,
-        Digest32::from_bytes([0x51; 32]),
-        query_fences,
-        EmbeddingVector::new(vec![1.0, 0.0, 0.0], &contract).expect("query embedding"),
-    )
-    .expect("one-hop query vector");
+    let vector = problem_vector(&ticket, Uuid::from_u128(0x51), vec![1.0, 0.0, 0.0]);
     let mut read = super::super::SemanticGraphReadTx {
         tx,
         ticket,
@@ -807,15 +817,7 @@ async fn one_hop_scoped_search_read_only_current_database_canary() {
         .expect("one-hop ticket");
     let mut values = vec![0.0_f32; ticket.generation.model_contract.dimensions];
     values[0] = 1.0;
-    let embedding = EmbeddingVector::new(values, &ticket.generation.model_contract)
-        .expect("one-hop canary vector");
-    let query = SemanticExactQueryVector::new(
-        &ticket,
-        buzz_semantic::Digest32::from_bytes([0xA5; 32]),
-        ticket.query_fences,
-        embedding,
-    )
-    .expect("one-hop exact vector");
+    let query = problem_vector(&ticket, Uuid::from_u128(0xA5), values);
     let mut read = db
         .begin_semantic_graph_read(
             &ticket,

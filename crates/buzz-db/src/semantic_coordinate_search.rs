@@ -9,13 +9,15 @@ use buzz_project_context::ProjectContextCoordinate;
 use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic_query::{
     coordinate_search_query_contract_digest, EncodedCoordinateSearchQuery,
-    ProjectContextCoordinateSearchCandidate, Score, MAX_COORDINATE_SEARCH_LIMIT,
+    ProjectContextCoordinateSearchCandidate, Score, SemanticQueryInputKind,
+    MAX_COORDINATE_SEARCH_LIMIT,
 };
 use pgvector::Vector;
 use sqlx::Row;
 
 use crate::semantic_query::{
-    SemanticGraphQueryTicket, SemanticGraphReadTx, SemanticGraphSnapshotBinding,
+    GenerationBoundQueryVector, SemanticGraphQueryTicket, SemanticGraphReadTx,
+    SemanticGraphSnapshotBinding,
 };
 use crate::{DbError, Result};
 
@@ -32,9 +34,7 @@ pub struct SemanticCoordinateSearchBatch {
 
 /// One Coordinate-search vector bound to the active Foundation generation.
 pub struct SemanticCoordinateSearchVector {
-    embedding: buzz_semantic::EmbeddingVector,
-    query_contract_digest: buzz_semantic::Digest32,
-    query_input_digest: buzz_semantic::Digest32,
+    inner: GenerationBoundQueryVector,
 }
 
 impl SemanticCoordinateSearchVector {
@@ -43,31 +43,28 @@ impl SemanticCoordinateSearchVector {
         ticket: &SemanticGraphQueryTicket,
         encoded: EncodedCoordinateSearchQuery,
     ) -> Result<Self> {
-        if encoded.source_generation_contract_digest()
-            != ticket.query_fences.source_generation_contract_digest
-            || encoded.embedding_space_fence() != ticket.query_fences.embedding_space_fence
-            || encoded.response_model() != ticket.generation.model_contract.model
-            || encoded.query_contract_digest() != coordinate_search_query_contract_digest()
+        if !matches!(
+            encoded.provider_encoded().channel_kind(),
+            SemanticQueryInputKind::CoordinateSearch
+        ) || encoded.query_contract_digest() != coordinate_search_query_contract_digest()
         {
             return Err(DbError::InvalidData(
                 "Coordinate-search Provider result does not match the active generation".to_owned(),
             ));
         }
         Ok(Self {
-            query_contract_digest: encoded.query_contract_digest(),
-            query_input_digest: encoded.query_input_digest(),
-            embedding: encoded.embedding().clone(),
+            inner: GenerationBoundQueryVector::bind(ticket, encoded.into_provider_encoded())?,
         })
     }
 
     /// Independently versioned query contract digest.
     pub const fn query_contract_digest(&self) -> buzz_semantic::Digest32 {
-        self.query_contract_digest
+        self.inner.encoding_contract_digest()
     }
 
     /// Exact canonical Provider input digest.
     pub const fn query_input_digest(&self) -> buzz_semantic::Digest32 {
-        self.query_input_digest
+        self.inner.input_digest()
     }
 }
 
@@ -87,7 +84,12 @@ impl SemanticGraphReadTx {
                 "Coordinate-search limit must be between 1 and {MAX_COORDINATE_SEARCH_LIMIT}"
             )));
         }
-        if query_vector.query_contract_digest != coordinate_search_query_contract_digest() {
+        if !matches!(
+            query_vector.inner.channel_kind(),
+            SemanticQueryInputKind::CoordinateSearch
+        ) || query_vector.query_contract_digest() != coordinate_search_query_contract_digest()
+            || query_vector.inner.generation_fences() != &self.ticket.generation_fences()?
+        {
             return Err(DbError::InvalidData(
                 "Coordinate-search vector does not match the query contract".to_owned(),
             ));
@@ -110,7 +112,9 @@ impl SemanticGraphReadTx {
             .bind(self.ticket.generation.extractor_version.as_str())
             .bind(self.ticket.generation.model_contract.model.as_str())
             .bind(dimensions)
-            .bind(Vector::from(query_vector.embedding.as_slice().to_vec()))
+            .bind(Vector::from(
+                query_vector.inner.embedding().as_slice().to_vec(),
+            ))
             .bind(observed_limit)
             .fetch_all(&mut *self.tx)
             .await?;

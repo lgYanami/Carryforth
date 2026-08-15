@@ -14,8 +14,7 @@ use buzz_semantic_query::{
     edge_coordinate_ranking_contract_digest, incident_edge_ranking_contract_digest,
     OneHopSemanticError, OneHopSemanticObservations, OneHopSemanticScope,
     ProjectContextOneHopSemanticQuery, ProjectContextOneHopSemanticQueryResult,
-    QueryCompatibilityFences, SemanticGraphQueryError, SemanticQueryEncoder,
-    MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS,
+    SemanticGraphQueryError, SemanticQueryEncoder, MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS,
 };
 use nostr::Event;
 
@@ -239,18 +238,8 @@ fn bind_one_hop_query_vector(
     {
         return Err(verification_failed("provider_result_identity"));
     }
-    let fences = QueryCompatibilityFences {
-        source_generation_contract_digest: encoded.source_generation_contract_digest(),
-        embedding_space_fence: encoded.embedding_space_fence(),
-        query_contract_digest: encoded.query_contract_digest(),
-    };
-    SemanticExactQueryVector::new(
-        ticket,
-        encoded.channel_id(),
-        fences,
-        encoded.embedding().clone(),
-    )
-    .map_err(classify_database)
+    SemanticExactQueryVector::new(ticket, encoded.into_provider_encoded())
+        .map_err(classify_database)
 }
 
 fn classify_database(error: buzz_db::DbError) -> OneHopSemanticExecutionError {
