@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U4 已通过；U5–U7 待交付
+> 状态：U0–U5 已通过；U6–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -16,7 +16,7 @@
 | U2 共同 Provider encoder | 通过 | Coordinate 与 graph 兼容 adapter 委托同一 bounded batch primitive；无 retry/fallback/额外调用 |
 | U3 one-hop tagged family | 通过 | 两个 variant 只切换到 closed explicit-source facade；原有同一 exact SQL 与全部 policy 保持不变 |
 | U4 whole-graph Coordinate | 通过 | Coordinate v1 接入共同 scorer；同 snapshot 精确差分与10k性能门通过 |
-| U5 bounded complete path | 待执行 | — |
+| U5 bounded complete path | 通过 | Q0/Qi closed bundle、root/relation/target scorer与path retention零行为迁移通过 |
 | U6 默认切换与 legacy 收口 | 待执行 | — |
 | U7 最终资格与文档关闭 | 待执行 | — |
 
@@ -240,3 +240,44 @@ aggregate gate继续通过49个`buzz-semantic-query`测试、31个相关DB测试
 定向回归。Coordinate的40913 wire/capability/gate、Provider单调用、one-shot RR/release、public result和错误
 合同未变；one-hop与完整路径回归未发生policy漂移。真实Provider canary仍因缺少受支持的
 `BUZZ_SEMANTIC_*`配置未运行。
+
+## 7. U5 bounded complete path
+
+U5 将完整路径的有序Q0/Qi结果收口为`SemanticGraphQueryVectorBundle`。该类型只接受：Q0首项、其后按
+canonical Coordinate严格排序的Qi、graph query contract digest，以及同一request、Community/generation、
+model space和Provider batch。traversal channel binding还会在DB侧逐项验证`channel_id`对应的Qi Coordinate，
+不能交换Q0或两个context分支。
+
+迁移保留两条closed adapter：
+
+- compiled `Legacy`继续执行历史graph encoder与`SemanticExactQueryVector` binder，再无损转换为bundle；
+- `Migrated`直接执行共同`SemanticInputEncoder`并由writer-DB ticket绑定共同Provider bundle。
+
+两条adapter之后共用同一个授权/current-head/exact-score SQL和既有policy owner。普通请求仍由compiled
+`migrated/migrated/legacy/legacy` profile选择legacy完整路径adapter；不存在请求字段、自动fallback、双Provider
+调用或第二个snapshot。fleet runtime contract/digest因此仍保持U4值。
+
+差分证据分为三层：
+
+1. pure binder：同一Provider Q0+Qi结果经历史wrapper和共同bundle后逐字段相等，并拒绝错误Q0/Qi绑定；
+2. disposable pgvector：同一RR snapshot中历史exact入口与共同graph scorer的root score rows完全相等；共同
+   bundle继续完成relation Document与完整Hyperedge target排名，保留原coherence、relation/target/transition
+   floor；
+3. traversal/packing：compatibility/common bundle在同一2-hop synthetic backend得到完全相同的roots、paths、
+   materialization、retention、truncation与completion；既有1–6 hop pack/sign/SDK验证以及40912回归继续通过。
+
+最终执行证据：
+
+~~~text
+just semantic-migration-test
+just semantic-retrieval-computation
+cargo clippy -p buzz-semantic-query -p buzz-db -p buzz-relay --all-targets -- -D warnings
+cargo check -p buzz-semantic-query -p buzz-db -p buzz-relay
+git diff --check
+~~~
+
+aggregate gate通过49个`buzz-semantic-query`测试、32个相关DB测试（4 ignored）和74个Relay语义测试；
+service-backed disposable pgvector fixture额外实际执行了完整路径root、relation和target scorer。完整路径现有
+generation/context churn retry、Provider reservation/final confirm、traversal permit、唯一RR snapshot、budget、
+path identity、coverage/packing与`expected_snapshot: None` release语义均未修改。真实Provider canary仍因缺少
+受支持的`BUZZ_SEMANTIC_*`配置未运行。

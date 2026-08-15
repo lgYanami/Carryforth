@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use buzz_core::CommunityId;
+use buzz_project_context::ProjectContextCoordinate;
 use buzz_semantic::{Digest32, EmbeddingVector, SemanticSourceIdentity};
 use buzz_semantic_query::{
     coordinate_search_query_contract_digest, LifecycleFilter, ProviderEncodedSemanticInput,
@@ -183,6 +184,67 @@ impl GenerationBoundQueryVector {
 #[derive(Clone, PartialEq)]
 pub struct GenerationBoundQueryVectorBundle {
     vectors: Vec<GenerationBoundQueryVector>,
+}
+
+/// Closed ordered Q0/Qi bundle accepted by the bounded complete-path scorer.
+///
+/// The common generation-bound representation is deliberately wrapped again
+/// at the operation boundary. This prevents a Coordinate-search vector or a
+/// non-canonical Q0/Qi set from entering graph root or traversal scoring even
+/// though all operations share the mathematical exact-score kernel.
+#[derive(Clone, PartialEq)]
+pub struct SemanticGraphQueryVectorBundle {
+    inner: GenerationBoundQueryVectorBundle,
+}
+
+impl std::fmt::Debug for SemanticGraphQueryVectorBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticGraphQueryVectorBundle")
+            .field("vector_count", &self.inner.vectors.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SemanticGraphQueryVectorBundle {
+    /// Bind one common Provider result bundle to an authorized graph-query
+    /// ticket and revalidate the closed Q0/Qi operation shape.
+    pub fn bind(
+        ticket: &SemanticGraphQueryTicket,
+        encoded: ProviderEncodedSemanticInputBundle,
+    ) -> Result<Self> {
+        let inner = GenerationBoundQueryVectorBundle::bind(ticket, encoded)?;
+        validate_graph_query_vectors(ticket, inner.vectors.iter(), inner.vectors.len())?;
+        Ok(Self { inner })
+    }
+
+    /// Convert the historical per-channel graph wrappers without changing a
+    /// vector, channel, generation binding, or order.
+    pub fn from_compatibility_vectors(
+        ticket: &SemanticGraphQueryTicket,
+        vectors: Vec<SemanticExactQueryVector>,
+    ) -> Result<Self> {
+        let inner = GenerationBoundQueryVectorBundle {
+            vectors: vectors.into_iter().map(|vector| vector.inner).collect(),
+        };
+        validate_graph_query_vectors(ticket, inner.vectors.iter(), inner.vectors.len())?;
+        Ok(Self { inner })
+    }
+
+    /// Ordered Q0 followed by every retained canonical Qi vector.
+    pub fn vectors(&self) -> &[GenerationBoundQueryVector] {
+        self.inner.vectors()
+    }
+
+    /// Number of executed query channels.
+    pub fn len(&self) -> usize {
+        self.inner.vectors.len()
+    }
+
+    /// Whether this closed bundle has no channel.
+    pub fn is_empty(&self) -> bool {
+        self.inner.vectors.is_empty()
+    }
 }
 
 impl GenerationBoundQueryVectorBundle {
@@ -456,6 +518,45 @@ pub(super) fn validate_generation_bound_vectors<'a>(
         return Err(DbError::InvalidData(
             "semantic query vector iterator count mismatch".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_graph_query_vectors<'a>(
+    ticket: &SemanticGraphQueryTicket,
+    vectors: impl IntoIterator<Item = &'a GenerationBoundQueryVector>,
+    count: usize,
+) -> Result<()> {
+    let vectors = vectors.into_iter().collect::<Vec<_>>();
+    validate_generation_bound_vectors(ticket, vectors.iter().copied(), count)?;
+    let mut previous_context: Option<&ProjectContextCoordinate> = None;
+    for (index, channel) in vectors.into_iter().enumerate() {
+        if channel.encoding_contract_digest() != ticket.query_fences.query_contract_digest {
+            return Err(DbError::InvalidData(format!(
+                "semantic query vector {index} does not match the graph input contract"
+            )));
+        }
+        match (index, channel.channel_kind()) {
+            (0, SemanticQueryInputKind::Problem) => {}
+            (0, _) => {
+                return Err(DbError::InvalidData(
+                    "semantic query vector bundle must begin with Q0".to_owned(),
+                ));
+            }
+            (_, SemanticQueryInputKind::ConditionedContext { context_coordinate }) => {
+                if previous_context.is_some_and(|previous| previous >= context_coordinate) {
+                    return Err(DbError::InvalidData(
+                        "semantic conditioned vector order is not canonical".to_owned(),
+                    ));
+                }
+                previous_context = Some(context_coordinate);
+            }
+            (_, _) => {
+                return Err(DbError::InvalidData(
+                    "semantic query vector bundle contains a non-Qi tail".to_owned(),
+                ));
+            }
+        }
     }
     Ok(())
 }

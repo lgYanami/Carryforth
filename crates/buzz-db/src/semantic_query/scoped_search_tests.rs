@@ -7,7 +7,8 @@ use buzz_semantic::{
 };
 use buzz_semantic_query::{
     build_problem_query_encoder_input, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
-    OneHopSemanticSelection, ProviderEncodedSemanticInput, QueryCompatibilityFences, Score,
+    OneHopSemanticSelection, ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle,
+    QueryCompatibilityFences, Score, SemanticQueryInputBundle,
 };
 use chrono::Utc;
 use pgvector::Vector;
@@ -16,7 +17,12 @@ use uuid::Uuid;
 
 use super::*;
 use crate::semantic::{observe_semantic_source_in_connection, SemanticGenerationRecord};
-use crate::semantic_query::{SemanticCurrentHead, SemanticGraphStructuralRoles};
+use crate::semantic_query::{
+    SemanticCurrentHead, SemanticEdgeTargetRankOutcome, SemanticEdgeTargetRankRequest,
+    SemanticGraphQueryVectorBundle, SemanticGraphStructuralRoles, SemanticHyperedgeExpectation,
+    SemanticHyperedgeReadOutcome, SemanticIncidentRelationRankOutcome,
+    SemanticIncidentRelationRankRequest, SemanticTraversalQueryChannels,
+};
 use crate::{Db, DbConfig};
 
 fn problem_vector(
@@ -24,16 +30,38 @@ fn problem_vector(
     request_id: Uuid,
     values: Vec<f32>,
 ) -> SemanticExactQueryVector {
+    problem_vector_pair(ticket, request_id, values).0
+}
+
+fn problem_vector_pair(
+    ticket: &super::super::SemanticGraphQueryTicket,
+    request_id: Uuid,
+    values: Vec<f32>,
+) -> (SemanticExactQueryVector, SemanticGraphQueryVectorBundle) {
     let input =
         build_problem_query_encoder_input(request_id, "one-hop fixture").expect("problem input");
     let encoded = ProviderEncodedSemanticInput::new(
         input.semantic_input(),
         ticket.generation.model_contract.model.clone(),
-        values,
+        values.clone(),
         &ticket.generation.model_contract,
     )
     .expect("Provider-bound input");
-    SemanticExactQueryVector::new(ticket, encoded).expect("generation-bound query vector")
+    let compatibility = SemanticExactQueryVector::new(ticket, encoded.clone())
+        .expect("generation-bound query vector");
+    let input_bundle =
+        SemanticQueryInputBundle::from_closed_inputs(vec![input.semantic_input().clone()])
+            .expect("complete-path input bundle");
+    let provider_bundle = ProviderEncodedSemanticInputBundle::new(
+        &input_bundle,
+        ticket.generation.model_contract.model.clone(),
+        vec![values],
+        &ticket.generation.model_contract,
+    )
+    .expect("complete-path Provider bundle");
+    let migrated = SemanticGraphQueryVectorBundle::bind(ticket, provider_bundle)
+        .expect("complete-path query bundle");
+    (compatibility, migrated)
 }
 
 #[test]
@@ -376,13 +404,103 @@ async fn one_hop_scoped_search_real_pgvector_is_direct_complete_and_hydrated() {
         project_context_revision: 9,
         observed_at,
     };
-    let vector = problem_vector(&ticket, Uuid::from_u128(0x51), vec![1.0, 0.0, 0.0]);
+    let (vector, graph_vectors) =
+        problem_vector_pair(&ticket, Uuid::from_u128(0x51), vec![1.0, 0.0, 0.0]);
+    let problem_channel_id = vector.channel_id();
     let mut read = super::super::SemanticGraphReadTx {
         tx,
         ticket,
         reader_pubkey: reader.public_key().to_bytes().to_vec(),
         expected_projection_pubkey: projection,
     };
+
+    let compatibility_scores = read
+        .query_exact_source_scores(
+            buzz_semantic_query::LifecycleFilter::AllCurrent,
+            &[],
+            std::slice::from_ref(&vector),
+            None,
+            Some(8),
+        )
+        .await
+        .expect("compatibility complete-path root scores");
+    let migrated_scores = read
+        .query_graph_exact_source_scores(
+            buzz_semantic_query::LifecycleFilter::AllCurrent,
+            &[],
+            &graph_vectors,
+            None,
+            Some(8),
+        )
+        .await
+        .expect("migrated complete-path root scores");
+    assert_eq!(migrated_scores, compatibility_scores);
+
+    let traversal_channels = SemanticTraversalQueryChannels {
+        query_vectors: &graph_vectors,
+        problem_channel_id,
+        conditioned: &[],
+    };
+    let relation_rank = read
+        .rank_incident_relation_options_exact(SemanticIncidentRelationRankRequest {
+            entered_from: &coordinates[0],
+            channels: traversal_channels,
+            after: None,
+            limit: 8,
+        })
+        .await
+        .expect("migrated complete-path relation rank");
+    let SemanticIncidentRelationRankOutcome::Ranked(relation_rank) = relation_rank else {
+        panic!("ranked complete-path relation")
+    };
+    let relation = relation_rank.options.first().expect("relation option");
+    assert_eq!(relation.edge_key, edge_key);
+    assert_eq!(relation.document_id, relation_document);
+    let edge = read
+        .load_complete_hyperedge(&SemanticHyperedgeExpectation {
+            edge_key,
+            edge_provenance: relation.edge_provenance.clone(),
+            required_binding: Some(buzz_semantic_query::ContextDocumentBindingObservation {
+                document_id: relation.document_id,
+                provenance: relation.binding_provenance.clone(),
+            }),
+        })
+        .await
+        .expect("complete-path Hyperedge");
+    let SemanticHyperedgeReadOutcome::Current(edge) = edge else {
+        panic!("current complete-path Hyperedge")
+    };
+    let relation_head = &relation
+        .channel_scores
+        .first()
+        .expect("relation Q0 score")
+        .head;
+    let target_rank = read
+        .rank_edge_target_options_exact(SemanticEdgeTargetRankRequest {
+            hyperedge: &edge,
+            relation_document_id: relation.document_id,
+            relation_document_head: relation_head,
+            document_score: relation.document_score,
+            lifecycle_filter: buzz_semantic_query::LifecycleFilter::AllCurrent,
+            channels: traversal_channels,
+            after: None,
+            limit: 8,
+        })
+        .await
+        .expect("migrated complete-path target rank");
+    let SemanticEdgeTargetRankOutcome::Ranked(target_rank) = target_rank else {
+        panic!("ranked complete-path targets")
+    };
+    assert_eq!(target_rank.edge.edge_key, edge_key);
+    assert_eq!(target_rank.options.len(), 1);
+    assert!(target_rank
+        .options
+        .iter()
+        .all(|option| option.transition_score > Score::ZERO));
+    assert!(target_rank
+        .options
+        .windows(2)
+        .all(|pair| pair[0].transition_score >= pair[1].transition_score));
 
     let incident = read
         .search_incident_edges_one_hop(&coordinates[0], &vector, 8)

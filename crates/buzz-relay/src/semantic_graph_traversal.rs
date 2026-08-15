@@ -12,8 +12,8 @@ use std::future::Future;
 use buzz_db::semantic_query::{
     semantic_source_identity_for_coordinate, SemanticCanonicalHydrationBatch, SemanticCurrentHead,
     SemanticEdgeTargetRankOutcome, SemanticEdgeTargetRankRequest, SemanticExactSourceScore,
-    SemanticGraphQueryTicket, SemanticGraphReadTx, SemanticHydratedCurrentSource,
-    SemanticHyperedgeExpectation, SemanticHyperedgeReadOutcome,
+    SemanticGraphQueryTicket, SemanticGraphQueryVectorBundle, SemanticGraphReadTx,
+    SemanticHydratedCurrentSource, SemanticHyperedgeExpectation, SemanticHyperedgeReadOutcome,
     SemanticIncidentRelationRankOutcome, SemanticIncidentRelationRankRequest,
     SemanticRankedRelationOption, SemanticRankedTargetOption, SemanticRelationOptionOmission,
     SemanticTargetOptionOmission, SemanticTraversalConditionedChannel,
@@ -243,7 +243,7 @@ impl TraversalChannels {
 
     fn borrow<'a>(
         &'a self,
-        query_vectors: &'a [buzz_db::semantic_query::SemanticExactQueryVector],
+        query_vectors: &'a SemanticGraphQueryVectorBundle,
     ) -> SemanticTraversalQueryChannels<'a> {
         SemanticTraversalQueryChannels {
             query_vectors,
@@ -256,7 +256,7 @@ impl TraversalChannels {
 struct TraversalEngine<'a, B> {
     backend: &'a mut B,
     ticket: &'a SemanticGraphQueryTicket,
-    query_vectors: &'a [buzz_db::semantic_query::SemanticExactQueryVector],
+    query_vectors: &'a SemanticGraphQueryVectorBundle,
     channels: &'a TraversalChannels,
     lifecycle_filter: LifecycleFilter,
     budget: SemanticGraphQueryBudget,
@@ -275,7 +275,7 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
     fn new(
         backend: &'a mut B,
         ticket: &'a SemanticGraphQueryTicket,
-        query_vectors: &'a [buzz_db::semantic_query::SemanticExactQueryVector],
+        query_vectors: &'a SemanticGraphQueryVectorBundle,
         channels: &'a TraversalChannels,
         lifecycle_filter: LifecycleFilter,
         budget: SemanticGraphQueryBudget,
@@ -2362,9 +2362,9 @@ mod tests {
         query_contract_digest, ranking_contract_digest, CanonicalSourceProvenance,
         DegradedModeCounts, EmbeddingCoverageCounts, OmittedContextChannelCounts,
         OmittedForResponseBudgetCounts, ProjectContextEdgeProvenance, ProviderEncodedSemanticInput,
-        RootDiscoveryChannel, SemanticGraphQuery, SemanticGraphQueryCoverage,
-        SemanticGraphQueryInputObservations, SemanticGraphQueryObservations,
-        TruncationCountsByDimension,
+        ProviderEncodedSemanticInputBundle, RootDiscoveryChannel, SemanticGraphQuery,
+        SemanticGraphQueryCoverage, SemanticGraphQueryInputObservations,
+        SemanticGraphQueryObservations, SemanticQueryInputBundle, TruncationCountsByDimension,
     };
     use chrono::Utc;
     use nostr::Keys;
@@ -2873,6 +2873,23 @@ mod tests {
         (ticket, vector, problem_channel_id)
     }
 
+    fn migrated_linear_bundle(ticket: &SemanticGraphQueryTicket) -> SemanticGraphQueryVectorBundle {
+        let input = build_problem_query_encoder_input(fixture_uuid(3), "linear traversal")
+            .expect("problem input");
+        let inputs =
+            SemanticQueryInputBundle::from_closed_inputs(vec![input.semantic_input().clone()])
+                .expect("common input bundle");
+        let provider = ProviderEncodedSemanticInputBundle::new(
+            &inputs,
+            ticket.generation.model_contract.model.clone(),
+            vec![vec![1.0, 0.0, 0.0]],
+            &ticket.generation.model_contract,
+        )
+        .expect("common Provider result");
+        SemanticGraphQueryVectorBundle::bind(ticket, provider)
+            .expect("migrated complete-path bundle")
+    }
+
     fn linear_steps(project_id: uuid::Uuid, hop_count: u8) -> Vec<LinearStep> {
         (1..=hop_count)
             .map(|index| {
@@ -2992,7 +3009,9 @@ mod tests {
                 problem_channel_id,
                 conditioned: Vec::new(),
             };
-            let query_vectors = vec![vector];
+            let query_vectors =
+                SemanticGraphQueryVectorBundle::from_compatibility_vectors(&ticket, vec![vector])
+                    .expect("complete-path query bundle");
             let search = TraversalEngine::new(
                 &mut backend,
                 &ticket,
@@ -3102,6 +3121,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compatibility_and_common_vector_adapters_retain_the_same_path() {
+        let (ticket, vector, problem_channel_id) = linear_ticket();
+        let compatibility =
+            SemanticGraphQueryVectorBundle::from_compatibility_vectors(&ticket, vec![vector])
+                .expect("compatibility complete-path bundle");
+        let migrated = migrated_linear_bundle(&ticket);
+        assert_eq!(compatibility, migrated);
+
+        let budget = SemanticGraphQueryBudget {
+            max_hops_per_path: 2,
+            max_paths: 1,
+            ..SemanticGraphQueryBudget::default()
+        };
+        let root = linear_root(&ticket, score(900_000));
+        let channels = TraversalChannels {
+            problem_channel_id,
+            conditioned: Vec::new(),
+        };
+        let mut compatibility_backend = LinearTraversalBackend {
+            steps: linear_steps(*ticket.community_id.as_uuid(), 2),
+            ticket: ticket.clone(),
+            problem_channel_id,
+        };
+        let compatibility_output = TraversalEngine::new(
+            &mut compatibility_backend,
+            &ticket,
+            &compatibility,
+            &channels,
+            LifecycleFilter::AllCurrent,
+            budget,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("compatibility traversal")
+        .search(std::slice::from_ref(&root))
+        .await
+        .expect("compatibility path");
+        let mut migrated_backend = LinearTraversalBackend {
+            steps: linear_steps(*ticket.community_id.as_uuid(), 2),
+            ticket: ticket.clone(),
+            problem_channel_id,
+        };
+        let migrated_output = TraversalEngine::new(
+            &mut migrated_backend,
+            &ticket,
+            &migrated,
+            &channels,
+            LifecycleFilter::AllCurrent,
+            budget,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("migrated traversal")
+        .search(std::slice::from_ref(&root))
+        .await
+        .expect("migrated path");
+
+        assert_eq!(compatibility_output.roots, migrated_output.roots);
+        assert_eq!(compatibility_output.paths, migrated_output.paths);
+        assert_eq!(
+            compatibility_output.expanded_coordinates,
+            migrated_output.expanded_coordinates
+        );
+        assert_eq!(
+            compatibility_output.incident_edges_materialized,
+            migrated_output.incident_edges_materialized
+        );
+        assert_eq!(
+            compatibility_output.relation_options_materialized,
+            migrated_output.relation_options_materialized
+        );
+        assert_eq!(
+            compatibility_output.target_options_materialized,
+            migrated_output.target_options_materialized
+        );
+        assert_eq!(
+            compatibility_output.paths_generated,
+            migrated_output.paths_generated
+        );
+        assert_eq!(
+            compatibility_output.paths_retained,
+            migrated_output.paths_retained
+        );
+        assert_eq!(
+            compatibility_output.truncation_counts,
+            migrated_output.truncation_counts
+        );
+        assert_eq!(
+            compatibility_output.exhausted_dimensions,
+            migrated_output.exhausted_dimensions
+        );
+    }
+
+    #[tokio::test]
     async fn traversal_stops_before_an_n_plus_one_coordinate_expansion() {
         let (ticket, vector, problem_channel_id) = linear_ticket();
         let budget = SemanticGraphQueryBudget {
@@ -3124,7 +3235,8 @@ mod tests {
         let search = TraversalEngine::new(
             &mut backend,
             &ticket,
-            &[vector],
+            &SemanticGraphQueryVectorBundle::from_compatibility_vectors(&ticket, vec![vector])
+                .expect("complete-path query bundle"),
             &channels,
             LifecycleFilter::AllCurrent,
             budget,

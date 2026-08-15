@@ -733,8 +733,8 @@ pub struct SemanticTraversalConditionedChannel {
 /// method that consumes this value.
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticTraversalQueryChannels<'a> {
-    /// Exact query vectors, including Q0 and every retained Qi.
-    pub query_vectors: &'a [SemanticExactQueryVector],
+    /// Closed exact query bundle, including Q0 and every retained Qi.
+    pub query_vectors: &'a SemanticGraphQueryVectorBundle,
     /// Channel identity of the problem-only Q0 vector.
     pub problem_channel_id: Digest32,
     /// Exact one-to-one Qi-to-Coordinate bindings.
@@ -1737,7 +1737,7 @@ impl SemanticGraphReadTx {
         &mut self,
         lifecycle_filter: LifecycleFilter,
         explicit_initial_sources: &[SemanticSourceIdentity],
-        query_vectors: &[SemanticExactQueryVector],
+        query_vectors: &SemanticGraphQueryVectorBundle,
         recall_per_channel: u16,
     ) -> Result<SemanticExactRecallBatch> {
         if recall_per_channel == 0 || recall_per_channel > MAX_RECALL_PER_CHANNEL {
@@ -1751,7 +1751,7 @@ impl SemanticGraphReadTx {
                 DbError::InvalidData("semantic recall observation limit overflow".to_string())
             })?;
         let observed = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 lifecycle_filter,
                 explicit_initial_sources,
                 query_vectors,
@@ -1760,8 +1760,9 @@ impl SemanticGraphReadTx {
             )
             .await?;
         let channel_ids: Vec<Digest32> = query_vectors
+            .vectors()
             .iter()
-            .map(SemanticExactQueryVector::channel_id)
+            .map(GenerationBoundQueryVector::channel_id)
             .collect();
         partition_exact_recall(&channel_ids, observed, recall_per_channel)
     }
@@ -1773,7 +1774,7 @@ impl SemanticGraphReadTx {
         &mut self,
         lifecycle_filter: LifecycleFilter,
         explicit_initial_sources: &[SemanticSourceIdentity],
-        query_vectors: &[SemanticExactQueryVector],
+        query_vectors: &SemanticGraphQueryVectorBundle,
         candidates: &[SemanticSourceIdentity],
     ) -> Result<Vec<SemanticExactSourceScore>> {
         if candidates.is_empty() {
@@ -1784,7 +1785,7 @@ impl SemanticGraphReadTx {
                 "semantic score matrix source count exceeds the server bound".to_string(),
             ));
         }
-        self.query_exact_source_scores(
+        self.query_graph_exact_source_scores(
             lifecycle_filter,
             explicit_initial_sources,
             query_vectors,
@@ -1861,7 +1862,7 @@ impl SemanticGraphReadTx {
             .collect::<Vec<_>>();
         validate_unique_sources(&sources, "incident relation")?;
         let matrix = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 LifecycleFilter::AllCurrent,
                 &[],
                 request.channels.query_vectors,
@@ -2037,7 +2038,7 @@ impl SemanticGraphReadTx {
             .collect::<Result<Vec<_>>>()?;
         validate_unique_sources(&sources, "Hyperedge target")?;
         let matrix = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 request.lifecycle_filter,
                 &[],
                 request.channels.query_vectors,
@@ -2442,6 +2443,47 @@ impl SemanticGraphReadTx {
         rows.iter().map(exact_score_from_row).collect()
     }
 
+    async fn query_graph_exact_source_scores(
+        &mut self,
+        lifecycle_filter: LifecycleFilter,
+        explicit_initial_sources: &[SemanticSourceIdentity],
+        query_vectors: &SemanticGraphQueryVectorBundle,
+        candidates: Option<&[SemanticSourceIdentity]>,
+        top_per_channel: Option<u32>,
+    ) -> Result<Vec<SemanticExactSourceScore>> {
+        validate_source_inputs(
+            self.ticket.community_id,
+            explicit_initial_sources,
+            MAX_INITIAL_COORDINATES,
+            "explicit initial source",
+        )?;
+        validate_graph_query_vectors(
+            &self.ticket,
+            query_vectors.vectors().iter(),
+            query_vectors.len(),
+        )?;
+        if let Some(candidates) = candidates {
+            validate_source_inputs(
+                self.ticket.community_id,
+                candidates,
+                MAX_TARGET_SCORE_SET,
+                "candidate source",
+            )?;
+        }
+
+        let rows = self
+            .query_generation_bound_source_score_rows(
+                lifecycle_filter,
+                explicit_initial_sources,
+                &query_vectors.vectors().iter().collect::<Vec<_>>(),
+                candidates,
+                top_per_channel,
+                SemanticExactScoreScope::GraphSources,
+            )
+            .await?;
+        rows.iter().map(exact_score_from_row).collect()
+    }
+
     async fn query_generation_bound_source_score_rows(
         &mut self,
         lifecycle_filter: LifecycleFilter,
@@ -2739,28 +2781,42 @@ fn validate_traversal_channels(
     ticket: &SemanticGraphQueryTicket,
     channels: SemanticTraversalQueryChannels<'_>,
 ) -> Result<()> {
-    validate_query_vectors(ticket, channels.query_vectors)?;
+    validate_graph_query_vectors(
+        ticket,
+        channels.query_vectors.vectors().iter(),
+        channels.query_vectors.len(),
+    )?;
     if channels.conditioned.len().checked_add(1) != Some(channels.query_vectors.len()) {
         return Err(DbError::InvalidData(
             "semantic traversal Q0/Qi binding count is inconsistent".to_string(),
         ));
     }
-    let vector_ids = channels
-        .query_vectors
+    let vectors = channels.query_vectors.vectors();
+    let vector_ids = vectors
         .iter()
-        .map(SemanticExactQueryVector::channel_id)
+        .map(GenerationBoundQueryVector::channel_id)
         .collect::<BTreeSet<_>>();
-    if !vector_ids.contains(&channels.problem_channel_id) {
+    if vectors.first().map(GenerationBoundQueryVector::channel_id)
+        != Some(channels.problem_channel_id)
+    {
         return Err(DbError::InvalidData(
-            "semantic traversal channel binding lacks Q0".to_string(),
+            "semantic traversal channel binding does not identify Q0".to_string(),
         ));
     }
     let mut bound_ids = BTreeSet::from([channels.problem_channel_id]);
     let mut coordinates = BTreeSet::new();
     for conditioned in channels.conditioned {
         validate_coordinate(ticket.community_id, &conditioned.context_coordinate)?;
+        let matches_vector = vectors.iter().any(|vector| {
+            vector.channel_id() == conditioned.channel_id
+                && matches!(
+                    vector.channel_kind(),
+                    SemanticQueryInputKind::ConditionedContext { context_coordinate }
+                        if context_coordinate == &conditioned.context_coordinate
+                )
+        });
         if conditioned.channel_id == channels.problem_channel_id
-            || !vector_ids.contains(&conditioned.channel_id)
+            || !matches_vector
             || !bound_ids.insert(conditioned.channel_id)
             || !coordinates.insert(conditioned.context_coordinate.clone())
         {
@@ -3516,49 +3572,13 @@ fn validate_query_vectors(
     ticket: &SemanticGraphQueryTicket,
     query_vectors: &[SemanticExactQueryVector],
 ) -> Result<()> {
-    if query_vectors.is_empty() || query_vectors.len() > MAX_QUERY_CHANNELS {
-        return Err(DbError::InvalidData(
-            "semantic query vector count is outside the server bound".to_string(),
-        ));
-    }
-    validate_generation_bound_vectors(
+    validate_graph_query_vectors(
         ticket,
         query_vectors
             .iter()
             .map(SemanticExactQueryVector::generation_bound),
         query_vectors.len(),
-    )?;
-    let mut previous_context: Option<&ProjectContextCoordinate> = None;
-    for (index, channel) in query_vectors.iter().enumerate() {
-        let channel = channel.generation_bound();
-        if channel.encoding_contract_digest() != ticket.query_fences.query_contract_digest {
-            return Err(DbError::InvalidData(format!(
-                "semantic query vector {index} does not match the graph input contract"
-            )));
-        }
-        match (index, channel.channel_kind()) {
-            (0, SemanticQueryInputKind::Problem) => {}
-            (0, _) => {
-                return Err(DbError::InvalidData(
-                    "semantic query vector bundle must begin with Q0".to_owned(),
-                ));
-            }
-            (_, SemanticQueryInputKind::ConditionedContext { context_coordinate }) => {
-                if previous_context.is_some_and(|previous| previous >= context_coordinate) {
-                    return Err(DbError::InvalidData(
-                        "semantic conditioned vector order is not canonical".to_owned(),
-                    ));
-                }
-                previous_context = Some(context_coordinate);
-            }
-            (_, _) => {
-                return Err(DbError::InvalidData(
-                    "semantic query vector bundle contains a non-Qi tail".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 fn vector_norm_squared(values: &[f32]) -> f64 {
@@ -5740,10 +5760,11 @@ mod tests {
     };
     use buzz_semantic_query::{
         build_coordinate_search_encoder_input, build_problem_query_encoder_input,
-        ContextDocumentBindingObservation, ProjectContextBindingProvenance,
-        ProjectContextCoordinateSearchQuery, ProjectContextEdgeProvenance,
-        ProviderEncodedSemanticInput, QueryCompatibilityFences, RelationRankCursor, Score,
-        SemanticEdgeObservation, TargetRankCursor,
+        build_query_encoder_inputs, ConditionedContextOverview, ContextDocumentBindingObservation,
+        LifecycleFilter, ProjectContextBindingProvenance, ProjectContextCoordinateSearchQuery,
+        ProjectContextEdgeProvenance, ProviderEncodedSemanticInput,
+        ProviderEncodedSemanticInputBundle, QueryCompatibilityFences, RelationRankCursor, Score,
+        SemanticEdgeObservation, SemanticGraphQuery, SemanticGraphQueryBudget, TargetRankCursor,
     };
     use chrono::Utc;
     use pgvector::Vector;
@@ -5759,12 +5780,14 @@ mod tests {
         validate_query_vectors, CurrentSemanticAvailabilityClass, SemanticContextEgressExpectation,
         SemanticContextOmissionReason, SemanticCurrentContextOverview, SemanticCurrentHead,
         SemanticExactQueryVector, SemanticExactRecallExhaustion, SemanticExactSourceScore,
-        SemanticGraphQueryTicket, SemanticGraphStructuralRoles, SemanticOmittedContextEvidence,
-        SemanticRankedRelationOption, SemanticRankedTargetOption, SemanticTraversalSliceExhaustion,
-        AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
-        CURRENT_SEMANTIC_SOURCE_STATES_SQL, EXACT_SOURCE_SCORES_SQL,
-        FINAL_CONFIRMATION_ISOLATION_SQL, GLOBAL_GRAPH_COORDINATE_SCORES_SQL,
-        INCIDENT_RELATION_REFS_SQL, LOCK_EGRESS_CONTEXT_STATE_SQL, LOCK_EGRESS_GENERATION_SQL,
+        SemanticGraphQueryTicket, SemanticGraphQueryVectorBundle, SemanticGraphStructuralRoles,
+        SemanticOmittedContextEvidence, SemanticRankedRelationOption, SemanticRankedTargetOption,
+        SemanticTraversalConditionedChannel, SemanticTraversalQueryChannels,
+        SemanticTraversalSliceExhaustion, AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL,
+        CURRENT_COORDINATE_MEMBERSHIPS_SQL, CURRENT_SEMANTIC_SOURCE_STATES_SQL,
+        EXACT_SOURCE_SCORES_SQL, FINAL_CONFIRMATION_ISOLATION_SQL,
+        GLOBAL_GRAPH_COORDINATE_SCORES_SQL, INCIDENT_RELATION_REFS_SQL,
+        LOCK_EGRESS_CONTEXT_STATE_SQL, LOCK_EGRESS_GENERATION_SQL,
         LOCK_FINAL_CONFIRMATION_COMMUNITY_SQL, SEMANTIC_GRAPH_COVERAGE_SQL,
     };
     use crate::semantic::SemanticGenerationRecord;
@@ -5976,6 +5999,94 @@ mod tests {
             EmbeddingVector::new(vec![0.0, 0.0, 0.0], &first_ticket.generation.model_contract)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn complete_path_common_bundle_matches_historical_graph_wrappers() {
+        let encoder = DeterministicFakeEncoder::new(3).expect("fake encoder");
+        let ticket = ticket(encoder.contract().clone());
+        let context = ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Work,
+            object_id: Uuid::new_v4(),
+        };
+        let query = SemanticGraphQuery {
+            request_id: Uuid::new_v4(),
+            project_id: *ticket.community_id.as_uuid(),
+            problem: "complete-path adapter parity".to_owned(),
+            initial_coordinates: Vec::new(),
+            context_coordinates: vec![context.clone()],
+            lifecycle_filter: LifecycleFilter::AllCurrent,
+            budget: SemanticGraphQueryBudget::default(),
+        };
+        let inputs = build_query_encoder_inputs(
+            &query,
+            &[ConditionedContextOverview {
+                coordinate: context,
+                current_overview_semantic_text: "current Work overview".to_owned(),
+            }],
+        )
+        .expect("Q0/Qi inputs");
+        let common_inputs = inputs.semantic_input_bundle().expect("common input bundle");
+        let provider = ProviderEncodedSemanticInputBundle::new(
+            &common_inputs,
+            ticket.generation.model_contract.model.clone(),
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            &ticket.generation.model_contract,
+        )
+        .expect("Provider bundle");
+        let direct = SemanticGraphQueryVectorBundle::bind(&ticket, provider.clone())
+            .expect("direct graph bundle");
+        let compatibility = provider
+            .into_inputs()
+            .into_iter()
+            .map(|encoded| SemanticExactQueryVector::new(&ticket, encoded))
+            .collect::<crate::Result<Vec<_>>>()
+            .expect("historical graph wrappers");
+        let compatibility =
+            SemanticGraphQueryVectorBundle::from_compatibility_vectors(&ticket, compatibility)
+                .expect("compatibility graph bundle");
+
+        assert_eq!(direct, compatibility);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(
+            direct.vectors()[0].channel_id(),
+            inputs.inputs[0].channel_id()
+        );
+        assert_eq!(
+            direct.vectors()[1].channel_id(),
+            inputs.inputs[1].channel_id()
+        );
+
+        let conditioned = [SemanticTraversalConditionedChannel {
+            channel_id: inputs.inputs[1].channel_id(),
+            context_coordinate: query.context_coordinates[0].clone(),
+        }];
+        let channels = SemanticTraversalQueryChannels {
+            query_vectors: &direct,
+            problem_channel_id: inputs.inputs[0].channel_id(),
+            conditioned: &conditioned,
+        };
+        assert!(super::validate_traversal_channels(&ticket, channels).is_ok());
+        let wrong_problem = SemanticTraversalQueryChannels {
+            problem_channel_id: inputs.inputs[1].channel_id(),
+            ..channels
+        };
+        assert!(super::validate_traversal_channels(&ticket, wrong_problem).is_err());
+        let wrong_conditioned = [SemanticTraversalConditionedChannel {
+            channel_id: inputs.inputs[1].channel_id(),
+            context_coordinate: ProjectContextCoordinate::ProjectViewObject {
+                object_type: ProjectViewObjectType::Work,
+                object_id: Uuid::new_v4(),
+            },
+        }];
+        assert!(super::validate_traversal_channels(
+            &ticket,
+            SemanticTraversalQueryChannels {
+                conditioned: &wrong_conditioned,
+                ..channels
+            }
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0–U4 已交付；U5–U7 待交付
+> 状态：实现设计已冻结；U0–U5 已交付；U6–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -615,7 +615,8 @@ Phase 1并另开兼容迁移。
 | U2 共同 Provider encoder | 已完成 | Coordinate、one-hop 与完整路径 adapter 均委托一次 bounded common batch；历史 fake/golden 不变 |
 | U3 one-hop tagged family | 已完成 | 两个 variant 通过 closed explicit-source scope facade 调用既有同一 exact SQL；40914 policy/wire 不变 |
 | U4 whole-graph Coordinate | 已完成 | 独立模板进入 shared scorer；同 snapshot legacy/shared 精确相等，10k closed physical plan 无性能退化 |
-| U5–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
+| U5 bounded complete path | 已完成 | Q0/Qi closed bundle进入root与traversal scorer；同快照/同向量与路径差分通过 |
+| U6–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
 
 ### U0：设计与差分门
 
@@ -705,6 +706,22 @@ fleet runtime digest `9601b101…`。因此普通Coordinate流量仍走legacy，
 
 退出条件：四象限差分均闭合：legacy scorer/legacy policy、new scorer/legacy policy、legacy scorer/new
 adapter、new/new；40912 wire、budget和known-negative现状无意外变化。
+
+交付复核：U5 新增`SemanticGraphQueryVectorBundle`作为完整路径专属的closed Q0/Qi DB边界。compiled
+`Legacy` route继续调用历史`SemanticQueryEncoder`和逐channel `SemanticExactQueryVector` binder，再无损转换为
+closed bundle；`Migrated` route才直接调用共同`SemanticInputEncoder`并绑定共同Provider bundle。两条route在
+请求开始时固定，失败后不fallback，也不会产生第二次Provider调用。root recall、candidate matrix、relation与
+target scorer现统一消费该bundle；DB会再次验证Q0首项、Qi canonical顺序、operation digest、tenant/generation
+以及channel-id到context Coordinate的一一绑定。
+
+完整路径在迁移前并不存在第二套ranking/traversal/packing policy或第二份exact SQL，因此四象限被拆成可执行的
+adapter/scorer/policy证据，而不是复制一套伪legacy policy：同一Provider结果分别经历史wrapper和共同bundle
+绑定后完全相等；同一disposable pgvector RR snapshot中历史exact入口与共同graph scorer的root rows完全相等；
+relation/target继续使用原coherence/floor/transition；compatibility/common bundle驱动相同的2-hop backend得到
+完全相同的roots、paths、retention与coverage计数；既有1–6 hop pack/sign/SDK验证继续覆盖40912结果。现有
+generation/context churn最多第二个完整root attempt、process/traversal permit、唯一RR transaction和
+`expected_snapshot: None` release均未改。U5 compiled route profile仍为
+`migrated/migrated/legacy/legacy`，默认切流留给U6。
 
 ### U6：默认切换与legacy删除
 
