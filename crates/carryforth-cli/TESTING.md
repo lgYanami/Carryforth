@@ -561,6 +561,78 @@ Timeout, body loss, 429, 502, 503, or 504 therefore returns an error without an
 automatic replay. A user-initiated rerun creates a new request UUID and auth
 Event.
 
+### 6.15 Project Context Coordinate starting-point search
+
+`coordinate-search` is the Agent self-query entry point when no exact graph
+Coordinate is already known. It requires the independent NIP-11 capability
+`carryforth-project-context-coordinate-search-http`; it does not fall back to
+`semantic-query` when that capability is unavailable.
+
+```bash
+cf project-context coordinate-search \
+  --query "backend authorization failure during release" | jq .
+
+cf --format compact project-context coordinate-search \
+  --query "work relevant to preparing the frontend release meeting" \
+  --limit 12 | jq -c .
+```
+
+The verified output is the Relay-signed result DTO itself. It contains request,
+Project, graph-snapshot, and request-binding observations plus only
+`coordinates: [{rank,coordinate,score}]` and `truncated`. It contains no Edge,
+path, title, summary, preview, source body, or generated read command. A score
+is a direct fixed-point cosine candidate signal, not a fact or authorization;
+an empty result means only that no eligible current indexed active-edge
+Coordinate was available. `truncated` means a K+1 candidate existed in the
+same snapshot.
+
+The CLI sends one canonical natural-language Provider input through one
+NIP-98-bound, non-redirecting, non-retried HTTP attempt with a 60-second client
+timeout (45-second Relay budget plus transport grace). `--limit` is `1..=32`
+and defaults to 8. There are no Role, Work, lifecycle, context, Edge, path,
+weight, floor, or threshold request controls.
+
+### 6.16 Project Context one-hop semantic selection
+
+These two commands rank only one already-bounded graph neighborhood. They
+require the independent NIP-11 capability
+`carryforth-project-context-one-hop-semantic-search-http` and never fall back
+to either `coordinate-search` or `semantic-query`.
+
+```bash
+# Rank this Coordinate's incident Edges through their relation Documents.
+cf project-context coordinate edge-search "role:${ROLE_ID}" \
+  --query "the relation proving frontend release ownership" --limit 8 | jq .
+
+# Rank only the complete member set of this exact active Edge.
+cf --format compact project-context edge coordinate-search "$EDGE_KEY" \
+  --query "the work responsible for the current incident" --limit 8 | jq -c .
+```
+
+`coordinate edge-search` returns ranked Edge identities and the matched
+canonical relation-Document observations for each Edge. It never returns the
+Edge's Coordinate members. `edge coordinate-search` returns ranked Coordinate
+identities and their canonical lightweight source observations. It never
+returns relation Documents or the complete Edge DTO. Use `edge coordinates`
+or `edge documents` as separate structural reads when those collections are
+needed.
+
+The signed results deliberately include current canonical title/name,
+available description, source-owned summary, lifecycle/status, typed
+provenance, and a source-basis-bound read descriptor. Those fields let an Agent
+reject a linguistically similar but contextually wrong candidate before taking
+another graph step. They are not full source bodies and are not semantic
+previews generated from embedding input. Read the typed canonical source when
+full content is needed as evidence.
+
+Both commands send exactly one fixed Q0 Provider input through one
+NIP-98-bound, non-redirecting, non-retried HTTP attempt. `--limit` is `1..=32`
+and defaults to 8. The CLI prints only the SDK-verified Relay-signed result; it
+does not rank locally, hydrate missing fields, echo the natural-language query,
+or automatically execute the other one-hop operation. Closed Relay errors are
+mapped to fixed content-free CLI errors rather than printing Relay response
+text.
+
 ---
 
 ## 7. Error Path Testing

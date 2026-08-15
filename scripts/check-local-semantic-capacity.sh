@@ -128,11 +128,15 @@ for setting in "${!expected_settings[@]}"; do
 done
 
 migration_count=$(postgres_value \
-  "SELECT count(*) FROM _sqlx_migrations WHERE version IN (57, 58) AND success")
-[[ "$migration_count" == "2" ]] || fail "semantic migrations 0057/0058 are not both successful"
+  "SELECT count(*) FROM _sqlx_migrations WHERE version IN (57, 58, 59, 60) AND success")
+[[ "$migration_count" == "4" ]] || fail "semantic migrations 0057/0058/0059/0060 are not all successful"
 schema_count=$(postgres_value \
   "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relname IN ('semantic_index_generations','semantic_graph_http_fleet_attestations')")
 [[ "$schema_count" == "2" ]] || fail "semantic schema contract is incomplete"
+virtual_result_constraint_count=$(postgres_value \
+  "SELECT count(*) FROM pg_constraint WHERE conrelid='events'::regclass AND convalidated AND conname IN ('events_kind_not_semantic_graph_query_result','events_kind_not_project_context_coordinate_search_result','events_kind_not_project_context_one_hop_semantic_search_result')")
+[[ "$virtual_result_constraint_count" == "3" ]] \
+  || fail "semantic virtual-result persistence guards are incomplete"
 
 main_max=$(read_numeric_env BUZZ_DB_MAIN_MAX_CONNECTIONS 12)
 control_max=$(read_numeric_env BUZZ_DB_CONTROL_MAX_CONNECTIONS 2)

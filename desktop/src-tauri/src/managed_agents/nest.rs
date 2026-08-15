@@ -48,21 +48,50 @@ pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 /// Written to ~/.buzz/.agents/skills/carryforth-cli/SKILL.md on first init.
 const CARRYFORTH_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 
+/// Default SKILL.md content for progressive Project Context retrieval.
+const SEARCH_PROJECT_CONTEXT_SKILL_MD: &str = include_str!("search_project_context_skill.md");
+
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
 const NEST_AGENTS_VERSION: u32 = 5;
 
-/// Template content version for SKILL.md.
+/// Template content version for the carryforth-cli SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
 const NEST_SKILL_VERSION: u32 = 5;
+
+/// Template content version for the search-project-context SKILL.md.
+const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 1;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
 
 /// Canonical skill directory path relative to the nest root.
 const CANONICAL_SKILL_DIR: &str = ".agents/skills/carryforth-cli";
+const SEARCH_PROJECT_CONTEXT_SKILL_DIR: &str = ".agents/skills/search-project-context";
 const LEGACY_CANONICAL_SKILL_DIR: &str = ".agents/skills/buzz-cli";
+
+struct ManagedSkillTemplate {
+    name: &'static str,
+    canonical_dir: &'static str,
+    body: &'static str,
+    version: u32,
+}
+
+const MANAGED_SKILL_TEMPLATES: &[ManagedSkillTemplate] = &[
+    ManagedSkillTemplate {
+        name: "carryforth-cli",
+        canonical_dir: CANONICAL_SKILL_DIR,
+        body: CARRYFORTH_CLI_SKILL_MD,
+        version: NEST_SKILL_VERSION,
+    },
+    ManagedSkillTemplate {
+        name: "search-project-context",
+        canonical_dir: SEARCH_PROJECT_CONTEXT_SKILL_DIR,
+        body: SEARCH_PROJECT_CONTEXT_SKILL_MD,
+        version: SEARCH_PROJECT_CONTEXT_SKILL_VERSION,
+    },
+];
 
 /// Nest directory name for production builds.
 const NEST_DIR_PROD: &str = ".buzz";
@@ -150,9 +179,9 @@ pub fn ensure_nest() -> Result<(), String> {
 ///
 /// - Creates the root directory and all subdirectories.
 /// - Writes `AGENTS.md` only if it doesn't already exist.
-/// - Writes `.agents/skills/carryforth-cli/SKILL.md` only if it doesn't already exist.
-/// - Creates harness-specific symlinks pointing to the canonical
-///   `.agents/skills/carryforth-cli` directory for each known provider.
+/// - Writes app-managed Skill templates only if they don't already exist.
+/// - Creates harness-specific symlinks pointing to each canonical
+///   `.agents/skills/<name>` directory for every known provider.
 /// - Sets 700 permissions on the root, all subdirectories, and the skill
 ///   directory tree (Unix).
 ///
@@ -216,25 +245,27 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
     }
 
-    // Write the Carryforth CLI skill to the harness-agnostic .agents path.
-    let agents_skill_dir = root.join(CANONICAL_SKILL_DIR);
-    fs::create_dir_all(&agents_skill_dir)
-        .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
+    // Write each managed skill to the harness-agnostic .agents path.
+    for skill in MANAGED_SKILL_TEMPLATES {
+        let agents_skill_dir = root.join(skill.canonical_dir);
+        fs::create_dir_all(&agents_skill_dir)
+            .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
 
-    let skill_md = agents_skill_dir.join("SKILL.md");
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&skill_md)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(CARRYFORTH_CLI_SKILL_MD.as_bytes())
-                .map_err(|e| format!("write {}: {e}", skill_md.display()))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            return Err(format!("create {}: {e}", skill_md.display()));
+        let skill_md = agents_skill_dir.join("SKILL.md");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&skill_md)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(skill.body.as_bytes())
+                    .map_err(|e| format!("write {}: {e}", skill_md.display()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(format!("create {}: {e}", skill_md.display()));
+            }
         }
     }
 
@@ -284,9 +315,9 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         // Skill directory trees inside root get 700.
         // Build the list from canonical path + all known provider skill dirs.
         let mut skill_perm_dirs = Vec::new();
-        {
+        for skill in MANAGED_SKILL_TEMPLATES {
             let mut accumulated = std::path::PathBuf::new();
-            for component in std::path::Path::new(CANONICAL_SKILL_DIR).components() {
+            for component in std::path::Path::new(skill.canonical_dir).components() {
                 accumulated.push(component);
                 skill_perm_dirs.push(root.join(&accumulated));
             }
@@ -322,15 +353,17 @@ fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
     for skill_dir in known_skill_dirs() {
         let parent = root.join(skill_dir);
         fs::create_dir_all(&parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        let link = parent.join("carryforth-cli");
-        if link.symlink_metadata().is_ok() {
-            continue; // symlink or real path exists — skip
-        }
         let depth = std::path::Path::new(skill_dir).components().count();
         let prefix = "../".repeat(depth);
-        let target = format!("{prefix}{CANONICAL_SKILL_DIR}");
-        create_symlink(std::path::Path::new(&target), &link)
-            .map_err(|e| format!("symlink {} → {}: {e}", link.display(), target))?;
+        for skill in MANAGED_SKILL_TEMPLATES {
+            let link = parent.join(skill.name);
+            if link.symlink_metadata().is_ok() {
+                continue; // symlink or real path exists — skip
+            }
+            let target = format!("{prefix}{}", skill.canonical_dir);
+            create_symlink(std::path::Path::new(&target), &link)
+                .map_err(|e| format!("symlink {} → {}: {e}", link.display(), target))?;
+        }
     }
     Ok(())
 }
@@ -455,9 +488,16 @@ fn refresh_agents_md_if_stale(root: &Path) -> Result<(), String> {
 ///
 /// SKILL.md has no user-editable sections — it is fully overwritten on version bump.
 fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
-    let agents_skill_dir = root.join(CANONICAL_SKILL_DIR);
+    for skill in MANAGED_SKILL_TEMPLATES {
+        refresh_managed_skill_if_stale(root, skill)?;
+    }
+    Ok(())
+}
+
+fn refresh_managed_skill_if_stale(root: &Path, skill: &ManagedSkillTemplate) -> Result<(), String> {
+    let agents_skill_dir = root.join(skill.canonical_dir);
     let version_path = agents_skill_dir.join(".skill-version");
-    if read_version_file(&version_path) >= NEST_SKILL_VERSION {
+    if read_version_file(&version_path) >= skill.version {
         return Ok(());
     }
 
@@ -471,13 +511,13 @@ fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("tempfile in {}: {e}", agents_skill_dir.display()))?;
     {
         use std::io::Write;
-        tmp.write_all(CARRYFORTH_CLI_SKILL_MD.as_bytes())
+        tmp.write_all(skill.body.as_bytes())
             .map_err(|e| format!("write tempfile: {e}"))?;
     }
     tmp.persist(&skill_md)
         .map_err(|e| format!("persist {}: {e}", skill_md.display()))?;
 
-    fs::write(&version_path, format!("{NEST_SKILL_VERSION}\n"))
+    fs::write(&version_path, format!("{}\n", skill.version))
         .map_err(|e| format!("write {}: {e}", version_path.display()))?;
 
     Ok(())

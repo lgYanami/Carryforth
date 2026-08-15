@@ -22,11 +22,11 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
-    // Semantic graph query results are response-only virtual Events. They are
-    // returned exclusively by the authenticated semantic query handler and
+    // Semantic query results are response-only virtual Events. They are
+    // returned exclusively by their authenticated semantic query handlers and
     // must never leak through an ordinary REQ, COUNT, by-id, search, feed, or
     // live-delivery path even if a broken importer somehow persisted one.
-    if crate::kind::is_semantic_graph_virtual_result_kind(kind) {
+    if crate::kind::is_semantic_query_virtual_result_kind(kind) {
         return false;
     }
     if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
@@ -310,18 +310,21 @@ mod tests {
         let relay = Keys::generate();
         let caller = Keys::generate();
         let caller_hex = caller.public_key().to_hex();
-        let event = EventBuilder::new(
-            Kind::Custom(crate::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT as u16),
-            "{}",
-        )
-        .tags([Tag::parse(["p", caller_hex.as_str()]).expect("p tag")])
-        .sign_with_keys(&relay)
-        .expect("sign");
+        for kind in [
+            crate::kind::KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+            crate::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+            crate::kind::KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind as u16), "{}")
+                .tags([Tag::parse(["p", caller_hex.as_str()]).expect("p tag")])
+                .sign_with_keys(&relay)
+                .expect("sign");
 
-        assert!(!reader_authorized_for_event(&event, &caller_hex));
-        assert!(!reader_authorized_for_event(
-            &event,
-            &relay.public_key().to_hex()
-        ));
+            assert!(!reader_authorized_for_event(&event, &caller_hex));
+            assert!(!reader_authorized_for_event(
+                &event,
+                &relay.public_key().to_hex()
+            ));
+        }
     }
 }

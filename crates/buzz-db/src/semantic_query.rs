@@ -5,6 +5,10 @@
 //! observations to the Relay query orchestrator. Raw source vectors never
 //! cross this API.
 
+mod scoped_search;
+
+pub use scoped_search::*;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
@@ -57,6 +61,8 @@ pub struct SemanticGraphQueryTicket {
     /// Closed source-generation/vector-space/query-template compatibility
     /// fences derived from the active generation.
     pub query_fences: QueryCompatibilityFences,
+    /// Project Context projection generation observed with the ticket.
+    pub projection_generation: u64,
     /// Project Context catalog revision observed with the generation pointer.
     pub project_context_revision: u64,
     /// Database time at which this ticket snapshot was observed.
@@ -681,6 +687,7 @@ pub enum SemanticGraphEmbeddingCoverageClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentSemanticAvailabilityClass {
     Current,
+    NonQueryableZeroVector,
     Missing,
     Building,
     Failed,
@@ -993,6 +1000,9 @@ pub enum SemanticGraphQueryReleaseConfirmation {
     /// The principal or one of the current query/read prerequisites is no
     /// longer authorized.
     Denied,
+    /// An optional caller-supplied generation/Context snapshot no longer
+    /// matches the current canonical query ticket.
+    SnapshotChanged,
     /// Attested-Fleet mode no longer authorizes this exact serving instance.
     /// This outcome is unreachable in trusted mode.
     FleetUnavailable,
@@ -1006,6 +1016,10 @@ pub struct SemanticGraphQueryReleaseRequest<'a> {
     pub reader_pubkey: &'a [u8],
     /// Relay projection signer required by all canonical read models.
     pub expected_projection_pubkey: &'a PublicKey,
+    /// Optional exact Stage C snapshot that must still own the active
+    /// generation, projection generation, and Context revision. Existing
+    /// graph-query callers may omit this to preserve their snapshot contract.
+    pub expected_snapshot: Option<&'a SemanticGraphQueryTicket>,
     /// Explicit single-Relay or attested-Fleet routing requirement.
     pub routing_trust: SemanticGraphQueryRoutingTrust<'a>,
 }
@@ -1016,10 +1030,10 @@ pub struct SemanticGraphQueryReleaseRequest<'a> {
 /// readiness are checked before this value is returned. Every distance method
 /// additionally binds its SQL to the same principal and expected generation.
 pub struct SemanticGraphReadTx {
-    tx: Transaction<'static, Postgres>,
-    ticket: SemanticGraphQueryTicket,
-    reader_pubkey: Vec<u8>,
-    expected_projection_pubkey: PublicKey,
+    pub(crate) tx: Transaction<'static, Postgres>,
+    pub(crate) ticket: SemanticGraphQueryTicket,
+    pub(crate) reader_pubkey: Vec<u8>,
+    pub(crate) expected_projection_pubkey: PublicKey,
 }
 
 impl std::fmt::Debug for SemanticGraphReadTx {
@@ -1076,6 +1090,7 @@ impl Db {
             community_id,
             reader_pubkey,
             expected_projection_pubkey,
+            expected_snapshot,
             routing_trust,
         } = request;
         validate_pubkey(reader_pubkey)?;
@@ -1088,7 +1103,7 @@ impl Db {
             tx.rollback().await?;
             return Ok(SemanticGraphQueryReleaseConfirmation::Denied);
         }
-        match load_authorized_ticket_in_tx(
+        let current_ticket = match load_authorized_ticket_in_tx(
             &mut tx,
             community_id,
             reader_pubkey,
@@ -1096,12 +1111,18 @@ impl Db {
         )
         .await
         {
-            Ok(_) => {}
+            Ok(ticket) => ticket,
             Err(DbError::AccessDenied(_)) | Err(DbError::NotFound(_)) => {
                 tx.rollback().await?;
                 return Ok(SemanticGraphQueryReleaseConfirmation::Denied);
             }
             Err(error) => return Err(error),
+        };
+        if expected_snapshot
+            .is_some_and(|expected| !same_release_snapshot(&current_ticket, expected))
+        {
+            tx.rollback().await?;
+            return Ok(SemanticGraphQueryReleaseConfirmation::SnapshotChanged);
         }
         if !crate::semantic_fleet::semantic_graph_query_routing_ready_in_tx(
             &mut tx,
@@ -1591,6 +1612,9 @@ impl SemanticGraphReadTx {
                 CurrentSemanticAvailabilityClass::Missing => SemanticInitialHeadState::Missing,
                 CurrentSemanticAvailabilityClass::Building => SemanticInitialHeadState::Building,
                 CurrentSemanticAvailabilityClass::Failed => SemanticInitialHeadState::Failed,
+                CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+                    SemanticInitialHeadState::Failed
+                }
                 CurrentSemanticAvailabilityClass::Unsupported => {
                     SemanticInitialHeadState::Unsupported
                 }
@@ -1679,6 +1703,9 @@ impl SemanticGraphReadTx {
                     Some(SemanticContextOmissionReason::SemanticHeadBuilding)
                 }
                 CurrentSemanticAvailabilityClass::Failed => {
+                    Some(SemanticContextOmissionReason::SemanticHeadFailed)
+                }
+                CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
                     Some(SemanticContextOmissionReason::SemanticHeadFailed)
                 }
                 CurrentSemanticAvailabilityClass::Unsupported => {
@@ -2894,6 +2921,9 @@ fn traversal_omission_reason(
         CurrentSemanticAvailabilityClass::Failed => {
             SemanticTraversalSourceOmissionReason::SemanticHeadFailed
         }
+        CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+            SemanticTraversalSourceOmissionReason::SemanticHeadFailed
+        }
         CurrentSemanticAvailabilityClass::Unsupported => {
             SemanticTraversalSourceOmissionReason::SemanticHeadUnsupported
         }
@@ -3314,6 +3344,7 @@ const fn initial_omission_reason(reason: IneligibilityReason) -> SemanticInitial
 fn current_availability_from_db(value: &str) -> Result<CurrentSemanticAvailabilityClass> {
     match value {
         "current" => Ok(CurrentSemanticAvailabilityClass::Current),
+        "non_queryable_zero_vector" => Ok(CurrentSemanticAvailabilityClass::NonQueryableZeroVector),
         "missing" => Ok(CurrentSemanticAvailabilityClass::Missing),
         "building" => Ok(CurrentSemanticAvailabilityClass::Building),
         "failed" => Ok(CurrentSemanticAvailabilityClass::Failed),
@@ -3330,6 +3361,12 @@ fn source_eligibility_from_db(
 ) -> Result<Option<SemanticEligibility>> {
     match (eligibility, reason) {
         (None, None) => Ok(None),
+        // `unknown` is the normal pre-observation state after a canonical
+        // source change. It is not an ineligibility verdict: callers still
+        // classify the source through its missing/building/failed head state,
+        // and no score or hydrated candidate can be produced until the worker
+        // publishes an exact eligible current head.
+        (Some("unknown"), None) => Ok(Some(SemanticEligibility::Eligible)),
         (Some("eligible"), None) => Ok(Some(SemanticEligibility::Eligible)),
         (Some("ineligible"), Some("tombstone")) => Ok(Some(SemanticEligibility::Ineligible(
             IneligibilityReason::Tombstone,
@@ -4134,7 +4171,10 @@ SELECT generation.community_id,
        current_head.summary_coverage,
        current_head.semantic_text,
        CASE
-         WHEN current_head.unit_set_id IS NOT NULL THEN 'current'
+         WHEN current_head.unit_set_id IS NOT NULL AND current_head.queryable_vector
+           THEN 'current'
+         WHEN current_head.unit_set_id IS NOT NULL
+           THEN 'non_queryable_zero_vector'
          WHEN job.state = 'poison'
            OR (job.state = 'succeeded' AND current_head.unit_set_id IS NULL)
            OR source.coverage_state = 'failed'
@@ -4168,7 +4208,8 @@ LEFT JOIN LATERAL (
            unit.unit_key,
            unit.semantic_text_digest,
            unit.summary_coverage,
-           unit.semantic_text
+           unit.semantic_text,
+           vector_norm(embedding.embedding) > 0 AS queryable_vector
     FROM semantic_source_generation_heads head
     JOIN semantic_unit_sets unit_set
       ON unit_set.community_id = head.community_id
@@ -4195,7 +4236,6 @@ LEFT JOIN LATERAL (
      AND embedding.dimensions = generation.dimensions
      AND embedding.response_model = generation.model
      AND vector_dims(embedding.embedding) = generation.dimensions
-     AND vector_norm(embedding.embedding) > 0
     WHERE head.community_id = source.community_id
       AND head.generation_id = generation.generation_id
       AND head.source_family = source.source_family
@@ -5120,6 +5160,9 @@ fn context_egress_expectation(
         CurrentSemanticAvailabilityClass::Failed => {
             Some(SemanticContextOmissionReason::SemanticHeadFailed)
         }
+        CurrentSemanticAvailabilityClass::NonQueryableZeroVector => {
+            Some(SemanticContextOmissionReason::SemanticHeadFailed)
+        }
         CurrentSemanticAvailabilityClass::Unsupported => {
             Some(SemanticContextOmissionReason::SourceIneligible)
         }
@@ -5295,6 +5338,10 @@ async fn load_authorized_ticket_in_tx(
             row.try_get("context_revision")?,
             "project_context_revision",
         )?,
+        projection_generation: positive_u64(
+            row.try_get("projection_generation")?,
+            "project_context_projection_generation",
+        )?,
         observed_at: row.try_get("observed_at")?,
     })
 }
@@ -5306,6 +5353,15 @@ fn same_generation_contract(
     observed.community_id == expected.community_id
         && observed.generation == expected.generation
         && observed.query_fences == expected.query_fences
+}
+
+fn same_release_snapshot(
+    observed: &SemanticGraphQueryTicket,
+    expected: &SemanticGraphQueryTicket,
+) -> bool {
+    same_generation_contract(observed, expected)
+        && observed.projection_generation == expected.projection_generation
+        && observed.project_context_revision == expected.project_context_revision
 }
 
 fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
@@ -5412,7 +5468,8 @@ authorized_reader AS MATERIALIZED (
 authorized_project AS MATERIALIZED (
     SELECT community.id AS community_id,
            community.semantic_active_generation_id AS generation_id,
-           context_state.context_revision
+           context_state.context_revision,
+           context_state.projection_generation
     FROM communities community
     CROSS JOIN authorized_reader
     JOIN project_view_maintenance maintenance
@@ -5441,7 +5498,7 @@ authorized_project AS MATERIALIZED (
       AND context_state.projection_pubkey = $3
       AND community.semantic_active_generation_id IS NOT NULL
 )
-SELECT generation.*, project.context_revision,
+SELECT generation.*, project.context_revision, project.projection_generation,
        clock_timestamp() AS observed_at
 FROM authorized_project project
 JOIN semantic_index_generations generation
@@ -5474,9 +5531,10 @@ mod tests {
     use super::{
         bindings_from_json, canonical_query_coordinates, compare_ranked_relations,
         compare_ranked_targets, context_state_set_digest, current_availability_from_db,
-        edge_keys_from_json, partition_exact_recall, semantic_hyperedge_identity_bytes,
-        semantic_source_identity_for_coordinate, slice_ranked_relations, slice_ranked_targets,
-        source_eligibility_from_db, validate_query_vectors, SemanticContextEgressExpectation,
+        edge_keys_from_json, partition_exact_recall, same_release_snapshot,
+        semantic_hyperedge_identity_bytes, semantic_source_identity_for_coordinate,
+        slice_ranked_relations, slice_ranked_targets, source_eligibility_from_db,
+        validate_query_vectors, CurrentSemanticAvailabilityClass, SemanticContextEgressExpectation,
         SemanticContextOmissionReason, SemanticCurrentContextOverview, SemanticCurrentHead,
         SemanticExactQueryVector, SemanticExactRecallExhaustion, SemanticExactSourceScore,
         SemanticGraphQueryTicket, SemanticGraphStructuralRoles, SemanticOmittedContextEvidence,
@@ -5507,9 +5565,28 @@ mod tests {
                 created_at: Utc::now(),
             },
             query_fences,
+            projection_generation: 1,
             project_context_revision: 1,
             observed_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn coordinate_release_snapshot_binds_generation_projection_and_context_revision() {
+        let expected = ticket(SemanticModelContract::volcengine_overview_v1());
+        assert!(same_release_snapshot(&expected, &expected));
+
+        let mut projection_changed = expected.clone();
+        projection_changed.projection_generation += 1;
+        assert!(!same_release_snapshot(&projection_changed, &expected));
+
+        let mut context_changed = expected.clone();
+        context_changed.project_context_revision += 1;
+        assert!(!same_release_snapshot(&context_changed, &expected));
+
+        let mut generation_changed = expected.clone();
+        generation_changed.generation.generation_id = Uuid::new_v4();
+        assert!(!same_release_snapshot(&generation_changed, &expected));
     }
 
     fn exact_score(channel_id: Digest32, rank: u32, source_id: Uuid) -> SemanticExactSourceScore {
@@ -5751,12 +5828,22 @@ mod tests {
             "head.source_snapshot_digest = source.snapshot_digest",
             "embedding.response_model = generation.model",
             "vector_norm(embedding.embedding) > 0",
+            "THEN 'non_queryable_zero_vector'",
             "job.desired_invalidation_epoch = source.invalidation_epoch",
         ] {
             assert!(CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains(marker));
         }
         assert!(!CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains("content_markdown"));
         assert!(!CURRENT_SEMANTIC_SOURCE_STATES_SQL.contains("project_view_projection"));
+        assert_eq!(
+            current_availability_from_db("non_queryable_zero_vector")
+                .expect("zero-vector availability"),
+            CurrentSemanticAvailabilityClass::NonQueryableZeroVector
+        );
+        assert_eq!(
+            source_eligibility_from_db(Some("unknown"), None).expect("pending source eligibility"),
+            Some(SemanticEligibility::Eligible)
+        );
         assert!(current_availability_from_db("unknown").is_err());
     }
 

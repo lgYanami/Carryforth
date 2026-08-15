@@ -478,6 +478,19 @@ pub const KIND_PROJECT_CONTEXT_META: u32 = 40909;
 /// This is a response-only virtual Event. It is never accepted from clients,
 /// persisted, indexed, queried through ordinary Nostr filters, or fanned out.
 pub const KIND_SEMANTIC_GRAPH_QUERY_RESULT: u32 = 40912;
+/// Relay-signed Project Context Coordinate-search result.
+///
+/// This is a response-only virtual Event. It is returned only by the
+/// authenticated Carryforth Coordinate-search query handler and must never be
+/// accepted from clients, persisted, indexed, queried through ordinary Nostr
+/// filters, or fanned out.
+pub const KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT: u32 = 40913;
+/// Relay-signed Project Context one-hop semantic-selection result.
+///
+/// This is a response-only virtual Event shared by the closed Coordinate-to-
+/// Edge and Edge-to-Coordinate selection variants. It must never be accepted
+/// from clients, persisted, indexed, queried, counted, searched, or fanned out.
+pub const KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT: u32 = 40914;
 
 // Direct messages (41000–41999)
 /// Open/create DM (p-tags = participants).
@@ -724,6 +737,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_PROJECT_CONTEXT_EDGE_BINDING,
     KIND_PROJECT_CONTEXT_META,
     KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
     KIND_DM_VISIBILITY,
     KIND_DM_OPEN,
     KIND_DM_ADD_MEMBER,
@@ -900,6 +915,20 @@ pub const fn is_semantic_graph_virtual_result_kind(kind: u32) -> bool {
     kind == KIND_SEMANTIC_GRAPH_QUERY_RESULT
 }
 
+/// Returns `true` for response-only semantic query result Event kinds.
+///
+/// These Events are authenticated response envelopes rather than canonical
+/// Nostr state. Every ordinary ingest, persistence, search, COUNT, REQ, and
+/// fan-out path must reject them.
+pub const fn is_semantic_query_virtual_result_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_SEMANTIC_GRAPH_QUERY_RESULT
+            | KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+            | KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+    )
+}
+
 /// Returns `true` for Community-global protocols with member-only reads.
 ///
 /// This classifier is the protocol registry boundary. Relay read paths still
@@ -983,6 +1012,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_PROJECT_CONTEXT_EDGE_BINDING
             | KIND_PROJECT_CONTEXT_META
             | KIND_SEMANTIC_GRAPH_QUERY_RESULT
+            | KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+            | KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
@@ -1088,6 +1119,33 @@ const _: () = assert!(!is_project_context_protocol_kind(
 ));
 const _: () = assert!(!is_command_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
 const _: () = assert!(is_relay_only_kind(KIND_SEMANTIC_GRAPH_QUERY_RESULT));
+const _: () = assert!(is_semantic_query_virtual_result_kind(
+    KIND_SEMANTIC_GRAPH_QUERY_RESULT
+));
+const _: () = assert!(is_semantic_query_virtual_result_kind(
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+));
+const _: () = assert!(!is_project_context_protocol_kind(
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+));
+const _: () = assert!(!is_command_kind(
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+));
+const _: () = assert!(is_relay_only_kind(
+    KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT
+));
+const _: () = assert!(is_semantic_query_virtual_result_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(!is_project_context_protocol_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(!is_command_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
+const _: () = assert!(is_relay_only_kind(
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT
+));
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
@@ -1316,6 +1374,33 @@ mod tests {
         assert!(!is_parameterized_replaceable(
             KIND_SEMANTIC_GRAPH_QUERY_RESULT
         ));
+    }
+
+    #[test]
+    fn semantic_query_result_kinds_have_a_closed_response_only_classification() {
+        let virtual_kinds = [
+            KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+            KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+            KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT,
+        ];
+        for &kind in ALL_KINDS {
+            assert_eq!(
+                is_semantic_query_virtual_result_kind(kind),
+                virtual_kinds.contains(&kind),
+                "semantic virtual-result classification mismatch for kind {kind}"
+            );
+        }
+        for kind in virtual_kinds {
+            assert!(is_relay_only_kind(kind));
+            assert!(!is_command_kind(kind));
+            assert!(!is_project_context_projection_kind(kind));
+            assert!(!is_project_context_protocol_kind(kind));
+            assert!(!is_community_private_protocol_kind(kind));
+            assert!(!has_indexed_d_tag(kind));
+            assert!(!is_ephemeral(kind));
+            assert!(!is_replaceable(kind));
+            assert!(!is_parameterized_replaceable(kind));
+        }
     }
 
     #[test]

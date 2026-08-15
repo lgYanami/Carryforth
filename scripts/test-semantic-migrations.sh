@@ -56,6 +56,14 @@ BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.
   cargo test -p buzz-db semantic_pipeline_activates_only_a_complete_fenced_set -- --nocapture
 BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
 BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
+  cargo test -p buzz-db coordinate_search_real_pgvector_is_coordinate_only_deduplicated_and_stable \
+    -- --nocapture
+BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
+BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
+  cargo test -p buzz-db one_hop_scoped_search_real_pgvector_is_direct_complete_and_hydrated \
+    -- --nocapture
+BUZZ_TEST_SEMANTIC_DISPOSABLE="fleet-policy-v1" \
+BUZZ_TEST_SEMANTIC_DATABASE_URL="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${TEST_DATABASE}" \
   cargo test -p buzz-db semantic_fleet::tests:: -- --ignored --nocapture
 
 # Upgraded databases intentionally retain the zero-vector constraint as NOT
@@ -91,8 +99,8 @@ semantic_drift="$(
   jq '[
     .groups[].steps[]?
     | select(
-        ((.path // "") | test("semantic"; "i"))
-        or ((.sql // "") | test("semantic"; "i"))
+        ((.path // "") | test("semantic|coordinate[_ -]?search"; "i"))
+        or ((.sql // "") | test("semantic|coordinate[_ -]?search"; "i"))
       )
     | select(
         (.path // "") !=
@@ -143,6 +151,18 @@ docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
           SELECT 1 FROM pg_constraint
           WHERE conrelid = 'events'::regclass
             AND conname = 'events_kind_not_semantic_graph_query_result'
+            AND convalidated
+        )
+        AND EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'events'::regclass
+            AND conname = 'events_kind_not_project_context_coordinate_search_result'
+            AND convalidated
+        )
+        AND EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'events'::regclass
+            AND conname = 'events_kind_not_project_context_one_hop_semantic_search_result'
             AND convalidated
         )
         AND EXISTS (
