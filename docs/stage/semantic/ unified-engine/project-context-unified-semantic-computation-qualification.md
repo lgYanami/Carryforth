@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U2 已通过；U3–U7 待交付
+> 状态：U0–U3 已通过；U4–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -14,7 +14,7 @@
 | U0 设计与差分门 | 通过 | 历史 v1 oracle 与独立 Phase 1 gate 可在同一工作树运行 |
 | U1 共同 input/fence/vector | 通过 | 三种 closed input 与两类旧 wrapper 已委托共同类型；exact generation 只由 writer DB ticket 绑定 |
 | U2 共同 Provider encoder | 通过 | Coordinate 与 graph 兼容 adapter 委托同一 bounded batch primitive；无 retry/fallback/额外调用 |
-| U3 one-hop tagged family | 待执行 | — |
+| U3 one-hop tagged family | 通过 | 两个 variant 只切换到 closed explicit-source facade；原有同一 exact SQL 与全部 policy 保持不变 |
 | U4 whole-graph Coordinate | 待执行 | — |
 | U5 bounded complete path | 待执行 | — |
 | U6 默认切换与 legacy 收口 | 待执行 | — |
@@ -111,7 +111,7 @@ git diff --check
 U1 只完成共同 production types 与 DB generation binder；共同 Provider encoder 与共同 exact scorer 尚未
 切换 production operation。它不代表可靠性 runtime、资源治理或 production SLO 已交付。
 
-真实 Provider canary 仍缺少受支持的 `BUZZ_SEMANTIC_*` 配置，未在 U0–U2 运行；不得挪用 `LLM_*`。
+真实 Provider canary 仍缺少受支持的 `BUZZ_SEMANTIC_*` 配置，未在 U0–U3 运行；不得挪用 `LLM_*`。
 
 ## 4. U2 共同 Provider encoder
 
@@ -148,3 +148,37 @@ git diff --check
 
 HTTP fake Provider 直接断言了：Coordinate 为一次单输入调用；one-hop 为一次 Q0 调用；完整路径 Q0+Qi 为一次
 有序 batch 调用；Provider 乱序 datum 仍按 index 恢复，exact text 与 input digest 没有变化。
+
+## 5. U3 one-hop tagged family
+
+U3 按 `Edge → member Coordinate`、`Coordinate → incident Edge` 的顺序，将两个 one-hop variant 接入
+`SemanticExactExplicitSourceScope` 与 `score_explicit_source_scope_exact`。这个 facade 只接受 DB 结构读取已经
+解析出的两种 closed source set，并分别保持 4096 Coordinate / 2048 relation binding 的既有上限。
+
+审查确认迁移前两个 variant 已经调用完整路径共用的 `query_exact_source_scores`，因此本阶段没有第二份 SQL、
+没有 score 算法切换，也没有必要制造无实际差异的 runtime route。facade 继续固定：
+
+- `AllCurrent` direct Q0 exact score；
+- 无 floor、coherence、context gain、Edge grouping 或 public projection；
+- Relay 不可构造 scope，只有 DB operation method 能选择 closed variant；
+- Incident Edge 的 Document grouping/max-score、Edge canonical tie、preview/coverage/omission/truncation仍在
+  `scoped_search`；
+- Edge Coordinate 的完整 Hyperedge、membership proof、Coordinate tie、preview/coverage/omission/truncation
+  仍在 `scoped_search`。
+
+U3 最终证据：
+
+~~~text
+cargo test -p buzz-db --lib one_hop                              # 2 passed
+cargo test -p buzz-db --lib semantic_                            # 31 passed, 4 ignored
+cargo test -p buzz-relay --lib one_hop                           # 6 passed
+cargo test -p buzz-semantic-query --test compatibility_baseline # 1 passed
+cargo test -p buzz-semantic-query --test computation_differential # 2 passed
+cargo clippy -p buzz-db -p buzz-relay --all-targets -- -D warnings
+./scripts/check-semantic-retrieval-computation.sh all
+git diff --check
+~~~
+
+其中 disposable-pgvector one-hop fixture 继续验证两个 variant 的 direct score、完整 scope、canonical hydration
+与结果形状；40914 Relay/SDK closed tagged family 回归继续通过。U3 没有修改 Provider、snapshot/release、wire、
+Event kind、capability、schema 或 migration。

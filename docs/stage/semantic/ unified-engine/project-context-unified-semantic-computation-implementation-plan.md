@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0–U2 已交付；U3–U7 待交付
+> 状态：实现设计已冻结；U0–U3 已交付；U4–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -613,7 +613,8 @@ Phase 1并另开兼容迁移。
 | U0 设计与差分门 | 已完成 | 历史 v1 oracle 与 Phase 1 differential/protected-surface gate 同时通过 |
 | U1 共同 input、fence 与 vector | 已完成 | 冻结 bytes/digest 不变；共同 Provider 结果只由 writer DB 绑定 tenant-scoped generation |
 | U2 共同 Provider encoder | 已完成 | Coordinate、one-hop 与完整路径 adapter 均委托一次 bounded common batch；历史 fake/golden 不变 |
-| U3–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
+| U3 one-hop tagged family | 已完成 | 两个 variant 通过 closed explicit-source scope facade 调用既有同一 exact SQL；40914 policy/wire 不变 |
+| U4–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
 
 ### U0：设计与差分门
 
@@ -664,6 +665,12 @@ Phase 1并另开兼容迁移。
 - 差分失败立即关闭新mode，不影响另一个variant。
 
 退出条件：两个variant在同vector/snapshot下typed result与closed error全等；40914 wire回归全绿。
+
+U3 实施审查确认：两个 one-hop variant 在迁移前已经直接调用完整路径所用的同一个
+`query_exact_source_scores` SQL，本阶段只增加 closed explicit-source scope facade，不存在第二套 scorer 或
+SQL 可供真实 legacy/new 选择。因此 U3 不新增没有实际分流效果的 runtime route；原计划中的独立 route
+要求只在某个 variant 真正出现第二套计算实现时适用。U4 迁移 Coordinate 专用 SQL 时才建立有意义的
+legacy/shared 对照与切换边界。
 
 ### U4：迁移whole-graph Coordinate discovery
 

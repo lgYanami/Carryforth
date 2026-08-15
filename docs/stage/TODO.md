@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0–U2已交付，待进入U3
+> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0–U3已交付，待进入U4
 >
 > 更新日期：2026-08-16
 >
@@ -19,7 +19,8 @@
 > Provider统一canary因缺少受支持配置未运行。统一语义计算的零行为迁移设计已通过代码、currentness、
 > lifecycle与兼容性复核；历史v1 oracle和独立Phase 1差分/受保护surface门已同时闭合。共同input、
 > model-space fence、Provider-bound result与writer-DB generation-bound vector已经交付；Coordinate与graph
-> adapter也已委托同一个bounded Provider batch primitive。下一步进入U3 one-hop tagged family共同scorer迁移。
+> adapter也已委托同一个bounded Provider batch primitive；两个one-hop variant现通过closed explicit-source
+> facade调用原本已经共享的exact SQL。下一步进入U4 whole-graph Coordinate专用SQL迁移。
 
 ### 背景
 

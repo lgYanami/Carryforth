@@ -3,14 +3,17 @@
 use std::collections::BTreeSet;
 
 use buzz_core::CommunityId;
-use buzz_semantic::{Digest32, EmbeddingVector};
+use buzz_semantic::{Digest32, EmbeddingVector, SemanticSourceIdentity};
 use buzz_semantic_query::{
-    ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle, SemanticModelSpaceFences,
-    SemanticQueryInputKind, MAX_QUERY_CHANNELS,
+    LifecycleFilter, ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle,
+    SemanticModelSpaceFences, SemanticQueryInputKind, MAX_ONE_HOP_EDGE_COORDINATES,
+    MAX_ONE_HOP_RELATION_BINDINGS, MAX_QUERY_CHANNELS,
 };
 use uuid::Uuid;
 
-use super::{vector_norm_squared, SemanticGraphQueryTicket};
+use super::{
+    vector_norm_squared, SemanticExactSourceScore, SemanticGraphQueryTicket, SemanticGraphReadTx,
+};
 use crate::{DbError, Result};
 
 /// Exact tenant-scoped active semantic generation identity.
@@ -211,6 +214,73 @@ impl GenerationBoundQueryVectorBundle {
 #[derive(Clone, PartialEq)]
 pub struct SemanticExactQueryVector {
     inner: GenerationBoundQueryVector,
+}
+
+/// DB-internal closed explicit source scopes accepted by the shared scorer.
+///
+/// The Relay cannot construct this type. Structural operation methods resolve
+/// the source identities first, then choose the matching fixed bound.
+pub(super) enum SemanticExactExplicitSourceScope<'a> {
+    /// Current relation Documents on one Coordinate's incident Edges.
+    OneHopIncidentDocuments(&'a [SemanticSourceIdentity]),
+    /// Complete current member Coordinates of one exact Edge.
+    OneHopEdgeCoordinates(&'a [SemanticSourceIdentity]),
+}
+
+impl SemanticExactExplicitSourceScope<'_> {
+    fn sources(&self) -> &[SemanticSourceIdentity] {
+        match self {
+            Self::OneHopIncidentDocuments(sources) | Self::OneHopEdgeCoordinates(sources) => {
+                sources
+            }
+        }
+    }
+
+    fn maximum(&self) -> usize {
+        match self {
+            Self::OneHopIncidentDocuments(_) => MAX_ONE_HOP_RELATION_BINDINGS as usize,
+            Self::OneHopEdgeCoordinates(_) => MAX_ONE_HOP_EDGE_COORDINATES as usize,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::OneHopIncidentDocuments(_) => "one-hop incident relation Document",
+            Self::OneHopEdgeCoordinates(_) => "one-hop Edge Coordinate",
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.sources().len() > self.maximum() {
+            return Err(DbError::InvalidData(format!(
+                "semantic {} source count exceeds the closed bound",
+                self.label()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl SemanticGraphReadTx {
+    /// Score one DB-resolved explicit source scope with direct all-current Q0.
+    ///
+    /// This facade intentionally owns no Edge grouping, tie policy, coverage,
+    /// hydration, floor, coherence, or public result projection.
+    pub(super) async fn score_explicit_source_scope_exact(
+        &mut self,
+        query_vector: &SemanticExactQueryVector,
+        scope: SemanticExactExplicitSourceScope<'_>,
+    ) -> Result<Vec<SemanticExactSourceScore>> {
+        scope.validate()?;
+        self.query_exact_source_scores(
+            LifecycleFilter::AllCurrent,
+            &[],
+            std::slice::from_ref(query_vector),
+            Some(scope.sources()),
+            None,
+        )
+        .await
+    }
 }
 
 impl std::fmt::Debug for SemanticExactQueryVector {
