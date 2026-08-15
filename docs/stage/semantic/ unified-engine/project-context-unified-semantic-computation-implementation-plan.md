@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0–U5 已交付；U6–U7 待交付
+> 状态：实现设计已冻结；U0–U6 已交付；U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -616,7 +616,8 @@ Phase 1并另开兼容迁移。
 | U3 one-hop tagged family | 已完成 | 两个 variant 通过 closed explicit-source scope facade 调用既有同一 exact SQL；40914 policy/wire 不变 |
 | U4 whole-graph Coordinate | 已完成 | 独立模板进入 shared scorer；同 snapshot legacy/shared 精确相等，10k closed physical plan 无性能退化 |
 | U5 bounded complete path | 已完成 | Q0/Qi closed bundle进入root与traversal scorer；同快照/同向量与路径差分通过 |
-| U6–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
+| U6 默认切换与 legacy 收口 | 已完成 | 四个operation统一切到compiled migrated profile；旧实现仅保留到profile rollback截止日 |
+| U7 | 待交付 | 最终资格、全仓门禁与文档关闭 |
 
 ### U0：设计与差分门
 
@@ -736,6 +737,23 @@ generation/context churn最多第二个完整root attempt、process/traversal pe
 
 退出条件：不能同时声称“旧SQL已删除”和“无需恢复旧二进制即可切回legacy实现”；任何attested fleet
 rollback都必须遵守统一profile与重新attestation。
+
+交付复核：U6 将`SEMANTIC_COMPUTATION_ROUTES`冻结为四项全`Migrated`，因此全图Coordinate默认执行共同
+current-head/exact scorer，完整路径默认执行共同input encoder、generation-bound Q0/Qi bundle及共同scorer。
+route matrix继续是server-owned compiled profile，不进入request；单请求没有legacy fallback、双Provider调用或
+第二个RR snapshot。runtime contract升级为`semantic-query-http-runtime-20260816-u6`，新digest为
+`e49d7ae9e69a2818a9ce9c061443a4441d332c86a3f8b46824b147a5da716f40`。旧U4 inventory虽然内部同质，仍会被
+U6 binary以`RuntimeMismatch`拒绝，正常fleet不能混跑旧/新route。
+
+本阶段选择保留Coordinate legacy SQL与完整路径compatibility adapter作为**profile rollback源代码**，计划删除
+日期为`2026-09-16`。保留不构成运行时flag：若需回滚，仍须关闭gate/capability、撤销inventory、drain、部署
+统一legacy profile并重新attest。到期后只有在U7资格、至少一次部署/回滚演练证据和回滚窗口均闭合时才删除；
+若条件未满足，必须以新的显式架构事项延期，不能静默永久保留。
+
+默认切流后的disposable pgvector矩阵继续证明Coordinate compiled route与legacy/migrated K、K+1、tie、scope
+逐项相等，完整路径root/relation/target与one-hop scope均保持；10k Coordinate资格没有temp spill或错误，shared
+EXPLAIN为290.774ms、同运行legacy参考为266.037ms，属于已批准的测量画像而非SLO。10k×4 channel graph
+exact kernel为381.208ms，hard-cap 10k×9为822.103ms；取消、currentness、release及fleet fail-closed回归通过。
 
 ### U7：资格与阶段关闭
 
@@ -906,7 +924,6 @@ cargo test -p carryforth-cli
 just semantic-test
 just semantic-query-qualification
 just coordinate-search-qualification
-just semantic-retrieval-exact-qualification
 cargo clippy -p buzz-semantic-query -p buzz-db -p buzz-relay --all-targets -- -D warnings
 just test-unit
 just ci

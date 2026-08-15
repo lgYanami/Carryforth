@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U5 已通过；U6–U7 待交付
+> 状态：U0–U6 已通过；U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -17,7 +17,7 @@
 | U3 one-hop tagged family | 通过 | 两个 variant 只切换到 closed explicit-source facade；原有同一 exact SQL 与全部 policy 保持不变 |
 | U4 whole-graph Coordinate | 通过 | Coordinate v1 接入共同 scorer；同 snapshot 精确差分与10k性能门通过 |
 | U5 bounded complete path | 通过 | Q0/Qi closed bundle、root/relation/target scorer与path retention零行为迁移通过 |
-| U6 默认切换与 legacy 收口 | 待执行 | — |
+| U6 默认切换与 legacy 收口 | 通过 | 四个operation默认Migrated；新fleet digest拒绝旧profile；rollback源保留到2026-09-16 |
 | U7 最终资格与文档关闭 | 待执行 | — |
 
 ## 2. U0 证据
@@ -281,3 +281,44 @@ service-backed disposable pgvector fixture额外实际执行了完整路径root�
 generation/context churn retry、Provider reservation/final confirm、traversal permit、唯一RR snapshot、budget、
 path identity、coverage/packing与`expected_snapshot: None` release语义均未修改。真实Provider canary仍因缺少
 受支持的`BUZZ_SEMANTIC_*`配置未运行。
+
+## 8. U6 默认切换与 legacy 收口
+
+U6把compiled route profile从`migrated/migrated/legacy/legacy`切换为四项全`migrated`。全图Coordinate和
+bounded complete path因此默认消费U4/U5已经差分通过的共同计算路径；40912/40913/40914、三个HTTP extension、
+capability、Community gate、CLI、SDK、ranking、budget、result和错误合同均未改。runtime contract升级为
+`semantic-query-http-runtime-20260816-u6`，compiled digest为：
+
+~~~text
+e49d7ae9e69a2818a9ce9c061443a4441d332c86a3f8b46824b147a5da716f40
+~~~
+
+fleet回归明确证明旧U4 digest `9601b101…`形成的inventory即使内部同质，也不能通过U6 binary的compiled-runtime
+验证；因此旧/新profile不能在普通attested fleet中混跑。此次本地资格没有部署或修改任何真实fleet/gate，不能
+冒充production cutover。
+
+legacy Coordinate SQL与完整路径compatibility adapter保留为profile rollback源，删除日期为`2026-09-16`。
+它们不受request、动态配置或失败路径选择；rollback仍要求gate/capability off、drain、整fleet同profile部署与
+重新attestation，不是即时flag或单pod回退。
+
+默认切流后的执行证据：
+
+~~~text
+just semantic-migration-test
+just semantic-retrieval-computation
+just coordinate-search-qualification
+just semantic-query-qualification
+cargo check -p buzz-db -p buzz-relay
+~~~
+
+结果：
+
+- disposable migration/service矩阵全部通过，包含compiled Coordinate route、one-hop和完整路径
+  root/relation/target的同snapshot证据；
+- aggregate继续通过49个pure contract、32个DB（4 ignored）和74个Relay语义测试；
+- 10k Coordinate shared EXPLAIN 290.774ms、legacy同运行参考266.037ms，均无temp spill；4-client 8秒soak完成
+  98次、0 error；
+- graph exact kernel在10k×4 channel的EXPLAIN为381.208ms，在10k×9 hard-cap为822.103ms；statement
+  cancellation无残留session，soak无失败事务；
+- 以上为本地合成测量，未冻结生产SLO。真实Provider canary仍留给U7，并且只接受受支持的
+  `BUZZ_SEMANTIC_*`配置。

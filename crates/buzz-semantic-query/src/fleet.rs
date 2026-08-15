@@ -169,15 +169,15 @@ impl SemanticComputationRouteMatrix {
 
 /// Current compiled Phase 1 operation routes.
 ///
-/// U4 keeps the newly implemented whole-graph scorer behind the legacy
-/// production route until the final profile cutover. The one-hop operations
-/// have no second computation implementation and were closed in U3.
+/// U6 moves all four closed operations to the shared computation path. Legacy
+/// adapters remain compiled only for the documented profile rollback window;
+/// no request can select them or fall back to them dynamically.
 pub const SEMANTIC_COMPUTATION_ROUTES: SemanticComputationRouteMatrix =
     SemanticComputationRouteMatrix {
         edge_member_coordinate: SemanticComputationRoute::Migrated,
         coordinate_incident_edge: SemanticComputationRoute::Migrated,
-        whole_graph_coordinate_discovery: SemanticComputationRoute::Legacy,
-        bounded_complete_path: SemanticComputationRoute::Legacy,
+        whole_graph_coordinate_discovery: SemanticComputationRoute::Migrated,
+        bounded_complete_path: SemanticComputationRoute::Migrated,
     };
 
 /// Explicitly bumped closed descriptor for the compiled HTTP query runtime.
@@ -187,7 +187,7 @@ pub const SEMANTIC_COMPUTATION_ROUTES: SemanticComputationRouteMatrix =
 /// incompatible change to those contracts must change the dated profile and this
 /// descriptor before a mixed fleet can attest itself ready.
 pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-http-runtime-20260816-u4\n",
+    "runtime-contract=semantic-query-http-runtime-20260816-u6\n",
     "transport=http-post-query-exclusive-single-filter\n",
     "request=unversioned-closed-request-id-project-id-problem-initial-context-lifecycle-budget\n",
     "result=unversioned-closed-project-request-completion-observations-input-observations-roots-paths-target-lifecycle-typed-basis-path-source-provenance-explicit-provenance-coverage\n",
@@ -447,7 +447,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "9601b1014e85e16d0eaa8db6146e168653353e489646478380234fc4f56565c8",
+            "e49d7ae9e69a2818a9ce9c061443a4441d332c86a3f8b46824b147a5da716f40",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(
@@ -468,19 +468,19 @@ mod tests {
         );
         assert_eq!(
             SEMANTIC_COMPUTATION_ROUTES.whole_graph_coordinate_discovery,
-            SemanticComputationRoute::Legacy
+            SemanticComputationRoute::Migrated
         );
         assert_eq!(
             SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
-            SemanticComputationRoute::Legacy
+            SemanticComputationRoute::Migrated
         );
         assert_eq!(
             SEMANTIC_COMPUTATION_ROUTES.canonical_profile(),
             concat!(
                 "edge-member-coordinate=migrated\n",
                 "coordinate-incident-edge=migrated\n",
-                "whole-graph-coordinate-discovery=legacy\n",
-                "bounded-complete-path=legacy\n",
+                "whole-graph-coordinate-discovery=migrated\n",
+                "bounded-complete-path=migrated\n",
             )
         );
     }
@@ -570,6 +570,26 @@ mod tests {
         );
         assert!(parsed.contains_instance("relay-0"));
         assert!(!parsed.contains_instance("relay-2"));
+    }
+
+    #[test]
+    fn previous_route_profile_requires_a_new_fleet_attestation() {
+        let previous_runtime = buzz_semantic::Digest32::from_hex(
+            "9601b1014e85e16d0eaa8db6146e168653353e489646478380234fc4f56565c8",
+        )
+        .expect("U4 runtime digest");
+        let mut previous_inventory = inventory();
+        for instance in &mut previous_inventory.instances {
+            instance.runtime_digest = previous_runtime;
+        }
+
+        previous_inventory
+            .validate()
+            .expect("previous profile remains internally homogeneous");
+        assert_eq!(
+            previous_inventory.validate_for_compiled_runtime(),
+            Err(SemanticGraphFleetInventoryError::RuntimeMismatch)
+        );
     }
 
     #[test]

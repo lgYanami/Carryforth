@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0–U5已交付，待进入U6
+> 状态：概念规范、兼容基线与统一语义计算实现设计已冻结；U0–U6已交付，待进入U7资格关闭
 >
 > 更新日期：2026-08-16
 >
@@ -23,8 +23,9 @@
 > facade调用原本已经共享的exact SQL。whole-graph Coordinate现也通过共同授权/current-head/distance/
 > fixed-score静态kernel执行，并保留独立模板、canonical tie和K+1；同snapshot差分与10k资格已通过。
 > bounded complete path现以专属closed Q0/Qi bundle驱动共同root/relation/target scorer，并保持原有
-> traversal、packing、retry与release语义；同快照root差分和路径差分已通过。下一步进入U6默认route切换与
-> legacy收口。
+> traversal、packing、retry与release语义；同快照root差分和路径差分已通过。U6已把四个operation切换为
+> 同一compiled migrated profile，并通过新fleet runtime digest拒绝旧/新profile混跑。legacy Coordinate SQL与
+> graph adapter只保留到2026-09-16的profile rollback窗口。下一步进入U7资格与阶段关闭。
 
 ### 背景
 

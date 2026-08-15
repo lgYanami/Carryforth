@@ -96,8 +96,11 @@ impl SemanticGraphReadTx {
         }
     }
 
-    /// Acceptance-only entry to the migrated scorer while the compiled U4
-    /// production profile remains on the legacy route.
+    /// Shared scorer selected by the compiled U6 production profile.
+    ///
+    /// The explicit entry remains available to same-snapshot differential
+    /// qualification while the legacy implementation is retained for the
+    /// documented profile rollback window.
     pub(crate) async fn search_coordinate_starts_migrated(
         &mut self,
         query_vector: &SemanticCoordinateSearchVector,
