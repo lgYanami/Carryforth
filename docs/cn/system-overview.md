@@ -88,7 +88,7 @@ Carryforth 区分规范项目状态和派生读取结果：
 - Project View 对象、Document Revision、Context Edge、Meeting 状态和签名消息是规范记录；
 - Role Brief、客户端或模型生成的摘要、索引、查询结果和部分 UI cache 是从规范状态派生的读取面；
 - 派生状态不能在冲突时覆盖 Relay 中的权威对象；
-- 语义查询结果不作为新的虚拟 Event 写回规范历史。
+- 语义候选结果和 Agent 检索路径不作为新的虚拟 Event 写回规范历史。
 
 这一区分避免某个 Agent 的总结、某次查询或某个客户端缓存静默成为项目的新事实源。
 
@@ -146,17 +146,22 @@ community、updater 或 push 服务。
 
 ## 6. 语义 Provider 边界
 
-Project Context 图语义查询使用用户配置的外部 Provider 生成向量。当前允许进入 Provider 请求的
-索引信息受到合同限制，查询还要经过 Community gate、成员授权、对象 currentness、Provider admission
-和结果签名等检查。
+Project Context 语义发现使用用户配置的外部 Provider 生成向量。语义索引覆盖 eligible current
+Coordinates 与 relation Documents。Managed Agent 可以用它发现起始 Coordinate、按 relation Documents
+排列 incident Edges，以及在一条已选 Edge 内排列成员；随后由 Agent 结合当前 Role 和相关工作环境，
+而不是由 Provider 自动生成渐进阅读路径。
 
-启用查询时，operator 必须明确确认 problem 与 overview 文本（来源类型、当前可见标题/名称和
-可选摘要）会离开本地控制面并发送给所配置的 Provider；当前 foundation 不发送 Document 正文
-或 chunk。Provider API Key 只应存在于本地私有环境或受控 secret 注入中，不应写入 Project
+允许进入 Provider 请求的索引信息受到合同限制，每次查询还要经过 Community gate、成员授权、对象
+currentness、Provider admission 和结果签名等检查。
+
+启用语义检索时，operator 必须明确确认自然语言 query 与索引 overview 文本（来源类型、当前可见
+标题/名称和可选摘要）会离开本地控制面并发送给所配置的 Provider；当前 foundation 不发送 Document
+正文或 chunk。Provider API Key 只应存在于本地私有环境或受控 secret 注入中，不应写入 Project
 Document、日志或事件。
 
-语义查询是可选能力。关闭 Worker 和 Query HTTP 进程，或关闭 Community query gate，
-不会删除 Project View、Documents、Context Edge 或其他规范项目数据。
+语义检索是可选能力。关闭 Worker 和语义 HTTP 进程，或关闭 Community query gate，不会删除
+Project View、Documents、Context Edge 或其他规范项目数据。保留的有界完整路径型
+`semantic-query` 使用同一派生基础设施，但只是 Agent 自主渐进检索的补充能力。
 
 ## 7. 媒体与外部内容
 

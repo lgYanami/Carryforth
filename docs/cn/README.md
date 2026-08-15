@@ -20,9 +20,9 @@
    理解稳定坐标、无向 Edge / Hyperedge 与版本化 Document 为什么采用这种分工，
    以及 Agent 如何从当前工作坐标发现和维护相关上下文。
 
-4. [核心设计：上下文环境感知的图语义检索](core-design/context-aware-semantic-graph-retrieval.md)
+4. [核心设计：Agent 自主的上下文环境感知 Project Context 图检索](core-design/context-aware-semantic-graph-retrieval.md)
 
-   理解同一个问题如何在不同 Role、Work 等环境下，从统一 Project Context 图中得到
+   理解 Agent 如何结合当前 Role 与相关工作环境，在统一 Project Context 图中渐进选择
    不同但相关、可追溯的上下文路径，而无需建立 Agent 私有上下文。
 
 5. [核心设计：Meeting](core-design/meeting.md)

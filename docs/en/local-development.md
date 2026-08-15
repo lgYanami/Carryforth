@@ -83,8 +83,20 @@ BUZZ_SEMANTIC_WORKER_ENABLED=true
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
 ```
 
-When either switch is enabled, three Provider settings with no defaults must be supplied
-explicitly:
+Agent-directed start discovery and one-hop semantic selection have independent process masters.
+They remain off unless an operator explicitly adds them to the private `.env`:
+
+```dotenv
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
+```
+
+Turning either one on uses the same Provider and semantic-index foundation; it still does not open
+the durable Community gates or advertise a capability until the remaining readiness checks pass.
+
+Whenever any semantic indexing or query process is enabled, three Provider settings with no
+defaults must be supplied explicitly. The source launcher prompts for them because its Worker and
+complete-path Query switches start enabled by default:
 
 | Environment variable | Interactive input | Meaning |
 |---|---|---|
@@ -99,11 +111,13 @@ a default URL or model.
 Values are written only to the local Git-ignored `.env`. The API Key must not appear in terminal
 echo, logs, documentation, issues, or test fixtures.
 
-To avoid semantic capabilities entirely, disable both process switches in `.env`:
+To avoid semantic capabilities entirely, keep all four process switches disabled in `.env`:
 
 ```dotenv
 BUZZ_SEMANTIC_WORKER_ENABLED=false
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 ```
 
 ### 4.1 Process switches are not Community authorization
@@ -114,7 +128,7 @@ capabilities. It does not automatically perform:
 - Project View / Project Context initialization;
 - the durable Community semantic-index gate;
 - generation creation, build, verification, or activation;
-- the durable Community semantic-query gate;
+- the durable Community semantic retrieval/query gate;
 - acknowledgement that the problem and overview text (source type, current visible title/name, and
   optional summary; not Document bodies/chunks in the current foundation) leave the local system
   for the external Provider.
