@@ -1,0 +1,177 @@
+{
+  "contract_digests": {
+    "coordinate_query": "6e2e4f9dd2f7107ae2285c42a7ff548513815a8a57c365c443b782db4b39ed02",
+    "fleet_runtime": "325238245fe41d6e7916fa369c539aa35ac789a0f2d9c8d7c4275fba8f360bbe",
+    "graph_budget": "5247ffd12435a00ec5a0242875b3f868e2eb7c52d7e7fee5ce16cd83ee0bb893",
+    "graph_query_q0_qi": "990c06961dd01f5cd4be93c81d1223906000b19feec96e2539e09de227d4f348",
+    "graph_ranking": "d2abed4abc7b9298f3629ddc1ad05b2853907eb860cf73647966fab2bd7e5f8c",
+    "one_hop_edge_coordinate_ranking": "d3c47a0f869c950ff0fe2ec627147525b332694f39f95a7b8a9c9c0e8a1247ef",
+    "one_hop_incident_edge_ranking": "8cb1837682223e49365cb28c3bb9279a858e85148a4a7e1018ef2c738d0d756a"
+  },
+  "current_runtime_profile": {
+    "complete_path": {
+      "internal_retry": "one_generation_or_context_churn_root_attempt",
+      "operations": [
+        "bounded_complete_path"
+      ],
+      "release_snapshot": "existing_operation_specific_contract"
+    },
+    "one_shot": {
+      "internal_retry": "none",
+      "operations": [
+        "whole_graph_coordinate_discovery",
+        "coordinate_incident_edge",
+        "edge_member_coordinate"
+      ],
+      "release_snapshot": "exact_expected_snapshot"
+    }
+  },
+  "fixed_score_goldens": {
+    "candidate_score": 527500,
+    "conditioned_score": 850000,
+    "cosine_distance_0_2": 900000,
+    "environment_gain": 200000,
+    "path_final_score": 545614,
+    "problem_score": 650000,
+    "relation_document_score": 575000,
+    "target_coordinate_score": 575000,
+    "transition_score": 575000
+  },
+  "fixture_id": "carryforth.semantic-retrieval-compatibility.v1",
+  "model_space": {
+    "dimensions": 16,
+    "embedding_space_fence": "f4dcd72575ad503af1be6ff0917af1dc66d8ac7305b2ffe737ec45612635a840",
+    "generation_contract_digest": "d0714183860fbc75eeb067915596978ff210ab526632b08a20a54f92c9af7289",
+    "model": "deterministic-fake-v1",
+    "provider": "deterministic_fake"
+  },
+  "operations": [
+    {
+      "canonical_inputs": [
+        "{\"contract\":\"carryforth.project-context-coordinate-search.query\",\"query\":\"locate authorization failure context\"}"
+      ],
+      "execution_lifecycle": "one_shot",
+      "input_count": 1,
+      "input_digests": [
+        "ff7743466bf7ebf45c1506f1fd7425a3ffe9ab95dd2c1b755165b2c97d89defd"
+      ],
+      "logical_operation": "whole_graph_coordinate_discovery",
+      "query_vector_digests": [
+        "587437c1741c8c8b65165d9e258ecea66a6575dc86ea3e48cba107df9688e7cd"
+      ],
+      "result_kind": 40913,
+      "result_shape": "rank_coordinate_score_only",
+      "surface": "coordinate_search"
+    },
+    {
+      "canonical_inputs": [
+        "{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}"
+      ],
+      "execution_lifecycle": "one_shot",
+      "input_count": 1,
+      "input_digests": [
+        "d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1"
+      ],
+      "logical_operation": "coordinate_incident_edge",
+      "query_vector_digests": [
+        "9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095"
+      ],
+      "result_kind": 40914,
+      "result_shape": "edge_with_ranked_relation_document_observations_no_coordinates",
+      "surface": "one_hop_tagged_family"
+    },
+    {
+      "canonical_inputs": [
+        "{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}"
+      ],
+      "execution_lifecycle": "one_shot",
+      "input_count": 1,
+      "input_digests": [
+        "d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1"
+      ],
+      "logical_operation": "edge_member_coordinate",
+      "query_vector_digests": [
+        "9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095"
+      ],
+      "result_kind": 40914,
+      "result_shape": "coordinate_observations_no_relation_documents_or_paths",
+      "surface": "one_hop_tagged_family"
+    },
+    {
+      "canonical_inputs": [
+        "{\"contract\":\"semantic-graph-query.problem\",\"problem\":\"locate authorization failure context\"}",
+        "{\"contract\":\"semantic-graph-query.conditioned-context\",\"problem\":\"locate authorization failure context\",\"context_overview\":\"type: Work\\ntitle: Client authorization\\nsummary: Verify disclosure-safe failure handling\"}"
+      ],
+      "execution_lifecycle": "multi_stage_traversal",
+      "input_count": 2,
+      "input_digests": [
+        "d5d62070a144c924b75ce24b10611c90712fff3a3b4d8012de5894fea35fc5f1",
+        "7a2a689b90f287551e9c705b63e2750ed52b62af9d1e14577267bc7a941e55ab"
+      ],
+      "logical_operation": "bounded_complete_path",
+      "query_vector_digests": [
+        "9fc76e08f6dccf5f4864c199d23561a9ca56357430699c2270130b42732d5095",
+        "9b622f19c99c93426d35ea92f2121ae5a97998a1e2d556c866d770c4e3ad85a8"
+      ],
+      "result_kind": 40912,
+      "result_shape": "roots_paths_provenance_coverage",
+      "surface": "semantic_graph_query"
+    }
+  ],
+  "protected_result_boundaries": {
+    "bounded_complete_path": {
+      "excludes": [
+        "caller_defined_query_plan"
+      ],
+      "includes": [
+        "roots",
+        "paths",
+        "provenance",
+        "coverage"
+      ]
+    },
+    "coordinate_incident_edge": {
+      "excludes": [
+        "member_coordinates",
+        "path"
+      ],
+      "includes": [
+        "edge",
+        "ranked_relation_document_observations"
+      ]
+    },
+    "coordinate_search": {
+      "excludes": [
+        "edge",
+        "path",
+        "preview"
+      ],
+      "includes": [
+        "rank",
+        "coordinate",
+        "score"
+      ]
+    },
+    "edge_member_coordinate": {
+      "excludes": [
+        "relation_documents",
+        "other_edges",
+        "path"
+      ],
+      "includes": [
+        "ranked_coordinate_observations"
+      ]
+    }
+  },
+  "schema_version": 1,
+  "synthetic_graph": {
+    "coordinates": [
+      "pv:123e4567-e89b-42d3-a456-426600000002:role:123e4567-e89b-42d3-a456-426600000003",
+      "pv:123e4567-e89b-42d3-a456-426600000002:work:123e4567-e89b-42d3-a456-426600000004",
+      "pv:123e4567-e89b-42d3-a456-426600000002:issue:123e4567-e89b-42d3-a456-426600000005"
+    ],
+    "edge_key": "eb8f7c8cbc4988c40ad20f27ed355dfce1ddf0a65a0d1515fa30a6db1e15178c",
+    "project_id": "123e4567-e89b-42d3-a456-426600000002",
+    "topology": "one complete undirected three-coordinate Hyperedge"
+  }
+}

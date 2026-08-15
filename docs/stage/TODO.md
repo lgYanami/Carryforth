@@ -2,9 +2,18 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：待单独设计，不并入当前 Agent Context Search 功能阶段
+> 状态：概念规范与兼容基线已冻结；统一语义计算实现设计待单独交付
 >
-> 记录日期：2026-08-14
+> 更新日期：2026-08-15
+>
+> 概念规范：
+> [Project Context 统一语义检索引擎规范](semantic/ unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
+>
+> 兼容基线：
+> [Project Context 语义检索兼容基线记录](semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md)
+>
+> 当前进展：四个逻辑operation、三个公开surface的deterministic与真实数据库兼容基线已冻结；真实
+> Provider统一canary因缺少受支持配置未运行。下一步是统一语义计算的零行为迁移设计。
 
 ### 背景
 
@@ -12,8 +21,8 @@ Project Context 正在形成四类语义检索面：
 
 1. 已交付的自然语言 Coordinate 起点检索；
 2. 已交付的多跳图语义路径检索；
-3. 拟议的 `Coordinate → incident Edge` 语义检索，以 Edge 绑定的关系 Documents 作为候选证据；
-4. 拟议的 `Edge → member Coordinate` 语义检索，在完整 Hyperedge 成员范围内排序Coordinate候选；
+3. 已交付的 `Coordinate → incident Edge` 语义检索，以 Edge 绑定的关系 Documents 作为候选证据；
+4. 已交付的 `Edge → member Coordinate` 语义检索，在完整 Hyperedge 成员范围内排序Coordinate候选；
    “下一步”与循环防护仍由后续Agent遍历策略决定。
 
 它们的候选范围与结果合同不同，但都可能复用以下基础设施：
@@ -56,8 +65,9 @@ Project Context 正在形成四类语义检索面：
 2. scope resolver、scorer、grouping/projector与result verifier采用哪些closed Rust types；
 3. 哪些query template、score解释和budget可以共享，哪些必须按operation独立冻结；
 4. global source snapshot、topology-scoped snapshot与multi-hop traversal如何共享同一generation/currentness合同；
-5. 两个新的一跳语义查询应共享一个内部engine到什么程度，同时是否保持独立wire/result/capability；
-6. 如何迁移现有Coordinate search和semantic graph query而不改变它们已发布的结果、权限与灰度语义；
+5. 两个已交付的一跳语义查询如何迁入统一引擎，同时保持各自的closed scope/result variant及既有共享
+   tagged wire family；
+6. 如何迁移现有三个wire surface和四个逻辑operation，而不改变已发布的结果、权限与灰度语义；
 7. 如何建立跨operation的Provider call-count、current-head、authorization、release-race、资源上限和性能回归矩阵。
 
 ### 范围边界
@@ -72,11 +82,11 @@ Project Context 正在形成四类语义检索面：
 
 后续应新建立项与实现计划，至少包含：
 
-1. 现有两条查询代码路径与重复设施的只读审计；
+1. 现有三个wire surface、四个逻辑operation与重复设施的只读审计；
 2. typed engine API和crate依赖设计；
-3. 两个拟议一跳语义操作的prototype对照；
+3. 两个已交付一跳语义操作的零行为变化迁移对照；
 4. 现有查询零行为变化的迁移方案；
 5. security/currentness/rollout review；
 6. target-scale benchmark与跨operation资格门。
 
-在该独立设计被确认前，本TODO不代表已经决定具体trait、crate、wire合并方式或迁移顺序。
+概念规范的确认不代表已经决定具体trait、crate、wire合并方式或迁移顺序。
