@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U1 已通过；U2–U7 待交付
+> 状态：U0–U2 已通过；U3–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | U0 设计与差分门 | 通过 | 历史 v1 oracle 与独立 Phase 1 gate 可在同一工作树运行 |
 | U1 共同 input/fence/vector | 通过 | 三种 closed input 与两类旧 wrapper 已委托共同类型；exact generation 只由 writer DB ticket 绑定 |
-| U2 共同 Provider encoder | 待执行 | — |
+| U2 共同 Provider encoder | 通过 | Coordinate 与 graph 兼容 adapter 委托同一 bounded batch primitive；无 retry/fallback/额外调用 |
 | U3 one-hop tagged family | 待执行 | — |
 | U4 whole-graph Coordinate | 待执行 | — |
 | U5 bounded complete path | 待执行 | — |
@@ -111,4 +111,40 @@ git diff --check
 U1 只完成共同 production types 与 DB generation binder；共同 Provider encoder 与共同 exact scorer 尚未
 切换 production operation。它不代表可靠性 runtime、资源治理或 production SLO 已交付。
 
-真实 Provider canary 仍缺少受支持的 `BUZZ_SEMANTIC_*` 配置，未在 U0–U1 运行；不得挪用 `LLM_*`。
+真实 Provider canary 仍缺少受支持的 `BUZZ_SEMANTIC_*` 配置，未在 U0–U2 运行；不得挪用 `LLM_*`。
+
+## 4. U2 共同 Provider encoder
+
+U2 新增 `SemanticInputEncoder`，其唯一输入/输出是一个已验证的 `SemanticQueryInputBundle` 与同序
+`ProviderEncodedSemanticInputBundle`。生产 `VolcengineSemanticProvider` 在这个 primitive 内：
+
+1. 在网络前复核 closed bundle 与 model space；
+2. 精确按 bundle 顺序发送 UTF-8 texts；
+3. 恰好发出一个 Provider batch；
+4. 继续使用既有 response body cap、HTTP status 分类、model/count/index/dimension/finite/non-zero 验证；
+5. 将完整 batch 一次性绑定到 input digest；任一成员失败即整批失败。
+
+现有 `encode_coordinate_search` 与 `encode_queries` API 保留，并作为 thin compatibility adapter 委托共同
+primitive。Coordinate、两个 one-hop variant 与完整路径的调用方、admission、deadline、retry 与 snapshot
+编排没有改变；单请求失败不会自动 fallback 或再次请求 Provider。
+
+新增 `ByteDeterministicSemanticInputEncoder` 只作为无 transport 的差分 seam：向量只由 exact Provider bytes
+与 model space 决定，request/channel 仅保留为结果绑定。原 `DeterministicFakeQueryEncoder` 的 channel-aware
+算法与历史 manifest 保持不变。
+
+U2 新增/更新后的实际证据：
+
+~~~text
+cargo test -p buzz-semantic-query --lib                         # 48 passed
+cargo test -p buzz-semantic-query --test compatibility_baseline # 1 passed
+cargo test -p buzz-semantic-query --test computation_differential # 2 passed
+cargo test -p buzz-relay --lib semantic_                         # 73 passed
+cargo test -p buzz-relay --lib coordinate_search                 # 4 passed
+cargo test -p buzz-relay --lib one_hop                           # 6 passed
+cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings
+./scripts/check-semantic-retrieval-computation.sh all
+git diff --check
+~~~
+
+HTTP fake Provider 直接断言了：Coordinate 为一次单输入调用；one-hop 为一次 Q0 调用；完整路径 Q0+Qi 为一次
+有序 batch 调用；Provider 乱序 datum 仍按 index 恢复，exact text 与 input digest 没有变化。

@@ -16,6 +16,11 @@ use crate::{
 pub type SemanticQueryEncoderFuture<'a> =
     Pin<Box<dyn Future<Output = QueryContractResult<Vec<EncodedSemanticQuery>>> + Send + 'a>>;
 
+/// Heap-allocated common Provider result without an async-trait dependency.
+pub type SemanticInputEncoderFuture<'a> = Pin<
+    Box<dyn Future<Output = QueryContractResult<ProviderEncodedSemanticInputBundle>> + Send + 'a>,
+>;
+
 /// One Provider result bound to exact closed input bytes and one model space.
 ///
 /// It deliberately carries no active generation UUID. Only a current,
@@ -174,6 +179,22 @@ impl ProviderEncodedSemanticInputBundle {
     }
 }
 
+/// Common Provider boundary for one validated, bounded semantic input batch.
+///
+/// Implementations must issue at most one Provider request for the bundle and
+/// preserve input order. This interface owns no retry, admission, generation,
+/// snapshot, scope, or ranking policy.
+pub trait SemanticInputEncoder: Send + Sync {
+    /// Exact Foundation model space produced by this encoder.
+    fn source_contract(&self) -> &SemanticModelContract;
+
+    /// Encode one complete bundle or fail the complete bundle.
+    fn encode_semantic_inputs<'a>(
+        &'a self,
+        inputs: &'a SemanticQueryInputBundle,
+    ) -> SemanticInputEncoderFuture<'a>;
+}
+
 /// Compatibility wrapper for one graph Q0/Qi Provider result.
 pub struct EncodedSemanticQuery {
     inner: ProviderEncodedSemanticInput,
@@ -204,6 +225,27 @@ impl EncodedSemanticQuery {
             values,
             source_contract,
         )?;
+        Self::from_provider_encoded(input, inner, source_contract)
+    }
+
+    /// Restore the graph compatibility wrapper around a common Provider result.
+    pub fn from_provider_encoded(
+        input: &SemanticQueryEncoderInput,
+        inner: ProviderEncodedSemanticInput,
+        source_contract: &SemanticModelContract,
+    ) -> QueryContractResult<Self> {
+        input.validate()?;
+        let fences = QueryCompatibilityFences::for_source_contract(source_contract)?;
+        if inner.request_id() != input.request_id()
+            || inner.channel_id() != input.channel_id()
+            || inner.channel_kind() != input.semantic_input().channel_kind()
+            || inner.input_digest() != input.text_digest()
+            || inner.response_model() != source_contract.model
+        {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "graph query Provider identity binding mismatch".to_owned(),
+            ));
+        }
         if inner.model_space.source_generation_contract_digest
             != fences.source_generation_contract_digest
             || inner.model_space.embedding_space_fence != fences.embedding_space_fence
@@ -277,6 +319,80 @@ pub trait SemanticQueryEncoder: Send + Sync {
         &'a self,
         inputs: &'a [SemanticQueryEncoderInput],
     ) -> SemanticQueryEncoderFuture<'a>;
+}
+
+/// Byte-deterministic common encoder for differential and adapter tests.
+///
+/// Unlike the historical fake query encoder, vector values depend only on
+/// exact Provider bytes and model space. Request and channel identities remain
+/// response bindings but do not affect the numbers.
+pub struct ByteDeterministicSemanticInputEncoder {
+    source_contract: SemanticModelContract,
+}
+
+impl ByteDeterministicSemanticInputEncoder {
+    /// Build a common deterministic encoder in the Foundation test space.
+    pub fn new(dimensions: usize) -> QueryContractResult<Self> {
+        let foundation = DeterministicFakeEncoder::new(dimensions)
+            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
+        Ok(Self {
+            source_contract: foundation.contract().clone(),
+        })
+    }
+}
+
+impl SemanticInputEncoder for ByteDeterministicSemanticInputEncoder {
+    fn source_contract(&self) -> &SemanticModelContract {
+        &self.source_contract
+    }
+
+    fn encode_semantic_inputs<'a>(
+        &'a self,
+        inputs: &'a SemanticQueryInputBundle,
+    ) -> SemanticInputEncoderFuture<'a> {
+        Box::pin(async move {
+            inputs.validate().map_err(|error| {
+                SemanticGraphQueryError::InvalidState(format!(
+                    "common semantic input bundle: {error}"
+                ))
+            })?;
+            let model_space = SemanticModelSpaceFences::for_source_contract(&self.source_contract)?;
+            let mut vectors = Vec::with_capacity(inputs.len());
+            for input in inputs.inputs() {
+                let mut values = Vec::with_capacity(self.source_contract.dimensions);
+                let mut counter = 0_u64;
+                while values.len() < self.source_contract.dimensions {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"carryforth.semantic-input-byte-deterministic-v1");
+                    hasher.update(model_space.embedding_space_fence.as_bytes());
+                    hasher.update(input.exact_utf8_text().as_bytes());
+                    hasher.update(counter.to_be_bytes());
+                    let block: [u8; 32] = hasher.finalize().into();
+                    for bytes in block.chunks_exact(4) {
+                        if values.len() == self.source_contract.dimensions {
+                            break;
+                        }
+                        let raw = u32::from_be_bytes(
+                            bytes
+                                .try_into()
+                                .map_err(|_| SemanticGraphQueryError::Serialization)?,
+                        );
+                        values.push(((f64::from(raw) / f64::from(u32::MAX)) * 2.0 - 1.0) as f32);
+                    }
+                    counter = counter
+                        .checked_add(1)
+                        .ok_or(SemanticGraphQueryError::Serialization)?;
+                }
+                vectors.push(values);
+            }
+            ProviderEncodedSemanticInputBundle::new(
+                inputs,
+                self.source_contract.model.clone(),
+                vectors,
+                &self.source_contract,
+            )
+        })
+    }
 }
 
 /// Offline deterministic fake query encoder for unit and DB integration tests.
@@ -353,11 +469,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DeterministicFakeQueryEncoder, ProviderEncodedSemanticInputBundle, SemanticQueryEncoder,
+        ByteDeterministicSemanticInputEncoder, DeterministicFakeQueryEncoder,
+        ProviderEncodedSemanticInputBundle, SemanticInputEncoder, SemanticQueryEncoder,
     };
     use crate::{
-        build_query_encoder_inputs, ConditionedContextOverview, LifecycleFilter,
-        SemanticGraphQuery, SemanticGraphQueryBudget,
+        build_problem_query_encoder_input, build_query_encoder_inputs, ConditionedContextOverview,
+        LifecycleFilter, SemanticGraphQuery, SemanticGraphQueryBudget,
     };
 
     fn uuid(value: u128) -> Uuid {
@@ -397,6 +514,44 @@ mod tests {
         assert_eq!(
             first[0].embedding().as_slice(),
             second[0].embedding().as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn common_fake_depends_on_exact_bytes_not_request_or_channel_identity() {
+        let first = build_problem_query_encoder_input(uuid(21), "same Provider bytes")
+            .expect("first input")
+            .semantic_input()
+            .clone();
+        let second = build_problem_query_encoder_input(uuid(22), "same Provider bytes")
+            .expect("second input")
+            .semantic_input()
+            .clone();
+        assert_ne!(first.request_id(), second.request_id());
+        assert_ne!(first.channel_id(), second.channel_id());
+        assert_eq!(first.exact_utf8_text(), second.exact_utf8_text());
+
+        let first =
+            crate::SemanticQueryInputBundle::from_closed_inputs(vec![first]).expect("first bundle");
+        let second = crate::SemanticQueryInputBundle::from_closed_inputs(vec![second])
+            .expect("second bundle");
+        let encoder = ByteDeterministicSemanticInputEncoder::new(8).expect("common fake");
+        let first = encoder
+            .encode_semantic_inputs(&first)
+            .await
+            .expect("first result");
+        let second = encoder
+            .encode_semantic_inputs(&second)
+            .await
+            .expect("second result");
+
+        assert_eq!(
+            first.inputs()[0].embedding().as_slice(),
+            second.inputs()[0].embedding().as_slice()
+        );
+        assert_ne!(
+            first.inputs()[0].request_id(),
+            second.inputs()[0].request_id()
         );
     }
 

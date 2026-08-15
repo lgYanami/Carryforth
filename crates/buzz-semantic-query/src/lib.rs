@@ -33,8 +33,9 @@ pub use contract::{
 };
 pub use coordinate_search::*;
 pub use encoder::{
-    DeterministicFakeQueryEncoder, EncodedSemanticQuery, ProviderEncodedSemanticInput,
-    ProviderEncodedSemanticInputBundle, SemanticQueryEncoder, SemanticQueryEncoderFuture,
+    ByteDeterministicSemanticInputEncoder, DeterministicFakeQueryEncoder, EncodedSemanticQuery,
+    ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle, SemanticInputEncoder,
+    SemanticInputEncoderFuture, SemanticQueryEncoder, SemanticQueryEncoderFuture,
 };
 pub use fence::{embedding_space_fence, QueryCompatibilityFences, SemanticModelSpaceFences};
 pub use fleet::{

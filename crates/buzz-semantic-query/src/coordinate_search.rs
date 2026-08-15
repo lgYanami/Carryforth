@@ -331,10 +331,31 @@ impl EncodedCoordinateSearchQuery {
             source_contract,
         )
         .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
+        Self::from_provider_encoded(input, inner, source_contract)
+    }
+
+    /// Restore the Coordinate compatibility wrapper around a common result.
+    pub fn from_provider_encoded(
+        input: &CoordinateSearchEncoderInput,
+        inner: ProviderEncodedSemanticInput,
+        source_contract: &SemanticModelContract,
+    ) -> CoordinateSearchResult<Self> {
+        input.validate()?;
         if !matches!(
             inner.channel_kind(),
             SemanticQueryInputKind::CoordinateSearch
-        ) || inner.encoding_contract_digest() != coordinate_search_query_contract_digest()
+        ) || inner.request_id() != input.request_id()
+            || inner.channel_id() != input.semantic_input().channel_id()
+            || inner.encoding_contract_digest() != coordinate_search_query_contract_digest()
+            || inner.input_digest() != input.text_digest()
+            || inner.response_model() != source_contract.model
+            || inner.model_space().source_generation_contract_digest
+                != source_contract
+                    .digest()
+                    .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?
+            || inner.model_space().embedding_space_fence
+                != crate::embedding_space_fence(source_contract)
+                    .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?
         {
             return Err(CoordinateSearchError::InvalidState(
                 "Coordinate-search Provider binding mismatch".to_owned(),
