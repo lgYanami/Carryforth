@@ -1,24 +1,31 @@
 import * as React from "react";
 import {
-  AlertCircle,
-  Boxes,
   ChevronRight,
-  CircleDot,
-  Flag,
-  GitBranch,
   LayoutDashboard,
-  Map as MapIcon,
-  Plus,
+  PanelRightClose,
+  PanelRightOpen,
   RefreshCw,
   ShieldCheck,
   WifiOff,
 } from "lucide-react";
 
-import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import {
-  countProjectViewFocus,
-  type ProjectViewCreateContext,
-} from "@/features/project-view/model";
+  identityFromMeta,
+  useProjectDocumentLiveSync,
+  useProjectDocumentMeta,
+  useProjectDocuments,
+} from "@/features/project-documents/hooks";
+import {
+  buildProjectViewExplorerModel,
+  buildProjectViewExplorerPage,
+  canonicalObjectOccurrenceKey,
+  indexProjectDocumentCatalog,
+  projectViewCanonicalParent,
+  projectViewExplorerFallbackObjectIds,
+  resolveProjectViewExplorerSelection,
+  type ProjectViewExplorerSelection,
+} from "@/features/project-view/explorerModel";
+import type { ProjectViewCreateContext } from "@/features/project-view/model";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
   useProjectViewLiveSync,
@@ -29,13 +36,17 @@ import {
   canGovernProjectRole,
   projectRoleGovernanceCapabilities,
 } from "@/features/project-view/projectRoleGovernance";
-import { ProjectViewActor } from "@/features/project-view/ui/ProjectViewActor";
+import { projectViewRoleLifecycleState } from "@/features/project-view/projectViewRoleLifecycle";
+import { ProjectViewContextManagementDialog } from "@/features/project-view/ui/ProjectViewContextManagementDialog";
+import { ProjectViewCurrentDocument } from "@/features/project-view/ui/ProjectViewCurrentDocument";
+import { ProjectViewCurrentObject } from "@/features/project-view/ui/ProjectViewCurrentObject";
 import { ProjectViewDeleteDialog } from "@/features/project-view/ui/ProjectViewDeleteDialog";
-import { ProjectViewInspector } from "@/features/project-view/ui/ProjectViewInspector";
-import { ProjectViewMap } from "@/features/project-view/ui/ProjectViewMap";
+import {
+  ProjectViewObjectActions,
+  ProjectViewObjectMaintenance,
+} from "@/features/project-view/ui/ProjectViewObjectMaintenance";
 import { ProjectViewObjectDialog } from "@/features/project-view/ui/ProjectViewObjectDialog";
-import { ProjectViewObjectCard } from "@/features/project-view/ui/ProjectViewObjectCard";
-import { ProjectRoleCard } from "@/features/project-view/ui/ProjectRoleCard";
+import { ProjectViewOutlinePanel } from "@/features/project-view/ui/ProjectViewOutlinePanel";
 import { ProjectViewV3SetupGuide } from "@/features/project-view/ui/ProjectViewV3SetupGuide";
 import {
   ProjectViewErrorState,
@@ -46,282 +57,53 @@ import {
 } from "@/features/project-view/ui/ProjectViewStates";
 import { isProjectViewIntegrityError } from "@/shared/api/tauriProjectView";
 import type {
-  ProjectView,
   ProjectViewLoadResult,
   ProjectViewObject,
   ProjectViewObjectType,
-  ProjectViewRoleContinuity,
 } from "@/shared/api/tauriProjectView";
 import {
   isRelayConnectionDegraded,
   useRelayConnection,
 } from "@/shared/api/useRelayConnection";
+import { useIsAuxiliaryPanelOverlay } from "@/shared/hooks/use-mobile";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 
 type ProjectViewScreenProps = {
+  onOpenDocument: (search: { document: string; revision?: number }) => void;
   onOpenOverview?: () => void;
-  onSelectObject: (objectId: string | undefined) => void;
+  onSelectItem: (
+    selection?: ProjectViewExplorerSelection,
+    options?: { replace?: boolean },
+  ) => void;
   onShowInProjectContext?: (object: ProjectViewObject) => void;
-  selectedObjectId?: string;
+  selection?: ProjectViewExplorerSelection;
 };
 
-function FocusMetric({
-  icon,
-  label,
-  value,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: number;
-}) {
-  return (
-    <div className="rounded-xl border border-border/70 bg-card/60 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground">
-        {icon}
-        <span className="text-2xs font-semibold uppercase tracking-wider">
-          {label}
-        </span>
-      </div>
-      <div className="mt-1 text-xl font-semibold tabular-nums">{value}</div>
-    </div>
-  );
-}
-
-function ProjectProfile({
-  actorProfiles,
-  currentPubkey,
-  onSelectObject,
-  selectedObjectId,
-  view,
-}: {
-  actorProfiles?: UserProfileLookup;
-  currentPubkey?: string;
-  onSelectObject: (objectId: string) => void;
-  selectedObjectId?: string;
-  view: ProjectView;
-}) {
-  const profile = view.profile;
-  const relatedIssueCount =
-    view.issueReferencesByTarget[profile.id]?.length ?? 0;
-  return (
-    <section
-      className="overflow-hidden rounded-2xl border border-border/70 bg-card/60 shadow-xs"
-      data-testid="project-view-profile"
-    >
-      <button
-        aria-label={`Inspect Project Profile ${profile.data.name}`}
-        className="w-full p-5 text-left transition-colors hover:bg-muted/20 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        data-object-id={profile.id}
-        onClick={() => onSelectObject(profile.id)}
-        type="button"
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="outline">Project profile</Badge>
-          {selectedObjectId === profile.id ? (
-            <Badge variant="info">Inspecting</Badge>
-          ) : null}
-          {relatedIssueCount > 0 ? (
-            <Badge variant="warning">
-              <AlertCircle className="mr-1 h-3 w-3" />
-              {relatedIssueCount} related{" "}
-              {relatedIssueCount === 1 ? "issue" : "issues"}
-            </Badge>
-          ) : null}
-        </div>
-        <h1 className="mt-3 text-2xl font-semibold tracking-tight">
-          {profile.data.name}
-        </h1>
-        <p className="mt-2 max-w-4xl text-sm leading-relaxed text-muted-foreground">
-          {profile.data.positioning}
-        </p>
-        <div className="mt-3 flex items-center gap-1 text-2xs text-muted-foreground">
-          <span>Updated {new Date(profile.updatedAt).toLocaleString()} by</span>
-          <ProjectViewActor
-            compact
-            currentPubkey={currentPubkey}
-            profiles={actorProfiles}
-            pubkey={profile.updatedBy}
-          />
-        </div>
-      </button>
-      <div className="grid border-t border-border/70 sm:grid-cols-3">
-        {[
-          ["Purpose", profile.data.purpose],
-          ["Problem", profile.data.problem],
-          ["Scope", profile.data.scope],
-        ].map(([label, value], index) => (
-          <div
-            className={
-              index === 0
-                ? "p-4"
-                : "border-t border-border/70 p-4 sm:border-l sm:border-t-0"
-            }
-            key={label}
-          >
-            <div className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
-              {label}
-            </div>
-            <p className="mt-1.5 text-sm leading-relaxed">{value}</p>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function SupportingObjects({
-  actorProfiles,
-  canCreateRole,
-  currentPubkey,
-  onCreateObject,
-  onSelectObject,
-  roleContinuity,
-  selectedObjectId,
-  view,
-}: {
-  actorProfiles?: UserProfileLookup;
-  canCreateRole: boolean;
-  currentPubkey?: string;
-  onCreateObject: (
-    objectType: "role" | "resource",
-    context?: ProjectViewCreateContext,
-  ) => void;
-  onSelectObject: (objectId: string) => void;
-  roleContinuity?: ProjectViewRoleContinuity;
-  selectedObjectId?: string;
-  view: ProjectView;
-}) {
-  const roleDefinitions = React.useMemo(
-    () =>
-      new Map(
-        roleContinuity?.roles.map((definition) => [
-          definition.roleId,
-          definition,
-        ]) ?? [],
-      ),
-    [roleContinuity],
-  );
-  const currentAssignments = React.useMemo(
-    () =>
-      new Map(
-        roleContinuity?.assignments
-          .filter((assignment) => !assignment.endedAt)
-          .map((assignment) => [assignment.roleId, assignment]) ?? [],
-      ),
-    [roleContinuity],
-  );
-
-  return (
-    <section className="grid gap-5 xl:grid-cols-2">
-      <div>
-        <div className="mb-2 flex items-center gap-2">
-          <Flag className="h-4 w-4 text-muted-foreground" />
-          <h2 className="text-sm font-semibold">Roles</h2>
-          <span className="text-xs text-muted-foreground">
-            Semantic responsibilities
-          </span>
-          {canCreateRole ? (
-            <Button
-              className="ml-auto h-7"
-              onClick={() => onCreateObject("role")}
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
-              <Plus />
-              Add Role
-            </Button>
-          ) : null}
-        </div>
-        {view.roles.length > 0 ? (
-          <div className="grid gap-2 sm:grid-cols-2">
-            {view.roles.map((role) => {
-              const definition = roleDefinitions.get(role.id);
-              return definition ? (
-                <ProjectRoleCard
-                  actorProfiles={actorProfiles}
-                  currentAssignment={currentAssignments.get(role.id)}
-                  currentPubkey={currentPubkey}
-                  definition={definition}
-                  key={role.id}
-                  object={role}
-                  onSelect={onSelectObject}
-                  selected={selectedObjectId === role.id}
-                />
-              ) : (
-                <ProjectViewObjectCard
-                  actorProfiles={actorProfiles}
-                  currentPubkey={currentPubkey}
-                  key={role.id}
-                  object={role}
-                  onSelect={onSelectObject}
-                  selected={selectedObjectId === role.id}
-                  size="compact"
-                />
-              );
-            })}
-          </div>
-        ) : (
-          <div className="rounded-xl border border-dashed border-border/70 p-4 text-xs text-muted-foreground">
-            No semantic roles declared.
-          </div>
-        )}
-      </div>
-      <div>
-        <div className="mb-2 flex items-center gap-2">
-          <Boxes className="h-4 w-4 text-muted-foreground" />
-          <h2 className="text-sm font-semibold">Resources</h2>
-          <span className="text-xs text-muted-foreground">
-            Stable project entry points
-          </span>
-          <Button
-            className="ml-auto h-7"
-            onClick={() => onCreateObject("resource")}
-            size="sm"
-            type="button"
-            variant="ghost"
-          >
-            <Plus />
-            Add Resource
-          </Button>
-        </div>
-        {view.resources.length > 0 ? (
-          <div className="grid gap-2 sm:grid-cols-2">
-            {view.resources.map((resource) => (
-              <ProjectViewObjectCard
-                actorProfiles={actorProfiles}
-                currentPubkey={currentPubkey}
-                key={resource.id}
-                object={resource}
-                onSelect={onSelectObject}
-                selected={selectedObjectId === resource.id}
-                size="compact"
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="rounded-xl border border-dashed border-border/70 p-4 text-xs text-muted-foreground">
-            No resources declared.
-          </div>
-        )}
-      </div>
-    </section>
-  );
+function selectionRequestKey(
+  selection: ProjectViewExplorerSelection | undefined,
+): string {
+  if (!selection) return "profile";
+  return selection.kind === "object"
+    ? `object:${selection.objectId}:${selection.via ?? "canonical"}`
+    : `document:${selection.documentId}:${selection.revision ?? "current"}:${selection.via ?? "canonical"}`;
 }
 
 function ReadyProjectView({
   activeObjectCount,
-  onSelectObject,
+  onOpenDocument,
+  onOutlineOpenChange,
+  onSelectItem,
   onShowInProjectContext,
+  outlineOpen,
   projectRevision,
   projectionGeneration,
   relayPubkey,
   roleContinuity,
   contextCapability,
   onRefresh,
-  selectedObjectId,
+  selection,
   syncMessage,
   syncState,
   updatedAt,
@@ -329,6 +111,8 @@ function ReadyProjectView({
 }: Extract<ProjectViewLoadResult, { status: "ready" }> &
   ProjectViewScreenProps & {
     onRefresh: () => Promise<unknown>;
+    onOutlineOpenChange: (open: boolean) => void;
+    outlineOpen: boolean;
     syncMessage?: string;
     syncState?: "refreshing" | "stale";
   }) {
@@ -341,7 +125,44 @@ function ReadyProjectView({
     | { mode: "edit"; object: ProjectViewObject };
 
   const [editor, setEditor] = React.useState<EditorRequest>();
-  const [deleteTarget, setDeleteTarget] = React.useState<ProjectViewObject>();
+  const [deleteTarget, setDeleteTarget] = React.useState<{
+    object: ProjectViewObject;
+    returnObjectId?: string;
+  }>();
+  const [contextTarget, setContextTarget] = React.useState<ProjectViewObject>();
+  const headingRef = React.useRef<HTMLHeadingElement>(null);
+  const focusMainAfterNavigation = React.useRef(false);
+  const lastValidLocation = React.useRef<
+    | {
+        requestKey: string;
+        fallbackObjectIds: string[];
+      }
+    | undefined
+  >(undefined);
+  const isOverlay = useIsAuxiliaryPanelOverlay();
+  const documentMetaQuery = useProjectDocumentMeta();
+  const documentsQuery = useProjectDocuments(documentMetaQuery.data);
+  useProjectDocumentLiveSync(documentMetaQuery.data);
+  const documentIdentity = documentMetaQuery.data
+    ? identityFromMeta(documentMetaQuery.data)
+    : undefined;
+  const documentCatalog = React.useMemo(
+    () => indexProjectDocumentCatalog(documentsQuery.data?.documents),
+    [documentsQuery.data?.documents],
+  );
+  const explorer = React.useMemo(
+    () => buildProjectViewExplorerModel({ view, documentCatalog }),
+    [documentCatalog, view],
+  );
+  const resolvedSelection = React.useMemo(
+    () => resolveProjectViewExplorerSelection(explorer, selection),
+    [explorer, selection],
+  );
+  const page = React.useMemo(
+    () => buildProjectViewExplorerPage(explorer, selection),
+    [explorer, selection],
+  );
+  const requestKey = selectionRequestKey(selection);
   const { actorProfiles, currentPubkey, objectsById } = useProjectViewActors(
     view,
     roleContinuity,
@@ -350,9 +171,8 @@ function ReadyProjectView({
     () => projectRoleGovernanceCapabilities(roleContinuity, currentPubkey),
     [currentPubkey, roleContinuity],
   );
-  const selectedObject = selectedObjectId
-    ? objectsById.get(selectedObjectId)
-    : undefined;
+  const selectedObject =
+    page.kind === "object" ? page.currentObject : undefined;
   const selectedRoleDefinition =
     selectedObject?.objectType === "role"
       ? roleContinuity?.roles.find(
@@ -362,135 +182,209 @@ function ReadyProjectView({
   const selectedRoleCanGovern = selectedRoleDefinition
     ? canGovernProjectRole(roleGovernance, selectedRoleDefinition.level)
     : false;
-  React.useEffect(() => {
-    if (selectedObjectId && !selectedObject) {
-      onSelectObject(undefined);
-    }
-  }, [onSelectObject, selectedObject, selectedObjectId]);
-  const focus = React.useMemo(() => countProjectViewFocus(view), [view]);
-  const selectObject = React.useCallback(
-    (objectId: string) => onSelectObject(objectId),
-    [onSelectObject],
+  const selectedObjectCanMaintain = Boolean(
+    selectedObject &&
+      (selectedObject.objectType !== "role" || selectedRoleCanGovern),
   );
-  const createObject = React.useCallback(
-    (
-      objectType: Exclude<ProjectViewObjectType, "project_profile">,
-      context?: ProjectViewCreateContext,
-    ) => {
-      if (objectType === "role" && !roleGovernance.canCreateMemberRole) return;
-      setEditor({ mode: "create", initialType: objectType, context });
+  const selectedRoleLifecycle = React.useMemo(
+    () => projectViewRoleLifecycleState(selectedRoleDefinition, roleContinuity),
+    [roleContinuity, selectedRoleDefinition],
+  );
+
+  const commitSelection = React.useCallback(
+    (next?: ProjectViewExplorerSelection, options?: { replace?: boolean }) => {
+      if (next?.kind === "object" && next.objectId === view.profile.id) {
+        onSelectItem(undefined, options);
+        return;
+      }
+      if (
+        next?.kind === "object" &&
+        next.via === canonicalObjectOccurrenceKey(next.objectId)
+      ) {
+        onSelectItem({ kind: "object", objectId: next.objectId }, options);
+        return;
+      }
+      onSelectItem(next, options);
     },
-    [roleGovernance.canCreateMemberRole],
+    [onSelectItem, view.profile.id],
   );
-  const closeInspector = React.useCallback(() => {
-    const closingObjectId = selectedObject?.id;
-    onSelectObject(undefined);
-    if (!closingObjectId) return;
+
+  React.useEffect(() => {
+    if (!selection) return;
+    if (selection.kind === "object" && selection.objectId === view.profile.id) {
+      onSelectItem(undefined, { replace: true });
+      return;
+    }
+    const canonicalVia =
+      selection.kind === "object" &&
+      selection.via === canonicalObjectOccurrenceKey(selection.objectId);
+    if (resolvedSelection.resolution === "canonicalized" || canonicalVia) {
+      commitSelection({ ...selection, via: undefined }, { replace: true });
+    } else if (resolvedSelection.resolution === "fallback") {
+      const previous = lastValidLocation.current;
+      const fallbackObjectId =
+        previous?.requestKey === requestKey
+          ? previous.fallbackObjectIds.find((objectId) =>
+              explorer.objectsById.has(objectId),
+            )
+          : undefined;
+      commitSelection(
+        fallbackObjectId
+          ? { kind: "object", objectId: fallbackObjectId }
+          : undefined,
+        { replace: true },
+      );
+    }
+  }, [
+    commitSelection,
+    explorer.objectsById,
+    onSelectItem,
+    requestKey,
+    resolvedSelection.resolution,
+    selection,
+    view.profile.id,
+  ]);
+
+  React.useEffect(() => {
+    if (resolvedSelection.resolution === "fallback") return;
+    lastValidLocation.current = {
+      requestKey,
+      fallbackObjectIds: projectViewExplorerFallbackObjectIds(explorer, page),
+    };
+  }, [explorer, page, requestKey, resolvedSelection.resolution]);
+
+  React.useEffect(() => {
+    if (contextTarget && contextTarget.id !== selectedObject?.id) {
+      setContextTarget(undefined);
+    }
+  }, [contextTarget, selectedObject?.id]);
+
+  React.useEffect(() => {
+    if (!focusMainAfterNavigation.current) return;
+    focusMainAfterNavigation.current = false;
     window.requestAnimationFrame(() => {
-      document
-        .querySelector<HTMLButtonElement>(
-          `button[data-object-id="${closingObjectId}"]`,
-        )
-        ?.focus();
+      if (headingRef.current?.dataset.occurrenceKey === page.occurrenceKey) {
+        headingRef.current.focus();
+      }
     });
-  }, [onSelectObject, selectedObject?.id]);
+  }, [page.occurrenceKey]);
+
+  const navigateFromMain = React.useCallback(
+    (next: ProjectViewExplorerSelection) => {
+      setContextTarget(undefined);
+      focusMainAfterNavigation.current = true;
+      commitSelection(next);
+    },
+    [commitSelection],
+  );
+  const navigateFromOutline = React.useCallback(
+    (next: ProjectViewExplorerSelection) => {
+      if (isOverlay) {
+        onOutlineOpenChange(false);
+        focusMainAfterNavigation.current = true;
+      }
+      commitSelection(next);
+    },
+    [commitSelection, isOverlay, onOutlineOpenChange],
+  );
+  function selectObjectFromContext(objectId: string) {
+    setContextTarget(undefined);
+    focusMainAfterNavigation.current = true;
+    commitSelection({ kind: "object", objectId });
+  }
+
+  function requestDelete(object: ProjectViewObject) {
+    const canonicalParent = projectViewCanonicalParent(explorer, object.id);
+    setDeleteTarget({
+      object,
+      returnObjectId: canonicalParent?.objectId,
+    });
+  }
+
+  function navigateAfterDelete() {
+    commitSelection(
+      deleteTarget?.returnObjectId
+        ? { kind: "object", objectId: deleteTarget.returnObjectId }
+        : undefined,
+    );
+  }
 
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       <main className="min-w-0 flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-7xl space-y-6 p-3 pb-12 sm:p-5">
-          <div className="flex items-start gap-3">
-            {syncMessage ? (
-              <div
-                className={
-                  syncState === "stale"
-                    ? "flex min-w-0 flex-1 items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2.5"
-                    : "flex min-w-0 flex-1 items-start gap-2 rounded-xl border border-border/70 bg-muted/30 px-3 py-2.5"
-                }
-                data-testid="project-view-sync-state"
-                role="status"
-              >
-                {syncState === "stale" ? (
-                  <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                ) : (
-                  <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
-                )}
-                <p className="text-xs leading-relaxed text-muted-foreground">
-                  {syncMessage}
-                </p>
-              </div>
-            ) : (
-              <div className="flex-1" />
-            )}
-            <Button
-              className="shrink-0"
-              data-testid="project-view-add"
-              onClick={() => setEditor({ mode: "create" })}
-              type="button"
+        {syncMessage ? (
+          <div className="mx-auto w-full max-w-6xl px-5 pt-5">
+            <div
+              className={
+                syncState === "stale"
+                  ? "flex min-w-0 items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2.5"
+                  : "flex min-w-0 items-start gap-2 rounded-xl border border-border/70 bg-muted/30 px-3 py-2.5"
+              }
+              data-testid="project-view-sync-state"
+              role="status"
             >
-              <Plus />
-              Add
-            </Button>
+              {syncState === "stale" ? (
+                <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              ) : (
+                <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+              )}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {syncMessage}
+              </p>
+            </div>
           </div>
-          <ProjectProfile
+        ) : null}
+
+        {page.kind === "object" ? (
+          <ProjectViewCurrentObject
+            actions={
+              <ProjectViewObjectActions
+                canCreateRole={roleGovernance.canCreateMemberRole}
+                canMaintain={selectedObjectCanMaintain}
+                lifecycle={selectedRoleLifecycle}
+                object={page.currentObject}
+                onCreate={(initialType, context) =>
+                  setEditor({ mode: "create", initialType, context })
+                }
+                onDelete={requestDelete}
+                onEdit={(object) => setEditor({ mode: "edit", object })}
+                onManageContext={setContextTarget}
+                onShowInProjectContext={onShowInProjectContext}
+              />
+            }
+            documentsLoading={
+              documentMetaQuery.isPending ||
+              (Boolean(documentMetaQuery.data) && documentsQuery.isPending)
+            }
+            headingRef={headingRef}
+            onNavigate={navigateFromMain}
+            page={page}
+          >
+            <ProjectViewObjectMaintenance
+              actorProfiles={actorProfiles}
+              currentPubkey={currentPubkey}
+              lifecycle={selectedRoleLifecycle}
+              object={page.currentObject}
+              projectionGeneration={projectionGeneration}
+              projectRevision={projectRevision}
+              roleContinuity={roleContinuity}
+              roleDefinition={selectedRoleDefinition}
+            />
+          </ProjectViewCurrentObject>
+        ) : (
+          <ProjectViewCurrentDocument
             actorProfiles={actorProfiles}
             currentPubkey={currentPubkey}
-            onSelectObject={selectObject}
-            selectedObjectId={selectedObjectId}
-            view={view}
+            headingRef={headingRef}
+            identity={documentIdentity}
+            identityLoading={documentMetaQuery.isPending}
+            onNavigate={navigateFromMain}
+            onOpenInDocuments={onOpenDocument}
+            page={page}
           />
+        )}
 
-          <section>
-            <div className="mb-2 flex items-center gap-2">
-              <CircleDot className="h-4 w-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold">Current focus</h2>
-              <span className="text-xs text-muted-foreground">
-                Derived from explicit object states
-              </span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-              <FocusMetric
-                icon={<GitBranch className="h-3.5 w-3.5" />}
-                label="Active plans"
-                value={focus.activePlans}
-              />
-              <FocusMetric
-                icon={<MapIcon className="h-3.5 w-3.5" />}
-                label="Active stages"
-                value={focus.activeStages}
-              />
-              <FocusMetric
-                icon={<CircleDot className="h-3.5 w-3.5" />}
-                label="Open issues"
-                value={focus.openIssues}
-              />
-              <FocusMetric
-                icon={<ShieldCheck className="h-3.5 w-3.5" />}
-                label="Work in progress"
-                value={focus.inProgressWork}
-              />
-            </div>
-          </section>
-
-          <ProjectViewMap
-            actorProfiles={actorProfiles}
-            currentPubkey={currentPubkey}
-            onCreateObject={createObject}
-            onSelectObject={selectObject}
-            selectedObjectId={selectedObjectId}
-            view={view}
-          />
-          <SupportingObjects
-            actorProfiles={actorProfiles}
-            canCreateRole={roleGovernance.canCreateMemberRole}
-            currentPubkey={currentPubkey}
-            onCreateObject={createObject}
-            onSelectObject={selectObject}
-            roleContinuity={roleContinuity}
-            selectedObjectId={selectedObjectId}
-            view={view}
-          />
-
+        <div className="mx-auto w-full max-w-6xl px-5 pb-8">
           <footer className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border/70 pt-4 text-2xs text-muted-foreground">
             <span>{activeObjectCount} verified objects</span>
             <span>Project revision {projectRevision}</span>
@@ -500,27 +394,32 @@ function ReadyProjectView({
           </footer>
         </div>
       </main>
-      {selectedObject ? (
-        <ProjectViewInspector
-          actorProfiles={actorProfiles}
-          currentPubkey={currentPubkey}
-          contextCapability={contextCapability}
-          object={selectedObject}
-          objectsById={objectsById}
-          onClose={closeInspector}
-          onDelete={setDeleteTarget}
-          onEdit={(object) => setEditor({ mode: "edit", object })}
-          onRefresh={onRefresh}
-          onSelectObject={selectObject}
-          onShowInProjectContext={onShowInProjectContext}
-          projectionGeneration={projectionGeneration}
-          projectRevision={projectRevision}
-          roleContinuity={roleContinuity}
-          roleDefinition={selectedRoleDefinition}
-          roleGovernance={roleGovernance}
-          view={view}
+      {outlineOpen ? (
+        <ProjectViewOutlinePanel
+          currentOccurrenceKey={page.occurrenceKey}
+          model={explorer}
+          onClose={() => onOutlineOpenChange(false)}
+          onNavigate={navigateFromOutline}
         />
       ) : null}
+      <ProjectViewContextManagementDialog
+        actingAssignmentId={
+          contextTarget?.objectType === "role"
+            ? roleGovernance.actingAssignmentId
+            : undefined
+        }
+        canMutate={selectedObjectCanMaintain}
+        contextCapability={contextCapability}
+        object={contextTarget}
+        objectsById={objectsById}
+        onOpenChange={(open) => {
+          if (!open) setContextTarget(undefined);
+        }}
+        onRefresh={onRefresh}
+        onSelectObject={selectObjectFromContext}
+        open={Boolean(contextTarget)}
+        projectRevision={projectRevision}
+      />
       {editor ? (
         <ProjectViewObjectDialog
           canCreateAdminRole={roleGovernance.canCreateAdminRole}
@@ -537,7 +436,9 @@ function ReadyProjectView({
           mode={editor.mode}
           object={editor.mode === "edit" ? editor.object : undefined}
           onApplied={(objectId) => {
-            if (objectId) onSelectObject(objectId);
+            if (objectId) {
+              commitSelection({ kind: "object", objectId });
+            }
           }}
           onOpenChange={(open) => {
             if (!open) setEditor(undefined);
@@ -546,25 +447,13 @@ function ReadyProjectView({
           open
           projectRevision={projectRevision}
           roleHasActiveAssignment={
-            editor.mode === "edit" &&
-            editor.object.objectType === "role" &&
-            Boolean(
-              roleContinuity?.assignments.some(
-                (assignment) =>
-                  assignment.roleId === editor.object.id && !assignment.endedAt,
-              ),
-            )
+            editor.mode === "edit" && selectedRoleLifecycle.hasActiveAssignment
           }
           roleHasOpenProposal={
-            editor.mode === "edit" &&
-            editor.object.objectType === "role" &&
-            Boolean(
-              roleContinuity?.proposals.some(
-                (proposal) =>
-                  proposal.roleId === editor.object.id &&
-                  proposal.status === "open",
-              ),
-            )
+            editor.mode === "edit" && selectedRoleLifecycle.hasOpenProposal
+          }
+          roleHasResponsibleWork={
+            editor.mode === "edit" && selectedRoleLifecycle.hasResponsibleWork
           }
           roleActingAssignmentId={roleGovernance.actingAssignmentId}
           view={view}
@@ -572,27 +461,45 @@ function ReadyProjectView({
       ) : null}
       <ProjectViewDeleteDialog
         actingAssignmentId={roleGovernance.actingAssignmentId}
-        object={deleteTarget}
-        onDeleted={() => onSelectObject(undefined)}
+        object={deleteTarget?.object}
+        onDeleted={navigateAfterDelete}
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(undefined);
         }}
         onReviewLatest={onRefresh}
         open={Boolean(deleteTarget)}
         projectRevision={projectRevision}
+        roleLifecycle={
+          deleteTarget?.object.objectType === "role"
+            ? selectedRoleLifecycle
+            : undefined
+        }
         view={view}
+        workHasActiveCommitment={Boolean(
+          deleteTarget?.object.objectType === "work" &&
+            roleContinuity?.commitments.some(
+              (commitment) =>
+                commitment.workId === deleteTarget.object.id &&
+                !commitment.endedAt,
+            ),
+        )}
       />
     </div>
   );
 }
 
 export function ProjectViewScreen({
+  onOpenDocument,
   onOpenOverview,
-  onSelectObject,
+  onSelectItem,
   onShowInProjectContext,
-  selectedObjectId,
+  selection,
 }: ProjectViewScreenProps) {
   const { activeCommunity } = useCommunities();
+  const isOutlineOverlay = useIsAuxiliaryPanelOverlay();
+  const [outlineOpen, setOutlineOpen] = React.useState(() => !isOutlineOverlay);
+  const previousOverlay = React.useRef(isOutlineOverlay);
+  const previousCommunityId = React.useRef(activeCommunity?.id);
   const query = useProjectViewQuery();
   const relayConnection = useRelayConnection();
   const relayPubkey =
@@ -634,6 +541,24 @@ export function ProjectViewScreen({
     fatalError instanceof Error
       ? fatalError.message
       : "The Relay returned an unexpected Project View response.";
+
+  React.useEffect(() => {
+    if (previousOverlay.current === isOutlineOverlay) return;
+    previousOverlay.current = isOutlineOverlay;
+    setOutlineOpen(!isOutlineOverlay);
+  }, [isOutlineOverlay]);
+
+  React.useEffect(() => {
+    const nextCommunityId = activeCommunity?.id;
+    const previousId = previousCommunityId.current;
+    previousCommunityId.current = nextCommunityId;
+    if (!previousId || !nextCommunityId || previousId === nextCommunityId) {
+      return;
+    }
+    onSelectItem(undefined, { replace: true });
+    setOutlineOpen(!isOutlineOverlay);
+  }, [activeCommunity?.id, isOutlineOverlay, onSelectItem]);
+
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <TopChromeInsetHeader flush>
@@ -661,7 +586,7 @@ export function ProjectViewScreen({
               Full Project View
             </div>
             <div className="hidden text-2xs text-muted-foreground sm:block">
-              Verified project map and maintenance
+              Focused explorer and verified maintenance
             </div>
           </div>
           {!degraded && query.data?.status === "ready" ? (
@@ -691,6 +616,23 @@ export function ProjectViewScreen({
           ) : null}
           {!degraded && liveStatus === "retrying" ? (
             <Badge variant="warning">Live sync retrying</Badge>
+          ) : null}
+          {query.data?.status === "ready" ? (
+            <Button
+              aria-label={
+                outlineOpen ? "Hide Project Outline" : "Show Project Outline"
+              }
+              data-testid="project-view-outline-toggle"
+              onClick={() => setOutlineOpen((open) => !open)}
+              size="icon"
+              title={
+                outlineOpen ? "Hide Project Outline" : "Show Project Outline"
+              }
+              type="button"
+              variant="ghost"
+            >
+              {outlineOpen ? <PanelRightClose /> : <PanelRightOpen />}
+            </Button>
           ) : null}
         </header>
       </TopChromeInsetHeader>
@@ -726,12 +668,15 @@ export function ProjectViewScreen({
       {query.data?.status === "ready" ? (
         <ReadyProjectView
           {...query.data}
+          onOpenDocument={onOpenDocument}
+          onOutlineOpenChange={setOutlineOpen}
           onRefresh={async () => {
             await query.refetch();
           }}
-          onSelectObject={onSelectObject}
+          onSelectItem={onSelectItem}
           onShowInProjectContext={onShowInProjectContext}
-          selectedObjectId={selectedObjectId}
+          outlineOpen={outlineOpen}
+          selection={selection}
           syncMessage={syncMessage}
           syncState={syncState}
         />

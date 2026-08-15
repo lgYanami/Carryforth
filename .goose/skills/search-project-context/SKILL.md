@@ -1,0 +1,1 @@
+../../../desktop/src-tauri/src/managed_agents/search_project_context_skill.md

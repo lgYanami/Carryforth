@@ -11,11 +11,12 @@ use tracing::{debug, error, info, warn};
 use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, is_ephemeral, is_project_context_protocol_kind,
-    is_project_document_protocol_kind, is_project_view_protocol_kind, is_unshared_persona_event,
-    AUTHOR_ONLY_KINDS, KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
+    is_project_document_protocol_kind, is_project_view_protocol_kind,
+    is_semantic_query_virtual_result_kind, is_unshared_persona_event, AUTHOR_ONLY_KINDS,
+    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_PRESENCE_UPDATE,
     KIND_PROJECT_CONTEXT_EDGE_BINDING, KIND_PROJECT_CONTEXT_META, KIND_PROJECT_DOCUMENT_HEAD,
     KIND_PROJECT_DOCUMENT_META, KIND_PROJECT_DOCUMENT_REVISION, KIND_PROJECT_VIEW_META,
-    KIND_PROJECT_VIEW_OBJECT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    KIND_PROJECT_VIEW_OBJECT,
 };
 use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -159,10 +160,10 @@ pub async fn filter_fanout_by_access(
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
     let kind = event_kind_u32(&stored_event.event);
-    // Semantic graph results are response-local virtual Events. Do not rely
+    // Semantic query results are response-local virtual Events. Do not rely
     // solely on the Event-store constraint: a corrupt import or injected
     // Redis payload must also fail closed at the final fan-out chokepoint.
-    if kind == KIND_SEMANTIC_GRAPH_QUERY_RESULT {
+    if is_semantic_query_virtual_result_kind(kind) {
         return Vec::new();
     }
     let configured_projection_signer = super::project_view::configured_projection_signer(state);

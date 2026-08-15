@@ -529,6 +529,23 @@ function contextUnavailableWithPreservedIssueRef(): RawProjectViewLoadResult {
   return view;
 }
 
+function pinnedDocumentV3View(): RawProjectViewLoadResult {
+  const view = structuredClone(V3_READY_VIEW);
+  const issueObject = view.objects_v3.find(
+    (candidate) => candidate.id === IDS.issue,
+  );
+  if (!issueObject) throw new Error("v3 Issue fixture is unavailable");
+  issueObject.context_references = [
+    {
+      type: "document",
+      document_id: GUIDE_ID,
+      mode: "pinned",
+      document_revision: 2,
+    },
+  ];
+  return view;
+}
+
 function guideDocumentState(): MockProjectDocumentState {
   const guide: ProjectDocument = {
     communityKey: "fixture",
@@ -794,6 +811,32 @@ async function openFullProjectView(page: import("@playwright/test").Page) {
   await page.goto("/#/view");
 }
 
+async function openProjectViewObject(
+  page: import("@playwright/test").Page,
+  objectId: string,
+) {
+  await page.goto(`/#/view?object=${objectId}`);
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    objectId,
+  );
+}
+
+async function chooseProjectViewCreateAction(
+  page: import("@playwright/test").Page,
+  name: string,
+) {
+  await page.getByTestId("project-view-add").click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
+
+async function openProjectViewContextManagement(
+  page: import("@playwright/test").Page,
+) {
+  await page.getByTestId("project-view-manage-context").click();
+  await expect(page.getByTestId("project-view-context-dialog")).toBeVisible();
+}
+
 function projectViewContextResult(): ProjectContextQueryResult {
   return {
     communityKey: "fixture",
@@ -836,8 +879,7 @@ test("active Project View object opens Incident Context independent of Context R
     projectContext: projectViewContextResult(),
     projectView: V3_READY_VIEW,
   });
-  await page.goto(`/#/view?object=${IDS.requirement}`);
-  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+  await openProjectViewObject(page, IDS.requirement);
   await expect(
     page.getByTestId("project-view-show-in-project-context"),
   ).toBeVisible();
@@ -871,10 +913,13 @@ test("active Project View object opens Incident Context independent of Context R
   await expect(page).toHaveURL(
     new RegExp(`/view\\?object=${IDS.requirement}$`),
   );
-  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    IDS.requirement,
+  );
 });
 
-test("Community overview presents Project View and Role context before the full map", async ({
+test("Community overview presents Project View and Role context before the focused Explorer", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -917,7 +962,7 @@ test("Community overview presents Project View and Role context before the full 
     .locator(`button[data-object-id="${IDS.issue}"]`)
     .click();
   await expect(page).toHaveURL(new RegExp(`\\/view\\?object=${IDS.issue}$`));
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
     "Projects naming overlap",
   );
   await page.getByTestId("return-community-overview").click();
@@ -928,7 +973,8 @@ test("Community overview presents Project View and Role context before the full 
 
   await page.getByTestId("open-full-project-view").click();
   await expect(page).toHaveURL(/\/view$/);
-  await expect(page.getByTestId("project-view-map")).toBeVisible();
+  await expect(page.getByTestId("project-view-current-object")).toBeVisible();
+  await expect(page.getByTestId("project-view-outline")).toBeVisible();
   await expect(page.getByTestId("return-community-overview")).toContainText(
     "Local Dev",
   );
@@ -968,7 +1014,101 @@ test("Community overview keeps its stable shell when Project View preview is dis
   expect(projectViewReads).toBe(0);
 });
 
-test("View renders the verified canonical map and object inspector", async ({
+test("focused Project View navigates one Main layer with one highlighted Outline occurrence", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [{ pubkey: ACTOR, name: "Context Agent" }],
+    projectView: V3_READY_VIEW,
+  });
+  await openFullProjectView(page);
+
+  const main = page.getByTestId("project-view-current-object");
+  const outline = page.getByTestId("project-view-outline");
+  await expect(main).toContainText("Lora");
+  await expect(outline).toBeVisible();
+  await expect(main).toContainText("Make project context legible");
+  await expect(main).not.toContainText("Read-only client");
+
+  await main
+    .getByRole("button", { name: "Open Goal: Make project context legible" })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(main).toContainText("Deliver Project View");
+  await expect(main).not.toContainText("Read-only client");
+  await expect(
+    outline.locator('[role="treeitem"][aria-selected="true"]'),
+  ).toContainText("Make project context legible");
+
+  await main
+    .getByRole("button", { name: "Open Plan: Deliver Project View" })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.plan}$`));
+  await expect(main).toContainText("Read-only client");
+  await expect(main).not.toContainText("Verified snapshot");
+  await expect(
+    main.getByRole("button", {
+      name: "Go to parent: Make project context legible",
+    }),
+  ).toBeVisible();
+
+  await page.goBack();
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(main).toContainText("Make project context legible");
+
+  await expect(page.getByTestId("project-view-edit-current")).toBeVisible();
+  await expect(page.getByTestId("project-view-provenance")).toBeVisible();
+  await expect(main).toHaveAttribute("data-object-id", IDS.goal);
+
+  await page.getByTestId("project-view-add").click();
+  await expect(page.getByRole("menuitem", { name: "Add Plan" })).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Add related Issue" }),
+  ).toBeVisible();
+  await page.getByRole("menuitem", { name: "Add related Issue" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "About" })).toHaveValue(
+    IDS.goal,
+  );
+  await expect(
+    page.getByRole("combobox", { name: "Planned in Stage" }),
+  ).toHaveValue("");
+  await page.keyboard.press("Escape");
+
+  await page.getByTestId("project-view-manage-context").click();
+  await expect(page.getByTestId("project-view-context-dialog")).toBeVisible();
+  await expect(outline).toBeVisible();
+  await page.keyboard.press("Escape");
+});
+
+test("narrow Project Outline opens as an overlay and returns focus to Main", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 560, height: 900 });
+  await installMockBridge(page, { projectView: V3_READY_VIEW });
+  await openFullProjectView(page);
+
+  const outline = page.getByTestId("project-view-outline");
+  await expect(outline).toHaveCount(0);
+  await page.getByRole("button", { name: "Show Project Outline" }).click();
+  await expect(outline).toBeVisible();
+
+  await outline.getByRole("treeitem", { name: "Goals", exact: true }).click();
+  await outline
+    .getByRole("treeitem", {
+      name: "Goal: Make project context legible",
+      exact: true,
+    })
+    .click();
+
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.goal}$`));
+  await expect(outline).toHaveCount(0);
+  await expect(
+    page.getByTestId("project-view-current-object").locator("h1"),
+  ).toBeFocused();
+});
+
+test("View renders one verified Main layer and occurrence-aware navigation", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -983,35 +1123,28 @@ test("View renders the verified canonical map and object inspector", async ({
   await openFullProjectView(page);
 
   await expect(page).toHaveURL(/\/view$/);
-  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
-  await expect(page.getByTestId("project-view-map")).toContainText(
-    "Make project context legible",
-  );
-  await expect(page.getByTestId("project-view-map")).toContainText(
-    "Verified snapshot",
-  );
-  await expect(page.getByTestId("project-view-unplanned")).toContainText(
-    "Unplanned feedback",
+  const main = page.getByTestId("project-view-current-object");
+  await expect(main).toContainText("Lora");
+  await expect(main).toContainText("Make project context legible");
+  await expect(main).toContainText("Unplanned feedback");
+  await expect(main).not.toContainText("Verified snapshot");
+  await expect(main).not.toContainText(
+    "Community projects and Git repositories use similar terms.",
   );
 
-  await page
-    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
+  await main
+    .getByRole("button", { name: "Open Issue: Projects naming overlap" })
     .click();
   await expect(page).toHaveURL(new RegExp(`object=${IDS.issue}`));
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
-    "Projects naming overlap",
-  );
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(main).toContainText("Projects naming overlap");
+  await expect(page.getByTestId("project-view-provenance")).toContainText(
     "Verified projection",
   );
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(page.getByTestId("project-view-provenance")).toContainText(
     "Context Agent",
   );
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
-    "Agent",
-  );
 
-  await page.getByRole("button", { name: "Close inspector" }).click();
+  await main.getByRole("button", { name: "Go to parent: Lora" }).click();
   await expect(page).toHaveURL(/\/view$/);
 });
 
@@ -1033,7 +1166,7 @@ test("v3 Resource creation uses an active Guide and never exposes a legacy locat
   await page.goto("/");
   await openFullProjectView(page);
 
-  await page.getByRole("button", { name: "Add Resource" }).click();
+  await chooseProjectViewCreateAction(page, "Add Resource");
   await expect(page.getByLabel("Locator")).toHaveCount(0);
   await expect(page.getByLabel("Resource type")).toHaveCount(0);
   await page.getByLabel("Name").fill("Deployment service");
@@ -1057,16 +1190,85 @@ test("v3 Resource creation uses an active Guide and never exposes a legacy locat
     },
   });
 
+  await openProjectViewObject(page, IDS.resource);
   await page
-    .getByRole("button", { name: "Inspect Resource Buzz repository" })
+    .getByRole("button", {
+      name: "Open Guide Document: Buzz repository guide",
+    })
     .click();
-  await page.getByRole("link", { name: "Open verified Guide" }).click();
+  await expect(page.getByTestId("project-view-current-document")).toBeVisible();
+  await page.getByTestId("project-view-open-document").click();
   await expect(page).toHaveURL(new RegExp(`/documents\\?document=${GUIDE_ID}`));
   await expect(
     page.getByRole("heading", { name: "Buzz repository guide" }),
   ).toBeVisible();
   await expect(page.getByTestId("document-markdown")).toContainText(
     "reviewed clone and contribution workflow",
+  );
+});
+
+test("pinned Document stays coordinate-only until selected, then reads the exact revision", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    projectDocument: guideDocumentState(),
+    projectView: pinnedDocumentV3View(),
+  });
+  await openProjectViewObject(page, IDS.issue);
+
+  const main = page.getByTestId("project-view-current-object");
+  const pinned = main.getByRole("button", {
+    name: "Open Pinned Document: Document 30000000 · pinned revision 2",
+  });
+  await expect(pinned).toBeVisible();
+  await expect(main).not.toContainText("Buzz repository guide");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ ?? []).filter(
+            (call) => call.command === "get_project_document",
+          ).length,
+      ),
+    )
+    .toBe(0);
+
+  await pinned.click();
+  const preview = page.getByTestId("project-view-current-document");
+  await expect(preview).toContainText("Buzz repository guide");
+  await expect(preview).toContainText("Revision 2");
+  await expect(
+    preview.getByRole("button", {
+      name: "Go to parent: Projects naming overlap",
+    }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ ?? []).filter(
+            (call) => call.command === "get_project_document",
+          ).length,
+      ),
+    )
+    .toBe(1);
+  const exactRead = await page.evaluate(() =>
+    (window.__BUZZ_E2E_PROJECT_DOCUMENT_CALLS__ ?? []).find(
+      (call) => call.command === "get_project_document",
+    ),
+  );
+  expect(exactRead).toMatchObject({
+    payload: {
+      input: {
+        documentId: GUIDE_ID,
+        revision: 2,
+      },
+    },
+  });
+
+  await page.getByTestId("project-view-open-document").click();
+  await expect(page).toHaveURL(
+    new RegExp(`/documents\\?document=${GUIDE_ID}&revision=2$`),
   );
 });
 
@@ -1078,11 +1280,8 @@ test("v3 Role Context picker submits canonical coordinates and Resource sources 
     projectView: contextReadyV3View(),
   });
   await page.goto("/");
-  await openFullProjectView(page);
-
-  await page
-    .getByRole("button", { name: "Inspect Role Context steward" })
-    .click();
+  await openProjectViewObject(page, IDS.role);
+  await openProjectViewContextManagement(page);
   const context = page.getByTestId("project-view-context");
   await expect(context).toContainText("Context References");
   await expect(context).toContainText("Verified coordinates only");
@@ -1113,10 +1312,9 @@ test("v3 Role Context picker submits canonical coordinates and Resource sources 
     context_references: [{ type: "resource", resource_id: IDS.resource }],
   });
 
-  await page.getByRole("button", { name: "Close inspector" }).click();
-  await page
-    .getByRole("button", { name: "Inspect Resource Buzz repository" })
-    .click();
+  await page.keyboard.press("Escape");
+  await openProjectViewObject(page, IDS.resource);
+  await openProjectViewContextManagement(page);
   const targetType = page.getByLabel("Context target type", { exact: true });
   await expect(targetType.locator('option[value="resource"]')).toHaveCount(0);
   await expect(targetType).toHaveValue("live_document");
@@ -1129,10 +1327,8 @@ test("disabled Context keeps preserved coordinates visible and permits only clea
     projectView: contextUnavailableWithPreservedIssueRef(),
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
-    .click();
+  await openProjectViewObject(page, IDS.issue);
+  await openProjectViewContextManagement(page);
 
   const context = page.getByTestId("project-view-context");
   await expect(context).toContainText("Unavailable");
@@ -1181,7 +1377,7 @@ test("v3 Resource saga preserves a newly committed Guide when the Resource confl
   });
   await page.goto("/");
   await openFullProjectView(page);
-  await page.getByRole("button", { name: "Add Resource" }).click();
+  await chooseProjectViewCreateAction(page, "Add Resource");
 
   await page.getByLabel("Name").fill("Canary environment");
   await page.getByLabel("Resource kind").fill("environment");
@@ -1239,7 +1435,7 @@ test("v3 Resource saga preserves a newly committed Guide when the Resource confl
   await expect(page.getByLabel("Guide")).toHaveValue(guideId ?? "");
 });
 
-test("v3 Role cards and Inspector show one verified continuity state", async ({
+test("Role current page shows one verified continuity state", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1249,15 +1445,13 @@ test("v3 Role cards and Inspector show one verified continuity state", async ({
   await page.goto("/");
   await openFullProjectView(page);
 
-  const roleCard = page.getByTestId(`project-role-card-${IDS.role}`);
-  await expect(roleCard).toContainText("Leader");
-  await expect(roleCard).toContainText("Assigned");
-  await expect(roleCard).toContainText("Context Agent");
-  await roleCard.click();
+  const main = page.getByTestId("project-view-current-object");
+  await main
+    .getByRole("button", { name: "Open Role: Context steward" })
+    .click();
 
-  const inspector = page.getByTestId("project-view-inspector");
-  await expect(inspector).toContainText("Leader · admin");
-  await expect(inspector).toContainText("Current tenure");
+  await expect(main).toContainText("Leader · admin");
+  await expect(main).toContainText("Current tenure");
   await expect(page.getByTestId("project-role-brief")).toContainText(
     "Verified Role Brief",
   );
@@ -1279,46 +1473,43 @@ test("v3 Role cards and Inspector show one verified continuity state", async ({
   await expect(page.getByTestId("project-role-brief")).toContainText(
     "Committed",
   );
-  await expect(inspector).toContainText(
-    "Return to project context stewardship",
-  );
-  await expect(inspector).toContainText("Tenure history");
-  await expect(inspector).toContainText("Continuity timeline");
+  await expect(main).toContainText("Return to project context stewardship");
+  await expect(main).toContainText("Tenure history");
+  await expect(main).toContainText("Continuity timeline");
   await expect(
     page.getByTestId("project-role-latest-checkpoint"),
   ).toContainText("The View is usable; finish the continuity timeline.");
   await expect(page.getByTestId("project-role-timeline")).toContainText(
     "Continue from the verified Project View.",
   );
-  await expect(
-    inspector.getByRole("button", { name: "Delete" }),
-  ).toBeDisabled();
+  await expect(main.getByRole("button", { name: "Delete" })).toBeDisabled();
   await expect(page.getByTestId("project-role-lifecycle-guard")).toBeVisible();
 
-  await inspector.getByRole("button", { name: "Edit" }).click();
+  await main.getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Active role")).toBeDisabled();
 });
 
-test("ordinary member can inspect and request Roles but cannot govern them", async ({
+test("ordinary member can read and request Roles but cannot govern them", async ({
   page,
 }) => {
   await installMockBridge(page, { projectView: memberViewerV3View() });
   await page.goto("/");
   await openFullProjectView(page);
 
-  await expect(page.getByRole("button", { name: "Add Role" })).toHaveCount(0);
   await page.getByTestId("project-view-add").click();
+  await expect(page.getByRole("menuitem", { name: "Add Role" })).toHaveCount(0);
+  await page
+    .getByRole("menuitem", { name: "Add another object…", exact: true })
+    .click();
   await expect(
     page.getByLabel("Object type").locator('option[value="role"]'),
   ).toHaveCount(0);
   await page.getByRole("button", { name: "Cancel" }).click();
 
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
-  const inspector = page.getByTestId("project-view-inspector");
-  await expect(inspector.getByRole("button", { name: "Edit" })).toHaveCount(0);
-  await expect(inspector.getByRole("button", { name: "Delete" })).toHaveCount(
-    0,
-  );
+  await openProjectViewObject(page, IDS.role);
+  const main = page.getByTestId("project-view-current-object");
+  await expect(main.getByRole("button", { name: "Edit" })).toHaveCount(0);
+  await expect(main.getByRole("button", { name: "Delete" })).toHaveCount(0);
   await expect(page.getByTestId("project-role-request")).toBeVisible();
 });
 
@@ -1329,7 +1520,7 @@ test("owner creates an admin Role with an explicit signed level", async ({
   await page.goto("/");
   await openFullProjectView(page);
 
-  await page.getByRole("button", { name: "Add Role" }).click();
+  await chooseProjectViewCreateAction(page, "Add Role");
   await page.getByLabel("Role level").selectOption("admin");
   await page.getByLabel("Name").fill("Delivery leader");
   await page.getByLabel("Purpose").fill("Govern member Roles");
@@ -1362,7 +1553,7 @@ test("active Leader creates only member Roles through the exact Assignment", asy
   await page.goto("/");
   await openFullProjectView(page);
 
-  await page.getByRole("button", { name: "Add Role" }).click();
+  await chooseProjectViewCreateAction(page, "Add Role");
   await expect(page.getByLabel("Role level")).toHaveValue("member");
   await expect(
     page.getByLabel("Role level").locator('option[value="admin"]'),
@@ -1399,18 +1590,14 @@ test("an open Role Proposal blocks deletion and deactivation", async ({
   projectView.role_continuity.briefs = [];
   await installMockBridge(page, { projectView });
   await page.goto("/");
-  await openFullProjectView(page);
-
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
-  const inspector = page.getByTestId("project-view-inspector");
-  await expect(
-    inspector.getByRole("button", { name: "Delete" }),
-  ).toBeDisabled();
+  await openProjectViewObject(page, IDS.role);
+  const main = page.getByTestId("project-view-current-object");
+  await expect(main.getByRole("button", { name: "Delete" })).toBeDisabled();
   await expect(page.getByTestId("project-role-lifecycle-guard")).toContainText(
     "This Role has an open Proposal",
   );
 
-  await inspector.getByRole("button", { name: "Edit" }).click();
+  await main.getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Active role")).toBeDisabled();
   await expect(
     page.getByText(
@@ -1419,7 +1606,7 @@ test("an open Role Proposal blocks deletion and deactivation", async ({
   ).toBeVisible();
 });
 
-test("Role Inspector loads the next history page through the native boundary", async ({
+test("Role current page loads the next history page through the native boundary", async ({
   page,
 }) => {
   const cursorId = "00000000-0000-4000-8000-000000000091";
@@ -1490,8 +1677,7 @@ test("Role Inspector loads the next history page through the native boundary", a
     projectViewRoleHistoryPages: pages,
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await openProjectViewObject(page, IDS.role);
 
   await expect(page.getByText("First bounded history page.")).toBeVisible();
   await expect
@@ -1522,18 +1708,17 @@ test("Role Inspector loads the next history page through the native boundary", a
   });
 });
 
-test("Work Inspector shows the verified responsibility and Commitment", async ({
+test("Work current page shows the verified responsibility and Commitment", async ({
   page,
 }) => {
   await installMockBridge(page, {
     projectView: V3_READY_VIEW,
   });
-  await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Work Add the View entry" })
-    .click();
+  await page.goto(`/#/view?object=${IDS.work}`);
 
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
+    "Add the View entry",
+  );
   const continuity = page.getByTestId("project-work-continuity");
   await expect(continuity).toContainText("Context steward");
   await expect(continuity).toContainText("Committed");
@@ -1547,10 +1732,7 @@ test("owner assigns uncommitted Work to a Role with a revision fence", async ({
     projectView: vacantV3View(),
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Work Add the View entry" })
-    .click();
+  await openProjectViewObject(page, IDS.work);
   await page.getByLabel("Responsible Role").selectOption(IDS.role);
   await page.getByRole("button", { name: "Save responsibility" }).click();
 
@@ -1572,7 +1754,7 @@ test("owner assigns uncommitted Work to a Role with a revision fence", async ({
   });
 });
 
-test("owner creates a revision-fenced Role offer from the Inspector", async ({
+test("owner creates a revision-fenced Role offer from the current Role page", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1594,8 +1776,7 @@ test("owner creates a revision-fenced Role offer from the Inspector", async ({
     projectView: V3_READY_VIEW,
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await openProjectViewObject(page, IDS.role);
   await page.getByTestId("project-role-offer").click();
   await page.getByTestId("project-role-candidate-picker").click();
   await page.getByTestId("project-role-candidate-search").fill("test-2");
@@ -1639,8 +1820,7 @@ test("the current assignee appends Checkpoint and Handoff context", async ({
     projectView: humanAssignedV3View(),
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await openProjectViewObject(page, IDS.role);
   await page.getByTestId("project-role-checkpoint").click();
   await page
     .getByLabel("Situation summary")
@@ -1724,8 +1904,7 @@ test("a concurrent Role replacement refreshes state without replaying intent", a
     },
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page.getByTestId(`project-role-card-${IDS.role}`).click();
+  await openProjectViewObject(page, IDS.role);
   await page.getByTestId("project-role-offer").click();
   await page.getByTestId("project-role-candidate-picker").click();
   await page.getByTestId("project-role-candidate-manual-toggle").click();
@@ -1787,10 +1966,11 @@ test("View keeps a stable skeleton until the first snapshot is verified", async 
   await openFullProjectView(page);
 
   await expect(page.getByTestId("project-view-loading-skeleton")).toBeVisible();
-  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
-  await expect(page.getByTestId("project-view-profile")).toContainText("Lora", {
-    timeout: 5_000,
-  });
+  await expect(page.getByTestId("project-view-current-object")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
+    "Lora",
+    { timeout: 5_000 },
+  );
 });
 
 test("View rejects a self-contradictory snapshot without rendering partial data", async ({
@@ -1808,7 +1988,7 @@ test("View rejects a self-contradictory snapshot without rendering partial data"
   await expect(
     page.getByRole("heading", { name: "View integrity check failed" }),
   ).toBeVisible();
-  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toHaveCount(0);
   await page.getByText("Diagnostic detail").click();
   await expect(page.getByText(/active object count 11/)).toBeVisible();
 });
@@ -1834,7 +2014,7 @@ test("View rejects a Role Directory that disagrees with verified continuity", as
   await expect(
     page.getByRole("heading", { name: "View integrity check failed" }),
   ).toBeVisible();
-  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toHaveCount(0);
   await page.getByText("Diagnostic detail").click();
   await expect(
     page.getByText(/Role Brief Role Directory disagrees with Role continuity/),
@@ -1857,62 +2037,113 @@ test("View explains a trusted-read failure without rendering project data", asyn
     page.getByText("Relay snapshot verification timed out"),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
-  await expect(page.getByTestId("project-view-profile")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toHaveCount(0);
 });
 
-test("an intentionally sparse View explains every major empty section", async ({
+test("an intentionally sparse View shows only its direct Goal and neutral summaries", async ({
   page,
 }) => {
   await installMockBridge(page, { projectView: minimalReadyView("Sparse") });
   await page.goto("/");
   await openFullProjectView(page);
 
-  await expect(page.getByTestId("project-view-profile")).toContainText(
-    "Sparse",
+  const main = page.getByTestId("project-view-current-object");
+  await expect(main).toContainText("Sparse");
+  await expect(page.getByTestId("project-view-current-summary")).toContainText(
+    "No summary provided.",
   );
-  await expect(page.getByText("This goal has no bound plan.")).toBeVisible();
-  await expect(page.getByText("No semantic roles declared.")).toBeVisible();
-  await expect(page.getByText("No resources declared.")).toBeVisible();
+  await expect(main.getByTestId("project-view-summary-item")).toHaveCount(1);
+  await expect(main.getByTestId("project-view-summary-item")).toContainText(
+    "Sparse goal",
+  );
+  await expect(page.getByTestId("project-view-outline")).toBeVisible();
 });
 
-test("arrow keys traverse the project map and Escape restores card focus", async ({
+test("arrow keys traverse and activate the visible Project Outline tree", async ({
   page,
 }) => {
   await installMockBridge(page, { projectView: READY_VIEW });
   await page.goto("/");
   await openFullProjectView(page);
 
-  const goalCard = page.locator(`button[data-object-id="${IDS.goal}"]`);
-  const planCard = page.locator(`button[data-object-id="${IDS.plan}"]`);
-  const lastCard = page.locator(`button[data-object-id="${IDS.looseIssue}"]`);
-  await goalCard.focus();
+  const outline = page.getByTestId("project-view-outline");
+  const projectItem = outline.getByRole("treeitem", {
+    name: "Project: Lora",
+    exact: true,
+  });
+  const goalsItem = outline.getByRole("treeitem", {
+    name: "Goals",
+    exact: true,
+  });
+  const goalItem = outline.getByRole("treeitem", {
+    name: "Goal: Make project context legible",
+    exact: true,
+  });
+  await projectItem.focus();
   await page.keyboard.press("ArrowDown");
-  await expect(planCard).toBeFocused();
-  await page.keyboard.press("End");
-  await expect(lastCard).toBeFocused();
+  await expect(goalsItem).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(goalsItem).toHaveAttribute("aria-expanded", "true");
+  await page.keyboard.press("ArrowDown");
+  await expect(goalItem).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(page.getByTestId("project-view-inspector")).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
-  await expect(lastCard).toBeFocused();
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    IDS.goal,
+  );
+  await expect(goalItem).toHaveAttribute("aria-selected", "true");
 });
 
-test("the Inspector becomes a focus-trapped drawer in a narrow window", async ({
+test("Project Outline header expands every branch and collapses back to the current path", async ({
   page,
 }) => {
   await installMockBridge(page, { projectView: READY_VIEW });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page.setViewportSize({ width: 560, height: 720 });
+  await openProjectViewObject(page, IDS.plan);
 
-  const issueCard = page.locator(`button[data-object-id="${IDS.issue}"]`);
-  await issueCard.click();
-  const inspector = page.getByTestId("project-view-inspector");
-  await expect(inspector).toHaveAttribute("data-presentation", "drawer");
-  await expect(inspector).toHaveAttribute("role", "dialog");
+  const outline = page.getByTestId("project-view-outline");
+  const currentPlan = outline.getByRole("treeitem", {
+    name: "Plan: Deliver Project View",
+    exact: true,
+  });
+  await page.getByTestId("project-view-outline-expand-all").click();
+
+  const expandableRows = outline.locator('[role="treeitem"][aria-expanded]');
+  expect(await expandableRows.count()).toBeGreaterThan(0);
+  const allExpandableRowsAreOpen = await expandableRows.evaluateAll((rows) =>
+    rows.every((row) => row.getAttribute("aria-expanded") === "true"),
+  );
+  expect(allExpandableRowsAreOpen).toBe(true);
+
+  await page.getByTestId("project-view-outline-collapse-all").click();
+  await expect(currentPlan).toBeVisible();
+  await expect(currentPlan).toHaveAttribute("aria-selected", "true");
+  await expect(currentPlan).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    IDS.plan,
+  );
+  await expect(page).toHaveURL(new RegExp(`/view\\?object=${IDS.plan}$`));
+});
+
+test("a narrow Main keeps the Outline in a dismissible overlay", async ({
+  page,
+}) => {
+  await installMockBridge(page, { projectView: READY_VIEW });
+  await page.goto("/");
+  await page.setViewportSize({ width: 560, height: 720 });
+  await openProjectViewObject(page, IDS.issue);
+
+  await page.getByRole("button", { name: "Show Project Outline" }).click();
+  const outline = page.getByTestId("project-view-outline");
+  await expect(outline).toBeVisible();
+  await outline.locator('[role="treeitem"][aria-selected="true"]').focus();
   await page.keyboard.press("Escape");
-  await expect(inspector).toHaveCount(0);
-  await expect(issueCard).toBeFocused();
+  await expect(outline).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toHaveAttribute(
+    "data-object-id",
+    IDS.issue,
+  );
 });
 
 test("an uninitialized v3 View exposes only the operator and owner setup guide", async ({
@@ -1971,9 +2202,9 @@ test("context creation preselects only a legal parent relation", async ({
     },
   });
   await page.goto("/");
-  await openFullProjectView(page);
+  await openProjectViewObject(page, IDS.plan);
 
-  await page.getByRole("button", { name: "Add Stage" }).first().click();
+  await chooseProjectViewCreateAction(page, "Add Stage");
   await expect(
     page.getByRole("heading", { name: "Add to View" }),
   ).toBeVisible();
@@ -2032,10 +2263,7 @@ test("a stale edit preserves its draft and requires an explicit new base", async
     projectViewAfterMutation: readyViewAtRevision(9),
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
-    .click();
+  await openProjectViewObject(page, IDS.issue);
 
   await page.getByRole("button", { name: "Edit" }).click();
   const title = page.getByLabel("Title");
@@ -2088,7 +2316,7 @@ test("projection events invalidate into a new complete verified snapshot", async
 }) => {
   await installMockBridge(page, { projectView: READY_VIEW });
   await page.goto("/");
-  await openFullProjectView(page);
+  await openProjectViewObject(page, IDS.issue);
   await expect(page.getByText("Project revision 7")).toBeVisible();
   await expect
     .poll(() =>
@@ -2118,7 +2346,7 @@ test("projection events invalidate into a new complete verified snapshot", async
   );
 
   await expect(page.getByText("Project revision 8")).toBeVisible();
-  await expect(page.getByTestId("project-view-map")).toContainText(
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
     "Agent refreshed this issue",
   );
 });
@@ -2145,19 +2373,18 @@ test("Human and Agent changes alternate through one trusted View", async ({
     },
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Issue Projects naming overlap" })
-    .click();
+  await openProjectViewObject(page, IDS.issue);
   await page.getByRole("button", { name: "Edit" }).click();
   await page.getByLabel("Title").fill("Human clarified the naming issue");
   await page.getByRole("button", { name: "Save changes" }).click();
 
   await expect(page.getByText("Project revision 8")).toBeVisible();
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
     "Human clarified the naming issue",
   );
-  await expect(page.getByTestId("project-view-inspector")).toContainText("You");
+  await expect(page.getByTestId("project-view-provenance")).toContainText(
+    "You",
+  );
 
   const agentRevision = readyViewAtRevision(9, {
     issueObjectRevision: 3,
@@ -2180,10 +2407,10 @@ test("Human and Agent changes alternate through one trusted View", async ({
   );
 
   await expect(page.getByText("Project revision 9")).toBeVisible();
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
     "Agent incorporated the Human decision",
   );
-  await expect(page.getByTestId("project-view-inspector")).toContainText(
+  await expect(page.getByTestId("project-view-provenance")).toContainText(
     "Context Agent",
   );
 });
@@ -2216,7 +2443,9 @@ test("the v3 setup guide stays read-only and refreshes after owner initializatio
     .click();
 
   await expect(page.getByTestId("project-view-v3-setup-guide")).toHaveCount(0);
-  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
+    "Lora",
+  );
 });
 
 test("local-only bootstrap never paints a stale alternate-port Project View", async ({
@@ -2243,7 +2472,7 @@ test("local-only bootstrap never paints a stale alternate-port Project View", as
     page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
   ).toHaveCount(0);
   await expect(page.getByText("Bravo project")).toHaveCount(0);
-  await expect(page.getByTestId("project-view-inspector")).toHaveCount(0);
+  await expect(page.getByTestId("project-view-current-object")).toHaveCount(0);
   await expect(page).not.toHaveURL(/object=/);
   await expect(
     page.getByRole("heading", {
@@ -2292,17 +2521,14 @@ test("local-only bootstrap never paints an alternate-port Assignment", async ({
   );
   await seedCommunities(page);
   await page.goto("/");
-  await openFullProjectView(page);
-  await expect(page.getByTestId(`project-role-card-${IDS.role}`)).toContainText(
-    "Assigned",
-  );
+  await openProjectViewObject(page, IDS.role);
   await expect(
     page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`),
   ).toHaveCount(0);
-  const roleCard = page.getByTestId(`project-role-card-${IDS.role}`);
-  await expect(roleCard).toContainText("Assigned");
-  await expect(roleCard).toContainText("Context Agent");
-  await expect(roleCard).not.toContainText("Vacant");
+  const main = page.getByTestId("project-view-current-object");
+  await expect(main).toContainText("Current tenure");
+  await expect(main).toContainText("Context Agent");
+  await expect(main).not.toContainText("Vacant");
 });
 
 test("a disconnected View keeps its verified snapshot and marks it stale", async ({
@@ -2321,7 +2547,9 @@ test("a disconnected View keeps its verified snapshot and marks it stale", async
   await expect(page.getByTestId("project-view-sync-state")).toContainText(
     "Showing verified project revision 7",
   );
-  await expect(page.getByTestId("project-view-profile")).toContainText("Lora");
+  await expect(page.getByTestId("project-view-current-object")).toContainText(
+    "Lora",
+  );
 });
 
 test("delete is blocked while an active object still references the target", async ({
@@ -2329,10 +2557,7 @@ test("delete is blocked while an active object still references the target", asy
 }) => {
   await installMockBridge(page, { projectView: READY_VIEW });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Plan Deliver Project View" })
-    .click();
+  await openProjectViewObject(page, IDS.plan);
 
   await page.getByRole("button", { name: "Delete" }).click();
   await expect(
@@ -2361,10 +2586,7 @@ test("an unreferenced object requires confirmation before deletion", async ({
     },
   });
   await page.goto("/");
-  await openFullProjectView(page);
-  await page
-    .getByRole("button", { name: "Inspect Resource Buzz repository" })
-    .click();
+  await openProjectViewObject(page, IDS.resource);
 
   await page.getByRole("button", { name: "Delete" }).click();
   await expect(

@@ -10,6 +10,7 @@ import {
   projectViewObjectTypeLabel,
 } from "@/features/project-view/model";
 import { ProjectViewConflictNotice } from "@/features/project-view/ui/ProjectViewFormFields";
+import type { ProjectViewRoleLifecycleState } from "@/features/project-view/projectViewRoleLifecycle";
 import type {
   ProjectView,
   ProjectViewMutationResult,
@@ -34,7 +35,9 @@ export function ProjectViewDeleteDialog({
   onReviewLatest,
   open,
   projectRevision,
+  roleLifecycle,
   view,
+  workHasActiveCommitment = false,
 }: {
   actingAssignmentId?: string;
   object?: ProjectViewObject;
@@ -43,7 +46,9 @@ export function ProjectViewDeleteDialog({
   onReviewLatest: () => Promise<unknown>;
   open: boolean;
   projectRevision: number;
+  roleLifecycle?: ProjectViewRoleLifecycleState;
   view: ProjectView;
+  workHasActiveCommitment?: boolean;
 }) {
   const mutation = useProjectViewMutation();
   const [baseRevision, setBaseRevision] = React.useState(projectRevision);
@@ -75,7 +80,12 @@ export function ProjectViewDeleteDialog({
   const lastGoal = object.objectType === "goal" && view.goals.length === 1;
   const profile = object.objectType === "project_profile";
   const targetMissing = latestObject === undefined;
-  const blocked = profile || lastGoal || targetMissing || incoming.length > 0;
+  const blocked =
+    profile ||
+    lastGoal ||
+    targetMissing ||
+    incoming.length > 0 ||
+    Boolean(roleLifecycle?.blocked);
 
   const reviewLatest = async () => {
     if (reviewingLatest) return;
@@ -219,6 +229,18 @@ export function ProjectViewDeleteDialog({
               ))}
             </ul>
           </section>
+        ) : null}
+        {roleLifecycle?.message ? (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+            {roleLifecycle.message}
+          </div>
+        ) : null}
+        {object.objectType === "work" && workHasActiveCommitment ? (
+          <div className="rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
+            This Work has an active Commitment. Deletion closes it with cause
+            <span className="font-mono"> work_closed</span> and preserves its
+            continuity history.
+          </div>
         ) : null}
         {error ? (
           <div

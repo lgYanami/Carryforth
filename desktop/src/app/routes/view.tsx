@@ -2,6 +2,12 @@ import * as React from "react";
 import { createFileRoute } from "@tanstack/react-router";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import type { ProjectViewExplorerSelection } from "@/features/project-view/explorerModel";
+import {
+  projectViewRouteForSelection,
+  projectViewSelectionFromRoute,
+  validateProjectViewRouteSearch,
+} from "@/features/project-view/routeSelection";
 import { usePreviewFeatureWarning } from "@/shared/features";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
@@ -10,21 +16,8 @@ const ProjectViewScreen = React.lazy(async () => {
   return { default: module.ProjectViewScreen };
 });
 
-type ViewRouteSearch = {
-  object?: string;
-};
-
-function validateViewSearch(search: Record<string, unknown>): ViewRouteSearch {
-  return {
-    object:
-      typeof search.object === "string" && search.object.length > 0
-        ? search.object
-        : undefined,
-  };
-}
-
 export const Route = createFileRoute("/view")({
-  validateSearch: validateViewSearch,
+  validateSearch: validateProjectViewRouteSearch,
   component: ViewRouteComponent,
 });
 
@@ -38,12 +31,19 @@ function ViewRouteComponent() {
     <React.Suspense fallback={<ViewLoadingFallback kind="view" />}>
       <ProjectViewScreen
         onOpenOverview={() => void goCommunity()}
-        onSelectObject={(object) =>
+        onOpenDocument={(documentSearch) =>
           void navigate({
-            search: (previous) => ({
-              ...previous,
-              object,
-            }),
+            to: "/documents",
+            search: documentSearch,
+          })
+        }
+        onSelectItem={(
+          selection: ProjectViewExplorerSelection | undefined,
+          options?: { replace?: boolean },
+        ) =>
+          void navigate({
+            replace: options?.replace,
+            search: projectViewRouteForSelection(selection),
           })
         }
         onShowInProjectContext={(object) =>
@@ -58,7 +58,7 @@ function ViewRouteComponent() {
             },
           })
         }
-        selectedObjectId={search.object}
+        selection={projectViewSelectionFromRoute(search)}
       />
     </React.Suspense>
   );

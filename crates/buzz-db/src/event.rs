@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, has_indexed_d_tag, is_ephemeral, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
+    KIND_HUDDLE_STARTED, KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT,
+    KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT, KIND_SEMANTIC_GRAPH_QUERY_RESULT,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -103,6 +104,31 @@ pub struct EventQuery {
     /// SQL pushdown is sound.  Keeping `event_visible_to_reader` as post-filter
     /// defense-in-depth catches any residual mismatch.
     pub persona_reader: Option<Vec<u8>>,
+}
+
+fn semantic_virtual_result_kinds_i32() -> Result<[i32; 3]> {
+    Ok([
+        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
+            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_owned())
+        })?,
+        i32::try_from(KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT).map_err(|_| {
+            DbError::InvalidData("Coordinate-search virtual result kind exceeds int4".to_owned())
+        })?,
+        i32::try_from(KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT).map_err(|_| {
+            DbError::InvalidData("one-hop semantic virtual result kind exceeds int4".to_owned())
+        })?,
+    ])
+}
+
+fn push_semantic_virtual_result_exclusions(
+    builder: &mut QueryBuilder<Postgres>,
+    column: &str,
+    kinds: [i32; 3],
+) {
+    for kind in kinds {
+        builder.push(format!(" AND {column} <> "));
+        builder.push_bind(kind);
+    }
 }
 
 impl EventQuery {
@@ -395,10 +421,7 @@ pub(crate) async fn retire_projection_head_in_tx(
 /// Uses `QueryBuilder` for dynamic filter composition — avoids string concatenation
 /// while keeping all user values in bind parameters.
 pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEvent>> {
-    let semantic_graph_result_kind =
-        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
-            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
-        })?;
+    let semantic_result_kinds = semantic_virtual_result_kinds_i32()?;
     // Composite cursor requires both halves.
     if q.before_id.is_some() && q.until.is_none() {
         return Err(DbError::InvalidData(
@@ -458,8 +481,7 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
         b.push_bind(p_hex.to_ascii_lowercase());
-        b.push(" AND e.kind <> ");
-        b.push_bind(semantic_graph_result_kind);
+        push_semantic_virtual_result_exclusions(&mut b, "e.kind", semantic_result_kinds);
         b
     } else {
         let mut b = QueryBuilder::new(
@@ -468,8 +490,7 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
         );
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND deleted_at IS NULL");
-        b.push(" AND kind <> ");
-        b.push_bind(semantic_graph_result_kind);
+        push_semantic_virtual_result_exclusions(&mut b, "kind", semantic_result_kinds);
         b
     };
 
@@ -687,14 +708,11 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
 
     let channel_id: Option<Uuid> = row.try_get("channel_id")?;
 
-    let semantic_graph_result_kind =
-        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
-            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
-        })?;
-    // Defense in depth for generic by-id/import/read paths. Kind 40912 is a
-    // response-local virtual Event and must stay unreadable even if a corrupt
+    let semantic_result_kinds = semantic_virtual_result_kinds_i32()?;
+    // Defense in depth for generic by-id/import/read paths. Semantic query
+    // results are response-local virtual Events and must stay unreadable even if a corrupt
     // backup or manual write bypassed the validated storage constraint.
-    if kind_i32 == semantic_graph_result_kind {
+    if semantic_result_kinds.contains(&kind_i32) {
         return Ok(None);
     }
 
@@ -733,10 +751,7 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
 ///
 /// Uses the same filter logic as `query_events` but returns only the count.
 pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
-    let semantic_graph_result_kind =
-        i32::try_from(KIND_SEMANTIC_GRAPH_QUERY_RESULT).map_err(|_| {
-            DbError::InvalidData("semantic graph virtual result kind exceeds int4".to_string())
-        })?;
+    let semantic_result_kinds = semantic_virtual_result_kinds_i32()?;
     // Empty list means "match nothing" — return 0 immediately.
     if q.kinds.as_deref().is_some_and(|k| k.is_empty()) {
         return Ok(0);
@@ -775,15 +790,13 @@ pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND e.deleted_at IS NULL AND m.pubkey_hex = ");
         b.push_bind(p_hex.to_ascii_lowercase());
-        b.push(" AND e.kind <> ");
-        b.push_bind(semantic_graph_result_kind);
+        push_semantic_virtual_result_exclusions(&mut b, "e.kind", semantic_result_kinds);
         b
     } else {
         let mut b = QueryBuilder::new("SELECT COUNT(*) as cnt FROM events WHERE community_id = ");
         b.push_bind(q.community_id.as_uuid());
         b.push(" AND deleted_at IS NULL");
-        b.push(" AND kind <> ");
-        b.push_bind(semantic_graph_result_kind);
+        push_semantic_virtual_result_exclusions(&mut b, "kind", semantic_result_kinds);
         b
     };
 
@@ -1726,6 +1739,18 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+    #[test]
+    fn ordinary_event_reads_exclude_all_semantic_virtual_result_kinds() {
+        assert_eq!(
+            semantic_virtual_result_kinds_i32().expect("semantic virtual result kinds"),
+            [
+                KIND_SEMANTIC_GRAPH_QUERY_RESULT as i32,
+                KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as i32,
+                KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT as i32,
+            ]
+        );
+    }
 
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")

@@ -214,6 +214,26 @@ pub fn canonical_problem_query_text(problem: &str) -> QueryContractResult<String
     Ok(output)
 }
 
+/// Build one immutable problem-only Q0 input without constructing a graph
+/// traversal request.
+///
+/// Scoped semantic selectors use this helper so their Provider input remains
+/// byte-for-byte compatible with the semantic graph Q0 contract while avoiding
+/// the graph root, context-lens, and traversal policies.
+pub fn build_problem_query_encoder_input(
+    request_id: Uuid,
+    problem: &str,
+) -> QueryContractResult<SemanticQueryEncoderInput> {
+    let text = canonical_problem_query_text(problem)?;
+    Ok(make_input(
+        request_id,
+        problem_channel_id(request_id),
+        SemanticQueryChannelKind::Problem,
+        query_contract_digest(),
+        text,
+    ))
+}
+
 /// Serialize one problem plus one current Coordinate overview Qi Provider
 /// input to exact canonical UTF-8 JSON.
 pub fn canonical_conditioned_query_text(
@@ -271,17 +291,13 @@ pub fn build_query_encoder_inputs(
         ));
     }
 
-    let contract_digest = query_contract_digest();
-    let problem_text = canonical_problem_query_text(&canonical_query.problem)?;
     let mut inputs = Vec::with_capacity(1 + overviews.len());
     let mut omitted_contexts = Vec::new();
-    inputs.push(make_input(
+    inputs.push(build_problem_query_encoder_input(
         canonical_query.request_id,
-        problem_channel_id(canonical_query.request_id),
-        SemanticQueryChannelKind::Problem,
-        contract_digest,
-        problem_text,
-    ));
+        &canonical_query.problem,
+    )?);
+    let contract_digest = query_contract_digest();
 
     for overview in overviews {
         let text = match canonical_conditioned_query_text(

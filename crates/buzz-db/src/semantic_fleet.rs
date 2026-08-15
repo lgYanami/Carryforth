@@ -1009,6 +1009,7 @@ mod tests {
                 community_id: fixture.community_id,
                 reader_pubkey: &fixture.reader_pubkey,
                 expected_projection_pubkey: &fixture.projection_pubkey,
+                expected_snapshot: None,
                 routing_trust: SemanticGraphQueryRoutingTrust::TrustedSingleRelay,
             })
             .await
@@ -1020,6 +1021,7 @@ mod tests {
                 community_id: fixture.community_id,
                 reader_pubkey: &fixture.reader_pubkey,
                 expected_projection_pubkey: &fixture.projection_pubkey,
+                expected_snapshot: None,
                 routing_trust: SemanticGraphQueryRoutingTrust::AttestedFleet {
                     deployment_id: TEST_DEPLOYMENT_ID,
                     instance_id: TEST_INSTANCE_ID,

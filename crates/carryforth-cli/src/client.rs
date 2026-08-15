@@ -3,7 +3,11 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use buzz_semantic_query::{SemanticGraphQuery, MAX_WALL_TIME_MS};
+use buzz_semantic_query::{
+    ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery, SemanticGraphQuery,
+    MAX_COORDINATE_SEARCH_RESPONSE_BYTES, MAX_COORDINATE_SEARCH_WALL_TIME_MS,
+    MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES, MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS, MAX_WALL_TIME_MS,
+};
 use nostr::{EventBuilder, EventId, JsonUtil, Keys, Kind, PublicKey, Tag};
 use sha2::{Digest, Sha256};
 
@@ -153,6 +157,10 @@ const RETRY_IN_MAX_SECS: u64 = 30;
 /// execution contract so the Relay, rather than the client, owns graceful
 /// wall-time exhaustion and its signed partial result.
 const SEMANTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(MAX_WALL_TIME_MS as u64 + 15_000);
+const COORDINATE_SEARCH_TIMEOUT: Duration =
+    Duration::from_millis(MAX_COORDINATE_SEARCH_WALL_TIME_MS as u64 + 15_000);
+const ONE_HOP_SEMANTIC_SEARCH_TIMEOUT: Duration =
+    Duration::from_millis(MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS as u64 + 15_000);
 
 /// Independent cap for a non-success semantic query response body.
 const SEMANTIC_QUERY_ERROR_RESPONSE_BYTES: u64 = 16 * 1024;
@@ -168,6 +176,80 @@ pub(crate) struct SemanticQueryOnceResponse {
     pub(crate) exact_body: Vec<u8>,
     /// Exact successful response body bytes.
     pub(crate) response_body: Vec<u8>,
+}
+
+/// Byte-exact observation returned by one Coordinate-search HTTP attempt.
+#[derive(Debug)]
+pub(crate) struct CoordinateSearchOnceResponse {
+    pub(crate) request: ProjectContextCoordinateSearchQuery,
+    pub(crate) nip98_auth_event_id: EventId,
+    pub(crate) exact_body: Vec<u8>,
+    pub(crate) response_body: Vec<u8>,
+}
+
+/// Byte-exact observation returned by one one-hop semantic HTTP attempt.
+pub(crate) struct OneHopSemanticSearchOnceResponse {
+    pub(crate) request: ProjectContextOneHopSemanticQuery,
+    pub(crate) nip98_auth_event_id: EventId,
+    pub(crate) exact_body: Vec<u8>,
+    pub(crate) response_body: Vec<u8>,
+}
+
+impl std::fmt::Debug for OneHopSemanticSearchOnceResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OneHopSemanticSearchOnceResponse")
+            .field("request_id", &self.request.request_id)
+            .field("request", &"<redacted>")
+            .field("nip98_auth_event_id", &self.nip98_auth_event_id)
+            .field(
+                "exact_body",
+                &format_args!("<redacted:{} bytes>", self.exact_body.len()),
+            )
+            .field("response_body_bytes", &self.response_body.len())
+            .finish()
+    }
+}
+
+struct SemanticHttpOnceResponse {
+    status: reqwest::StatusCode,
+    nip98_auth_event_id: EventId,
+    response_body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OneHopSemanticHttpErrorCode {
+    InvalidInput,
+    Unsupported,
+    Restricted,
+    NotFound,
+    Busy,
+    Conflict,
+    Timeout,
+    ScopeTooLarge,
+    HyperedgeTooLarge,
+    ResponseTooLarge,
+    Unavailable,
+    VerificationFailed,
+    Internal,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneHopSemanticHttpError {
+    code: OneHopSemanticHttpErrorCode,
+    message: String,
+    retryable: bool,
+    #[serde(default, deserialize_with = "deserialize_present_retry_after_seconds")]
+    retry_after_seconds: Option<u64>,
+}
+
+fn deserialize_present_retry_after_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <u64 as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// Result of the Project-command transport policy. An ambiguous outcome must
@@ -633,6 +715,7 @@ fn advance_query_cursor(
 
 pub struct CarryforthClient {
     http: reqwest::Client,
+    semantic_query_http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.cf.place"
     keys: Keys,
     /// Optional NIP-OA auth tag injected into every signed event.
@@ -663,13 +746,22 @@ impl CarryforthClient {
         auth_tag: Option<Tag>,
         auth_tag_json: Option<String>,
     ) -> Result<Self, CliError> {
+        let request_timeout = env_duration_secs("CARRYFORTH_TIMEOUT_SECS", 30);
+        let connect_timeout = env_duration_secs("CARRYFORTH_CONNECT_TIMEOUT_SECS", 15);
         let http = reqwest::Client::builder()
-            .timeout(env_duration_secs("CARRYFORTH_TIMEOUT_SECS", 30))
-            .connect_timeout(env_duration_secs("CARRYFORTH_CONNECT_TIMEOUT_SECS", 15))
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        let semantic_query_http = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CliError::Other(e.to_string()))?;
         Ok(Self {
             http,
+            semantic_query_http,
             relay_url,
             keys,
             auth_tag,
@@ -949,42 +1041,20 @@ impl CarryforthClient {
         })?;
         let request = prepared.request;
         let exact_body = prepared.exact_body;
-        let url = format!("{}/query", self.relay_url);
-        let authorization = sign_nip98_observed(&self.keys, "POST", &url, Some(&exact_body))?;
-
-        let response = self
-            .with_auth_tag(
-                self.http
-                    .post(&url)
-                    .timeout(SEMANTIC_QUERY_TIMEOUT)
-                    .header("Authorization", authorization.header)
-                    .header("Content-Type", "application/json")
-                    .body(exact_body.clone()),
+        let attempt = self
+            .semantic_http_once(
+                &exact_body,
+                SEMANTIC_QUERY_TIMEOUT,
+                u64::from(request.budget.max_response_bytes),
+                "invalid:semantic_graph_query:success_response_too_large",
+                "invalid:semantic_graph_query:error_response_too_large",
+                false,
             )
-            .send()
             .await?;
-        let status = response.status();
-        let response_limit = if status.is_success() {
-            u64::from(request.budget.max_response_bytes)
-        } else {
-            SEMANTIC_QUERY_ERROR_RESPONSE_BYTES
-        };
-        let response_body = read_bounded_semantic_query_response(response, response_limit)
-            .await
-            .map_err(|error| match error {
-                BoundedSemanticResponseError::Network(error) => CliError::Network(error),
-                BoundedSemanticResponseError::TooLarge if status.is_success() => CliError::Other(
-                    "invalid:semantic_graph_query:success_response_too_large".to_owned(),
-                ),
-                BoundedSemanticResponseError::TooLarge => CliError::Relay {
-                    status: status.as_u16(),
-                    body: "invalid:semantic_graph_query:error_response_too_large".to_owned(),
-                },
-            })?;
-        if !status.is_success() {
-            let raw = String::from_utf8_lossy(&response_body).into_owned();
+        if !attempt.status.is_success() {
+            let raw = String::from_utf8_lossy(&attempt.response_body).into_owned();
             let mut message = extract_relay_message_field(&raw).unwrap_or(raw);
-            if status == reqwest::StatusCode::FORBIDDEN
+            if attempt.status == reqwest::StatusCode::FORBIDDEN
                 && std::env::var("CARRYFORTH_AUTH_TAG").is_ok()
             {
                 message.push_str(
@@ -992,15 +1062,169 @@ impl CarryforthClient {
                 );
             }
             return Err(CliError::Relay {
-                status: status.as_u16(),
+                status: attempt.status.as_u16(),
                 body: message,
             });
         }
 
         Ok(SemanticQueryOnceResponse {
             request,
-            nip98_auth_event_id: authorization.event_id,
+            nip98_auth_event_id: attempt.nip98_auth_event_id,
             exact_body,
+            response_body: attempt.response_body,
+        })
+    }
+
+    /// Send one Coordinate starting-point search exactly once.
+    ///
+    /// The canonical filter body is serialized once and used byte-for-byte for
+    /// both NIP-98 authentication and the one non-retried `POST /query` call.
+    pub(crate) async fn coordinate_search_once(
+        &self,
+        relay_pubkey: &PublicKey,
+        request: ProjectContextCoordinateSearchQuery,
+    ) -> Result<CoordinateSearchOnceResponse, CliError> {
+        let prepared = buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_http_query_request(
+            request,
+            relay_pubkey,
+            &self.public_key(),
+        )
+        .map_err(|error| match error {
+            buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
+            other => CliError::Other(format!(
+                "Coordinate-search filter serialization failed: {other}"
+            )),
+        })?;
+        let request = prepared.request;
+        let exact_body = prepared.exact_body;
+        let attempt = self
+            .semantic_http_once(
+                &exact_body,
+                COORDINATE_SEARCH_TIMEOUT,
+                MAX_COORDINATE_SEARCH_RESPONSE_BYTES as u64,
+                "invalid:coordinate_search:success_response_too_large",
+                "invalid:coordinate_search:error_response_too_large",
+                false,
+            )
+            .await?;
+        if !attempt.status.is_success() {
+            let raw = String::from_utf8_lossy(&attempt.response_body).into_owned();
+            let mut message = extract_relay_message_field(&raw).unwrap_or(raw);
+            if attempt.status == reqwest::StatusCode::FORBIDDEN
+                && std::env::var("CARRYFORTH_AUTH_TAG").is_ok()
+            {
+                message.push_str(
+                    " (CARRYFORTH_AUTH_TAG is set — it may be stale or revoked; try unsetting it)",
+                );
+            }
+            return Err(CliError::Relay {
+                status: attempt.status.as_u16(),
+                body: message,
+            });
+        }
+        Ok(CoordinateSearchOnceResponse {
+            request,
+            nip98_auth_event_id: attempt.nip98_auth_event_id,
+            exact_body,
+            response_body: attempt.response_body,
+        })
+    }
+
+    /// Send one scoped one-hop semantic search exactly once.
+    ///
+    /// The exact SDK-built filter bytes are used for both NIP-98 and the
+    /// single non-retried request. Non-success responses must match the closed
+    /// one-hop error contract; Relay-provided text is never surfaced.
+    pub(crate) async fn one_hop_semantic_search_once(
+        &self,
+        relay_pubkey: &PublicKey,
+        request: ProjectContextOneHopSemanticQuery,
+    ) -> Result<OneHopSemanticSearchOnceResponse, CliError> {
+        let prepared = buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_http_query_request(
+            request,
+            relay_pubkey,
+            &self.public_key(),
+        )
+        .map_err(|error| match error {
+            buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
+            other => CliError::Other(format!(
+                "one-hop semantic filter serialization failed: {other}"
+            )),
+        })?;
+        let request = prepared.request;
+        let exact_body = prepared.exact_body;
+        let attempt = self
+            .semantic_http_once(
+                &exact_body,
+                ONE_HOP_SEMANTIC_SEARCH_TIMEOUT,
+                MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES as u64,
+                "invalid:one_hop_semantic:success_response_too_large",
+                "verification_failed:one_hop_semantic:invalid_closed_error",
+                true,
+            )
+            .await?;
+        if !attempt.status.is_success() {
+            return Err(map_one_hop_semantic_http_error(
+                attempt.status,
+                &attempt.response_body,
+            ));
+        }
+        Ok(OneHopSemanticSearchOnceResponse {
+            request,
+            nip98_auth_event_id: attempt.nip98_auth_event_id,
+            exact_body,
+            response_body: attempt.response_body,
+        })
+    }
+
+    async fn semantic_http_once(
+        &self,
+        exact_body: &[u8],
+        timeout: Duration,
+        success_response_limit: u64,
+        success_too_large_message: &'static str,
+        error_too_large_message: &'static str,
+        oversized_error_is_verification_failure: bool,
+    ) -> Result<SemanticHttpOnceResponse, CliError> {
+        let url = format!("{}/query", self.relay_url);
+        let authorization = sign_nip98_observed(&self.keys, "POST", &url, Some(exact_body))?;
+        let response = self
+            .with_auth_tag(
+                self.semantic_query_http
+                    .post(&url)
+                    .timeout(timeout)
+                    .header("Authorization", authorization.header)
+                    .header("Content-Type", "application/json")
+                    .body(exact_body.to_vec()),
+            )
+            .send()
+            .await?;
+        let status = response.status();
+        let response_limit = if status.is_success() {
+            success_response_limit
+        } else {
+            SEMANTIC_QUERY_ERROR_RESPONSE_BYTES
+        };
+        let response_body = read_bounded_semantic_query_response(response, response_limit)
+            .await
+            .map_err(|error| match error {
+                BoundedSemanticResponseError::Network(error) => CliError::Network(error),
+                BoundedSemanticResponseError::TooLarge if status.is_success() => {
+                    CliError::Other(success_too_large_message.to_owned())
+                }
+                BoundedSemanticResponseError::TooLarge
+                    if oversized_error_is_verification_failure =>
+                {
+                    CliError::Other(error_too_large_message.to_owned())
+                }
+                BoundedSemanticResponseError::TooLarge => CliError::Relay {
+                    status: status.as_u16(),
+                    body: error_too_large_message.to_owned(),
+                },
+            })?;
+        Ok(SemanticHttpOnceResponse {
+            status,
+            nip98_auth_event_id: authorization.event_id,
             response_body,
         })
     }
@@ -1687,6 +1911,85 @@ impl CarryforthClient {
     }
 }
 
+fn map_one_hop_semantic_http_error(status: reqwest::StatusCode, body: &[u8]) -> CliError {
+    let parsed = serde_json::from_slice::<OneHopSemanticHttpError>(body);
+    let Ok(error) = parsed else {
+        return invalid_one_hop_http_error();
+    };
+    if error.message.trim().is_empty() {
+        return invalid_one_hop_http_error();
+    }
+    let (expected_status, expected_retryable) =
+        match error.code {
+            OneHopSemanticHttpErrorCode::InvalidInput
+            | OneHopSemanticHttpErrorCode::Unsupported => (400, false),
+            OneHopSemanticHttpErrorCode::Restricted => (403, false),
+            OneHopSemanticHttpErrorCode::NotFound => (404, false),
+            OneHopSemanticHttpErrorCode::Busy => (429, true),
+            OneHopSemanticHttpErrorCode::Conflict => (409, false),
+            OneHopSemanticHttpErrorCode::Timeout => (504, true),
+            OneHopSemanticHttpErrorCode::ScopeTooLarge
+            | OneHopSemanticHttpErrorCode::HyperedgeTooLarge
+            | OneHopSemanticHttpErrorCode::ResponseTooLarge => (413, false),
+            OneHopSemanticHttpErrorCode::Unavailable => (503, true),
+            OneHopSemanticHttpErrorCode::VerificationFailed
+            | OneHopSemanticHttpErrorCode::Internal => (500, false),
+        };
+    if status.as_u16() != expected_status
+        || error.retryable != expected_retryable
+        || error
+            .retry_after_seconds
+            .is_some_and(|seconds| !expected_retryable || !(1..=3_600).contains(&seconds))
+    {
+        return invalid_one_hop_http_error();
+    }
+    match error.code {
+        OneHopSemanticHttpErrorCode::InvalidInput => {
+            CliError::Usage("one-hop semantic search request is invalid".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Unsupported => {
+            CliError::Usage("Relay does not support one-hop semantic search".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Restricted => {
+            CliError::Auth("one-hop semantic search is not authorized".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::NotFound => {
+            CliError::NotFound("one-hop semantic search scope was not found".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Busy => {
+            CliError::Unavailable("one-hop semantic search is busy".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Conflict => {
+            CliError::Conflict("one-hop semantic search snapshot changed".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Timeout => {
+            CliError::Unavailable("one-hop semantic search timed out".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::ScopeTooLarge => {
+            CliError::Usage("one-hop semantic search scope is too large".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::HyperedgeTooLarge => {
+            CliError::Usage("one-hop semantic search Edge is too large".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::ResponseTooLarge => {
+            CliError::Usage("one-hop semantic search response is too large".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::Unavailable => {
+            CliError::Unavailable("one-hop semantic search is unavailable".to_owned())
+        }
+        OneHopSemanticHttpErrorCode::VerificationFailed => CliError::Other(
+            "verification_failed:one_hop_semantic:Relay verification failed".to_owned(),
+        ),
+        OneHopSemanticHttpErrorCode::Internal => {
+            CliError::Other("one-hop semantic search failed internally".to_owned())
+        }
+    }
+}
+
+fn invalid_one_hop_http_error() -> CliError {
+    CliError::Other("verification_failed:one_hop_semantic:invalid_closed_error".to_owned())
+}
+
 enum BoundedSemanticResponseError {
     Network(reqwest::Error),
     TooLarge,
@@ -1877,16 +2180,20 @@ mod semantic_query_once_tests {
 
     use axum::body::{Body, Bytes};
     use axum::extract::State;
-    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::{CONTENT_LENGTH, LOCATION};
     use axum::http::{HeaderMap, Response, StatusCode};
     use axum::routing::post;
     use axum::Router;
-    use buzz_project_context::ProjectContextCoordinate;
+    use buzz_project_context::{EdgeKey, ProjectContextCoordinate};
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::Digest32;
     use buzz_semantic_query::{
-        derive_http_request_binding, verify_http_request_binding, LifecycleFilter,
-        SemanticGraphQuery, SemanticGraphQueryBudget,
+        derive_coordinate_search_http_request_binding, derive_http_request_binding,
+        derive_one_hop_semantic_http_request_binding,
+        verify_coordinate_search_http_request_binding, verify_http_request_binding,
+        verify_one_hop_semantic_http_request_binding, LifecycleFilter, OneHopSemanticScope,
+        ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery, SemanticGraphQuery,
+        SemanticGraphQueryBudget,
     };
     use futures_util::stream;
     use nostr::{Event, JsonUtil, Keys};
@@ -1894,7 +2201,10 @@ mod semantic_query_once_tests {
     use sha2::{Digest as _, Sha256};
     use uuid::Uuid;
 
-    use super::{CarryforthClient, SEMANTIC_QUERY_ERROR_RESPONSE_BYTES, SEMANTIC_QUERY_TIMEOUT};
+    use super::{
+        map_one_hop_semantic_http_error, CarryforthClient, ONE_HOP_SEMANTIC_SEARCH_TIMEOUT,
+        SEMANTIC_QUERY_ERROR_RESPONSE_BYTES, SEMANTIC_QUERY_TIMEOUT,
+    };
 
     #[derive(Clone)]
     struct CaptureState {
@@ -1928,7 +2238,7 @@ mod semantic_query_once_tests {
                     .unwrap_or_default()
                     .to_owned(),
             );
-        let (response, body) = if state.chunked_response {
+        let (mut response, body) = if state.chunked_response {
             let chunks = state
                 .response_body
                 .chunks(3)
@@ -1946,12 +2256,16 @@ mod semantic_query_once_tests {
                 Body::from(state.response_body.as_ref().clone()),
             )
         };
+        if state.status.is_redirection() {
+            response = response.header(LOCATION, "/redirect-target");
+        }
         response.body(body).expect("semantic fixture response")
     }
 
     async fn spawn_server(state: CaptureState) -> String {
         let app = Router::new()
             .route("/query", post(capture_query))
+            .route("/redirect-target", post(capture_query))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1974,6 +2288,30 @@ mod semantic_query_once_tests {
             context_coordinates: Vec::new(),
             lifecycle_filter: LifecycleFilter::AllCurrent,
             budget: SemanticGraphQueryBudget::default(),
+        }
+    }
+
+    fn coordinate_request(project_id: Uuid) -> ProjectContextCoordinateSearchQuery {
+        ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::new_v4(),
+            project_id,
+            query: "authorization failure during release".to_owned(),
+            limit: 8,
+        }
+    }
+
+    fn one_hop_request(project_id: Uuid) -> ProjectContextOneHopSemanticQuery {
+        ProjectContextOneHopSemanticQuery {
+            request_id: Uuid::new_v4(),
+            project_id,
+            query: "relation evidence for frontend authorization".to_owned(),
+            limit: 8,
+            scope: OneHopSemanticScope::IncidentEdges {
+                coordinate: ProjectContextCoordinate::ProjectViewObject {
+                    object_type: ProjectViewObjectType::Role,
+                    object_id: Uuid::new_v4(),
+                },
+            },
         }
     }
 
@@ -2250,6 +2588,290 @@ mod semantic_query_once_tests {
             } if body == "invalid:semantic_graph_query:error_response_too_large"
         ));
         assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn coordinate_search_freezes_one_exact_filter_auth_and_binding_observation() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let response = client
+            .coordinate_search_once(&relay.public_key(), coordinate_request(project_id))
+            .await
+            .expect("one Coordinate-search request");
+
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let bodies = state.bodies.lock().expect("body capture lock");
+        assert_eq!(bodies.as_slice(), [response.exact_body.as_slice()]);
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&response.exact_body)
+            .expect("Coordinate-search filter JSON")
+            .try_into()
+            .expect("one Coordinate-search filter");
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT])
+        );
+        assert_eq!(filter["authors"], json!([relay.public_key().to_hex()]));
+        assert_eq!(filter["#p"], json!([caller.public_key().to_hex()]));
+        assert_eq!(filter["limit"], json!(1));
+        assert_eq!(
+            filter["carryforth_project_context_coordinate_search"],
+            serde_json::to_value(&response.request).expect("request value")
+        );
+        assert!(filter.get("buzz_project_context_semantic").is_none());
+        drop(bodies);
+
+        let binding = derive_coordinate_search_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("derive Coordinate-search binding");
+        verify_coordinate_search_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("verify Coordinate-search binding");
+        assert_eq!(response.response_body, b"[]");
+    }
+
+    #[tokio::test]
+    async fn coordinate_search_neither_retries_nor_follows_redirects() {
+        for status in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let state = state(status);
+            let url = spawn_server(state.clone()).await;
+            let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+            let error = client
+                .coordinate_search_once(
+                    &Keys::generate().public_key(),
+                    coordinate_request(Uuid::new_v4()),
+                )
+                .await
+                .expect_err("non-success must return without replay or redirect");
+            assert!(matches!(error, crate::error::CliError::Relay { .. }));
+            assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn one_hop_search_freezes_one_exact_filter_auth_and_binding_observation() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let response = client
+            .one_hop_semantic_search_once(&relay.public_key(), one_hop_request(project_id))
+            .await
+            .expect("one one-hop request");
+
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let bodies = state.bodies.lock().expect("body capture lock");
+        assert_eq!(bodies.as_slice(), [response.exact_body.as_slice()]);
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&response.exact_body)
+            .expect("one-hop filter JSON")
+            .try_into()
+            .expect("one one-hop filter");
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT])
+        );
+        assert_eq!(filter["authors"], json!([relay.public_key().to_hex()]));
+        assert_eq!(filter["#p"], json!([caller.public_key().to_hex()]));
+        assert_eq!(filter["limit"], json!(1));
+        assert_eq!(
+            filter["carryforth_project_context_one_hop_semantic_search"],
+            serde_json::to_value(&response.request).expect("request value")
+        );
+        assert!(filter
+            .get("carryforth_project_context_coordinate_search")
+            .is_none());
+        assert!(filter.get("buzz_project_context_semantic").is_none());
+        drop(bodies);
+
+        let binding = derive_one_hop_semantic_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            &relay.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("derive one-hop binding");
+        verify_one_hop_semantic_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            &relay.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("verify one-hop binding");
+        assert_eq!(response.response_body, b"[]");
+        assert_eq!(
+            ONE_HOP_SEMANTIC_SEARCH_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("frontend authorization"));
+        assert!(!debug.contains("carryforth_project_context_one_hop_semantic_search"));
+    }
+
+    #[tokio::test]
+    async fn one_hop_search_neither_retries_nor_follows_redirects() {
+        for status in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let response_body = if status == StatusCode::SERVICE_UNAVAILABLE {
+                serde_json::to_vec(&json!({
+                    "code": "unavailable",
+                    "message": "must not be surfaced",
+                    "retryable": true,
+                }))
+                .expect("error body")
+            } else {
+                b"redirect".to_vec()
+            };
+            let state = state_with_response(status, response_body, false);
+            let url = spawn_server(state.clone()).await;
+            let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+            let _error = client
+                .one_hop_semantic_search_once(
+                    &Keys::generate().public_key(),
+                    one_hop_request(Uuid::new_v4()),
+                )
+                .await
+                .expect_err("non-success must return without replay or redirect");
+            assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn one_hop_search_rejects_oversized_closed_error_without_surfacing_body() {
+        let state = state_with_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            vec![b'x'; SEMANTIC_QUERY_ERROR_RESPONSE_BYTES as usize + 1],
+            false,
+        );
+        let url = spawn_server(state.clone()).await;
+        let client = CarryforthClient::new(url, Keys::generate(), None, None).expect("client");
+        let error = client
+            .one_hop_semantic_search_once(
+                &Keys::generate().public_key(),
+                one_hop_request(Uuid::new_v4()),
+            )
+            .await
+            .expect_err("oversized closed error must fail verification");
+        assert!(matches!(
+            error,
+            crate::error::CliError::Other(ref message)
+                if message == "verification_failed:one_hop_semantic:invalid_closed_error"
+        ));
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn one_hop_closed_errors_map_without_relay_text() {
+        let cases = [
+            ("invalid_input", 400, false, "user_error"),
+            ("unsupported", 400, false, "user_error"),
+            ("restricted", 403, false, "auth_error"),
+            ("not_found", 404, false, "not_found"),
+            ("busy", 429, true, "relay_unavailable"),
+            ("conflict", 409, false, "conflict"),
+            ("timeout", 504, true, "relay_unavailable"),
+            ("scope_too_large", 413, false, "user_error"),
+            ("hyperedge_too_large", 413, false, "user_error"),
+            ("response_too_large", 413, false, "user_error"),
+            ("unavailable", 503, true, "relay_unavailable"),
+            ("verification_failed", 500, false, "error"),
+            ("internal", 500, false, "error"),
+        ];
+        for (code, status, retryable, expected_category) in cases {
+            let body = serde_json::to_vec(&json!({
+                "code": code,
+                "message": "SECRET QUERY MUST NOT SURFACE",
+                "retryable": retryable,
+            }))
+            .expect("closed error");
+            let error = map_one_hop_semantic_http_error(
+                StatusCode::from_u16(status).expect("HTTP status"),
+                &body,
+            );
+            let rendered = error.to_string();
+            assert!(!rendered.contains("SECRET"));
+            let category = match error {
+                crate::error::CliError::Usage(_) => "user_error",
+                crate::error::CliError::Auth(_) => "auth_error",
+                crate::error::CliError::NotFound(_) => "not_found",
+                crate::error::CliError::Unavailable(_) => "relay_unavailable",
+                crate::error::CliError::Conflict(_) => "conflict",
+                crate::error::CliError::Other(_) => "error",
+                other => panic!("unexpected mapping for {code}: {other}"),
+            };
+            assert_eq!(category, expected_category, "code {code}");
+        }
+    }
+
+    #[test]
+    fn one_hop_closed_error_rejects_malformed_status_retry_and_shape() {
+        for (status, body) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","message":"x","retryable":false}"#.as_slice(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","message":"x","retryable":true,"retry_after_seconds":null}"#.as_slice(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","message":"x","retryable":true,"unknown":1}"#.as_slice(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","code":"busy","message":"x","retryable":true}"#.as_slice(),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                br#"{"code":"unavailable","message":"x","retryable":true}"#.as_slice(),
+            ),
+        ] {
+            let error = map_one_hop_semantic_http_error(status, body);
+            assert!(matches!(
+                error,
+                crate::error::CliError::Other(ref message)
+                    if message == "verification_failed:one_hop_semantic:invalid_closed_error"
+            ));
+        }
+    }
+
+    #[test]
+    fn edge_coordinate_scope_has_no_relation_document_field() {
+        let request = ProjectContextOneHopSemanticQuery {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            query: "next work item".to_owned(),
+            limit: 8,
+            scope: OneHopSemanticScope::EdgeCoordinates {
+                edge_key: EdgeKey::from_hex(&"33".repeat(32)).expect("Edge key"),
+            },
+        };
+        let value = serde_json::to_value(request).expect("scope JSON");
+        assert_eq!(value["scope"]["scope_type"], "edge_coordinates");
+        assert!(value["scope"].get("coordinate").is_none());
+        assert!(value["scope"].get("document_id").is_none());
     }
 }
 

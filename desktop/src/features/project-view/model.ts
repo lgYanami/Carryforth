@@ -11,6 +11,7 @@ export type ProjectViewCreateContext = {
   underPlanId?: string;
   plannedInStageId?: string;
   handles?: ProjectViewObjectRef;
+  about?: ProjectViewObjectRef;
 };
 
 export type ProjectViewIncomingReference = {
@@ -19,7 +20,8 @@ export type ProjectViewIncomingReference = {
     | "under plan"
     | "planned in stage"
     | "about"
-    | "handles";
+    | "handles"
+    | "context resource";
   source: ProjectViewObject;
 };
 
@@ -74,6 +76,13 @@ export function projectViewObjectDescription(
     case "resource":
       return object.data.summary ?? object.data.resourceKind;
   }
+}
+
+/** Return only the source-owned summary; never derive one from full fields. */
+export function projectViewObjectSummary(
+  object: ProjectViewObject,
+): string | undefined {
+  return object.data.summary;
 }
 
 export function projectViewObjectStatus(
@@ -234,6 +243,15 @@ export function projectViewIncomingReferences(
     }
     if (source.relations.handles?.objectId === targetId) {
       references.push({ source, relation: "handles" });
+    }
+    if (
+      source.contextReferences?.some(
+        (reference) =>
+          reference.referenceType === "resource" &&
+          reference.resourceId === targetId,
+      )
+    ) {
+      references.push({ source, relation: "context resource" });
     }
   }
   return references;

@@ -4898,6 +4898,13 @@ mod agent_draft_prompt_tests {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("| `cf project-context` |"));
         for command in [
+            "`coordinate-search`",
+            "`coordinate show`",
+            "`coordinate edges`",
+            "`coordinate edge-search`",
+            "`edge documents`",
+            "`edge coordinates`",
+            "`edge coordinate-search`",
             "`semantic-query`",
             "`exact`",
             "`incident`",
@@ -4929,6 +4936,8 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("Use all three supervised-attribution options only when"));
         assert!(prompt.contains("remove all three options, and retry once"));
         assert!(prompt.contains("do not apply that correction to Relay, auth, conflict"));
+        assert!(prompt.contains("The `search-project-context` Skill provides"));
+        assert!(prompt.contains("Load it when you determine"));
     }
 }
 

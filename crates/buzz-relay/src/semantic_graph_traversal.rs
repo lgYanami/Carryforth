@@ -2854,6 +2854,7 @@ mod tests {
                 created_at: observed_at,
             },
             query_fences,
+            projection_generation: 3,
             project_context_revision: 7,
             observed_at,
         };

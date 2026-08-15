@@ -108,45 +108,85 @@ fn ensure_nest_rejects_symlink_root() {
 }
 
 #[test]
-fn ensure_nest_creates_skill_file() {
+fn ensure_nest_creates_managed_skill_files() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
 
-    // Canonical location under .agents.
-    let skill = root.join(".agents/skills/carryforth-cli/SKILL.md");
-    assert!(skill.exists(), "SKILL.md should exist at .agents path");
-    let content = fs::read_to_string(&skill).unwrap();
-    assert_eq!(content, CARRYFORTH_CLI_SKILL_MD);
+    for (name, expected) in [
+        ("carryforth-cli", CARRYFORTH_CLI_SKILL_MD),
+        ("search-project-context", SEARCH_PROJECT_CONTEXT_SKILL_MD),
+    ] {
+        let skill = root.join(".agents/skills").join(name).join("SKILL.md");
+        assert!(skill.exists(), "{name}/SKILL.md should exist");
+        assert_eq!(fs::read_to_string(&skill).unwrap(), expected);
+    }
 
     // On unix, harness-specific symlinks should resolve to the canonical dir.
     #[cfg(unix)]
     {
         for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-            let link = root.join(dir).join("carryforth-cli");
-            assert!(
-                link.symlink_metadata().unwrap().file_type().is_symlink(),
-                "{dir}/carryforth-cli should be a symlink"
-            );
-            assert!(
-                link.join("SKILL.md").exists(),
-                "symlink at {dir}/carryforth-cli should resolve to dir with SKILL.md"
-            );
+            for name in ["carryforth-cli", "search-project-context"] {
+                let link = root.join(dir).join(name);
+                assert!(
+                    link.symlink_metadata().unwrap().file_type().is_symlink(),
+                    "{dir}/{name} should be a symlink"
+                );
+                assert!(
+                    link.join("SKILL.md").exists(),
+                    "symlink at {dir}/{name} should resolve to dir with SKILL.md"
+                );
+            }
         }
     }
 }
 
 #[test]
-fn ensure_nest_does_not_overwrite_skill_file() {
+fn search_project_context_skill_freezes_the_reviewed_workflow() {
+    assert!(SEARCH_PROJECT_CONTEXT_SKILL_MD
+        .starts_with("---\nname: search-project-context\ndescription: >\n"));
+    for required in [
+        "The current verified Role is mandatory",
+        "cf project-context coordinate-search",
+        "cf project-context coordinate show",
+        "cf project-context coordinate edge-search",
+        "cf project-context coordinate edges",
+        "cf project-context edge documents",
+        "cf project-context edge coordinate-search",
+        "cf project-context edge coordinates",
+        "Score controls inspection order, not selection",
+        "Do not publish command logs",
+        "### Case 7: Retrieval is unavailable",
+    ] {
+        assert!(
+            SEARCH_PROJECT_CONTEXT_SKILL_MD.contains(required),
+            "missing search-project-context workflow: {required}"
+        );
+    }
+    assert!(SEARCH_PROJECT_CONTEXT_SKILL_MD.len() < 32 * 1024);
+    assert!(SEARCH_PROJECT_CONTEXT_SKILL_MD.lines().count() < 500);
+}
+
+#[test]
+fn ensure_nest_does_not_overwrite_current_managed_skill_files() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
     ensure_nest_at(&root).unwrap();
 
-    let skill = root.join(".agents/skills/carryforth-cli/SKILL.md");
-    fs::write(&skill, "custom skill content").unwrap();
+    let carryforth = root.join(".agents/skills/carryforth-cli/SKILL.md");
+    let search = root.join(".agents/skills/search-project-context/SKILL.md");
+    fs::write(&carryforth, "custom CLI skill content").unwrap();
+    fs::write(&search, "custom search skill content").unwrap();
 
     ensure_nest_at(&root).unwrap();
-    assert_eq!(fs::read_to_string(&skill).unwrap(), "custom skill content");
+    assert_eq!(
+        fs::read_to_string(&carryforth).unwrap(),
+        "custom CLI skill content"
+    );
+    assert_eq!(
+        fs::read_to_string(&search).unwrap(),
+        "custom search skill content"
+    );
 }
 
 #[cfg(unix)]
@@ -162,6 +202,7 @@ fn ensure_nest_skill_dir_has_700_permissions() {
         ".agents",
         ".agents/skills",
         ".agents/skills/carryforth-cli",
+        ".agents/skills/search-project-context",
         ".goose",
         ".goose/skills",
         ".claude",
@@ -243,18 +284,23 @@ fn ensure_skill_symlinks_are_idempotent() {
     ensure_nest_at(&root).unwrap();
     // All symlinks still valid and point to relative targets.
     for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-        let link = root.join(dir).join("carryforth-cli");
-        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-        assert!(
-            link.join("SKILL.md").exists(),
-            "symlink at {dir}/carryforth-cli should resolve to dir with SKILL.md"
-        );
-        let target = fs::read_link(&link).unwrap();
-        assert_eq!(
-            target.to_str().unwrap(),
-            format!("../../{CANONICAL_SKILL_DIR}"),
-            "symlink at {dir}/carryforth-cli should use relative target"
-        );
+        for (name, canonical_dir) in [
+            ("carryforth-cli", CANONICAL_SKILL_DIR),
+            ("search-project-context", SEARCH_PROJECT_CONTEXT_SKILL_DIR),
+        ] {
+            let link = root.join(dir).join(name);
+            assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+            assert!(
+                link.join("SKILL.md").exists(),
+                "symlink at {dir}/{name} should resolve to dir with SKILL.md"
+            );
+            let target = fs::read_link(&link).unwrap();
+            assert_eq!(
+                target.to_str().unwrap(),
+                format!("../../{canonical_dir}"),
+                "symlink at {dir}/{name} should use a relative target"
+            );
+        }
     }
 }
 
@@ -839,133 +885,5 @@ fn test_upsert_idempotent() {
     );
 }
 
-#[test]
-fn refresh_agents_md_writes_version_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join(".buzz");
-    ensure_nest_at(&root).unwrap();
-    let version = fs::read_to_string(root.join(".nest-agents-version")).unwrap();
-    assert_eq!(version.trim(), NEST_AGENTS_VERSION.to_string());
-}
-
-#[test]
-fn refresh_skill_md_writes_version_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join(".buzz");
-    ensure_nest_at(&root).unwrap();
-    let version =
-        fs::read_to_string(root.join(".agents/skills/carryforth-cli/.skill-version")).unwrap();
-    assert_eq!(version.trim(), NEST_SKILL_VERSION.to_string());
-}
-
-#[test]
-fn refresh_agents_md_preserves_managed_section() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join(".buzz");
-    ensure_nest_at(&root).unwrap();
-
-    // Simulate a managed section update.
-    let agents_md = root.join("AGENTS.md");
-    upsert_managed_section(
-        &agents_md,
-        "## Active Agents\n\n| Name | Role |\n|------|------|\n| Kit | Builder |",
-    )
-    .unwrap();
-
-    // Remove version file to simulate an upgrade.
-    fs::remove_file(root.join(".nest-agents-version")).unwrap();
-
-    // Re-run ensure_nest_at (triggers refresh).
-    ensure_nest_at(&root).unwrap();
-
-    let content = fs::read_to_string(&agents_md).unwrap();
-    // Static content should be refreshed (from template).
-    assert!(
-        content.starts_with("# Carryforth Nest"),
-        "template header must be present"
-    );
-    // Managed section should be preserved.
-    assert!(
-        content.contains("Kit"),
-        "managed section agent table must survive refresh"
-    );
-    assert!(content.contains(BEGIN_MARKER), "BEGIN marker must survive");
-    assert!(content.contains(END_MARKER), "END marker must survive");
-}
-
-#[test]
-fn refresh_skips_when_version_current() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join(".buzz");
-    ensure_nest_at(&root).unwrap();
-
-    // Manually change AGENTS.md content after version file is written.
-    let agents_md = root.join("AGENTS.md");
-    fs::write(&agents_md, "user modified content").unwrap();
-
-    // Re-run ensure_nest_at — version file is current, so no refresh.
-    ensure_nest_at(&root).unwrap();
-
-    let content = fs::read_to_string(&agents_md).unwrap();
-    assert_eq!(
-        content, "user modified content",
-        "should not overwrite when version is current"
-    );
-}
-
-#[test]
-fn refresh_skill_overwrites_on_version_bump() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join(".buzz");
-    ensure_nest_at(&root).unwrap();
-
-    let skill_md = root.join(".agents/skills/carryforth-cli/SKILL.md");
-    fs::write(&skill_md, "stale skill content").unwrap();
-
-    // Remove version file to simulate upgrade.
-    let _ = fs::remove_file(root.join(".agents/skills/carryforth-cli/.skill-version"));
-
-    ensure_nest_at(&root).unwrap();
-
-    let content = fs::read_to_string(&skill_md).unwrap();
-    assert_eq!(
-        content, CARRYFORTH_CLI_SKILL_MD,
-        "SKILL.md must be refreshed on version bump"
-    );
-}
-
-#[test]
-fn test_path_is_dev_nest_dev_path_returns_true() {
-    let path = std::path::Path::new("/Users/someone/.buzz-dev");
-    assert!(
-        path_is_dev_nest(path),
-        ".buzz-dev path must be identified as dev nest"
-    );
-}
-
-#[test]
-fn test_path_is_dev_nest_prod_path_returns_false() {
-    let path = std::path::Path::new("/Users/someone/.buzz");
-    assert!(
-        !path_is_dev_nest(path),
-        ".buzz path must not be identified as dev nest"
-    );
-}
-
-#[test]
-fn test_path_is_dev_nest_unrelated_path_returns_false() {
-    let path = std::path::Path::new("/Users/someone/.buzz-staging");
-    assert!(
-        !path_is_dev_nest(path),
-        "unrelated path must not be identified as dev nest"
-    );
-}
-
-#[test]
-fn test_path_is_dev_nest_root_returns_false() {
-    let path = std::path::Path::new("/");
-    assert!(
-        !path_is_dev_nest(path),
-        "root path must not be identified as dev nest"
-    );
-}
+mod paths;
+mod refresh;

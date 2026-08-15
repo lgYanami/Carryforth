@@ -98,7 +98,13 @@ pub(crate) async fn semantic_graph_http_routing_ready_for_test(
 /// runtime rather than merely the presence of the parser code.
 pub(crate) fn semantic_graph_http_local_handler_ready(state: &AppState) -> bool {
     semantic_graph_http_local_handler_ready_from_facts(SemanticGraphHttpLocalHandlerFacts {
-        deployment_master: state.config.semantic_graph_query_http_available,
+        deployment_master: state.config.semantic_graph_query_http_available
+            || state
+                .config
+                .project_context_coordinate_search_http_available
+            || state
+                .config
+                .project_context_one_hop_semantic_search_http_available,
         stable_signer: state.config.relay_private_key.is_some(),
         routing_configuration_ready: state.config.semantic_graph_query_routing_trust().is_ok(),
         runtime_digest_ready: buzz_semantic_query::semantic_graph_http_runtime_digest().is_ok(),

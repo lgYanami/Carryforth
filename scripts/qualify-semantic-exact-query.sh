@@ -102,7 +102,7 @@ rg -Fqx 'pub const MAX_QUERY_CHANNELS: usize = 1 + MAX_CONTEXT_COORDINATES;' \
 rg -Fqx 'pub const MAX_RECALL_PER_CHANNEL: u16 = 256;' \
   "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
   fail "MAX_RECALL_PER_CHANNEL drifted from the hard-cap profile"
-rg -Fqx 'pub const MAX_WALL_TIME_MS: u32 = 30_000;' \
+rg -Fqx 'pub const MAX_WALL_TIME_MS: u32 = 180_000;' \
   "${REPO_ROOT}/crates/buzz-semantic-query/src/contract.rs" ||
   fail "MAX_WALL_TIME_MS drifted from the hard-cap profile"
 rg -Fqx '    max_recall_per_channel: 64,' \
@@ -110,7 +110,7 @@ rg -Fqx '    max_recall_per_channel: 64,' \
   fail "default recall budget drifted from the qualification profile"
 rg -Fqx "SET LOCAL statement_timeout = '30s';" \
   "${REPO_ROOT}/scripts/semantic-exact-query-qualification-pgbench.sql" ||
-  fail "pgbench statement timeout drifted from MAX_WALL_TIME_MS"
+  fail "pgbench statement timeout drifted from its bounded qualification profile"
 
 if [[ -e "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   fail "output directory already exists and is not empty: ${OUTPUT_DIR}"

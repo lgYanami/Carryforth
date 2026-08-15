@@ -1,5 +1,10 @@
 //! `cf project-context` — verified Edge discovery and explicit maintenance.
 
+#[path = "project_context_observation.rs"]
+mod observation;
+#[path = "project_context_one_hop.rs"]
+mod one_hop;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
@@ -27,11 +32,16 @@ use buzz_sdk::project_document::{
     document_head_coordinate, parse_document_head, parse_document_meta,
     verify_document_head_observation, VerifiedDocumentHead, VerifiedDocumentMeta,
 };
+use buzz_sdk::semantic_coordinate_search::{
+    parse_project_context_coordinate_search_result,
+    ProjectContextCoordinateSearchHttpRequestObservation,
+};
 use buzz_sdk::semantic_graph::{
     parse_semantic_graph_query_result, SemanticGraphHttpRequestObservation,
 };
 use buzz_semantic_query::{
-    LifecycleFilter, RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
+    LifecycleFilter, ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult,
+    RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
     SemanticGraphQueryResult,
 };
 use chrono::{DateTime, Utc};
@@ -44,12 +54,13 @@ use crate::client::{CarryforthClient, ProjectCommandDelivery};
 use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
+    COORDINATE_SEARCH_HTTP_EXTENSION, ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
     SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
 };
 use crate::error::CliError;
 use crate::{
-    OutputFormat, ProjectContextAttributionArgs, ProjectContextCmd, SemanticGraphBudgetArgs,
-    SemanticLifecycleArg,
+    OutputFormat, ProjectContextAttributionArgs, ProjectContextCmd, ProjectContextCoordinateCmd,
+    ProjectContextEdgeCmd, SemanticGraphBudgetArgs, SemanticLifecycleArg,
 };
 
 const QUERY_PAGE_SIZE: u16 = 500;
@@ -62,6 +73,7 @@ enum ContextQuery {
     Exact(Vec<ProjectContextCoordinate>),
     Incident(ProjectContextCoordinate),
     ContainsAll(Vec<ProjectContextCoordinate>),
+    EdgeKey(EdgeKey),
 }
 
 impl ContextQuery {
@@ -69,6 +81,7 @@ impl ContextQuery {
         match self {
             Self::Exact(coordinates) | Self::ContainsAll(coordinates) => coordinates.clone(),
             Self::Incident(coordinate) => vec![coordinate.clone()],
+            Self::EdgeKey(_) => Vec::new(),
         }
     }
 
@@ -77,6 +90,7 @@ impl ContextQuery {
             Self::Exact(_) => "exact",
             Self::Incident(_) => "incident",
             Self::ContainsAll(_) => "contains_all",
+            Self::EdgeKey(_) => "edge_key",
         }
     }
 
@@ -254,6 +268,73 @@ pub async fn dispatch(
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     match command {
+        ProjectContextCmd::Coordinate { command } => match command {
+            ProjectContextCoordinateCmd::Show { coordinate } => {
+                observation::run_coordinate_show(client, &coordinate, format).await
+            }
+            ProjectContextCoordinateCmd::Edges {
+                coordinate,
+                limit,
+                after_edge,
+                expected_context_meta_event_id,
+                expected_context_revision,
+                expected_projection_generation,
+            } => {
+                observation::run_coordinate_edges(
+                    client,
+                    &coordinate,
+                    limit,
+                    after_edge.as_deref(),
+                    expected_context_meta_event_id.as_deref(),
+                    expected_context_revision,
+                    expected_projection_generation,
+                    format,
+                )
+                .await
+            }
+            ProjectContextCoordinateCmd::EdgeSearch {
+                coordinate,
+                query,
+                limit,
+            } => {
+                one_hop::run_coordinate_edge_search(client, &coordinate, query, limit, format).await
+            }
+        },
+        ProjectContextCmd::Edge { command } => match command {
+            ProjectContextEdgeCmd::Documents {
+                edge_key,
+                document,
+                limit,
+                after_document,
+                expected_context_meta_event_id,
+                expected_context_revision,
+                expected_projection_generation,
+            } => {
+                observation::run_edge_documents(
+                    client,
+                    &edge_key,
+                    document,
+                    limit,
+                    after_document,
+                    expected_context_meta_event_id.as_deref(),
+                    expected_context_revision,
+                    expected_projection_generation,
+                    format,
+                )
+                .await
+            }
+            ProjectContextEdgeCmd::Coordinates { edge_key } => {
+                observation::run_edge_coordinates(client, &edge_key, format).await
+            }
+            ProjectContextEdgeCmd::CoordinateSearch {
+                edge_key,
+                query,
+                limit,
+            } => one_hop::run_edge_coordinate_search(client, &edge_key, query, limit, format).await,
+        },
+        ProjectContextCmd::CoordinateSearch { query, limit } => {
+            run_coordinate_search(client, query, limit, format).await
+        }
         ProjectContextCmd::SemanticQuery {
             problem,
             initial_coordinates,
@@ -315,6 +396,85 @@ pub async fn dispatch(
             .await
         }
     }
+}
+
+async fn run_coordinate_search(
+    client: &CarryforthClient,
+    query: String,
+    limit: u8,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let identity = require_coordinate_search_identity(client).await?;
+    let project = read_verified_v3_snapshot(client, identity)
+        .await
+        .map_err(|error| {
+            integrity_error(format!(
+                "cannot resolve current Project identity for Coordinate search: {error}"
+            ))
+        })?;
+    let project_id = *project.meta().project_id.as_uuid();
+    let request = ProjectContextCoordinateSearchQuery {
+        request_id: Uuid::new_v4(),
+        project_id,
+        query,
+        limit,
+    }
+    .validate_and_canonicalize()
+    .map_err(|error| CliError::Usage(format!("invalid Coordinate search: {error}")))?;
+    let response = client
+        .coordinate_search_once(&identity.relay_pubkey, request)
+        .await?;
+    let event = parse_single_semantic_result_event(&response.response_body)?;
+    let result = parse_project_context_coordinate_search_result(
+        &event,
+        &identity.relay_pubkey,
+        ProjectContextCoordinateSearchHttpRequestObservation {
+            project_id: CommunityId::from_uuid(project_id),
+            authenticated_caller: client.public_key(),
+            request: &response.request,
+            nip98_auth_event_id: response.nip98_auth_event_id,
+            exact_authenticated_body: &response.exact_body,
+        },
+    )
+    .map_err(|error| integrity_error(format!("invalid Coordinate-search result: {error}")))?;
+    print_coordinate_search_result(&result, format)
+}
+
+async fn require_coordinate_search_identity(
+    client: &CarryforthClient,
+) -> Result<ProjectViewIdentity, CliError> {
+    let identity = read_identity(client).await?.ok_or_else(|| {
+        CliError::Other("unavailable:coordinate_search:project_view_v3_not_ready".to_owned())
+    })?;
+    if identity.schema != ProjectViewSchema::V3 {
+        return Err(CliError::Other(
+            "unsupported:coordinate_search:project_view_v3_required".to_owned(),
+        ));
+    }
+    if !identity.coordinate_search_http_enabled {
+        if identity.extensions_temporarily_unavailable {
+            return Err(CliError::Unavailable(
+                "Relay Coordinate-search capability observation could not be completed".to_owned(),
+            ));
+        }
+        return Err(CliError::Other(format!(
+            "unsupported:coordinate_search:relay_does_not_advertise_{COORDINATE_SEARCH_HTTP_EXTENSION}"
+        )));
+    }
+    Ok(identity)
+}
+
+fn print_coordinate_search_result(
+    result: &ProjectContextCoordinateSearchResult,
+    format: &OutputFormat,
+) -> Result<(), CliError> {
+    let serialized = match format {
+        OutputFormat::Json => serde_json::to_string_pretty(result),
+        OutputFormat::Compact => serde_json::to_string(result),
+    }
+    .map_err(|error| CliError::Other(format!("failed to serialize output: {error}")))?;
+    println!("{serialized}");
+    Ok(())
 }
 
 async fn run_semantic_query(
@@ -805,6 +965,12 @@ async fn read_binding_pages(
             filter["#c"] = json!([coordinates[0].tag_value(project_id)]);
         }
         ContextQuery::ContainsAll(_) => {}
+        ContextQuery::EdgeKey(edge_key) => {
+            filter["#g"] = json!([project_context_edge_coordinate(
+                CommunityId::from_uuid(project_id),
+                *edge_key,
+            )]);
+        }
     }
 
     let mut values = Vec::new();
@@ -879,6 +1045,13 @@ fn apply_query_semantics(
                     .iter()
                     .all(|coordinate| edge.coordinates().binary_search(coordinate).is_ok())
             });
+        }
+        ContextQuery::EdgeKey(expected_edge_key) => {
+            if edges.len() > 1 || edges.iter().any(|edge| edge.key() != *expected_edge_key) {
+                return Err(integrity_error(
+                    "edge-key query returned a different or duplicate Edge",
+                ));
+            }
         }
     }
     Ok(())
@@ -1983,6 +2156,8 @@ mod tests {
             context_edge_migration_required: false,
             document_enabled: true,
             semantic_query_http_enabled: false,
+            coordinate_search_http_enabled: false,
+            one_hop_semantic_search_http_enabled: false,
             extensions_temporarily_unavailable: false,
         }
     }
@@ -2145,6 +2320,32 @@ mod tests {
     #[test]
     fn compact_query_shapes_cannot_contain_document_body() {
         let document_id = Uuid::new_v4();
+        let actor = Keys::generate().public_key();
+        let metadata = DocumentMetadata::Active {
+            title: "Context".to_owned(),
+            summary: Some("Summary".to_owned()),
+            document_revision: 2,
+            updated_at: Utc::now(),
+            updated_by: actor,
+        };
+        let legacy_relation = context_document_output(document_id, Some(&metadata))
+            .expect("legacy Context Document output");
+        let legacy_relation_json =
+            serde_json::to_value(legacy_relation).expect("serialize legacy relation");
+        assert_eq!(
+            legacy_relation_json["fetch_command"],
+            format!("cf documents get {document_id} --content-only")
+        );
+
+        let legacy_coordinate = document_coordinate_output(
+            ProjectContextCoordinate::Document { document_id },
+            Some(&metadata),
+        );
+        let legacy_coordinate_json =
+            serde_json::to_value(legacy_coordinate).expect("serialize legacy Coordinate");
+        assert!(legacy_coordinate_json.get("summary").is_none());
+        assert!(legacy_coordinate_json.get("fetch_command").is_none());
+
         let output = ContextDocumentOutput {
             document_id,
             state: "active",

@@ -1329,7 +1329,12 @@ mod tests {
             fixture.observation(),
         )
         .expect_err("work beyond the caller budget must be rejected");
-        assert!(error.to_string().contains("caller-requested work budget"));
+        assert!(
+            error
+                .to_string()
+                .contains("exceed the caller-requested budget"),
+            "unexpected verifier error: {error}"
+        );
     }
 
     #[test]

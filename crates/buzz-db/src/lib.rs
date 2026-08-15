@@ -79,6 +79,8 @@ pub mod relay_members;
 pub mod replica_fence;
 /// Project Context semantic-index deployment probes and derived state.
 pub mod semantic;
+/// Current, authorized Coordinate-only semantic starting-point search.
+pub mod semantic_coordinate_search;
 /// Durable deployment-fleet fence for semantic graph HTTP queries.
 pub mod semantic_fleet;
 /// Current, authorized Project Context semantic graph exact reads.
