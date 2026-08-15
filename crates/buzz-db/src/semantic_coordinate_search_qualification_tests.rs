@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 use super::{SemanticCoordinateSearchVector, COORDINATE_SEARCH_SQL};
 use crate::semantic::SemanticGenerationRecord;
-use crate::semantic_query::{SemanticGraphQueryTicket, SemanticGraphReadTx};
+use crate::semantic_query::{
+    SemanticGraphQueryTicket, SemanticGraphReadTx, GLOBAL_GRAPH_COORDINATE_SCORES_SQL,
+};
 use crate::{Db, DbConfig};
 
 const DEFAULT_TARGET_COORDINATES: u32 = 10_000;
@@ -323,7 +325,16 @@ async fn seed_target_scale(seed: TargetScaleSeed<'_>) {
         "INSERT INTO semantic_sources(community_id,source_family,source_subtype,source_id,\
          eligibility,lifecycle_class,source_basis,snapshot_digest,invalidation_epoch,\
          coverage_state,observed_at) \
-         SELECT $1,source_family,source_subtype,source_id,'eligible','active','{}'::jsonb,\
+         SELECT $1,source_family,source_subtype,source_id,'eligible','active',\
+                CASE source_family \
+                  WHEN 'project_view' THEN jsonb_build_object(\
+                    'family','project_view','basis',jsonb_build_object(\
+                      'schema_version',3,'object_revision',1,\
+                      'source_change_id',repeat('11',32)))\
+                  WHEN 'project_document' THEN jsonb_build_object(\
+                    'family','project_document','basis',jsonb_build_object(\
+                      'document_revision',1,'source_change_id',repeat('22',32)))\
+                END,\
                 snapshot_digest,1,'current',clock_timestamp() \
          FROM coordinate_search_qualification_seed",
     )
@@ -541,6 +552,46 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         SemanticCoordinateSearchVector::new(&ticket, encoded)
             .expect("snapshot-bound qualification vector"),
     );
+    let mut differential_read = begin_qualification_read(
+        &db,
+        &ticket,
+        reader.public_key().as_bytes(),
+        relay.public_key(),
+    )
+    .await;
+    let legacy = differential_read
+        .search_coordinate_starts_legacy(&query_vector, 32)
+        .await
+        .expect("target-scale legacy Coordinate query");
+    let shared = differential_read
+        .search_coordinate_starts_migrated(&query_vector, 32)
+        .await
+        .expect("target-scale shared Coordinate query");
+    assert_eq!(shared, legacy, "target-scale same-snapshot differential");
+    differential_read
+        .rollback()
+        .await
+        .expect("target-scale differential rollback");
+    let mut legacy_reference_ms = Vec::with_capacity(iterations.min(5));
+    for _ in 0..iterations.min(5) {
+        let started = Instant::now();
+        let mut read = begin_qualification_read(
+            &db,
+            &ticket,
+            reader.public_key().as_bytes(),
+            relay.public_key(),
+        )
+        .await;
+        let batch = read
+            .search_coordinate_starts_legacy(&query_vector, 32)
+            .await
+            .expect("legacy reference query");
+        assert_eq!(batch.coordinates.len(), 32);
+        assert!(batch.truncated);
+        read.rollback().await.expect("legacy reference rollback");
+        legacy_reference_ms.push(started.elapsed().as_millis());
+    }
+    legacy_reference_ms.sort_unstable();
     for _ in 0..3 {
         let mut read = begin_qualification_read(
             &db,
@@ -550,7 +601,7 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         )
         .await;
         let batch = read
-            .search_coordinate_starts(&query_vector, 32)
+            .search_coordinate_starts_migrated(&query_vector, 32)
             .await
             .expect("warmup query");
         assert_eq!(batch.coordinates.len(), 32);
@@ -569,7 +620,7 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         )
         .await;
         let batch = read
-            .search_coordinate_starts(&query_vector, 32)
+            .search_coordinate_starts_migrated(&query_vector, 32)
             .await
             .expect("timed query");
         assert_eq!(batch.coordinates.len(), 32);
@@ -579,9 +630,50 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
     }
     sequential_ms.sort_unstable();
 
-    let explain_sql =
-        format!("EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON) {COORDINATE_SEARCH_SQL}");
+    let explain_sql = format!(
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON) {GLOBAL_GRAPH_COORDINATE_SCORES_SQL}"
+    );
+    let empty_text = Vec::<String>::new();
+    let empty_ids = Vec::<Uuid>::new();
+    let channel_ids = vec![query_vector.inner.channel_id().as_bytes().to_vec()];
+    let query_vectors = vec![Vector::from(
+        query_vector.inner.embedding().as_slice().to_vec(),
+    )];
     let explain_row = sqlx::query(sqlx::AssertSqlSafe(explain_sql))
+        .bind(community_id)
+        .bind(reader.public_key().as_bytes())
+        .bind(relay.public_key().as_bytes())
+        .bind(generation_id)
+        .bind(
+            ticket
+                .generation
+                .model_contract_digest
+                .as_bytes()
+                .as_slice(),
+        )
+        .bind(ticket.generation.extractor_version.as_str())
+        .bind(ticket.generation.model_contract.model.as_str())
+        .bind(i32::try_from(DIMENSIONS).expect("dimensions"))
+        .bind("all_current")
+        .bind(&empty_text)
+        .bind(&empty_text)
+        .bind(&empty_ids)
+        .bind(&channel_ids)
+        .bind(&query_vectors)
+        .bind(false)
+        .bind(&empty_text)
+        .bind(&empty_text)
+        .bind(&empty_ids)
+        .bind(Some(33_i64))
+        .bind(true)
+        .fetch_one(db.writer())
+        .await
+        .expect("qualification EXPLAIN");
+    let plan: Value = explain_row.try_get(0).expect("EXPLAIN JSON");
+    let plan_root = &plan[0];
+    let legacy_explain_sql =
+        format!("EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON) {COORDINATE_SEARCH_SQL}");
+    let legacy_explain_row = sqlx::query(sqlx::AssertSqlSafe(legacy_explain_sql))
         .bind(community_id)
         .bind(reader.public_key().as_bytes())
         .bind(relay.public_key().as_bytes())
@@ -602,9 +694,9 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         .bind(33_i64)
         .fetch_one(db.writer())
         .await
-        .expect("qualification EXPLAIN");
-    let plan: Value = explain_row.try_get(0).expect("EXPLAIN JSON");
-    let plan_root = &plan[0];
+        .expect("legacy qualification EXPLAIN");
+    let legacy_plan: Value = legacy_explain_row.try_get(0).expect("legacy EXPLAIN JSON");
+    let legacy_plan_root = &legacy_plan[0];
 
     let latencies = Arc::new(Mutex::new(Vec::<u128>::new()));
     let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -624,7 +716,9 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
                 let result = async {
                     let mut read =
                         begin_qualification_read(&db, &ticket, &reader_pubkey, relay_pubkey).await;
-                    let batch = read.search_coordinate_starts(&query_vector, 32).await?;
+                    let batch = read
+                        .search_coordinate_starts_migrated(&query_vector, 32)
+                        .await?;
                     if batch.coordinates.len() != 32 || !batch.truncated {
                         return Err(crate::DbError::InvalidData(
                             "qualification query returned an unexpected shape".to_owned(),
@@ -673,6 +767,12 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
             "p95_ms": percentile(&sequential_ms, 95),
             "p99_ms": percentile(&sequential_ms, 99),
         },
+        "same_run_legacy_reference": {
+            "iterations": legacy_reference_ms.len(),
+            "p50_ms": percentile(&legacy_reference_ms, 50),
+            "p95_ms": percentile(&legacy_reference_ms, 95),
+            "p99_ms": percentile(&legacy_reference_ms, 99),
+        },
         "concurrent_soak": {
             "seconds": soak_seconds,
             "clients": clients,
@@ -691,6 +791,14 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
             "shared_written_blocks": plan_blocks(plan_root, "Shared Written Blocks"),
             "temp_read_blocks": plan_blocks(plan_root, "Temp Read Blocks"),
             "temp_written_blocks": plan_blocks(plan_root, "Temp Written Blocks"),
+        },
+        "same_run_legacy_explain": {
+            "planning_ms": legacy_plan_root.get("Planning Time").and_then(Value::as_f64),
+            "execution_ms": legacy_plan_root.get("Execution Time").and_then(Value::as_f64),
+            "shared_hit_blocks": plan_blocks(legacy_plan_root, "Shared Hit Blocks"),
+            "shared_read_blocks": plan_blocks(legacy_plan_root, "Shared Read Blocks"),
+            "temp_read_blocks": plan_blocks(legacy_plan_root, "Temp Read Blocks"),
+            "temp_written_blocks": plan_blocks(legacy_plan_root, "Temp Written Blocks"),
         },
     });
     println!("coordinate_search_qualification={summary}");

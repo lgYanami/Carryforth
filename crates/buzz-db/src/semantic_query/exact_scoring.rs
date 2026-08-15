@@ -5,10 +5,11 @@ use std::collections::BTreeSet;
 use buzz_core::CommunityId;
 use buzz_semantic::{Digest32, EmbeddingVector, SemanticSourceIdentity};
 use buzz_semantic_query::{
-    LifecycleFilter, ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle,
-    SemanticModelSpaceFences, SemanticQueryInputKind, MAX_ONE_HOP_EDGE_COORDINATES,
-    MAX_ONE_HOP_RELATION_BINDINGS, MAX_QUERY_CHANNELS,
+    coordinate_search_query_contract_digest, LifecycleFilter, ProviderEncodedSemanticInput,
+    ProviderEncodedSemanticInputBundle, Score, SemanticModelSpaceFences, SemanticQueryInputKind,
+    MAX_ONE_HOP_EDGE_COORDINATES, MAX_ONE_HOP_RELATION_BINDINGS, MAX_QUERY_CHANNELS,
 };
+use sqlx::Row;
 use uuid::Uuid;
 
 use super::{
@@ -227,6 +228,36 @@ pub(super) enum SemanticExactExplicitSourceScope<'a> {
     OneHopEdgeCoordinates(&'a [SemanticSourceIdentity]),
 }
 
+/// DB-owned candidate and tie policy selected before exact scoring begins.
+///
+/// This is deliberately closed and cannot be constructed from Relay input.
+/// Public operations retain their own ranking, floor, budget, and projection
+/// policies above this mathematical/currentness kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SemanticExactScoreScope {
+    /// Existing graph recall and explicit-source scoring semantics.
+    GraphSources,
+    /// Every current eligible Coordinate on at least one active Edge.
+    GlobalGraphCoordinates,
+}
+
+/// Lightweight exact score returned by the global Coordinate scope.
+///
+/// Coordinate search intentionally does not hydrate graph-role or current-head
+/// previews into its public result.
+pub(crate) struct SemanticGlobalCoordinateScore {
+    pub(crate) channel_id: Digest32,
+    pub(crate) source: SemanticSourceIdentity,
+    pub(crate) score: Score,
+    pub(crate) channel_rank: u32,
+}
+
+impl SemanticExactScoreScope {
+    pub(super) const fn coordinate_only(self) -> bool {
+        matches!(self, Self::GlobalGraphCoordinates)
+    }
+}
+
 impl SemanticExactExplicitSourceScope<'_> {
     fn sources(&self) -> &[SemanticSourceIdentity] {
         match self {
@@ -281,6 +312,59 @@ impl SemanticGraphReadTx {
         )
         .await
     }
+
+    /// Score the complete current active-edge Coordinate scope with one
+    /// Coordinate-search vector and canonical Coordinate tie ordering.
+    ///
+    /// The returned rows include the caller's K+1 observation. This facade
+    /// owns no public result projection and applies no relevance floor.
+    pub(crate) async fn score_global_graph_coordinates_exact(
+        &mut self,
+        query_vector: &GenerationBoundQueryVector,
+        observed_limit: u32,
+    ) -> Result<Vec<SemanticGlobalCoordinateScore>> {
+        if observed_limit == 0
+            || !matches!(
+                query_vector.channel_kind(),
+                SemanticQueryInputKind::CoordinateSearch
+            )
+            || query_vector.encoding_contract_digest() != coordinate_search_query_contract_digest()
+            || query_vector.generation_fences() != &self.ticket.generation_fences()?
+        {
+            return Err(DbError::InvalidData(
+                "Coordinate-search vector does not match the closed global Coordinate scope"
+                    .to_owned(),
+            ));
+        }
+        let rows = self
+            .query_generation_bound_source_score_rows(
+                LifecycleFilter::AllCurrent,
+                &[],
+                &[query_vector],
+                None,
+                Some(observed_limit),
+                SemanticExactScoreScope::GlobalGraphCoordinates,
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SemanticGlobalCoordinateScore {
+                    channel_id: super::digest_from_bytes(row.try_get("channel_id")?, "channel_id")?,
+                    source: super::source_identity_from_row(
+                        row,
+                        "source_family",
+                        "source_subtype",
+                        "source_id",
+                    )?,
+                    score: super::score_from_i64(row.try_get("semantic_score")?)?,
+                    channel_rank: super::positive_u32(
+                        row.try_get("channel_rank")?,
+                        "channel_rank",
+                    )?,
+                })
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for SemanticExactQueryVector {
@@ -321,10 +405,6 @@ impl SemanticExactQueryVector {
 
     pub(super) const fn generation_bound(&self) -> &GenerationBoundQueryVector {
         &self.inner
-    }
-
-    pub(super) fn embedding(&self) -> &EmbeddingVector {
-        self.inner.embedding()
     }
 }
 

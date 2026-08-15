@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U3 已通过；U4–U7 待交付
+> 状态：U0–U4 已通过；U5–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -15,7 +15,7 @@
 | U1 共同 input/fence/vector | 通过 | 三种 closed input 与两类旧 wrapper 已委托共同类型；exact generation 只由 writer DB ticket 绑定 |
 | U2 共同 Provider encoder | 通过 | Coordinate 与 graph 兼容 adapter 委托同一 bounded batch primitive；无 retry/fallback/额外调用 |
 | U3 one-hop tagged family | 通过 | 两个 variant 只切换到 closed explicit-source facade；原有同一 exact SQL 与全部 policy 保持不变 |
-| U4 whole-graph Coordinate | 待执行 | — |
+| U4 whole-graph Coordinate | 通过 | Coordinate v1 接入共同 scorer；同 snapshot 精确差分与10k性能门通过 |
 | U5 bounded complete path | 待执行 | — |
 | U6 默认切换与 legacy 收口 | 待执行 | — |
 | U7 最终资格与文档关闭 | 待执行 | — |
@@ -182,3 +182,61 @@ git diff --check
 其中 disposable-pgvector one-hop fixture 继续验证两个 variant 的 direct score、完整 scope、canonical hydration
 与结果形状；40914 Relay/SDK closed tagged family 回归继续通过。U3 没有修改 Provider、snapshot/release、wire、
 Event kind、capability、schema 或 migration。
+
+## 6. U4 whole-graph Coordinate
+
+U4 新增 `GlobalGraphCoordinates` closed scope，并让 Coordinate v1 保持独立 query template/digest 与兼容
+wrapper后可进入共同 `GenerationBoundQueryVector` 和 scorer facade。共享内核只保留一份：
+
+- authorized reader/project、active generation与model-space验证；
+- current source head、active unit set、overview unit与exact-current embedding join；
+- exact cosine、finite检查与fixed-point `Score`量化。
+
+graph recall与global Coordinate使用由上述相同静态片段组成的两个closed physical plan。前者保留graph role
+evidence、raw-distance per-channel rank与late hydration；后者只物化active Edge中去重的Coordinate并按
+`Score DESC, ProjectContextCoordinate::Ord ASC`先取K+1。Relay与caller不能选择SQL、scope或ordering。
+
+同一disposable pgvector RR事务中的legacy/shared差分覆盖：active Edge、multi-Edge去重、relation-only
+Document排除、Document兼任Coordinate、terminal、missing head、K+1，以及raw distance不同但fixed score
+相同的canonical tie。limit 4与5的typed batch均精确相等。旧Coordinate SQL只供acceptance与profile
+rollback窗口使用，不存在请求内fallback或第二次Provider调用。
+
+当前compiled route matrix按`edge-member/coordinate-incident/whole-coordinate/full-path`依次为
+`migrated/migrated/legacy/legacy`。profile字节纳入fleet runtime digest；runtime contract已显式升级为
+`semantic-query-http-runtime-20260816-u4`，digest为
+`9601b1014e85e16d0eaa8db6146e168653353e489646478380234fc4f56565c8`。因此U4 production Coordinate
+仍返回legacy路径；migrated scorer只由同snapshot资格入口执行，普通请求不能选择compare或自动fallback。
+
+10k目标规模最终测量：
+
+~~~text
+target indexed Coordinates:       10,000
+active Coordinates missing head:   1,000
+deleted-edge indexed distractors:  5,000
+graph-external distractors:         5,000
+dimensions:                         2,048
+limit / observed:                  32 / 33
+
+shared sequential:                 p50 285ms / p95 412ms
+same-run legacy reference:         p50 311ms / p95 411ms
+shared EXPLAIN:                     plan 40.942ms / execute 286.716ms
+legacy EXPLAIN:                     plan 33.327ms / execute 290.538ms
+temp read/write blocks:             0 / 0 (both plans)
+4-client 8s soak:                   101 completed / 0 errors / p50 310ms
+~~~
+
+最终执行证据：
+
+~~~text
+just semantic-migration-test
+just coordinate-search-qualification
+cargo test -p buzz-db --lib                         # 179 passed, 227 ignored
+cargo clippy -p buzz-db -p buzz-relay --all-targets -- -D warnings
+just semantic-retrieval-computation
+git diff --check
+~~~
+
+aggregate gate继续通过49个`buzz-semantic-query`测试、31个相关DB测试、73个Relay语义测试及三个surface
+定向回归。Coordinate的40913 wire/capability/gate、Provider单调用、one-shot RR/release、public result和错误
+合同未变；one-hop与完整路径回归未发生policy漂移。真实Provider canary仍因缺少受支持的
+`BUZZ_SEMANTIC_*`配置未运行。

@@ -118,6 +118,68 @@ impl SemanticGraphQueryEnableRequirement<'_> {
     }
 }
 
+/// Compiled execution path for one closed semantic computation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticComputationRoute {
+    /// Preserve the implementation selected by the compatibility baseline.
+    Legacy,
+    /// Use the shared semantic-computation implementation.
+    Migrated,
+}
+
+impl SemanticComputationRoute {
+    const fn profile_token(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Migrated => "migrated",
+        }
+    }
+}
+
+/// Closed route matrix compiled into every routable Relay instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SemanticComputationRouteMatrix {
+    /// Edge-to-member-Coordinate one-hop operation.
+    pub edge_member_coordinate: SemanticComputationRoute,
+    /// Coordinate-to-incident-Edge one-hop operation.
+    pub coordinate_incident_edge: SemanticComputationRoute,
+    /// Whole-graph Coordinate discovery operation.
+    pub whole_graph_coordinate_discovery: SemanticComputationRoute,
+    /// Bounded complete-path operation.
+    pub bounded_complete_path: SemanticComputationRoute,
+}
+
+impl SemanticComputationRouteMatrix {
+    /// Return the canonical content-free descriptor bound into fleet trust.
+    pub fn canonical_profile(self) -> String {
+        format!(
+            concat!(
+                "edge-member-coordinate={}\n",
+                "coordinate-incident-edge={}\n",
+                "whole-graph-coordinate-discovery={}\n",
+                "bounded-complete-path={}\n",
+            ),
+            self.edge_member_coordinate.profile_token(),
+            self.coordinate_incident_edge.profile_token(),
+            self.whole_graph_coordinate_discovery.profile_token(),
+            self.bounded_complete_path.profile_token(),
+        )
+    }
+}
+
+/// Current compiled Phase 1 operation routes.
+///
+/// U4 keeps the newly implemented whole-graph scorer behind the legacy
+/// production route until the final profile cutover. The one-hop operations
+/// have no second computation implementation and were closed in U3.
+pub const SEMANTIC_COMPUTATION_ROUTES: SemanticComputationRouteMatrix =
+    SemanticComputationRouteMatrix {
+        edge_member_coordinate: SemanticComputationRoute::Migrated,
+        coordinate_incident_edge: SemanticComputationRoute::Migrated,
+        whole_graph_coordinate_discovery: SemanticComputationRoute::Legacy,
+        bounded_complete_path: SemanticComputationRoute::Legacy,
+    };
+
 /// Explicitly bumped closed descriptor for the compiled HTTP query runtime.
 ///
 /// This descriptor intentionally binds the strict request/result/Event and
@@ -125,7 +187,7 @@ impl SemanticGraphQueryEnableRequirement<'_> {
 /// incompatible change to those contracts must change the dated profile and this
 /// descriptor before a mixed fleet can attest itself ready.
 pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-http-runtime-20260815-a\n",
+    "runtime-contract=semantic-query-http-runtime-20260816-u4\n",
     "transport=http-post-query-exclusive-single-filter\n",
     "request=unversioned-closed-request-id-project-id-problem-initial-context-lifecycle-budget\n",
     "result=unversioned-closed-project-request-completion-observations-input-observations-roots-paths-target-lifecycle-typed-basis-path-source-provenance-explicit-provenance-coverage\n",
@@ -136,6 +198,7 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
     "packing=deterministic-single-signed-event-whole-summary-whole-path\n",
     "errors=closed-content-free-400-401-403-409-413-429-503-504\n",
     "ordinary-query=semantic-extension-exclusive-kind-40912-always-denied",
+    "\ncomputation-route=closed-compiled-profile-bound-separately",
     "\ncoordinate-search=request-one-natural-language-input-limit-1-to-32;result-kind-40913-coordinate-rank-score-only;extension-carryforth_project_context_coordinate_search;no-floor-no-edge-no-path",
     "\none-hop-search=request-one-natural-language-q0-input-limit-1-to-32-tagged-incident-edge-or-edge-coordinate-scope;result-kind-40914-canonical-preview-and-typed-read-descriptor;extension-carryforth_project_context_one_hop_semantic_search;direct-cosine-no-floor-no-coherence-no-path"
 );
@@ -308,10 +371,12 @@ pub fn semantic_graph_http_runtime_digest() -> QueryContractResult<Digest32> {
     let query = query_contract_digest();
     let ranking = ranking_contract_digest()?;
     let budget = budget_profile_digest()?;
+    let computation_routes = SEMANTIC_COMPUTATION_ROUTES.canonical_profile();
     Ok(hash_domain(
         b"buzz.semantic-graph-http-runtime",
         &[
             SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT.as_bytes(),
+            computation_routes.as_bytes(),
             query.as_bytes(),
             ranking.as_bytes(),
             budget.as_bytes(),
@@ -350,9 +415,9 @@ fn hash_domain(domain: &[u8], parts: &[&[u8]]) -> Digest32 {
 mod tests {
     use super::{
         semantic_graph_http_runtime_digest, ParseSemanticGraphQueryFleetPolicyError,
-        SemanticGraphFleetInventoryError, SemanticGraphHttpFleetInstance,
+        SemanticComputationRoute, SemanticGraphFleetInventoryError, SemanticGraphHttpFleetInstance,
         SemanticGraphHttpFleetInventory, SemanticGraphQueryEnableRequirement,
-        SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust,
+        SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust, SEMANTIC_COMPUTATION_ROUTES,
         SEMANTIC_GRAPH_HTTP_TRANSPORT,
     };
 
@@ -382,12 +447,41 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "325238245fe41d6e7916fa369c539aa35ac789a0f2d9c8d7c4275fba8f360bbe",
+            "9601b1014e85e16d0eaa8db6146e168653353e489646478380234fc4f56565c8",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(
             digest,
             semantic_graph_http_runtime_digest().expect("runtime digest")
+        );
+    }
+
+    #[test]
+    fn compiled_computation_routes_are_closed_and_digest_visible() {
+        assert_eq!(
+            SEMANTIC_COMPUTATION_ROUTES.edge_member_coordinate,
+            SemanticComputationRoute::Migrated
+        );
+        assert_eq!(
+            SEMANTIC_COMPUTATION_ROUTES.coordinate_incident_edge,
+            SemanticComputationRoute::Migrated
+        );
+        assert_eq!(
+            SEMANTIC_COMPUTATION_ROUTES.whole_graph_coordinate_discovery,
+            SemanticComputationRoute::Legacy
+        );
+        assert_eq!(
+            SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
+            SemanticComputationRoute::Legacy
+        );
+        assert_eq!(
+            SEMANTIC_COMPUTATION_ROUTES.canonical_profile(),
+            concat!(
+                "edge-member-coordinate=migrated\n",
+                "coordinate-incident-edge=migrated\n",
+                "whole-graph-coordinate-discovery=legacy\n",
+                "bounded-complete-path=legacy\n",
+            )
         );
     }
 

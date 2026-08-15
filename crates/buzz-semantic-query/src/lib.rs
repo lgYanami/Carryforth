@@ -40,10 +40,11 @@ pub use encoder::{
 pub use fence::{embedding_space_fence, QueryCompatibilityFences, SemanticModelSpaceFences};
 pub use fleet::{
     semantic_graph_http_runtime_digest, ParseSemanticGraphQueryFleetPolicyError,
-    SemanticGraphFleetInventoryError, SemanticGraphHttpFleetInstance,
-    SemanticGraphHttpFleetInventory, SemanticGraphQueryEnableRequirement,
-    SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust,
-    MAX_SEMANTIC_GRAPH_FLEET_INSTANCES, MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES,
+    SemanticComputationRoute, SemanticComputationRouteMatrix, SemanticGraphFleetInventoryError,
+    SemanticGraphHttpFleetInstance, SemanticGraphHttpFleetInventory,
+    SemanticGraphQueryEnableRequirement, SemanticGraphQueryFleetPolicy,
+    SemanticGraphQueryRoutingTrust, MAX_SEMANTIC_GRAPH_FLEET_INSTANCES,
+    MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES, SEMANTIC_COMPUTATION_ROUTES,
     SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT, SEMANTIC_GRAPH_HTTP_TRANSPORT,
 };
 pub use frontier::{

@@ -7,10 +7,11 @@
 
 use buzz_project_context::ProjectContextCoordinate;
 use buzz_project_view::ProjectViewObjectType;
+use buzz_semantic::{ProjectViewSemanticType, SemanticSourceIdentity, SemanticSourceKind};
 use buzz_semantic_query::{
     coordinate_search_query_contract_digest, EncodedCoordinateSearchQuery,
-    ProjectContextCoordinateSearchCandidate, Score, SemanticQueryInputKind,
-    MAX_COORDINATE_SEARCH_LIMIT,
+    ProjectContextCoordinateSearchCandidate, Score, SemanticComputationRoute,
+    SemanticQueryInputKind, MAX_COORDINATE_SEARCH_LIMIT, SEMANTIC_COMPUTATION_ROUTES,
 };
 use pgvector::Vector;
 use sqlx::Row;
@@ -66,6 +67,10 @@ impl SemanticCoordinateSearchVector {
     pub const fn query_input_digest(&self) -> buzz_semantic::Digest32 {
         self.inner.input_digest()
     }
+
+    pub(super) const fn generation_bound(&self) -> &GenerationBoundQueryVector {
+        &self.inner
+    }
 }
 
 impl SemanticGraphReadTx {
@@ -79,6 +84,69 @@ impl SemanticGraphReadTx {
         query_vector: &SemanticCoordinateSearchVector,
         limit: u8,
     ) -> Result<SemanticCoordinateSearchBatch> {
+        match SEMANTIC_COMPUTATION_ROUTES.whole_graph_coordinate_discovery {
+            SemanticComputationRoute::Legacy => {
+                self.search_coordinate_starts_legacy(query_vector, limit)
+                    .await
+            }
+            SemanticComputationRoute::Migrated => {
+                self.search_coordinate_starts_migrated(query_vector, limit)
+                    .await
+            }
+        }
+    }
+
+    /// Acceptance-only entry to the migrated scorer while the compiled U4
+    /// production profile remains on the legacy route.
+    pub(crate) async fn search_coordinate_starts_migrated(
+        &mut self,
+        query_vector: &SemanticCoordinateSearchVector,
+        limit: u8,
+    ) -> Result<SemanticCoordinateSearchBatch> {
+        self.validate_coordinate_search(query_vector, limit)?;
+        let observed_limit = u32::from(limit) + 1;
+        let scores = self
+            .score_global_graph_coordinates_exact(query_vector.generation_bound(), observed_limit)
+            .await?;
+        let truncated = scores.len() > usize::from(limit);
+        let coordinates = scores
+            .into_iter()
+            .take(usize::from(limit))
+            .enumerate()
+            .map(|(index, scored)| {
+                let expected_rank = u32::try_from(index + 1).map_err(|_| {
+                    DbError::InvalidData("Coordinate-search rank exceeds uint32".to_owned())
+                })?;
+                if scored.channel_id != query_vector.inner.channel_id()
+                    || scored.channel_rank != expected_rank
+                {
+                    return Err(DbError::InvalidData(
+                        "global Coordinate scope returned a non-canonical channel rank".to_owned(),
+                    ));
+                }
+                let rank = u8::try_from(index + 1).map_err(|_| {
+                    DbError::InvalidData("Coordinate-search rank exceeds uint8".to_owned())
+                })?;
+                Ok(ProjectContextCoordinateSearchCandidate {
+                    rank,
+                    coordinate: coordinate_from_source(&scored.source)?,
+                    score: scored.score,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(SemanticCoordinateSearchBatch {
+            snapshot: self.coordinate_search_snapshot(),
+            coordinates,
+            truncated,
+        })
+    }
+
+    fn validate_coordinate_search(
+        &self,
+        query_vector: &SemanticCoordinateSearchVector,
+        limit: u8,
+    ) -> Result<()> {
         if !(1..=MAX_COORDINATE_SEARCH_LIMIT).contains(&limit) {
             return Err(DbError::InvalidData(format!(
                 "Coordinate-search limit must be between 1 and {MAX_COORDINATE_SEARCH_LIMIT}"
@@ -94,6 +162,29 @@ impl SemanticGraphReadTx {
                 "Coordinate-search vector does not match the query contract".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn coordinate_search_snapshot(&self) -> SemanticGraphSnapshotBinding {
+        SemanticGraphSnapshotBinding {
+            community_id: self.ticket.community_id,
+            generation_id: self.ticket.generation.generation_id,
+            query_fences: self.ticket.query_fences,
+            extractor_version: self.ticket.generation.extractor_version.clone(),
+            project_context_revision: self.ticket.project_context_revision,
+            observed_at: self.ticket.observed_at,
+        }
+    }
+
+    /// Retained during the profile rollback window and used by same-snapshot
+    /// differential qualification. It is never selected dynamically inside a
+    /// request.
+    async fn search_coordinate_starts_legacy(
+        &mut self,
+        query_vector: &SemanticCoordinateSearchVector,
+        limit: u8,
+    ) -> Result<SemanticCoordinateSearchBatch> {
+        self.validate_coordinate_search(query_vector, limit)?;
         let dimensions = i32::try_from(self.ticket.generation.model_contract.dimensions)
             .map_err(|_| DbError::InvalidData("semantic dimensions exceed int4".to_owned()))?;
         let observed_limit = i64::from(limit) + 1;
@@ -142,17 +233,51 @@ impl SemanticGraphReadTx {
         }
 
         Ok(SemanticCoordinateSearchBatch {
-            snapshot: SemanticGraphSnapshotBinding {
-                community_id: self.ticket.community_id,
-                generation_id: self.ticket.generation.generation_id,
-                query_fences: self.ticket.query_fences,
-                extractor_version: self.ticket.generation.extractor_version.clone(),
-                project_context_revision: self.ticket.project_context_revision,
-                observed_at: self.ticket.observed_at,
-            },
+            snapshot: self.coordinate_search_snapshot(),
             coordinates,
             truncated,
         })
+    }
+}
+
+fn coordinate_from_source(source: &SemanticSourceIdentity) -> Result<ProjectContextCoordinate> {
+    let coordinate = match source.kind {
+        SemanticSourceKind::ProjectView(object_type) => {
+            ProjectContextCoordinate::ProjectViewObject {
+                object_type: project_view_object_type_from_semantic(object_type),
+                object_id: source.source_id,
+            }
+        }
+        SemanticSourceKind::ProjectDocument => ProjectContextCoordinate::Document {
+            document_id: source.source_id,
+        },
+        SemanticSourceKind::Meeting => ProjectContextCoordinate::Meeting {
+            meeting_id: source.source_id,
+        },
+    };
+    coordinate
+        .validate_for_project(source.community_id)
+        .map_err(|error| {
+            DbError::InvalidData(format!(
+                "invalid Coordinate-search source identity: {error}"
+            ))
+        })?;
+    Ok(coordinate)
+}
+
+const fn project_view_object_type_from_semantic(
+    value: ProjectViewSemanticType,
+) -> ProjectViewObjectType {
+    match value {
+        ProjectViewSemanticType::ProjectProfile => ProjectViewObjectType::ProjectProfile,
+        ProjectViewSemanticType::Goal => ProjectViewObjectType::Goal,
+        ProjectViewSemanticType::Role => ProjectViewObjectType::Role,
+        ProjectViewSemanticType::Plan => ProjectViewObjectType::Plan,
+        ProjectViewSemanticType::Stage => ProjectViewObjectType::Stage,
+        ProjectViewSemanticType::Requirement => ProjectViewObjectType::Requirement,
+        ProjectViewSemanticType::Issue => ProjectViewObjectType::Issue,
+        ProjectViewSemanticType::Work => ProjectViewObjectType::Work,
+        ProjectViewSemanticType::Resource => ProjectViewObjectType::Resource,
     }
 }
 
@@ -411,8 +536,9 @@ mod tests {
     use buzz_project_context::ProjectContextCoordinate;
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::{
-        Digest32, SemanticDistanceMetric, SemanticModelContract, SemanticNormalization,
-        SemanticProviderBoundary,
+        Digest32, MeetingSourceBasis, ProjectDocumentSourceBasis, ProjectViewSourceBasis,
+        SemanticDistanceMetric, SemanticModelContract, SemanticNormalization,
+        SemanticProviderBoundary, SemanticSourceBasis,
     };
     use buzz_semantic_query::{
         build_coordinate_search_encoder_input, EncodedCoordinateSearchQuery,
@@ -473,11 +599,31 @@ mod tests {
         let unit_set_id = Uuid::new_v4();
         let snapshot_digest = vec![seed; 32];
         let text_digest = vec![seed.wrapping_add(1); 32];
+        let source_change_id = Digest32::from_bytes([seed.wrapping_add(2); 32]);
+        let source_basis = match family {
+            "project_view" => SemanticSourceBasis::ProjectView(ProjectViewSourceBasis {
+                schema_version: 3,
+                object_revision: 1,
+                source_change_id,
+            }),
+            "project_document" => {
+                SemanticSourceBasis::ProjectDocument(ProjectDocumentSourceBasis {
+                    document_revision: 1,
+                    source_change_id,
+                })
+            }
+            "meeting" => SemanticSourceBasis::Meeting(MeetingSourceBasis {
+                create_event_id: source_change_id,
+                end_event_id: None,
+            }),
+            _ => panic!("unsupported semantic source family fixture"),
+        };
+        let source_basis = serde_json::to_value(source_basis).expect("serialize source basis");
         sqlx::query(
             "INSERT INTO semantic_sources(community_id,source_family,source_subtype,source_id,\
              eligibility,lifecycle_class,source_basis,snapshot_digest,invalidation_epoch,\
              coverage_state,observed_at) \
-             VALUES($1,$2,$3,$4,'eligible',$5,'{}'::jsonb,$6,1,'current',clock_timestamp()) \
+             VALUES($1,$2,$3,$4,'eligible',$5,$6,$7,1,'current',clock_timestamp()) \
              ON CONFLICT (community_id,source_family,source_subtype,source_id) DO UPDATE SET \
              eligibility='eligible',ineligibility_reason=NULL,lifecycle_class=EXCLUDED.lifecycle_class,\
              source_basis=EXCLUDED.source_basis,snapshot_digest=EXCLUDED.snapshot_digest,\
@@ -488,6 +634,7 @@ mod tests {
         .bind(subtype)
         .bind(source_id)
         .bind(lifecycle)
+        .bind(source_basis)
         .bind(&snapshot_digest)
         .execute(&mut **tx)
         .await
@@ -944,7 +1091,7 @@ mod tests {
                 "work",
                 work_low,
                 "active",
-                vec![1.0, 0.0, 0.0],
+                vec![1.0, 0.0008, 0.0],
                 2,
             ),
             (
@@ -952,7 +1099,7 @@ mod tests {
                 "work",
                 work_high,
                 "active",
-                vec![1.0, 0.0, 0.0],
+                vec![1.0, 0.0001, 0.0],
                 3,
             ),
             (
@@ -1048,16 +1195,31 @@ mod tests {
             expected_projection_pubkey: relay.public_key(),
         };
 
-        let limited = read
+        let legacy_limited = read
+            .search_coordinate_starts_legacy(&query_vector, 4)
+            .await
+            .expect("legacy K+1 Coordinate search");
+        let compiled_limited = read
             .search_coordinate_starts(&query_vector, 4)
             .await
+            .expect("compiled-route K+1 Coordinate search");
+        assert_eq!(compiled_limited, legacy_limited);
+        let limited = read
+            .search_coordinate_starts_migrated(&query_vector, 4)
+            .await
             .expect("K+1 Coordinate search");
+        assert_eq!(limited, legacy_limited);
         assert!(limited.truncated);
         assert_eq!(limited.coordinates.len(), 4);
+        let legacy_complete = read
+            .search_coordinate_starts_legacy(&query_vector, 5)
+            .await
+            .expect("legacy complete Coordinate search");
         let complete = read
-            .search_coordinate_starts(&query_vector, 5)
+            .search_coordinate_starts_migrated(&query_vector, 5)
             .await
             .expect("complete Coordinate search");
+        assert_eq!(complete, legacy_complete);
         assert!(!complete.truncated);
         assert_eq!(
             complete

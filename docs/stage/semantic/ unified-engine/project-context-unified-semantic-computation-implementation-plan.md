@@ -1,6 +1,6 @@
 # Project Context 统一语义计算实现计划
 
-> 状态：实现设计已冻结；U0–U3 已交付；U4–U7 待交付
+> 状态：实现设计已冻结；U0–U4 已交付；U5–U7 待交付
 >
 > 日期：2026-08-16
 >
@@ -614,7 +614,8 @@ Phase 1并另开兼容迁移。
 | U1 共同 input、fence 与 vector | 已完成 | 冻结 bytes/digest 不变；共同 Provider 结果只由 writer DB 绑定 tenant-scoped generation |
 | U2 共同 Provider encoder | 已完成 | Coordinate、one-hop 与完整路径 adapter 均委托一次 bounded common batch；历史 fake/golden 不变 |
 | U3 one-hop tagged family | 已完成 | 两个 variant 通过 closed explicit-source scope facade 调用既有同一 exact SQL；40914 policy/wire 不变 |
-| U4–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
+| U4 whole-graph Coordinate | 已完成 | 独立模板进入 shared scorer；同 snapshot legacy/shared 精确相等，10k closed physical plan 无性能退化 |
+| U5–U7 | 待交付 | 按下列阶段逐项审查、提交与记录 |
 
 ### U0：设计与差分门
 
@@ -683,6 +684,16 @@ legacy/shared 对照与切换边界。
 
 退出条件：边界score、完全tie、多Edge去重、Document双重角色、terminal、missing/building/failed、K+1及
 10k EXPLAIN/测量均等价或不退化到批准范围外。
+
+交付复核：U4 已将 Coordinate v1 的 generation-bound vector 接入同一个 scorer facade的migrated adapter。
+scorer由共享的授权/active-generation、current-overview join、exact distance与fixed-score静态片段组成，并为graph recall
+和global Coordinate保留各自closed physical plan；这避免万能动态SQL，也避免让graph-only role/projection
+增加Coordinate top-K的计划成本。Coordinate旧SQL只保留在acceptance differential/profile rollback窗口，
+单请求不会自动fallback。disposable pgvector同一RR事务验证legacy/shared在K与K+1完全相等；raw distance
+不同但量化同分的候选仍按`ProjectContextCoordinate::Ord`排序。10k资格测量中shared/legacy EXPLAIN execution
+分别为286.716ms/290.538ms，均无temp spill；shared sequential p50为285ms，legacy同运行参考p50为311ms。
+U4 compiled route profile为`migrated/migrated/legacy/legacy`（两个one-hop、Coordinate、完整路径）；它已进入
+fleet runtime digest `9601b101…`。因此普通Coordinate流量仍走legacy，资格入口才直接调用migrated adapter。
 
 ### U5：迁移bounded complete path
 
