@@ -315,24 +315,39 @@ pub(crate) async fn run_demo_echo(
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
     let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+        // `recv_validated` consumes the wire frame before awaiting its Redis
+        // fence check, so recreating it after every non-draining tick can lose
+        // an already-read frame. Keep one pinned receive future alive until it
+        // completes; cancellation is deliberate only when the session drains.
+        let frame = {
+            let receive = stream.recv_validated(&directory);
+            tokio::pin!(receive);
+            loop {
+                tokio::select! {
+                    frame = &mut receive => break Some(frame),
+                    _ = drain_tick.tick() => {
+                        if shutting_down.load(Ordering::Relaxed) {
+                            break None;
                         }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
                     }
-                    return;
                 }
-                continue;
             }
-            frame = stream.recv_validated(&directory) => frame,
+        };
+        let Some(frame) = frame else {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+                }
+            } else {
+                let _ = stream.finish();
+                tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
+            }
+            return;
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
