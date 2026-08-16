@@ -107,10 +107,14 @@ fn refresh_managed_skills_overwrite_on_version_bump() {
     for version in [
         ".agents/skills/carryforth-cli/.skill-version",
         ".agents/skills/search-project-context/.skill-version",
-        ".agents/skills/carryforth-meeting/.skill-version",
     ] {
         let _ = fs::remove_file(root.join(version));
     }
+    fs::write(
+        root.join(".agents/skills/carryforth-meeting/.skill-version"),
+        "1\n",
+    )
+    .unwrap();
 
     ensure_nest_at(&root).unwrap();
 

@@ -1,7 +1,8 @@
 # Carryforth Meeting System Prompt
 
-本文定义本轮优化后应常驻 System 优先级的 Meeting 内容。它只负责宽泛触发 Skill、声明当前身份模型和保留
-不能延迟到 Skill 的安全边界；创建、参会、主持、CLI 和 Action 的具体方法由 `carryforth-meeting` 提供。
+本文定义应常驻 System 优先级的 Meeting 内容。`carryforth-meeting` 只负责会议创建前判断和会议外审查；平台
+派发的限时托管 Turn 必须由 System contract、Turn Prompt、Envelope 和外附 Board 自包含地完成，不能把正常
+推进依赖到运行时 Skill 发现、文件读取或额外工具往返。
 
 ## 注入位置
 
@@ -45,8 +46,9 @@ Skill；任何 Agent 也可以依据工作情况主动发起。
 [Meeting]
 
 你正在参加由 Relay 管理的 Carryforth 正式 Meeting。每个完整 Turn 都提供当前 Role Context、
-`MEETING TURN ENVELOPE`，并在其后附加本 Turn 独立读取的 `current_board`。加载并遵循
-`carryforth-meeting` Skill；以当前 `turn_kind` 和可信 actor role 确定本 Turn 的唯一视角和职责；
+`MEETING TURN ENVELOPE`，并在其后附加本 Turn 独立读取的 `current_board`。这些输入与本 System contract、
+当前 Turn Prompt 共同构成完整运行时合同；直接按当前 `turn_kind` 和可信 actor role 确定唯一视角和职责，
+不要先加载外部 workflow 或 reference；
 `action_finalization` 使用可信 `moderator_pubkey`、`phase` 和 control-plane status 表示逻辑主持行动视角。
 
 Project Role、Meeting role 和当前 Turn 视角是不同概念。主持人在 `participant_intent` 或
@@ -83,15 +85,22 @@ Action 只按以下门槛返回：全部必需结果及要求的回读/派生记
 每个托管 Turn 只完成 `turn_kind` 指定的职责，并只返回一个符合当前 schema 的原始 JSON 对象。
 ```
 
+## 托管 Turn 的正常路径要求
+
+当注入证据足够时，五类托管 Turn 必须可以在零工具调用下直接产生合法结果。文件系统可用性、Skill 安装、
+Skill 发现和 reference 读取都不能成为会议开始、发言、维护 Board、安排 Floor 或物化 Action 的前置条件。
+只在一个缺失事实会实质改变本 Turn 结果、且当前工具策略明确允许时，才执行一次必要的有界读取。
+
 ## 必须在 Turn 中重申的内容
 
 具体 Turn 只重复立即生效的高风险边界：
 
-- 加载 `carryforth-meeting` 及对应 reference；
+- 当前 Prompt 与平台合同是完整运行时指令，直接回答，不加载外部 workflow 或 reference；
 - 当前 Meeting role、当前视角和唯一职责；
 - 当前是讨论只读、Board result，还是 frozen-Board 业务物化；
 - Meeting 协议发布由 Harness 独占；
 - 只返回当前 schema 的一个原始 JSON；
 - Floor 的关闭/行动/中止门槛，或 Action 的四种终态门槛。
 
-完整生命周期、CLI、JSON 示例、history 补读、主持策略和 Action 物化步骤不要复制回 System。
+创建前判断和会议外 CLI 教学留在 Skill。会影响托管 Turn 正确输出和推进的 JSON 形状、Board 判定、Floor
+选择以及 Action 边界必须存在于 System 或当前 Turn Prompt，不能只存在于 reference。

@@ -175,6 +175,9 @@ fn carryforth_meeting_skill_freezes_the_reviewed_workflow() {
         "references/participant-turns.md",
         "references/moderator-turns.md",
         "references/action-finalization.md",
+        "托管 Turn 不依赖 Skill",
+        "完整运行时合同",
+        "不依赖文件系统",
     ] {
         assert!(
             CARRYFORTH_MEETING_SKILL_MD.contains(required),
@@ -183,6 +186,12 @@ fn carryforth_meeting_skill_freezes_the_reviewed_workflow() {
     }
     assert!(CARRYFORTH_MEETING_SKILL_MD.len() < 32 * 1024);
     assert!(CARRYFORTH_MEETING_SKILL_MD.lines().count() < 500);
+    let description = CARRYFORTH_MEETING_SKILL_MD
+        .split("---")
+        .nth(1)
+        .expect("skill frontmatter");
+    assert!(description.contains("自包含的限时运行时 Turn"));
+    assert!(description.contains("不使用\n  本 Skill 或其 reference"));
 }
 
 #[test]

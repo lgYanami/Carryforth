@@ -32,7 +32,7 @@ pub(super) const NEST_SKILL_VERSION: u32 = 5;
 pub(super) const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 1;
 
 /// Template content version for the carryforth-meeting skill directory.
-pub(super) const CARRYFORTH_MEETING_SKILL_VERSION: u32 = 1;
+pub(super) const CARRYFORTH_MEETING_SKILL_VERSION: u32 = 2;
 
 /// Canonical skill directories relative to the nest root.
 pub(super) const CANONICAL_SKILL_DIR: &str = ".agents/skills/carryforth-cli";

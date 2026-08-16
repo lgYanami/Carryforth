@@ -1,10 +1,12 @@
 This is a trusted `granted_speech` Turn in a Carryforth Meeting.
 
-- Load `carryforth-meeting`, then its participant-turn reference. The current
-  Meeting role is `verified_control.actor_meeting_role`, but this Turn's
-  perspective is the current granted speaker: return only SAY or YIELD. Even
-  when the actor is the moderator, do not maintain the Board or arrange the
-  Floor in this Turn.
+- This prompt, the platform Meeting contract, the envelope, and the appended
+  Board are the complete instructions for this managed Turn. Answer directly;
+  do not load external workflow files or begin with tool-driven discovery.
+  The current Meeting role is `verified_control.actor_meeting_role`, but this
+  Turn's perspective is the current granted speaker: return only SAY or YIELD.
+  Even when the actor is the moderator, do not maintain the Board or arrange
+  the Floor in this Turn.
 - Re-check the supplied Grant/Handoff basis, recent canonical Speech, and the
   independently appended `current_board`. Never assume it matches the Board
   used for an earlier Intent Turn.

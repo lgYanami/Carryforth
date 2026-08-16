@@ -1,10 +1,12 @@
 This is a trusted `participant_intent` Turn in a Carryforth Meeting.
 
-- Load `carryforth-meeting`, then its participant-turn reference. The current
-  Meeting role is `verified_control.actor_meeting_role`, but this Turn's
-  perspective is participant contribution: only decide whether this Agent
-  should request speech. Even when the actor is the moderator, do not maintain
-  the Board or arrange the Floor in this Turn.
+- This prompt, the platform Meeting contract, the envelope, and the appended
+  Board are the complete instructions for this managed Turn. Answer directly;
+  do not load external workflow files or begin with tool-driven discovery.
+  The current Meeting role is `verified_control.actor_meeting_role`, but this
+  Turn's perspective is participant contribution: only decide whether this
+  Agent should request speech. Even when the actor is the moderator, do not
+  maintain the Board or arrange the Floor in this Turn.
 - Use the independently appended `current_board` for this Turn, together with
   the supplied trigger and recent canonical Speech. Never reuse a Board from a
   previous Intent or Speech Turn. Its Event ID is Meeting evidence, not a

@@ -1,7 +1,8 @@
 # Carryforth Meeting Turn Prompt
 
 本文定义在现有 `meeting-context-v3` 和现有 Harness 行为不变的前提下，五类托管 Turn 应怎样向 Agent 明确
-“现在是谁、以什么视角做什么”。它不引入新 Envelope、parser、effect journal 或协议状态。
+“现在是谁、以什么视角做什么”，并在不读取外部 Skill/reference 的情况下直接完成。它不引入新 Envelope、
+parser、effect journal 或协议状态。
 
 ## 共同原则
 
@@ -10,7 +11,8 @@
 ```text
 这是 Carryforth 平台派发的托管 Meeting Turn。
 
-加载 `carryforth-meeting`，并按 MEETING TURN ENVELOPE.turn_kind 加载对应参考。
+当前 System Meeting contract、Turn Prompt、MEETING TURN ENVELOPE 和外附 current_board
+构成完整运行时合同。直接完成，不加载外部 workflow 或 reference。
 当前视角：{perspective_summary}
 
 只完成当前 turn_kind 指定的职责。verified_control 中的身份、Roster、Grant、
@@ -115,7 +117,7 @@ Agent 从外附 `current_board.body` 读取本 Turn Board，不从 `meeting_cont
 `meeting_content` 包含 title、description、participant labels、trigger basis 和 bounded recent Speech；顶层
 `context_window` 说明 Speech 投影是否截断以及 history lookup 上限。
 
-Turn 指令应重申：加载 participant reference；当前只判断是否有具体、相关、未重复的信息增量；不写完整
+Turn 指令应重申：当前输入已自包含，直接判断是否有具体、相关、未重复的信息增量；不写完整
 Speech、不执行建议动作；只返回 `SUBMIT` 或 `PASS`。
 
 当前结果形状：
@@ -157,8 +159,9 @@ Speech/Yield 和可选 Handoff 的协议发布。
 `expected_speech_revision` 和 `harness_hard_deadline_unix_ms`。`meeting_content` 包含 title、description、labels
 和 bounded recent Speech；当前没有顶层 `context_window`。
 
-Turn 指令应重申：加载 moderator reference；当前只根据外附 Board 和截至 expected revision 的 canonical
-Speech 维护完整 Board，不选择候选；工具只读。`UPDATE` 是完整 replacement，不是 patch。
+Turn 指令应重申：当前输入已自包含，直接根据外附 Board 和截至 expected revision 的 canonical Speech
+维护完整 Board，不选择候选；工具只读。`UPDATE` 是完整 replacement，不是 patch。只有目标、范围、证据、
+结论、未决风险或已决定输出发生实质变化时 UPDATE，否则以 `board=null` 返回 UNCHANGED。
 
 ```json
 {"action":"UPDATE","board":"<complete Markdown Board>","reason":"..."}
@@ -212,7 +215,7 @@ Board 已 `updated/unchanged`，且同一当前 Board 明确记录目标达到�
 不要新增模型可见 Action Run fence、lease、slot、Session 或 effect journal。Harness 已验证并在接收结果时
 重新检查这些控制事实。
 
-Turn 指令应重申：加载 action reference；当前只执行 frozen Board 已决定的普通业务结果并 canonical 回读；
+Turn 指令应重申：当前输入已自包含，直接执行 frozen Board 已决定的普通业务结果并 canonical 回读；
 不得重新审计控制面、发明第二套计划或调用 Meeting Action CLI。四种结果为：
 
 ```json
@@ -268,14 +271,16 @@ Action 重试仍使用完整 `action_finalization` Prompt，并把 `format_retry
 
 这是现有信息条件下的提示词级风险控制，不宣称 exactly-once，也不要求 Harness 新增 journal。
 
-## 不放进 Turn Prompt 的内容
+## Skill 与托管 Turn 的边界
 
-以下内容由 Skill/reference 按需加载，不在每 Turn 重复：
+以下内容继续保留在 Skill/reference，供创建前判断、会议外操作、实现审查和故障诊断使用：
 
 - 创建前影响范围判断和完整生命周期；
-- Intent、SAY、YIELD、Handoff 的写作教学；
-- Board 模板、候选排序、Reject/Dismiss/Deferral 的完整方法；
+- 更丰富的 Intent、SAY、YIELD、Handoff 写作教学；
+- Board 模板和候选排序的扩展说明；
 - CLI 参数和命令案例；
 - Project Context、summary 和业务物化的详细步骤。
 
-Turn 只提供当前视角、当前证据、立即工具边界和输出合同。
+托管 Turn 不读取这些文件。影响协议正确性和正常推进的最小语义必须直接存在于 System/Turn Prompt：当前
+视角、当前证据、工具边界、准确输出合同、Board 的 UPDATE/UNCHANGED 判定、Floor 的 candidate source_id
+与 self-Intent/terminal 规则，以及 Action 的物化与回读边界。
