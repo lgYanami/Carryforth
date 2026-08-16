@@ -155,6 +155,12 @@ fn search_project_context_skill_freezes_the_reviewed_workflow() {
         "cf project-context edge coordinate-search",
         "cf project-context edge coordinates",
         "Score controls inspection order, not selection",
+        "Treat the desired starting Coordinate as the primary semantic",
+        "other environment fact when it genuinely distinguishes candidates",
+        "do not copy the complete problem into every semantic query",
+        "Do not add final response requirements",
+        "--coordinate-type",
+        "Filtering happens within the complete Edge membership before top-K",
         "Do not publish command logs",
         "### Case 7: Retrieval is unavailable",
     ] {

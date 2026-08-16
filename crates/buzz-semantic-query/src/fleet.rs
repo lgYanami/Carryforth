@@ -187,7 +187,7 @@ pub const SEMANTIC_COMPUTATION_ROUTES: SemanticComputationRouteMatrix =
 /// incompatible change to those contracts must change the dated profile and this
 /// descriptor before a mixed fleet can attest itself ready.
 pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-http-runtime-20260816-u6\n",
+    "runtime-contract=semantic-query-http-runtime-20260816-coordinate-filter-v2\n",
     "transport=http-post-query-exclusive-single-filter\n",
     "request=unversioned-closed-request-id-project-id-problem-initial-context-lifecycle-budget\n",
     "result=unversioned-closed-project-request-completion-observations-input-observations-roots-paths-target-lifecycle-typed-basis-path-source-provenance-explicit-provenance-coverage\n",
@@ -199,8 +199,8 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
     "errors=closed-content-free-400-401-403-409-413-429-503-504\n",
     "ordinary-query=semantic-extension-exclusive-kind-40912-always-denied",
     "\ncomputation-route=closed-compiled-profile-bound-separately",
-    "\ncoordinate-search=request-one-natural-language-input-limit-1-to-32;result-kind-40913-coordinate-rank-score-only;extension-carryforth_project_context_coordinate_search;no-floor-no-edge-no-path",
-    "\none-hop-search=request-one-natural-language-q0-input-limit-1-to-32-tagged-incident-edge-or-edge-coordinate-scope;result-kind-40914-canonical-preview-and-typed-read-descriptor;extension-carryforth_project_context_one_hop_semantic_search;direct-cosine-no-floor-no-coherence-no-path"
+    "\ncoordinate-search=request-one-natural-language-input-limit-1-to-32;result-kind-40913-coordinate-rank-score-only;extensions-carryforth_project_context_coordinate_search-and-v2-filtered;v2-closed-coordinate-type-filter-before-score-and-top-k;no-floor-no-edge-no-path",
+    "\none-hop-search=request-one-natural-language-q0-input-limit-1-to-32-tagged-incident-edge-or-edge-coordinate-scope;result-kind-40914-canonical-preview-and-typed-read-descriptor;extensions-carryforth_project_context_one_hop_semantic_search-and-v2-filtered-edge-coordinate;v2-filter-only-edge-coordinate-members-before-score-and-top-k;direct-cosine-no-floor-no-coherence-no-path"
 );
 
 /// One instance asserted to be in the current HTTP load-balancer inventory.
@@ -447,7 +447,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "e49d7ae9e69a2818a9ce9c061443a4441d332c86a3f8b46824b147a5da716f40",
+            "d9878ff28260cc8161795ce8cd479ba879387f3f34ae35b389734fd6ea753bef",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

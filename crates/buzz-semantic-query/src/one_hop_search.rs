@@ -14,8 +14,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    build_problem_query_encoder_input, query_contract_digest, QueryContractResult, Score,
-    SemanticQueryEncoderInput, MAX_PROBLEM_BYTES,
+    build_problem_query_encoder_input, query_contract_digest, ProjectContextCoordinateTypeFilter,
+    QueryContractResult, Score, SemanticQueryEncoderInput, MAX_PROBLEM_BYTES,
 };
 
 /// Default number of one-hop candidates returned to the caller.
@@ -70,8 +70,23 @@ const EDGE_COORDINATE_RANKING_DESCRIPTOR: &str = concat!(
     "max-materialized-coordinates=4096"
 );
 
+const EDGE_COORDINATE_FILTERED_RANKING_DESCRIPTOR: &str = concat!(
+    "contract=carryforth.project-context-one-hop-edge-coordinate-ranking.v2\n",
+    "query=semantic-graph-query.problem\n",
+    "scope=complete-edge-members-filtered-by-closed-coordinate-type-before-scoring\n",
+    "coordinate-score=direct-current-head-cosine\n",
+    "order=score-desc-coordinate-ord-asc\n",
+    "lifecycle=all-current\n",
+    "floor=none\n",
+    "coherence=none\n",
+    "max-coordinates=32\n",
+    "max-materialized-coordinates=4096"
+);
+
 const ONE_HOP_HTTP_REQUEST_BINDING_DOMAIN: &[u8] =
     b"carryforth.project-context-one-hop-semantic-search-http-request\0";
+const ONE_HOP_V2_HTTP_REQUEST_BINDING_DOMAIN: &[u8] =
+    b"carryforth.project-context-one-hop-semantic-search-v2-http-request\0";
 
 /// Result alias for the pure one-hop semantic contract.
 pub type OneHopSemanticResult<T> = Result<T, OneHopSemanticError>;
@@ -124,6 +139,9 @@ pub enum OneHopSemanticError {
     /// A Coordinate was malformed or crossed the host Project boundary.
     #[error("invalid one-hop semantic Coordinate: {0}")]
     InvalidCoordinate(String),
+    /// A present Edge-member Coordinate type filter was empty or malformed.
+    #[error("invalid one-hop Coordinate type filter: {0}")]
+    InvalidCoordinateTypes(String),
     /// A completed result violated a closed invariant.
     #[error("invalid one-hop semantic state: {0}")]
     InvalidState(String),
@@ -145,6 +163,9 @@ pub enum OneHopSemanticScope {
     EdgeCoordinates {
         /// Exact current Edge identity whose complete members form the scope.
         edge_key: EdgeKey,
+        /// Optional closed Coordinate types; omitted preserves the v1 scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coordinate_types: Option<ProjectContextCoordinateTypeFilter>,
     },
 }
 
@@ -163,6 +184,10 @@ impl OneHopSemanticScope {
     pub fn ranking_contract_digest(&self) -> Digest32 {
         match self {
             Self::IncidentEdges { .. } => incident_edge_ranking_contract_digest(),
+            Self::EdgeCoordinates {
+                coordinate_types: Some(_),
+                ..
+            } => edge_coordinate_filtered_ranking_contract_digest(),
             Self::EdgeCoordinates { .. } => edge_coordinate_ranking_contract_digest(),
         }
     }
@@ -240,6 +265,16 @@ impl ProjectContextOneHopSemanticQuery {
                 .validate_for_project(self.project_id)
                 .map_err(|error| OneHopSemanticError::InvalidCoordinate(error.to_string()))?;
         }
+        if let OneHopSemanticScope::EdgeCoordinates {
+            coordinate_types, ..
+        } = &mut self.scope
+        {
+            *coordinate_types = coordinate_types
+                .as_ref()
+                .map(ProjectContextCoordinateTypeFilter::canonicalized)
+                .transpose()
+                .map_err(|error| OneHopSemanticError::InvalidCoordinateTypes(error.to_string()))?;
+        }
         self.query = query.to_owned();
         let canonical =
             serde_json::to_vec(&self).map_err(|_| OneHopSemanticError::Serialization)?;
@@ -275,6 +310,15 @@ pub fn edge_coordinate_ranking_contract_digest() -> Digest32 {
     hash_domain(
         b"carryforth.project-context-one-hop-ranking-contract",
         &[EDGE_COORDINATE_RANKING_DESCRIPTOR.as_bytes()],
+    )
+}
+
+/// Return the filtered Edge-member Coordinate v2 ranking contract digest.
+#[must_use]
+pub fn edge_coordinate_filtered_ranking_contract_digest() -> Digest32 {
+    hash_domain(
+        b"carryforth.project-context-one-hop-ranking-contract",
+        &[EDGE_COORDINATE_FILTERED_RANKING_DESCRIPTOR.as_bytes()],
     )
 }
 
@@ -322,6 +366,50 @@ pub fn verify_one_hop_semantic_http_request_binding(
     )?;
     if observed != expected {
         return invalid("one-hop semantic HTTP request binding digest mismatch");
+    }
+    Ok(())
+}
+
+/// Derive the independently versioned filtered one-hop request binding.
+pub fn derive_one_hop_semantic_v2_http_request_binding(
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    expected_relay_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> OneHopSemanticResult<Digest32> {
+    validate_uuid_v4(host_project_id, "host_project_id")?;
+    let body_digest: [u8; 32] = Sha256::digest(exact_authenticated_body).into();
+    Ok(hash_domain(
+        ONE_HOP_V2_HTTP_REQUEST_BINDING_DOMAIN,
+        &[
+            host_project_id.as_bytes(),
+            authenticated_caller_pubkey,
+            expected_relay_pubkey,
+            nip98_auth_event_id.as_bytes(),
+            &body_digest,
+        ],
+    ))
+}
+
+/// Verify a filtered one-hop binding against exact authenticated bytes.
+pub fn verify_one_hop_semantic_v2_http_request_binding(
+    observed: Digest32,
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    expected_relay_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> OneHopSemanticResult<()> {
+    let expected = derive_one_hop_semantic_v2_http_request_binding(
+        host_project_id,
+        authenticated_caller_pubkey,
+        expected_relay_pubkey,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+    )?;
+    if observed != expected {
+        return invalid("filtered one-hop HTTP request binding digest mismatch");
     }
     Ok(())
 }
@@ -663,9 +751,17 @@ pub struct IncidentEdgeCoverage {
 pub struct EdgeCoordinateCoverage {
     /// Complete member count of the current active Edge.
     pub edge_coordinate_count: u32,
-    /// Members with a current scorable semantic head.
+    /// Complete members matching the applied v2 type filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_matched_coordinate_count: Option<u32>,
+    /// Complete members excluded only because their Coordinate type differed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_filtered_out_coordinates: Option<u32>,
+    /// Members in the active result pool with a current scorable semantic head.
+    ///
+    /// The pool is the complete Edge for v1 and the type-matched partition for v2.
     pub scorable_coordinates: u32,
-    /// Scorable members whose current overview contains title only.
+    /// Scorable members in that same pool whose current overview contains title only.
     pub title_only_scorable_coordinates: u32,
     /// Closed mutually exclusive omission counts.
     pub omitted_coordinates: OneHopOmittedCandidateCounts,
@@ -740,6 +836,9 @@ pub enum OneHopSemanticSelection {
     EdgeCoordinates {
         /// Input Edge identity echoed from the request.
         edge_key: EdgeKey,
+        /// Applied v2 Coordinate type scope; omitted only for v1 results.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coordinate_types: Option<ProjectContextCoordinateTypeFilter>,
         /// Ranked current member selections.
         ranked_coordinates: Vec<OneHopRankedCoordinate>,
         /// Complete candidate-pool coverage.
@@ -806,9 +905,15 @@ impl ProjectContextOneHopSemanticQueryResult {
                 self.validate_incident_edges()?;
                 incident_edge_ranking_contract_digest()
             }
-            OneHopSemanticSelection::EdgeCoordinates { .. } => {
+            OneHopSemanticSelection::EdgeCoordinates {
+                coordinate_types, ..
+            } => {
                 self.validate_edge_coordinates()?;
-                edge_coordinate_ranking_contract_digest()
+                if coordinate_types.is_some() {
+                    edge_coordinate_filtered_ranking_contract_digest()
+                } else {
+                    edge_coordinate_ranking_contract_digest()
+                }
             }
         };
         if self.observations.ranking_contract_digest != expected_ranking {
@@ -842,14 +947,18 @@ impl ProjectContextOneHopSemanticQueryResult {
                 validate_limit(edges.len(), *truncated, request.limit)?;
             }
             (
-                OneHopSemanticScope::EdgeCoordinates { edge_key: expected },
+                OneHopSemanticScope::EdgeCoordinates {
+                    edge_key: expected,
+                    coordinate_types: expected_types,
+                },
                 OneHopSemanticSelection::EdgeCoordinates {
                     edge_key,
+                    coordinate_types,
                     ranked_coordinates,
                     truncated,
                     ..
                 },
-            ) if edge_key == expected => {
+            ) if edge_key == expected && coordinate_types == expected_types => {
                 validate_limit(ranked_coordinates.len(), *truncated, request.limit)?;
             }
             _ => return invalid("result scope variant or identity does not match request"),
@@ -937,6 +1046,7 @@ impl ProjectContextOneHopSemanticQueryResult {
 
     fn validate_edge_coordinates(&self) -> OneHopSemanticResult<()> {
         let OneHopSemanticSelection::EdgeCoordinates {
+            coordinate_types,
             ranked_coordinates,
             coverage,
             truncated,
@@ -946,14 +1056,44 @@ impl ProjectContextOneHopSemanticQueryResult {
             return invalid("expected Edge Coordinate selection");
         };
         if coverage.edge_coordinate_count > MAX_ONE_HOP_EDGE_COORDINATES
-            || coverage.scorable_coordinates > coverage.edge_coordinate_count
             || coverage.title_only_scorable_coordinates > coverage.scorable_coordinates
-            || coverage
-                .scorable_coordinates
-                .checked_add(coverage.omitted_coordinates.total()?)
-                != Some(coverage.edge_coordinate_count)
         {
             return invalid("Edge Coordinate coverage is inconsistent");
+        }
+        match coordinate_types {
+            None => {
+                if coverage.type_matched_coordinate_count.is_some()
+                    || coverage.type_filtered_out_coordinates.is_some()
+                    || coverage.scorable_coordinates > coverage.edge_coordinate_count
+                    || coverage
+                        .scorable_coordinates
+                        .checked_add(coverage.omitted_coordinates.total()?)
+                        != Some(coverage.edge_coordinate_count)
+                {
+                    return invalid("v1 Edge Coordinate coverage is inconsistent");
+                }
+            }
+            Some(filter) => {
+                if !filter.is_canonical() {
+                    return invalid("filtered Edge Coordinate types are not canonical");
+                }
+                let (Some(type_matched), Some(type_filtered_out)) = (
+                    coverage.type_matched_coordinate_count,
+                    coverage.type_filtered_out_coordinates,
+                ) else {
+                    return invalid("filtered Edge Coordinate coverage is incomplete");
+                };
+                if type_matched.checked_add(type_filtered_out)
+                    != Some(coverage.edge_coordinate_count)
+                    || coverage.scorable_coordinates > type_matched
+                    || coverage
+                        .scorable_coordinates
+                        .checked_add(coverage.omitted_coordinates.total()?)
+                        != Some(type_matched)
+                {
+                    return invalid("filtered Edge Coordinate coverage is inconsistent");
+                }
+            }
         }
         validate_count_against_pool(
             ranked_coordinates.len(),
@@ -969,6 +1109,12 @@ impl ProjectContextOneHopSemanticQueryResult {
                 .map_err(|error| OneHopSemanticError::InvalidCoordinate(error.to_string()))?;
             if !seen_coordinates.insert(candidate.coordinate.clone()) {
                 return invalid("ranked Coordinates must be unique");
+            }
+            if coordinate_types
+                .as_ref()
+                .is_some_and(|filter| !filter.matches(&candidate.coordinate))
+            {
+                return invalid("ranked Coordinate violates the applied type filter");
             }
             candidate
                 .canonical_observation
@@ -1087,6 +1233,8 @@ mod tests {
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::{ProjectDocumentSourceBasis, ProjectViewSourceBasis};
 
+    use crate::ProjectContextCoordinateType;
+
     use super::*;
 
     fn uuid(value: u128) -> Uuid {
@@ -1197,10 +1345,10 @@ mod tests {
 
     #[test]
     fn request_is_closed_trimmed_redacted_and_q0_compatible() {
-        let request = request(OneHopSemanticScope::IncidentEdges {
+        let unfiltered_request = request(OneHopSemanticScope::IncidentEdges {
             coordinate: work(3),
         });
-        let canonical = request
+        let canonical = unfiltered_request
             .clone()
             .validate_and_canonicalize()
             .expect("request");
@@ -1212,6 +1360,20 @@ mod tests {
             input.channel_kind(),
             &crate::SemanticQueryChannelKind::Problem
         );
+
+        let filtered = request(OneHopSemanticScope::EdgeCoordinates {
+            edge_key: edge(canonical.project_id, 3, 4),
+            coordinate_types: Some(
+                ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                    .expect("filter"),
+            ),
+        })
+        .validate_and_canonicalize()
+        .expect("filtered request");
+        let filtered_input =
+            build_one_hop_semantic_query_encoder_input(&filtered).expect("filtered Q0");
+        assert_eq!(filtered_input.text(), input.text());
+        assert_eq!(filtered_input.text_digest(), input.text_digest());
 
         let mut value = serde_json::to_value(&canonical).expect("json");
         value["unexpected"] = serde_json::json!(true);
@@ -1320,17 +1482,21 @@ mod tests {
     fn edge_coordinate_result_validates_preview_and_read_descriptor() {
         let project_id = uuid(2);
         let edge_key = edge(project_id, 3, 4);
-        let request = request(OneHopSemanticScope::EdgeCoordinates { edge_key })
-            .validate_and_canonicalize()
-            .expect("request");
+        let unfiltered_request = request(OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types: None,
+        })
+        .validate_and_canonicalize()
+        .expect("request");
         let coordinate = work(3);
         let result = ProjectContextOneHopSemanticQueryResult {
-            request_id: request.request_id,
+            request_id: unfiltered_request.request_id,
             project_id,
             request_binding_digest: digest(41),
             observations: observations(edge_coordinate_ranking_contract_digest()),
             selection: OneHopSemanticSelection::EdgeCoordinates {
                 edge_key,
+                coordinate_types: None,
                 ranked_coordinates: vec![OneHopRankedCoordinate {
                     rank: 1,
                     coordinate: coordinate.clone(),
@@ -1339,6 +1505,8 @@ mod tests {
                 }],
                 coverage: EdgeCoordinateCoverage {
                     edge_coordinate_count: 1,
+                    type_matched_coordinate_count: None,
+                    type_filtered_out_coordinates: None,
                     scorable_coordinates: 1,
                     title_only_scorable_coordinates: 0,
                     omitted_coordinates: OneHopOmittedCandidateCounts::default(),
@@ -1346,7 +1514,9 @@ mod tests {
                 truncated: false,
             },
         };
-        result.validate_for_request(&request).expect("result");
+        result
+            .validate_for_request(&unfiltered_request)
+            .expect("result");
         let json = serde_json::to_value(&result).expect("json");
         assert_eq!(
             json["selection"]["ranked_coordinates"][0]["canonical_observation"]["preview"]
@@ -1354,6 +1524,43 @@ mod tests {
             "Client implementation"
         );
         assert!(json["selection"].get("ranked_documents").is_none());
+
+        let filter =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter");
+        let filtered_request = request(OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types: Some(filter.clone()),
+        })
+        .validate_and_canonicalize()
+        .expect("filtered request");
+        let mut filtered_result = result;
+        filtered_result.request_id = filtered_request.request_id;
+        filtered_result.observations.ranking_contract_digest =
+            edge_coordinate_filtered_ranking_contract_digest();
+        let OneHopSemanticSelection::EdgeCoordinates {
+            coordinate_types,
+            coverage,
+            ..
+        } = &mut filtered_result.selection
+        else {
+            panic!("Edge Coordinate selection")
+        };
+        *coordinate_types = Some(filter);
+        coverage.type_matched_coordinate_count = Some(1);
+        coverage.type_filtered_out_coordinates = Some(0);
+        filtered_result
+            .validate_for_request(&filtered_request)
+            .expect("filtered result");
+        let OneHopSemanticSelection::EdgeCoordinates { coverage, .. } =
+            &mut filtered_result.selection
+        else {
+            panic!("Edge Coordinate selection")
+        };
+        coverage.type_filtered_out_coordinates = Some(1);
+        assert!(filtered_result
+            .validate_for_request(&filtered_request)
+            .is_err());
     }
 
     #[test]
@@ -1378,6 +1585,10 @@ mod tests {
         assert_ne!(
             incident_edge_ranking_contract_digest(),
             edge_coordinate_ranking_contract_digest()
+        );
+        assert_ne!(
+            edge_coordinate_ranking_contract_digest(),
+            edge_coordinate_filtered_ranking_contract_digest()
         );
         assert_eq!(
             incident_edge_ranking_contract_digest(),
@@ -1405,6 +1616,24 @@ mod tests {
             body,
         )
         .expect("binding verifies");
+        let v2 = derive_one_hop_semantic_v2_http_request_binding(
+            uuid(2),
+            &[3; 32],
+            &[4; 32],
+            digest(5),
+            body,
+        )
+        .expect("v2 binding");
+        assert_ne!(binding, v2);
+        verify_one_hop_semantic_v2_http_request_binding(
+            v2,
+            uuid(2),
+            &[3; 32],
+            &[4; 32],
+            digest(5),
+            body,
+        )
+        .expect("v2 binding verifies");
 
         for changed in [
             derive_one_hop_semantic_http_request_binding(

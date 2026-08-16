@@ -16,8 +16,8 @@ use buzz_semantic_query::{
     EdgeCoordinateCoverage, IncidentEdgeCoverage, OneHopCandidatePreview,
     OneHopCanonicalCandidateObservation, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
     OneHopRankedCoordinate, OneHopRankedDocument, OneHopRankedEdge, OneHopSemanticSelection,
-    MAX_ONE_HOP_DOCUMENTS_PER_EDGE, MAX_ONE_HOP_EDGE_COORDINATES,
-    MAX_ONE_HOP_HYPEREDGE_IDENTITY_BYTES, MAX_ONE_HOP_INCIDENT_EDGES,
+    ProjectContextCoordinateTypeFilter, MAX_ONE_HOP_DOCUMENTS_PER_EDGE,
+    MAX_ONE_HOP_EDGE_COORDINATES, MAX_ONE_HOP_HYPEREDGE_IDENTITY_BYTES, MAX_ONE_HOP_INCIDENT_EDGES,
     MAX_ONE_HOP_RELATION_BINDINGS, MAX_ONE_HOP_SEMANTIC_LIMIT,
 };
 use sqlx::Row;
@@ -304,6 +304,39 @@ impl SemanticGraphReadTx {
         query_vector: &SemanticExactQueryVector,
         limit: u8,
     ) -> Result<SemanticEdgeCoordinateSearchOutcome> {
+        self.search_edge_coordinates_one_hop_with_filter(edge_key, query_vector, limit, None)
+            .await
+    }
+
+    /// Rank only members of one exact Edge matching a closed Coordinate type set.
+    pub async fn search_edge_coordinates_one_hop_filtered(
+        &mut self,
+        edge_key: EdgeKey,
+        query_vector: &SemanticExactQueryVector,
+        coordinate_types: &ProjectContextCoordinateTypeFilter,
+        limit: u8,
+    ) -> Result<SemanticEdgeCoordinateSearchOutcome> {
+        if !coordinate_types.is_canonical() {
+            return Err(DbError::InvalidData(
+                "one-hop Coordinate type filter is not canonical".to_owned(),
+            ));
+        }
+        self.search_edge_coordinates_one_hop_with_filter(
+            edge_key,
+            query_vector,
+            limit,
+            Some(coordinate_types),
+        )
+        .await
+    }
+
+    async fn search_edge_coordinates_one_hop_with_filter(
+        &mut self,
+        edge_key: EdgeKey,
+        query_vector: &SemanticExactQueryVector,
+        limit: u8,
+        coordinate_types: Option<&ProjectContextCoordinateTypeFilter>,
+    ) -> Result<SemanticEdgeCoordinateSearchOutcome> {
         validate_one_hop_input(self, query_vector, limit)?;
         let Some(edge) =
             load_complete_hyperedge_in_tx(&mut self.tx, &self.ticket, edge_key).await?
@@ -324,8 +357,23 @@ impl SemanticGraphReadTx {
             });
         }
 
-        let sources = edge
+        let matched_coordinates = edge
             .complete_coordinates
+            .iter()
+            .filter(|coordinate| coordinate_types.is_none_or(|filter| filter.matches(coordinate)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let type_matched_coordinate_count = u32_count(
+            matched_coordinates.len(),
+            "one-hop type-matched Coordinate count",
+        )?;
+        let type_filtered_out_coordinates = edge_coordinate_count
+            .checked_sub(type_matched_coordinate_count)
+            .ok_or_else(|| {
+                DbError::InvalidData("one-hop filtered Coordinate count underflow".to_owned())
+            })?;
+
+        let sources = matched_coordinates
             .iter()
             .map(|coordinate| {
                 semantic_source_identity_for_coordinate(self.ticket.community_id, coordinate)
@@ -351,7 +399,7 @@ impl SemanticGraphReadTx {
         let mut omissions = OneHopOmittedCandidateCounts::default();
         let mut title_only_scorable_coordinates = 0_u32;
         let mut scored = Vec::with_capacity(score_map.len());
-        for (coordinate, source) in edge.complete_coordinates.iter().cloned().zip(&sources) {
+        for (coordinate, source) in matched_coordinates.into_iter().zip(&sources) {
             let key = semantic_source_sort_key(source);
             let state = state_map.get(&key).ok_or_else(|| {
                 DbError::InvalidData("one-hop Coordinate source state is missing".to_owned())
@@ -409,9 +457,14 @@ impl SemanticGraphReadTx {
         }
         let selection = OneHopSemanticSelection::EdgeCoordinates {
             edge_key,
+            coordinate_types: coordinate_types.cloned(),
             ranked_coordinates,
             coverage: EdgeCoordinateCoverage {
                 edge_coordinate_count,
+                type_matched_coordinate_count: coordinate_types
+                    .map(|_| type_matched_coordinate_count),
+                type_filtered_out_coordinates: coordinate_types
+                    .map(|_| type_filtered_out_coordinates),
                 scorable_coordinates,
                 title_only_scorable_coordinates,
                 omitted_coordinates: omissions,

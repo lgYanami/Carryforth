@@ -173,9 +173,13 @@ cf project-context coordinate show <TYPE:UUID>
 
 ```bash
 cf project-context coordinate-search \
-  --query "<当前 Role，以及缺失、相关或想进一步了解的上下文>" \
+  --query "<目标起点对象或责任位置；简短的当前 Role 责任；可选的单一区分事实>" \
+  --coordinate-type work \
   --limit 8
 ```
+
+如果起点的结构类型已经明确，可以重复使用`--coordinate-type`形成一个小型 OR 集合；过滤在语义排序和
+top-K之前执行。类型不确定时省略该选项。结构过滤只缩小候选集合，Agent仍需根据上下文环境检查候选。
 
 该命令只返回 Coordinate identity、rank 和 score。返回的是待观察候选，不是已经选定的起点。
 Agent 按排名安排 `coordinate show` 的观察顺序，然后根据上下文环境判断：
@@ -202,6 +206,8 @@ CLI 把每一步拆成原子操作，避免一个命令替 Agent 同时选择 Ed
 | 查看一条 Edge 的完整成员集合 | `edge coordinates` | 完整 Hyperedge membership 的轻量观察 |
 
 语义命令负责缩小观察范围；结构命令负责回答完整集合问题。二者不能互相冒充。
+`edge coordinate-search`也支持重复`--coordinate-type`，只在该Edge完整成员内先按类型过滤再排序；
+`coordinate edge-search`不接受该过滤，因为它选择的是Edge而不是Coordinate。
 
 ### 7.1 从 Coordinate 选择 Edge
 

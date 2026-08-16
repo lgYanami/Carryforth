@@ -2491,7 +2491,7 @@ impl SemanticGraphReadTx {
         query_vectors: &[&GenerationBoundQueryVector],
         candidates: Option<&[SemanticSourceIdentity]>,
         top_per_channel: Option<u32>,
-        score_scope: SemanticExactScoreScope,
+        score_scope: SemanticExactScoreScope<'_>,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
         validate_source_inputs(
             self.ticket.community_id,
@@ -2527,12 +2527,24 @@ impl SemanticGraphReadTx {
         let dimensions = i32::try_from(self.ticket.generation.model_contract.dimensions)
             .map_err(|_| DbError::InvalidData("semantic dimensions exceed int4".to_string()))?;
         let top_per_channel = top_per_channel.map(i64::from);
+        let coordinate_type_tokens = score_scope
+            .coordinate_types()
+            .map(|filter| {
+                filter
+                    .types()
+                    .iter()
+                    .map(|coordinate_type| coordinate_type.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let exact_sql = match score_scope {
             SemanticExactScoreScope::GraphSources => EXACT_SOURCE_SCORES_SQL,
-            SemanticExactScoreScope::GlobalGraphCoordinates => GLOBAL_GRAPH_COORDINATE_SCORES_SQL,
+            SemanticExactScoreScope::GlobalGraphCoordinates { .. } => {
+                GLOBAL_GRAPH_COORDINATE_SCORES_SQL
+            }
         };
 
-        let rows = sqlx::query(exact_sql)
+        let query = sqlx::query(exact_sql)
             .bind(self.ticket.community_id.as_uuid())
             .bind(self.reader_pubkey.as_slice())
             .bind(self.expected_projection_pubkey.as_bytes())
@@ -2558,9 +2570,16 @@ impl SemanticGraphReadTx {
             .bind(&candidates.subtypes)
             .bind(&candidates.ids)
             .bind(top_per_channel)
-            .bind(score_scope.coordinate_only())
-            .fetch_all(&mut *self.tx)
-            .await?;
+            .bind(score_scope.coordinate_only());
+        let rows = match score_scope {
+            SemanticExactScoreScope::GraphSources => query.fetch_all(&mut *self.tx).await?,
+            SemanticExactScoreScope::GlobalGraphCoordinates { .. } => {
+                query
+                    .bind(&coordinate_type_tokens)
+                    .fetch_all(&mut *self.tx)
+                    .await?
+            }
+        };
         Ok(rows)
     }
 }
@@ -5072,6 +5091,14 @@ coordinate_roles AS MATERIALIZED (
      AND edge.state = 'active'
     CROSS JOIN coordinate_scope_guard
     WHERE coordinate.community_id = $1
+      AND (
+        cardinality($21::text[]) = 0
+        OR CASE coordinate.coordinate_type
+             WHEN 'project_view_object' THEN coordinate.coordinate_subtype
+             WHEN 'document' THEN 'document'
+             WHEN 'meeting' THEN 'meeting'
+           END = ANY($21::text[])
+      )
 ),
 scoped_heads AS NOT MATERIALIZED (
     SELECT head.community_id, head.generation_id, head.source_family,
@@ -5977,6 +6004,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             query: "exact score fixture".to_owned(),
+            coordinate_types: None,
             limit: 8,
         };
         let coordinate_input =
@@ -6108,6 +6136,8 @@ mod tests {
         );
         assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("semantic_score DESC"));
         assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("LIMIT $19"));
+        assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("cardinality($21::text[]) = 0"));
+        assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("= ANY($21::text[])"));
     }
 
     #[test]

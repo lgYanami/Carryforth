@@ -558,6 +558,7 @@ mod tests {
             request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0101),
             project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0102),
             query: "Locate work related to authorization failures".to_owned(),
+            coordinate_types: None,
             limit: 1,
         };
         let input = build_coordinate_search_encoder_input(&request).expect("closed input");
@@ -722,6 +723,7 @@ mod tests {
             request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0011),
             project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0012),
             query: "authorization failure during release".to_owned(),
+            coordinate_types: None,
             limit: 8,
         };
         let input = build_coordinate_search_encoder_input(&request).expect("Coordinate input");

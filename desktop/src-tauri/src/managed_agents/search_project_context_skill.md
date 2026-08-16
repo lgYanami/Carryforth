@@ -101,15 +101,42 @@ cf project-context coordinate show <TYPE:UUID>
 ```
 
 Only when no explicit relevant Coordinate exists in current work, task, Meeting, or environment,
-perform one whole-graph search. Include the current Role and express the object or the missing,
-related, or desired context. Include other environment facts only when relevant; do not invent a
-hard scope:
+perform one whole-graph search. Treat the desired starting Coordinate as the primary semantic
+signal. Add one short statement of the current Role's relevant responsibility, and at most one
+other environment fact when it genuinely distinguishes candidates. Do not turn this query into a
+miniature task prompt: keep the complete problem, final output format, downstream Edge or path
+goals, chat history, and unrelated Role Brief content in task state rather than sending them here.
+Do not invent a hard scope.
+
+When the needed starting object type is already known, add one or more repeated
+`--coordinate-type` values. This is a deterministic structural OR filter applied before ranking;
+it is not another context lens. Use it for facts such as "I need a Work or Issue", not to encode
+frontend/backend responsibility or other semantic distinctions. Omit it when the object type is
+uncertain. The closed values are `project_profile`, `goal`, `role`, `plan`, `stage`, `requirement`,
+`issue`, `work`, `resource`, `document`, and `meeting`; `document` means a Document Coordinate,
+not a relation Document attached to an Edge.
 
 ```bash
 cf project-context coordinate-search \
-  --query "<object to locate, or context that is missing, related, or worth understanding>" \
+  --query "<desired starting object or responsibility; short current Role responsibility; optional single discriminator>" \
+  --coordinate-type work \
   --limit 8
 ```
+
+Remove the `--coordinate-type` line when the type is not known. Repeat it to allow a small OR set,
+for example `--coordinate-type work --coordinate-type issue`; do not pass every type to simulate
+an unfiltered search.
+
+For example, prefer:
+
+```text
+Desired start: the current client-retry Work. Role responsibility: maintain client retry behavior.
+Discriminator: this release.
+```
+
+Do not send the complete incident narrative followed by instructions to find Edges, explain the
+root cause, traverse the graph, and prepare a report. A short phrase from the underlying problem is
+appropriate only when it is necessary to identify the starting Coordinate.
 
 The result contains starting candidates, not a chosen start. It returns rank, Coordinate identity,
 and score, without title, description, or summary. Inspect promising candidates with
@@ -131,24 +158,27 @@ limitation and stop. Report it only if it prevents fulfilling the user's request
 
 ## Form a local semantic query
 
-Describe only the choice at the current hop. Keep the problem stable, include the current Role in
-every query, and add only environment facts that distinguish the candidates:
+Describe only the choice at the current hop. Keep the underlying problem stable in task state, but
+do not copy the complete problem into every semantic query. Include the current Role's relevant
+responsibility in every query and add only environment facts that distinguish the candidates:
 
-- for a start, describe the object or responsibility location being sought;
+- for a start, make the desired object or responsibility location the main signal;
 - from a Coordinate, describe the relation, explanation, or evidence being sought;
 - from an Edge, describe the next object and why it matters to the task.
 
-For the same problem, two environments may produce queries such as:
+For the same underlying problem, two starting-point queries may be:
 
 ```text
-Problem: Why does this release keep failing? Current Role: responsible for client retry behavior.
-Relevant environment: I own the client retry Work. Find relation evidence for that Work.
+Desired start: the current client-retry Work. Role responsibility: maintain client retry behavior.
 ```
 
 ```text
-Problem: Why does this release keep failing? Current Role: responsible for backend authorization.
-Relevant environment: I own the authorization preflight Work. Find the next relevant object.
+Desired start: the current authorization-preflight Work. Role responsibility: maintain the backend
+authorization boundary.
 ```
+
+Do not add final response requirements, the complete investigation plan, or later-hop relation and
+path goals to a starting-point query. Those belong to task state and to later local queries.
 
 Role words do not guarantee correctness. Always inspect canonical lightweight observations and
 relation Documents. A genuine cross-Role dependency may still be relevant.
@@ -210,6 +240,11 @@ cf project-context edge coordinate-search <EDGE_KEY> \
   --query "<next object needed and why it matters>" \
   --limit 8
 ```
+
+If the next hop must be one or more known Coordinate types, use the same repeated
+`--coordinate-type` filter. Filtering happens within the complete Edge membership before top-K;
+it does not change the Edge, infer the correct next hop, or replace lightweight candidate review.
+Omit it when a cross-type dependency may be relevant.
 
 The result contains ranked Coordinate identities and canonical lightweight observations, not
 relation Documents or a complete Edge DTO. Decide whether a candidate advances the information
@@ -336,9 +371,23 @@ not required.
 
 A release-coordination Role needs the responsibility location for a rollback, but the task and
 Meeting provide no Coordinate. Run `coordinate-search` once, including the Role and rollback need.
+Because the desired start is known to be a Work or Issue, pass
+`--coordinate-type work --coordinate-type issue` so unrelated Coordinate types cannot consume the
+candidate window.
 Use scores to order `coordinate show` calls, not to choose. If rank 1 is an old-release Requirement
 with similar wording and rank 3 is the current Issue, choose rank 3 after lightweight inspection.
 Reject every candidate if none fits; do not repeatedly paraphrase the query to evade the budget.
+
+Prefer a focused starting query:
+
+```text
+Desired start: the current rollback-ownership Issue or Work. Role responsibility: coordinate
+rollback ownership and handoff. Discriminator: this release.
+```
+
+Do not copy the full release-failure narrative, ask for relation Documents and next Coordinates,
+and request a final report in the same starting query. Those later goals dilute the object being
+located and remain in task state until their own hop.
 
 ### Case 4: A Meeting supplies the start
 

@@ -547,7 +547,7 @@
     {
       "id": "inline-crates-buzz-relay-src-nip11-1",
       "path": "crates/buzz-relay/src/nip11.rs",
-      "locators": ["878:19", "886:19", "891:19"],
+      "locators": ["892:19", "900:19", "905:19"],
       "media_type": "image/webp",
       "encoding": "base64",
       "decoded_sha256": "a40ff3d5900fb7698b8c865041347cb49eccedc8f93945f89629ad104aaecce4",

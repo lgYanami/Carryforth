@@ -46,8 +46,12 @@ pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
     "buzz-project-context-semantic-query-http";
 pub(crate) const COORDINATE_SEARCH_HTTP_EXTENSION: &str =
     "carryforth-project-context-coordinate-search-http";
+pub(crate) const COORDINATE_SEARCH_V2_HTTP_EXTENSION: &str =
+    "carryforth-project-context-coordinate-search-v2-http";
 pub(crate) const ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION: &str =
     "carryforth-project-context-one-hop-semantic-search-http";
+pub(crate) const ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION: &str =
+    "carryforth-project-context-one-hop-semantic-search-v2-http";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const V2_OBJECT_PAGE_SIZE: usize = 500;
 const ENTITY_PAGE_SIZE: usize = 500;
@@ -72,7 +76,9 @@ pub(crate) struct ProjectViewIdentity {
     pub(crate) document_enabled: bool,
     pub(crate) semantic_query_http_enabled: bool,
     pub(crate) coordinate_search_http_enabled: bool,
+    pub(crate) coordinate_search_v2_http_enabled: bool,
     pub(crate) one_hop_semantic_search_http_enabled: bool,
+    pub(crate) one_hop_semantic_search_v2_http_enabled: bool,
     pub(crate) extensions_temporarily_unavailable: bool,
 }
 
@@ -191,10 +197,18 @@ fn identity_from_nip11(
             .supported_extensions
             .iter()
             .any(|extension| extension == COORDINATE_SEARCH_HTTP_EXTENSION),
+        coordinate_search_v2_http_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == COORDINATE_SEARCH_V2_HTTP_EXTENSION),
         one_hop_semantic_search_http_enabled: info
             .supported_extensions
             .iter()
             .any(|extension| extension == ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION),
+        one_hop_semantic_search_v2_http_enabled: info
+            .supported_extensions
+            .iter()
+            .any(|extension| extension == ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION),
         extensions_temporarily_unavailable,
     })
 }
@@ -724,7 +738,8 @@ mod tests {
     use super::{
         identity_from_nip11, is_managed_runtime_value, runtime_fence_from_file,
         runtime_fence_from_legacy_env, v3_identity_from_nip11, Nip11Document, ProjectViewSchema,
-        SupportedExtensionsObservationStatus, ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
+        SupportedExtensionsObservationStatus, COORDINATE_SEARCH_V2_HTTP_EXTENSION,
+        ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION, ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION,
         PROJECT_CONTEXT_EDGE_EXTENSION, PROJECT_VIEW_V3_EXTENSION,
         SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
     };
@@ -797,6 +812,8 @@ mod tests {
                     PROJECT_VIEW_V3_EXTENSION.to_owned(),
                     SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION.to_owned(),
                     ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION.to_owned(),
+                    COORDINATE_SEARCH_V2_HTTP_EXTENSION.to_owned(),
+                    ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION.to_owned(),
                 ],
                 buzz_supported_extensions_status: None,
                 relay_self: Some(Keys::generate().public_key().to_hex()),
@@ -806,6 +823,8 @@ mod tests {
         .expect("read semantic query identity");
         assert!(semantic.semantic_query_http_enabled);
         assert!(semantic.one_hop_semantic_search_http_enabled);
+        assert!(semantic.coordinate_search_v2_http_enabled);
+        assert!(semantic.one_hop_semantic_search_v2_http_enabled);
 
         let unavailable = v3_identity_from_nip11(Nip11Document {
             supported_extensions: Vec::new(),

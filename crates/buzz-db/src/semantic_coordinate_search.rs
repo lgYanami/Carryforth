@@ -10,8 +10,9 @@ use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic::{ProjectViewSemanticType, SemanticSourceIdentity, SemanticSourceKind};
 use buzz_semantic_query::{
     coordinate_search_query_contract_digest, EncodedCoordinateSearchQuery,
-    ProjectContextCoordinateSearchCandidate, Score, SemanticComputationRoute,
-    SemanticQueryInputKind, MAX_COORDINATE_SEARCH_LIMIT, SEMANTIC_COMPUTATION_ROUTES,
+    ProjectContextCoordinateSearchCandidate, ProjectContextCoordinateTypeFilter, Score,
+    SemanticComputationRoute, SemanticQueryInputKind, MAX_COORDINATE_SEARCH_LIMIT,
+    SEMANTIC_COMPUTATION_ROUTES,
 };
 use pgvector::Vector;
 use sqlx::Row;
@@ -27,6 +28,8 @@ use crate::{DbError, Result};
 pub struct SemanticCoordinateSearchBatch {
     /// Current generation and Project Context snapshot used for every row.
     pub snapshot: SemanticGraphSnapshotBinding,
+    /// Applied v2 Coordinate types; omitted only for v1 all-type searches.
+    pub coordinate_types: Option<ProjectContextCoordinateTypeFilter>,
     /// Public top-K candidates in deterministic score/Coordinate order.
     pub coordinates: Vec<ProjectContextCoordinateSearchCandidate>,
     /// Whether an eligible K+1 row existed in this same snapshot.
@@ -96,6 +99,21 @@ impl SemanticGraphReadTx {
         }
     }
 
+    /// Rank only current active-edge Coordinates matching one closed type set.
+    pub async fn search_coordinate_starts_filtered(
+        &mut self,
+        query_vector: &SemanticCoordinateSearchVector,
+        coordinate_types: &ProjectContextCoordinateTypeFilter,
+        limit: u8,
+    ) -> Result<SemanticCoordinateSearchBatch> {
+        self.search_coordinate_starts_migrated_with_filter(
+            query_vector,
+            limit,
+            Some(coordinate_types),
+        )
+        .await
+    }
+
     /// Shared scorer selected by the compiled U6 production profile.
     ///
     /// The explicit entry remains available to same-snapshot differential
@@ -106,10 +124,24 @@ impl SemanticGraphReadTx {
         query_vector: &SemanticCoordinateSearchVector,
         limit: u8,
     ) -> Result<SemanticCoordinateSearchBatch> {
+        self.search_coordinate_starts_migrated_with_filter(query_vector, limit, None)
+            .await
+    }
+
+    async fn search_coordinate_starts_migrated_with_filter(
+        &mut self,
+        query_vector: &SemanticCoordinateSearchVector,
+        limit: u8,
+        coordinate_types: Option<&ProjectContextCoordinateTypeFilter>,
+    ) -> Result<SemanticCoordinateSearchBatch> {
         self.validate_coordinate_search(query_vector, limit)?;
         let observed_limit = u32::from(limit) + 1;
         let scores = self
-            .score_global_graph_coordinates_exact(query_vector.generation_bound(), observed_limit)
+            .score_global_graph_coordinates_exact(
+                query_vector.generation_bound(),
+                coordinate_types,
+                observed_limit,
+            )
             .await?;
         let truncated = scores.len() > usize::from(limit);
         let coordinates = scores
@@ -140,6 +172,7 @@ impl SemanticGraphReadTx {
 
         Ok(SemanticCoordinateSearchBatch {
             snapshot: self.coordinate_search_snapshot(),
+            coordinate_types: coordinate_types.cloned(),
             coordinates,
             truncated,
         })
@@ -237,6 +270,7 @@ impl SemanticGraphReadTx {
 
         Ok(SemanticCoordinateSearchBatch {
             snapshot: self.coordinate_search_snapshot(),
+            coordinate_types: None,
             coordinates,
             truncated,
         })
@@ -545,7 +579,8 @@ mod tests {
     };
     use buzz_semantic_query::{
         build_coordinate_search_encoder_input, EncodedCoordinateSearchQuery,
-        ProjectContextCoordinateSearchQuery, QueryCompatibilityFences,
+        ProjectContextCoordinateSearchQuery, ProjectContextCoordinateType,
+        ProjectContextCoordinateTypeFilter, QueryCompatibilityFences,
     };
     use chrono::Utc;
     use pgvector::Vector;
@@ -1179,6 +1214,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             project_id: community_id,
             query: "find the relevant starting coordinate".to_owned(),
+            coordinate_types: None,
             limit: 5,
         };
         let input = build_coordinate_search_encoder_input(&request).expect("encoder input");
@@ -1265,6 +1301,58 @@ mod tests {
                         meeting_id: missing_meeting,
                     }
         }));
+
+        let work_only =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("Work filter");
+        let filtered = read
+            .search_coordinate_starts_filtered(&query_vector, &work_only, 1)
+            .await
+            .expect("filtered K+1 Coordinate search");
+        assert_eq!(filtered.coordinate_types.as_ref(), Some(&work_only));
+        assert_eq!(filtered.coordinates.len(), 1);
+        assert!(filtered.truncated);
+        assert!(filtered
+            .coordinates
+            .iter()
+            .all(|candidate| work_only.matches(&candidate.coordinate)));
+
+        let document_only =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Document])
+                .expect("Document filter");
+        let filtered = read
+            .search_coordinate_starts_filtered(&query_vector, &document_only, 8)
+            .await
+            .expect("filtered Document Coordinate search");
+        assert!(!filtered.truncated);
+        assert_eq!(filtered.coordinates.len(), 1);
+        assert_eq!(
+            filtered.coordinates[0].coordinate,
+            ProjectContextCoordinate::Document {
+                document_id: coordinate_document,
+            }
+        );
+
+        let all_types = ProjectContextCoordinateTypeFilter::new(vec![
+            ProjectContextCoordinateType::ProjectProfile,
+            ProjectContextCoordinateType::Goal,
+            ProjectContextCoordinateType::Role,
+            ProjectContextCoordinateType::Plan,
+            ProjectContextCoordinateType::Stage,
+            ProjectContextCoordinateType::Requirement,
+            ProjectContextCoordinateType::Issue,
+            ProjectContextCoordinateType::Work,
+            ProjectContextCoordinateType::Resource,
+            ProjectContextCoordinateType::Document,
+            ProjectContextCoordinateType::Meeting,
+        ])
+        .expect("all-type filter");
+        let filtered_complete = read
+            .search_coordinate_starts_filtered(&query_vector, &all_types, 5)
+            .await
+            .expect("all-type Coordinate search");
+        assert_eq!(filtered_complete.coordinates, complete.coordinates);
+        assert_eq!(filtered_complete.truncated, complete.truncated);
         read.rollback().await.expect("roll back fixture");
     }
 }

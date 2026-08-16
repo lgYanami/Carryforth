@@ -704,6 +704,9 @@ pub enum ProjectContextCmd {
         /// Natural-language description of the task and desired starting context.
         #[arg(long)]
         query: String,
+        /// Restrict candidates to this Coordinate type; repeat to form an OR set.
+        #[arg(long = "coordinate-type", value_enum)]
+        coordinate_types: Vec<ProjectContextCoordinateTypeArg>,
         /// Maximum candidates to return.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
         limit: u8,
@@ -889,10 +892,30 @@ pub enum ProjectContextEdgeCmd {
         /// Natural-language description of the next Coordinate to find.
         #[arg(long)]
         query: String,
+        /// Restrict Edge members to this Coordinate type; repeat to form an OR set.
+        #[arg(long = "coordinate-type", value_enum)]
+        coordinate_types: Vec<ProjectContextCoordinateTypeArg>,
         /// Maximum ranked Coordinates to return.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
         limit: u8,
     },
+}
+
+/// Closed Coordinate type accepted by semantic Coordinate-selection filters.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProjectContextCoordinateTypeArg {
+    #[value(name = "project_profile")]
+    ProjectProfile,
+    Goal,
+    Role,
+    Plan,
+    Stage,
+    Requirement,
+    Issue,
+    Work,
+    Resource,
+    Document,
+    Meeting,
 }
 
 /// Lifecycle selector for semantic graph traversal.
@@ -3696,6 +3719,10 @@ mod tests {
                 edge_key.as_str(),
                 "--query",
                 "the work responsible for this incident",
+                "--coordinate-type",
+                "work",
+                "--coordinate-type",
+                "issue",
                 "--limit",
                 "12",
             ],
@@ -3705,6 +3732,10 @@ mod tests {
                 "coordinate-search",
                 "--query",
                 "authorization failure during release",
+                "--coordinate-type",
+                "work",
+                "--coordinate-type",
+                "document",
                 "--limit",
                 "12",
             ],
@@ -3812,6 +3843,16 @@ mod tests {
             "starting point",
             "--limit",
             "0",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "cf",
+            "project-context",
+            "coordinate-search",
+            "--query",
+            "starting point",
+            "--coordinate-type",
+            "all",
         ])
         .is_err());
         for args in [

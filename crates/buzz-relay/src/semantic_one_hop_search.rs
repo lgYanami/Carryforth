@@ -11,10 +11,12 @@ use buzz_db::semantic_query::{
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     build_one_hop_semantic_query_encoder_input, derive_one_hop_semantic_http_request_binding,
-    edge_coordinate_ranking_contract_digest, incident_edge_ranking_contract_digest,
-    OneHopSemanticError, OneHopSemanticObservations, OneHopSemanticScope,
-    ProjectContextOneHopSemanticQuery, ProjectContextOneHopSemanticQueryResult,
-    SemanticGraphQueryError, SemanticQueryEncoder, MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS,
+    derive_one_hop_semantic_v2_http_request_binding,
+    edge_coordinate_filtered_ranking_contract_digest, edge_coordinate_ranking_contract_digest,
+    incident_edge_ranking_contract_digest, OneHopSemanticError, OneHopSemanticObservations,
+    OneHopSemanticScope, ProjectContextOneHopSemanticQuery,
+    ProjectContextOneHopSemanticQueryResult, SemanticGraphQueryError, SemanticQueryEncoder,
+    MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS,
 };
 use nostr::Event;
 
@@ -68,9 +70,61 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
     exact_authenticated_body: &[u8],
     query: ProjectContextOneHopSemanticQuery,
 ) -> Result<Event, OneHopSemanticExecutionError> {
+    execute_one_hop_semantic_search(
+        state,
+        community_id,
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+        false,
+    )
+    .await
+}
+
+/// Execute one authenticated filtered Edge-to-Coordinate v2 selection.
+pub(crate) async fn execute_project_context_one_hop_semantic_search_v2(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    exact_authenticated_body: &[u8],
+    query: ProjectContextOneHopSemanticQuery,
+) -> Result<Event, OneHopSemanticExecutionError> {
+    execute_one_hop_semantic_search(
+        state,
+        community_id,
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+        true,
+    )
+    .await
+}
+
+async fn execute_one_hop_semantic_search(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    exact_authenticated_body: &[u8],
+    query: ProjectContextOneHopSemanticQuery,
+    filtered: bool,
+) -> Result<Event, OneHopSemanticExecutionError> {
     let query = query
         .validate_and_canonicalize()
         .map_err(OneHopSemanticExecutionError::Contract)?;
+    let request_is_filtered = matches!(
+        query.scope,
+        OneHopSemanticScope::EdgeCoordinates {
+            coordinate_types: Some(_),
+            ..
+        }
+    );
+    if filtered != request_is_filtered {
+        return Err(OneHopSemanticExecutionError::InvalidRequest);
+    }
     if query.project_id != *community_id.as_uuid() {
         return Err(OneHopSemanticExecutionError::InvalidRequest);
     }
@@ -137,12 +191,27 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
                     Err(OneHopSemanticExecutionError::ScopeTooLarge)
                 }
             })?,
-        OneHopSemanticScope::EdgeCoordinates { edge_key } => execution
-            .before_deadline(read.search_edge_coordinates_one_hop(
-                *edge_key,
-                &query_vector,
-                query.limit,
-            ))
+        OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types,
+        } => execution
+            .before_deadline(async {
+                match coordinate_types.as_ref() {
+                    Some(coordinate_types) => {
+                        read.search_edge_coordinates_one_hop_filtered(
+                            *edge_key,
+                            &query_vector,
+                            coordinate_types,
+                            query.limit,
+                        )
+                        .await
+                    }
+                    None => {
+                        read.search_edge_coordinates_one_hop(*edge_key, &query_vector, query.limit)
+                            .await
+                    }
+                }
+            })
             .await
             .map_err(map_one_shot)?
             .map_err(classify_database)
@@ -170,16 +239,30 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
         .await
         .map_err(map_one_shot)?;
 
-    let request_binding_digest = derive_one_hop_semantic_http_request_binding(
-        query.project_id,
-        &reader_pubkey,
-        &execution.relay_pubkey().to_bytes(),
-        Digest32::from_bytes(nip98_auth_event_id),
-        exact_authenticated_body,
-    )
+    let request_binding_digest = if filtered {
+        derive_one_hop_semantic_v2_http_request_binding(
+            query.project_id,
+            &reader_pubkey,
+            &execution.relay_pubkey().to_bytes(),
+            Digest32::from_bytes(nip98_auth_event_id),
+            exact_authenticated_body,
+        )
+    } else {
+        derive_one_hop_semantic_http_request_binding(
+            query.project_id,
+            &reader_pubkey,
+            &execution.relay_pubkey().to_bytes(),
+            Digest32::from_bytes(nip98_auth_event_id),
+            exact_authenticated_body,
+        )
+    }
     .map_err(OneHopSemanticExecutionError::Contract)?;
     let ranking_contract_digest = match query.scope {
         OneHopSemanticScope::IncidentEdges { .. } => incident_edge_ranking_contract_digest(),
+        OneHopSemanticScope::EdgeCoordinates {
+            coordinate_types: Some(_),
+            ..
+        } => edge_coordinate_filtered_ranking_contract_digest(),
         OneHopSemanticScope::EdgeCoordinates { .. } => edge_coordinate_ranking_contract_digest(),
     };
     let result = ProjectContextOneHopSemanticQueryResult {
@@ -204,17 +287,23 @@ pub(crate) async fn execute_project_context_one_hop_semantic_search(
     result
         .validate_for_request(&query)
         .map_err(|_| verification_failed("result_contract"))?;
-    let builder =
+    let builder = if filtered {
+        buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_search_v2_result(
+            &result,
+            &authenticated_caller,
+        )
+    } else {
         buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_search_result(
             &result,
             &authenticated_caller,
         )
-        .map_err(|error| match error {
-            buzz_sdk::SdkError::ContentTooLarge { .. } => {
-                OneHopSemanticExecutionError::ResponseTooLarge
-            }
-            _ => verification_failed("result_event_builder"),
-        })?;
+    }
+    .map_err(|error| match error {
+        buzz_sdk::SdkError::ContentTooLarge { .. } => {
+            OneHopSemanticExecutionError::ResponseTooLarge
+        }
+        _ => verification_failed("result_event_builder"),
+    })?;
     builder
         .sign_with_keys(&state.relay_keypair)
         .map_err(|_| OneHopSemanticExecutionError::Signing)

@@ -61,7 +61,7 @@ const NEST_AGENTS_VERSION: u32 = 5;
 const NEST_SKILL_VERSION: u32 = 5;
 
 /// Template content version for the search-project-context SKILL.md.
-const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 1;
+const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 2;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";

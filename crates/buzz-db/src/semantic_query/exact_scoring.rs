@@ -6,9 +6,10 @@ use buzz_core::CommunityId;
 use buzz_project_context::ProjectContextCoordinate;
 use buzz_semantic::{Digest32, EmbeddingVector, SemanticSourceIdentity};
 use buzz_semantic_query::{
-    coordinate_search_query_contract_digest, LifecycleFilter, ProviderEncodedSemanticInput,
-    ProviderEncodedSemanticInputBundle, Score, SemanticModelSpaceFences, SemanticQueryInputKind,
-    MAX_ONE_HOP_EDGE_COORDINATES, MAX_ONE_HOP_RELATION_BINDINGS, MAX_QUERY_CHANNELS,
+    coordinate_search_query_contract_digest, LifecycleFilter, ProjectContextCoordinateTypeFilter,
+    ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle, Score,
+    SemanticModelSpaceFences, SemanticQueryInputKind, MAX_ONE_HOP_EDGE_COORDINATES,
+    MAX_ONE_HOP_RELATION_BINDINGS, MAX_QUERY_CHANNELS,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -296,11 +297,14 @@ pub(super) enum SemanticExactExplicitSourceScope<'a> {
 /// Public operations retain their own ranking, floor, budget, and projection
 /// policies above this mathematical/currentness kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SemanticExactScoreScope {
+pub(super) enum SemanticExactScoreScope<'a> {
     /// Existing graph recall and explicit-source scoring semantics.
     GraphSources,
     /// Every current eligible Coordinate on at least one active Edge.
-    GlobalGraphCoordinates,
+    GlobalGraphCoordinates {
+        /// Optional closed Coordinate types applied before scoring and K+1.
+        coordinate_types: Option<&'a ProjectContextCoordinateTypeFilter>,
+    },
 }
 
 /// Lightweight exact score returned by the global Coordinate scope.
@@ -314,9 +318,16 @@ pub(crate) struct SemanticGlobalCoordinateScore {
     pub(crate) channel_rank: u32,
 }
 
-impl SemanticExactScoreScope {
+impl<'a> SemanticExactScoreScope<'a> {
     pub(super) const fn coordinate_only(self) -> bool {
-        matches!(self, Self::GlobalGraphCoordinates)
+        matches!(self, Self::GlobalGraphCoordinates { .. })
+    }
+
+    pub(super) const fn coordinate_types(self) -> Option<&'a ProjectContextCoordinateTypeFilter> {
+        match self {
+            Self::GraphSources => None,
+            Self::GlobalGraphCoordinates { coordinate_types } => coordinate_types,
+        }
     }
 }
 
@@ -383,6 +394,7 @@ impl SemanticGraphReadTx {
     pub(crate) async fn score_global_graph_coordinates_exact(
         &mut self,
         query_vector: &GenerationBoundQueryVector,
+        coordinate_types: Option<&ProjectContextCoordinateTypeFilter>,
         observed_limit: u32,
     ) -> Result<Vec<SemanticGlobalCoordinateScore>> {
         if observed_limit == 0
@@ -398,6 +410,11 @@ impl SemanticGraphReadTx {
                     .to_owned(),
             ));
         }
+        if coordinate_types.is_some_and(|filter| !filter.is_canonical()) {
+            return Err(DbError::InvalidData(
+                "global Coordinate type filter is not canonical".to_owned(),
+            ));
+        }
         let rows = self
             .query_generation_bound_source_score_rows(
                 LifecycleFilter::AllCurrent,
@@ -405,7 +422,7 @@ impl SemanticGraphReadTx {
                 &[query_vector],
                 None,
                 Some(observed_limit),
-                SemanticExactScoreScope::GlobalGraphCoordinates,
+                SemanticExactScoreScope::GlobalGraphCoordinates { coordinate_types },
             )
             .await?;
         rows.iter()

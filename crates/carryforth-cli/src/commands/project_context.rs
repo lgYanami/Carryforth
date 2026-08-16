@@ -34,6 +34,7 @@ use buzz_sdk::project_document::{
 };
 use buzz_sdk::semantic_coordinate_search::{
     parse_project_context_coordinate_search_result,
+    parse_project_context_coordinate_search_v2_result,
     ProjectContextCoordinateSearchHttpRequestObservation,
 };
 use buzz_sdk::semantic_graph::{
@@ -41,8 +42,8 @@ use buzz_sdk::semantic_graph::{
 };
 use buzz_semantic_query::{
     LifecycleFilter, ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult,
-    RootStructuralEntrypoint, SemanticGraphQuery, SemanticGraphQueryBudget,
-    SemanticGraphQueryResult,
+    ProjectContextCoordinateType, ProjectContextCoordinateTypeFilter, RootStructuralEntrypoint,
+    SemanticGraphQuery, SemanticGraphQueryBudget, SemanticGraphQueryResult,
 };
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -54,13 +55,14 @@ use crate::client::{CarryforthClient, ProjectCommandDelivery};
 use crate::commands::meetings::{fetch_meeting_context_summaries, MeetingSummary};
 use crate::commands::project_view_snapshot::{
     read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
-    COORDINATE_SEARCH_HTTP_EXTENSION, ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
-    SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
+    COORDINATE_SEARCH_HTTP_EXTENSION, COORDINATE_SEARCH_V2_HTTP_EXTENSION,
+    ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION, SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION,
 };
 use crate::error::CliError;
 use crate::{
     OutputFormat, ProjectContextAttributionArgs, ProjectContextCmd, ProjectContextCoordinateCmd,
-    ProjectContextEdgeCmd, SemanticGraphBudgetArgs, SemanticLifecycleArg,
+    ProjectContextCoordinateTypeArg, ProjectContextEdgeCmd, SemanticGraphBudgetArgs,
+    SemanticLifecycleArg,
 };
 
 const QUERY_PAGE_SIZE: u16 = 500;
@@ -329,12 +331,25 @@ pub async fn dispatch(
             ProjectContextEdgeCmd::CoordinateSearch {
                 edge_key,
                 query,
+                coordinate_types,
                 limit,
-            } => one_hop::run_edge_coordinate_search(client, &edge_key, query, limit, format).await,
+            } => {
+                one_hop::run_edge_coordinate_search(
+                    client,
+                    &edge_key,
+                    query,
+                    coordinate_types,
+                    limit,
+                    format,
+                )
+                .await
+            }
         },
-        ProjectContextCmd::CoordinateSearch { query, limit } => {
-            run_coordinate_search(client, query, limit, format).await
-        }
+        ProjectContextCmd::CoordinateSearch {
+            query,
+            coordinate_types,
+            limit,
+        } => run_coordinate_search(client, query, coordinate_types, limit, format).await,
         ProjectContextCmd::SemanticQuery {
             problem,
             initial_coordinates,
@@ -401,10 +416,12 @@ pub async fn dispatch(
 async fn run_coordinate_search(
     client: &CarryforthClient,
     query: String,
+    coordinate_types: Vec<ProjectContextCoordinateTypeArg>,
     limit: u8,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let identity = require_coordinate_search_identity(client).await?;
+    let coordinate_types = coordinate_type_filter(coordinate_types)?;
+    let identity = require_coordinate_search_identity(client, coordinate_types.is_some()).await?;
     let project = read_verified_v3_snapshot(client, identity)
         .await
         .map_err(|error| {
@@ -417,6 +434,7 @@ async fn run_coordinate_search(
         request_id: Uuid::new_v4(),
         project_id,
         query,
+        coordinate_types,
         limit,
     }
     .validate_and_canonicalize()
@@ -425,23 +443,29 @@ async fn run_coordinate_search(
         .coordinate_search_once(&identity.relay_pubkey, request)
         .await?;
     let event = parse_single_semantic_result_event(&response.response_body)?;
-    let result = parse_project_context_coordinate_search_result(
-        &event,
-        &identity.relay_pubkey,
-        ProjectContextCoordinateSearchHttpRequestObservation {
-            project_id: CommunityId::from_uuid(project_id),
-            authenticated_caller: client.public_key(),
-            request: &response.request,
-            nip98_auth_event_id: response.nip98_auth_event_id,
-            exact_authenticated_body: &response.exact_body,
-        },
-    )
+    let observation = ProjectContextCoordinateSearchHttpRequestObservation {
+        project_id: CommunityId::from_uuid(project_id),
+        authenticated_caller: client.public_key(),
+        request: &response.request,
+        nip98_auth_event_id: response.nip98_auth_event_id,
+        exact_authenticated_body: &response.exact_body,
+    };
+    let result = if response.request.coordinate_types.is_some() {
+        parse_project_context_coordinate_search_v2_result(
+            &event,
+            &identity.relay_pubkey,
+            observation,
+        )
+    } else {
+        parse_project_context_coordinate_search_result(&event, &identity.relay_pubkey, observation)
+    }
     .map_err(|error| integrity_error(format!("invalid Coordinate-search result: {error}")))?;
     print_coordinate_search_result(&result, format)
 }
 
 async fn require_coordinate_search_identity(
     client: &CarryforthClient,
+    filtered: bool,
 ) -> Result<ProjectViewIdentity, CliError> {
     let identity = read_identity(client).await?.ok_or_else(|| {
         CliError::Other("unavailable:coordinate_search:project_view_v3_not_ready".to_owned())
@@ -451,17 +475,58 @@ async fn require_coordinate_search_identity(
             "unsupported:coordinate_search:project_view_v3_required".to_owned(),
         ));
     }
-    if !identity.coordinate_search_http_enabled {
+    let capability_available = if filtered {
+        identity.coordinate_search_v2_http_enabled
+    } else {
+        identity.coordinate_search_http_enabled
+    };
+    if !capability_available {
         if identity.extensions_temporarily_unavailable {
             return Err(CliError::Unavailable(
                 "Relay Coordinate-search capability observation could not be completed".to_owned(),
             ));
         }
+        let extension = if filtered {
+            COORDINATE_SEARCH_V2_HTTP_EXTENSION
+        } else {
+            COORDINATE_SEARCH_HTTP_EXTENSION
+        };
         return Err(CliError::Other(format!(
-            "unsupported:coordinate_search:relay_does_not_advertise_{COORDINATE_SEARCH_HTTP_EXTENSION}"
+            "unsupported:coordinate_search:relay_does_not_advertise_{extension}"
         )));
     }
     Ok(identity)
+}
+
+fn coordinate_type_filter(
+    coordinate_types: Vec<ProjectContextCoordinateTypeArg>,
+) -> Result<Option<ProjectContextCoordinateTypeFilter>, CliError> {
+    if coordinate_types.is_empty() {
+        return Ok(None);
+    }
+    let types = coordinate_types
+        .into_iter()
+        .map(|coordinate_type| match coordinate_type {
+            ProjectContextCoordinateTypeArg::ProjectProfile => {
+                ProjectContextCoordinateType::ProjectProfile
+            }
+            ProjectContextCoordinateTypeArg::Goal => ProjectContextCoordinateType::Goal,
+            ProjectContextCoordinateTypeArg::Role => ProjectContextCoordinateType::Role,
+            ProjectContextCoordinateTypeArg::Plan => ProjectContextCoordinateType::Plan,
+            ProjectContextCoordinateTypeArg::Stage => ProjectContextCoordinateType::Stage,
+            ProjectContextCoordinateTypeArg::Requirement => {
+                ProjectContextCoordinateType::Requirement
+            }
+            ProjectContextCoordinateTypeArg::Issue => ProjectContextCoordinateType::Issue,
+            ProjectContextCoordinateTypeArg::Work => ProjectContextCoordinateType::Work,
+            ProjectContextCoordinateTypeArg::Resource => ProjectContextCoordinateType::Resource,
+            ProjectContextCoordinateTypeArg::Document => ProjectContextCoordinateType::Document,
+            ProjectContextCoordinateTypeArg::Meeting => ProjectContextCoordinateType::Meeting,
+        })
+        .collect();
+    ProjectContextCoordinateTypeFilter::new(types)
+        .map(Some)
+        .map_err(|error| CliError::Usage(format!("invalid Coordinate type filter: {error}")))
 }
 
 fn print_coordinate_search_result(
@@ -2157,7 +2222,9 @@ mod tests {
             document_enabled: true,
             semantic_query_http_enabled: false,
             coordinate_search_http_enabled: false,
+            coordinate_search_v2_http_enabled: false,
             one_hop_semantic_search_http_enabled: false,
+            one_hop_semantic_search_v2_http_enabled: false,
             extensions_temporarily_unavailable: false,
         }
     }
@@ -2205,6 +2272,28 @@ mod tests {
         assert!(parse_coordinate_token(&format!("unknown:{id}")).is_err());
         assert!(parse_coordinate_token("requirement:not-a-uuid").is_err());
         assert!(parse_coordinate_token(&format!("requirement:{}", Uuid::nil())).is_err());
+    }
+
+    #[test]
+    fn coordinate_type_flags_form_one_canonical_or_filter() {
+        let filter = coordinate_type_filter(vec![
+            ProjectContextCoordinateTypeArg::Document,
+            ProjectContextCoordinateTypeArg::Work,
+            ProjectContextCoordinateTypeArg::Work,
+        ])
+        .expect("Coordinate type filter")
+        .expect("present filter");
+        assert_eq!(
+            filter.types(),
+            &[
+                ProjectContextCoordinateType::Work,
+                ProjectContextCoordinateType::Document,
+            ]
+        );
+        assert_eq!(
+            coordinate_type_filter(Vec::new()).expect("unfiltered scope"),
+            None
+        );
     }
 
     #[test]

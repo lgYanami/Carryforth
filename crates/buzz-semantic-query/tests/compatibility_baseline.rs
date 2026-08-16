@@ -67,6 +67,7 @@ async fn manifest() -> Value {
         request_id,
         project_id,
         query: format!("  {SYNTHETIC_PROBLEM}  "),
+        coordinate_types: None,
         limit: DEFAULT_COORDINATE_SEARCH_LIMIT,
     }
     .validate_and_canonicalize()
@@ -93,7 +94,10 @@ async fn manifest() -> Value {
         project_id,
         query: SYNTHETIC_PROBLEM.to_owned(),
         limit: DEFAULT_ONE_HOP_SEMANTIC_LIMIT,
-        scope: OneHopSemanticScope::EdgeCoordinates { edge_key },
+        scope: OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types: None,
+        },
     }
     .validate_and_canonicalize()
     .expect("Edge Coordinate request");

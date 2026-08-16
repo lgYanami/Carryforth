@@ -10,9 +10,10 @@ use buzz_db::semantic_query::SemanticGraphReadTimeouts;
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     build_coordinate_search_encoder_input, derive_coordinate_search_http_request_binding,
-    CoordinateSearchError, ProjectContextCoordinateSearchObservations,
-    ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult,
-    SemanticGraphQueryError, MAX_COORDINATE_SEARCH_WALL_TIME_MS,
+    derive_coordinate_search_v2_http_request_binding, CoordinateSearchError,
+    ProjectContextCoordinateSearchObservations, ProjectContextCoordinateSearchQuery,
+    ProjectContextCoordinateSearchResult, SemanticGraphQueryError,
+    MAX_COORDINATE_SEARCH_WALL_TIME_MS,
 };
 use nostr::Event;
 
@@ -53,9 +54,54 @@ pub(crate) async fn execute_project_context_coordinate_search(
     exact_authenticated_body: &[u8],
     query: ProjectContextCoordinateSearchQuery,
 ) -> Result<Event, CoordinateSearchExecutionError> {
+    execute_coordinate_search(
+        state,
+        community_id,
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+        false,
+    )
+    .await
+}
+
+/// Execute one authenticated filtered Coordinate-search v2 request.
+pub(crate) async fn execute_project_context_coordinate_search_v2(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    exact_authenticated_body: &[u8],
+    query: ProjectContextCoordinateSearchQuery,
+) -> Result<Event, CoordinateSearchExecutionError> {
+    execute_coordinate_search(
+        state,
+        community_id,
+        authenticated_caller,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+        query,
+        true,
+    )
+    .await
+}
+
+async fn execute_coordinate_search(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    authenticated_caller: nostr::PublicKey,
+    nip98_auth_event_id: [u8; 32],
+    exact_authenticated_body: &[u8],
+    query: ProjectContextCoordinateSearchQuery,
+    filtered: bool,
+) -> Result<Event, CoordinateSearchExecutionError> {
     let query = query
         .validate_and_canonicalize()
         .map_err(CoordinateSearchExecutionError::Contract)?;
+    if filtered != query.coordinate_types.is_some() {
+        return Err(CoordinateSearchExecutionError::InvalidRequest);
+    }
     if query.project_id != *community_id.as_uuid() {
         return Err(CoordinateSearchExecutionError::InvalidRequest);
     }
@@ -108,8 +154,20 @@ pub(crate) async fn execute_project_context_coordinate_search(
         .await
         .map_err(map_one_shot)?
         .map_err(classify_database)?;
+    let search = async {
+        match query.coordinate_types.as_ref() {
+            Some(coordinate_types) => {
+                read.search_coordinate_starts_filtered(&query_vector, coordinate_types, query.limit)
+                    .await
+            }
+            None => {
+                read.search_coordinate_starts(&query_vector, query.limit)
+                    .await
+            }
+        }
+    };
     let batch = execution
-        .before_deadline(read.search_coordinate_starts(&query_vector, query.limit))
+        .before_deadline(search)
         .await
         .map_err(map_one_shot)?
         .map_err(classify_database)?;
@@ -125,12 +183,21 @@ pub(crate) async fn execute_project_context_coordinate_search(
         .await
         .map_err(map_one_shot)?;
 
-    let request_binding_digest = derive_coordinate_search_http_request_binding(
-        query.project_id,
-        &reader_pubkey,
-        Digest32::from_bytes(nip98_auth_event_id),
-        exact_authenticated_body,
-    )
+    let request_binding_digest = if filtered {
+        derive_coordinate_search_v2_http_request_binding(
+            query.project_id,
+            &reader_pubkey,
+            Digest32::from_bytes(nip98_auth_event_id),
+            exact_authenticated_body,
+        )
+    } else {
+        derive_coordinate_search_http_request_binding(
+            query.project_id,
+            &reader_pubkey,
+            Digest32::from_bytes(nip98_auth_event_id),
+            exact_authenticated_body,
+        )
+    }
     .map_err(CoordinateSearchExecutionError::Contract)?;
     let result = ProjectContextCoordinateSearchResult {
         request_id: query.request_id,
@@ -140,6 +207,7 @@ pub(crate) async fn execute_project_context_coordinate_search(
             semantic_generation_id: batch.snapshot.generation_id,
             embedding_space_fence: batch.snapshot.query_fences.embedding_space_fence,
             query_contract_digest: query_vector.query_contract_digest(),
+            coordinate_types: batch.coordinate_types,
             projection_generation: snapshot_projection_generation,
             project_context_revision: batch.snapshot.project_context_revision,
             snapshot_observed_at: batch.snapshot.observed_at,
@@ -150,12 +218,18 @@ pub(crate) async fn execute_project_context_coordinate_search(
     result
         .validate_for_request(&query)
         .map_err(CoordinateSearchExecutionError::Contract)?;
-    let builder =
+    let builder = if filtered {
+        buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_v2_result(
+            &result,
+            &authenticated_caller,
+        )
+    } else {
         buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_result(
             &result,
             &authenticated_caller,
         )
-        .map_err(|_| CoordinateSearchExecutionError::Signing)?;
+    }
+    .map_err(|_| CoordinateSearchExecutionError::Signing)?;
     builder
         .sign_with_keys(&state.relay_keypair)
         .map_err(|_| CoordinateSearchExecutionError::Signing)
