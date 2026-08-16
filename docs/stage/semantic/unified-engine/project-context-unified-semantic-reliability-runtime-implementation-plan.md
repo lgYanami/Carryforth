@@ -1,6 +1,6 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0、R1、R2 已交付；R3–R6 待实施
+> 状态：R0、R1、R2、R3 已交付；R4–R6 待实施
 >
 > 日期：2026-08-16
 >
@@ -892,6 +892,51 @@ snapshot attempt count
 退出门：四operation均接入共同Provider执行器，production行为为零差异。
 
 ### R3：deadline、cancellation与release-finalize
+
+> 当前状态：已交付（2026-08-16）。`crates/buzz-relay/src/semantic_query_runtime.rs`
+> 新增 §4.1 stage仲裁：`SemanticStageAbort`（`Deadline`/`Cancelled`）、
+> `SemanticExecutionContext::admit_stage`（已取消/已过期窗口拒绝开始新阶段，
+> deadline赢取同时落latch）、`run_stage`（biased `tokio::select!`：
+> cancellation确定性赢得平局，mid-flight future被drop = sqlx abort/RAII
+> mandatory cleanup）、`propagate_relay_shutdown`（host `shutting_down`
+> AtomicBool在阶段准入时转为request cancellation）。交付项逐条落地：
+> （1）shutdown经现有 `state.shutting_down` 标志在one-shot `prepare`、
+> complete-path `root_query_attempt`、bridge postflight准入处传播；
+> caller disconnect不引入新token——hyper在连接关闭时drop handler
+> future，随后的RAII/permit drop即mandatory cleanup，R3以文档固化该
+> 语义；（2）Provider reservation/confirmation/wait、DB acquire/query、
+> traversal、hydration统一经同一context仲裁（complete-path全部
+> `run_before_work_deadline` 站点改为 `run_root_stage(context, …)`，
+> traversal经 `TraversalControl{context, shutdown, work_deadline}` 借用
+> session context）；（3）（4）one-shot两surface的build/sign块在
+> `confirm_release`（release permit + `begin_finalize` 仲裁）与
+> `finalize_completed`（过期窗口检查 + discard post-check + `complete`，
+> permit同步消费）之间零await，满足DB"immediately following synchronous
+> signing"合同，R0 known gap（one-shot permit-drop）就此关闭；（5）
+> complete-path partial-result/deadline tails逐字保持：cancellation映射到
+> 现有 `WallTimeExhausted` global-stop tail（同一partial forest与
+> completion reason），latch让后续release/sign fence拒绝签名；
+> `classify_ticket_failure` 终端错误路径保留deadline-only
+> `run_before_work_deadline`；traversal DB子步骤与snapshot-close commit
+> 逐字未动；（6）新增cancel/fault注入测试：`admit_stage` 两拒绝路径、
+> `run_stage` cancellation/window-expiry下pending future被drop（Drop
+> guard标志）、`finalization_latch_discards_only_after_post_check`、
+> `encode_once` latch/source断言（R1事实固化：deadline赢取后存储的
+> latch状态是 `Cancelling`+`DeadlineExceeded`，`timeout()`只重标记返回
+> 值）。中立taxonomy新增 `Cancelled(SemanticCancellationSource)`
+> （egress与encode-once两处），各surface映射到已冻结deadline等价公开
+> 错误（one-shot `Timeout`、complete-path `QueryDeadlineExceeded`、
+> bridge 504 `timeout:semantic_graph_query:query_deadline_exceeded`）——
+> 已取消的请求没有留下的caller可区分。已知边界差异（公开不可见）：
+> 已取消/关机/准入即过期的请求现在停止开始新阶段并观察既有deadline
+> 错误（此前会继续跑满）；bridge release-confirm由裸
+> `timeout_at(absolute)` 换为 `run_stage(Absolute)`（同一instant，新增
+> 准入拒绝与cancellation竞速）。验证：`cargo clippy -D warnings` +
+> `cargo fmt` + `cargo test -p buzz-relay --lib semantic`（101 tests）
+> + 三个gate（compatibility、computation、reliability `all`，含
+> freeze-diff）实际运行通过；`just test-unit` 通过（8个
+> media/admin DB依赖测试因本环境无Postgres以PoolTimedOut失败，
+> 属`just test`集成层、与语义无关、与R3前基线一致）。
 
 目标：让一次operation的现有deadline覆盖所有底层等待和收尾，并正确处理取消。
 

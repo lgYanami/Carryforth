@@ -45,6 +45,8 @@ use buzz_semantic_query::{
     SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR,
     RESPONSE_TAIL_RESERVE_MS, SEMANTIC_COMPUTATION_ROUTES, SNAPSHOT_CLOSE_RESERVE_MS,
 };
+use std::sync::Arc;
+
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 
@@ -54,9 +56,10 @@ use crate::semantic_graph_observability::{
     SemanticGraphQueryMetricError,
 };
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, ProviderEgressObservation, ProviderEgressPlan,
-    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
-    SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+    encode_once, execute_provider_egress, propagate_relay_shutdown, ProviderEgressObservation,
+    ProviderEgressPlan, SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticEncodeOnceFailure,
+    SemanticExecutionContext, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+    SemanticStageAbort,
 };
 use crate::AppState;
 
@@ -141,10 +144,11 @@ async fn begin_semantic_graph_root_query_inner(
                     outcome: stage.outcome,
                     query_vectors: stage.query_vectors,
                     channels: stage.channels,
-                    work_deadline: deadlines.work,
                     snapshot_close_deadline: deadlines.snapshot_close,
                     absolute_deadline: deadlines.absolute,
                     snapshot_started_at: stage.snapshot_started_at,
+                    context,
+                    shutdown: Arc::clone(&state.shutting_down),
                     _process_permit: process_permit,
                     _traversal_permit: stage.traversal_permit,
                 });
@@ -178,8 +182,16 @@ async fn root_query_attempt(
         .ledger()
         .begin_operation_attempt()
         .map_err(|_| SemanticGraphRootQueryError::QueryProviderBusy)?;
-    let bootstrap_ticket = run_before_work_deadline(
-        deadlines.work,
+    propagate_relay_shutdown(state, context);
+    if let Err(abort) = context.admit_stage() {
+        return Err(match abort {
+            SemanticStageAbort::Deadline(_) | SemanticStageAbort::Cancelled(_) => {
+                SemanticGraphRootQueryError::QueryDeadlineExceeded
+            }
+        });
+    }
+    let bootstrap_ticket = run_root_stage(
+        context,
         state.db.semantic_graph_query_ticket(
             community_id,
             reader_pubkey,
@@ -193,7 +205,7 @@ async fn root_query_attempt(
         &bootstrap_ticket,
         reader_pubkey,
         &query.context_coordinates,
-        deadlines.work,
+        context,
     )
     .await?;
     if provider.source_contract() != &ticket.generation.model_contract {
@@ -244,7 +256,7 @@ async fn root_query_attempt(
     );
     let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
     let encoded = match encode_once(
-        deadlines.work.into_std(),
+        context,
         ProviderEgressObservation::CompletePathQuery,
         encode_complete_path_inputs(
             provider,
@@ -262,6 +274,9 @@ async fn root_query_attempt(
         Err(SemanticEncodeOnceFailure::Provider(error)) => {
             record_provider_failure(provider_failure_class(&error));
             return Err(map_encoder_error(error));
+        }
+        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
+            return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
         }
     };
     drop(_provider_timer);
@@ -290,7 +305,7 @@ async fn root_query_attempt(
     metrics::gauge!("buzz_semantic_graph_traversal_limit")
         .set(state.config.semantic_graph_traversal_max_in_flight as f64);
     let traversal_permit = SemanticGraphTraversalPermit::new(traversal_permit);
-    let read = begin_generation_bound_read(state, &ticket, reader_pubkey, deadlines.work).await?;
+    let read = begin_generation_bound_read(state, &ticket, reader_pubkey, context).await?;
     build_stage_c_roots(
         StageCReadAdmission {
             read,
@@ -301,7 +316,7 @@ async fn root_query_attempt(
         channels,
         query_vectors,
         &unsupported_conditioned,
-        deadlines,
+        context,
     )
     .await
 }
@@ -344,12 +359,14 @@ async fn classify_ticket_failure(
 /// sequence; this arm only mirrors that classifier's terminal fallback.
 /// `AttemptLedgerExhausted` has no pre-R2 counterpart — it is unreachable
 /// under the R2 zero-policy caps and maps onto the admission failure until
-/// R4 owns real retry decisions.
+/// R4 owns real retry decisions. R3 adds `Cancelled`: a cancelled,
+/// disconnected, or shutting-down request keeps the frozen deadline error.
 fn map_provider_egress_failure(
     failure: SemanticProviderEgressFailure,
 ) -> SemanticGraphRootQueryError {
     match failure {
-        SemanticProviderEgressFailure::DeadlineExceeded => {
+        SemanticProviderEgressFailure::DeadlineExceeded
+        | SemanticProviderEgressFailure::Cancelled(_) => {
             SemanticGraphRootQueryError::QueryDeadlineExceeded
         }
         SemanticProviderEgressFailure::Database(error) => {
@@ -391,12 +408,16 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) outcome: SemanticGraphRootQueryOutcome,
     pub(crate) query_vectors: SemanticGraphQueryVectorBundle,
     pub(crate) channels: Vec<QueryChannelBinding>,
-    /// Last instant at which traversal may start or continue database work.
-    pub(crate) work_deadline: Instant,
     /// Later deadline reserved exclusively for closing the read-only snapshot.
     pub(crate) snapshot_close_deadline: Instant,
     pub(crate) absolute_deadline: Instant,
     pub(crate) snapshot_started_at: std::time::Instant,
+    /// Reliability context of the logical request, carried into traversal
+    /// and the later release/sign fence so every phase arbitrates the same
+    /// latch and cancellation token.
+    pub(crate) context: SemanticExecutionContext,
+    /// Host-owned shutdown flag consulted between traversal units.
+    pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
     _process_permit: OwnedSemaphorePermit,
     _traversal_permit: SemanticGraphTraversalPermit,
 }
@@ -924,7 +945,7 @@ async fn select_automatic_roots_incremental(
     read: &mut SemanticGraphReadTx,
     candidates: &[CandidateScores],
     maximum: u16,
-    work_deadline: Instant,
+    context: &SemanticExecutionContext,
 ) -> Result<Vec<SelectedAutomaticRoot>, SemanticGraphRootQueryError> {
     let qualifying = candidates
         .iter()
@@ -953,7 +974,7 @@ async fn select_automatic_roots_incremental(
             &qualifying,
             state.selected.last().map(|selected| &selected.source),
             &mut state.pair_scores,
-            work_deadline,
+            context,
         )
         .await?;
     }
@@ -972,7 +993,7 @@ async fn select_automatic_roots_incremental(
                 &qualifying,
                 Some(&source),
                 &mut state.pair_scores,
-                work_deadline,
+                context,
             )
             .await?;
         }
@@ -990,7 +1011,7 @@ async fn select_automatic_roots_incremental(
                 &qualifying,
                 Some(&source),
                 &mut state.pair_scores,
-                work_deadline,
+                context,
             )
             .await?;
         }
@@ -1003,7 +1024,7 @@ async fn load_redundancy_for_selected(
     candidates: &[CandidateScores],
     selected: Option<&SemanticSourceIdentity>,
     pair_scores: &mut HashMap<SourcePairKey, Score>,
-    work_deadline: Instant,
+    context: &SemanticExecutionContext,
 ) -> Result<(), SemanticGraphRootQueryError> {
     let Some(selected) = selected else {
         return Ok(());
@@ -1026,9 +1047,7 @@ async fn load_redundancy_for_selected(
         .iter()
         .map(|pair| SourcePairKey::new(&pair.left, &pair.right))
         .collect::<HashSet<_>>();
-    let observed =
-        run_before_work_deadline(work_deadline, read.score_current_source_pairs_exact(&pairs))
-            .await??;
+    let observed = run_root_stage(context, read.score_current_source_pairs_exact(&pairs)).await??;
     record_db_distance_rows(SemanticGraphDistanceStage::RootRedundancy, observed.len());
     if observed.len() != expected.len() {
         return Err(invalid_state("root redundancy score result is incomplete"));
@@ -1566,15 +1585,15 @@ async fn build_stage_c_roots(
     channels: Vec<QueryChannelBinding>,
     query_vectors: SemanticGraphQueryVectorBundle,
     unsupported_conditioned: &HashSet<ProjectContextCoordinate>,
-    deadlines: QueryDeadlines,
+    context: &SemanticExecutionContext,
 ) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
     let StageCReadAdmission {
         mut read,
         traversal_permit,
     } = admission;
     let snapshot_started_at = std::time::Instant::now();
-    let observed_context = run_before_work_deadline(
-        deadlines.work,
+    let observed_context = run_root_stage(
+        context,
         read.observe_context_coordinates(&query.context_coordinates),
     )
     .await??;
@@ -1583,8 +1602,8 @@ async fn build_stage_c_roots(
         return Err(SemanticGraphRootQueryError::ContextSourceChanged);
     }
 
-    let initial = run_before_work_deadline(
-        deadlines.work,
+    let initial = run_root_stage(
+        context,
         read.observe_initial_coordinates(&query.initial_coordinates),
     )
     .await??;
@@ -1594,8 +1613,8 @@ async fn build_stage_c_roots(
         .map(|root| root.source.clone())
         .collect::<Vec<_>>();
 
-    let recall = run_before_work_deadline(
-        deadlines.work,
+    let recall = run_root_stage(
+        context,
         read.recall_current_graph_sources_exact(
             query.lifecycle_filter,
             &explicit_sources,
@@ -1613,8 +1632,8 @@ async fn build_stage_c_roots(
         .collect::<Vec<_>>();
     candidate_sources.sort_by(compare_sources);
     candidate_sources.dedup();
-    let matrix = run_before_work_deadline(
-        deadlines.work,
+    let matrix = run_root_stage(
+        context,
         read.score_candidate_matrix_exact(
             query.lifecycle_filter,
             &explicit_sources,
@@ -1629,7 +1648,7 @@ async fn build_stage_c_roots(
         &mut read,
         &candidates,
         query.budget.max_semantic_roots,
-        deadlines.work,
+        context,
     )
     .await?;
     let selected_scores = selected_automatic
@@ -1642,13 +1661,13 @@ async fn build_stage_c_roots(
                 .ok_or_else(|| invalid_state("selected root lost its exact score"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let automatic_hydration = run_before_work_deadline(
-        deadlines.work,
+    let automatic_hydration = run_root_stage(
+        context,
         read.hydrate_current_exact_sources(&selected_scores),
     )
     .await??;
-    let db_coverage = run_before_work_deadline(
-        deadlines.work,
+    let db_coverage = run_root_stage(
+        context,
         read.semantic_graph_coverage(query.lifecycle_filter, &explicit_sources),
     )
     .await??;
@@ -1764,7 +1783,7 @@ async fn observe_context_snapshot(
     ticket: &SemanticGraphQueryTicket,
     reader_pubkey: &[u8],
     coordinates: &[ProjectContextCoordinate],
-    work_deadline: Instant,
+    context: &SemanticExecutionContext,
 ) -> Result<
     (
         SemanticGraphQueryTicket,
@@ -1772,12 +1791,11 @@ async fn observe_context_snapshot(
     ),
     SemanticGraphRootQueryError,
 > {
-    let mut read = begin_generation_bound_read(state, ticket, reader_pubkey, work_deadline).await?;
+    let mut read = begin_generation_bound_read(state, ticket, reader_pubkey, context).await?;
     let observation =
-        run_before_work_deadline(work_deadline, read.observe_context_coordinates(coordinates))
-            .await??;
+        run_root_stage(context, read.observe_context_coordinates(coordinates)).await??;
     let observed_ticket = read.ticket().clone();
-    run_before_work_deadline(work_deadline, read.commit()).await??;
+    run_root_stage(context, read.commit()).await??;
     Ok((observed_ticket, observation))
 }
 
@@ -1785,13 +1803,14 @@ async fn begin_generation_bound_read(
     state: &AppState,
     ticket: &SemanticGraphQueryTicket,
     reader_pubkey: &[u8],
-    work_deadline: Instant,
+    context: &SemanticExecutionContext,
 ) -> Result<SemanticGraphReadTx, SemanticGraphRootQueryError> {
+    let work_deadline = context.windows().window(SemanticDeadlineWindow::Work);
     let remaining = work_deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(std::time::Instant::now())
         .ok_or(SemanticGraphRootQueryError::QueryDeadlineExceeded)?;
-    let opened = run_before_work_deadline(
-        work_deadline,
+    let opened = run_root_stage(
+        context,
         state.db.begin_semantic_graph_read(
             ticket,
             reader_pubkey,
@@ -1803,8 +1822,8 @@ async fn begin_generation_bound_read(
     match opened {
         Ok(read) => Ok(read),
         Err(buzz_db::DbError::AccessDenied(_)) => {
-            let fresh = run_before_work_deadline(
-                work_deadline,
+            let fresh = run_root_stage(
+                context,
                 state.db.semantic_graph_query_ticket(
                     ticket.community_id,
                     reader_pubkey,
@@ -1968,6 +1987,32 @@ impl QueryDeadlines {
     }
 }
 
+/// Run one root-stage database step inside the request's shared context.
+///
+/// Same work-window bound as the pre-R3 inline timeout, plus the context's
+/// cancellation race: a cancelled, disconnected, or shutting-down request
+/// stops starting new root or Stage C steps and observes the same frozen
+/// deadline error either way.
+async fn run_root_stage<F, T>(
+    context: &SemanticExecutionContext,
+    future: F,
+) -> Result<T, SemanticGraphRootQueryError>
+where
+    F: std::future::Future<Output = T>,
+{
+    context
+        .run_stage(SemanticDeadlineWindow::Work, future)
+        .await
+        .map_err(|abort| match abort {
+            SemanticStageAbort::Deadline(_) | SemanticStageAbort::Cancelled(_) => {
+                SemanticGraphRootQueryError::QueryDeadlineExceeded
+            }
+        })
+}
+
+/// Deadline-only wrapper kept for the terminal ticket re-classification in
+/// [`classify_ticket_failure`]: that path already failed its Provider egress
+/// and must keep its verbatim pre-R3 error mapping.
 async fn run_before_work_deadline<F, T>(
     work_deadline: Instant,
     future: F,
@@ -2051,6 +2096,12 @@ mod tests {
             },
             other => panic!("unexpected public error: {other:?}"),
         }
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::Cancelled(
+                crate::semantic_query_runtime::SemanticCancellationSource::ServerShutdown,
+            )),
+            SemanticGraphRootQueryError::QueryDeadlineExceeded
+        ));
         match map_provider_egress_failure(SemanticProviderEgressFailure::PermitContractViolated) {
             SemanticGraphRootQueryError::Contract(error) => match error {
                 SemanticGraphQueryError::InvalidState(reason) => assert_eq!(

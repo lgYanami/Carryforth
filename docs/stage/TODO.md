@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R2 已交付，R3–R6 待实施
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R3 已交付，R4–R6 待实施
 >
 > 更新日期：2026-08-16
 >
@@ -41,9 +41,12 @@
 > 已交付。R2共享Provider可靠性执行器零策略迁移已完成：四operation（whole-graph Coordinate、
 > one-hop两variant、complete-path每个root attempt）接入同一reservation/wait/egress/
 > encode-once primitive，neutral判别经冻结映射表还原各surface公开错误，production行为零差异；
-> deadline windows与attempt ledger进入生产路径，cancellation/latch/retry留给R3/R4，三个gate
-> 实际运行通过。下一步实施R3 deadline、cancellation与release-finalize；统一
-> 资源治理仍排在其后。
+> deadline windows与attempt ledger进入生产路径，三个gate实际运行通过。R3
+> deadline、cancellation与release-finalize已交付：stage准入/run_stage统一仲裁（cancellation
+> biased赢得平局、mid-flight future drop即mandatory cleanup）、shutdown/disconnect传播、
+> one-shot release permit同步消费到Event签名（R0 known gap关闭）、complete-path
+> partial-result tails逐字保持、latch post-check拒绝发送已取消的签名结果。下一步实施R4
+> 安全retry、backoff与request-local vector复用；统一资源治理仍排在其后。
 
 ### 背景
 

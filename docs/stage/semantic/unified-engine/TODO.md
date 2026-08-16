@@ -1,7 +1,7 @@
 # Project Context 统一语义检索引擎 TODO
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时实现
-> 计划已定稿并交付R0、R1、R2，R3–R6待实施
+> 计划已定稿并交付R0、R1、R2、R3，R4–R6待实施
 >
 > 日期：2026-08-16
 
@@ -51,10 +51,14 @@ target-only query。至少记录Recall@1/3/8、MRR、平均候选观察数、跨
 
 这项相关性工作与统一可靠性运行时分开验收。第二阶段可靠性运行时已按
 [统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)
-恢复实施：R0 characterization收口、R1 typed failure/执行上下文类型层与R2共享Provider
-可靠性执行器零策略迁移已交付——四operation（whole-graph Coordinate、one-hop两variant、
-complete-path每个root attempt）均接入同一reservation/wait/egress/encode-once primitive，
-neutral判别经冻结映射表还原各surface公开错误，production行为零差异；deadline windows与
-attempt ledger进入生产路径，cancellation/latch/retry留给R3/R4。相关性验收结果只影响
+恢复实施：R0 characterization收口、R1 typed failure/执行上下文类型层、R2共享Provider
+可靠性执行器零策略迁移与R3 deadline、cancellation与release-finalize已交付——四operation
+（whole-graph Coordinate、one-hop两variant、complete-path每个root attempt）均接入同一
+reservation/wait/egress/encode-once primitive，neutral判别经冻结映射表还原各surface公开
+错误，production行为零差异；deadline windows与attempt ledger进入生产路径；stage准入/
+run_stage统一仲裁deadline与cancellation（biased平局、future drop即mandatory cleanup），
+shutdown/disconnect传播至全部等待边界，one-shot release permit同步消费到Event签名
+（R0 known gap关闭），complete-path partial-result tails逐字保持，latch post-check拒绝
+发送已取消的签名结果。R4起retry/circuit策略另行逐项启用。相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

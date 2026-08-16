@@ -1534,6 +1534,7 @@ async fn execute_semantic_graph_http_query_after_routing(
     let traversal = crate::semantic_graph_traversal::complete_semantic_graph_traversal(session)
         .await
         .map_err(map_semantic_root_query_error)?;
+    let context = traversal.context;
     require_semantic_traversal_identity(
         traversal.request_id,
         traversal.project_id,
@@ -1570,6 +1571,17 @@ async fn execute_semantic_graph_http_query_after_routing(
 
     require_semantic_absolute_deadline(absolute_deadline)?;
     let postflight_timer = stage_timer(SemanticGraphMetricStage::Postflight);
+    // The postflight, release, and signing phases arbitrate the same context
+    // the root and traversal phases used: once cancellation or a deadline won
+    // its latch, no new release or signing stage may start here.
+    crate::semantic_query_runtime::propagate_relay_shutdown(state, &context);
+    if context.admit_stage().is_err() {
+        record_query_error(
+            SemanticGraphMetricStage::Postflight,
+            SemanticGraphQueryMetricError::DeadlineExceeded,
+        );
+        return Err(semantic_query_deadline_error());
+    }
     let Ok(routing_trust) = crate::semantic_fleet::semantic_graph_query_routing_trust(state) else {
         record_query_error(
             SemanticGraphMetricStage::Postflight,
@@ -1580,38 +1592,53 @@ async fn execute_semantic_graph_http_query_after_routing(
             "unavailable:semantic_graph_query:readiness",
         ));
     };
-    let release = tokio::time::timeout_at(
-        absolute_deadline,
-        state
-            .db
-            .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
-                community_id: tenant.community(),
-                reader_pubkey: &caller_bytes,
-                expected_projection_pubkey: &state.relay_keypair.public_key(),
-                expected_snapshot: None,
-                routing_trust,
-            }),
-    )
-    .await
-    .map_err(|_| {
-        record_query_error(
-            SemanticGraphMetricStage::Postflight,
-            SemanticGraphQueryMetricError::DeadlineExceeded,
-        );
-        semantic_query_deadline_error()
-    })?
-    .map_err(|_| {
-        record_query_error(
-            SemanticGraphMetricStage::Postflight,
-            SemanticGraphQueryMetricError::PostflightUnavailable,
-        );
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable:semantic_graph_query:postflight",
+    let release = context
+        .run_stage(
+            crate::semantic_query_runtime::SemanticDeadlineWindow::Absolute,
+            state
+                .db
+                .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
+                    community_id: tenant.community(),
+                    reader_pubkey: &caller_bytes,
+                    expected_projection_pubkey: &state.relay_keypair.public_key(),
+                    expected_snapshot: None,
+                    routing_trust,
+                }),
         )
-    })?;
+        .await
+        .map_err(|_| {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::DeadlineExceeded,
+            );
+            semantic_query_deadline_error()
+        })?
+        .map_err(|_| {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::PostflightUnavailable,
+            );
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:semantic_graph_query:postflight",
+            )
+        })?;
     let release_permit = match release {
-        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => permit,
+        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => {
+            match context.latch().begin_finalize() {
+                crate::semantic_query_runtime::SemanticLatchOutcome::Won(_) => permit,
+                // Cancellation or a deadline won while the confirmation was in
+                // flight: the issued permit is consumed here, nothing is signed.
+                crate::semantic_query_runtime::SemanticLatchOutcome::LostTerminal(_)
+                | crate::semantic_query_runtime::SemanticLatchOutcome::LostToFinalizing(_) => {
+                    record_query_error(
+                        SemanticGraphMetricStage::Postflight,
+                        SemanticGraphQueryMetricError::DeadlineExceeded,
+                    );
+                    return Err(semantic_query_deadline_error());
+                }
+            }
+        }
         SemanticGraphQueryReleaseConfirmation::Denied => {
             record_query_error(
                 SemanticGraphMetricStage::Postflight,
@@ -1649,6 +1676,18 @@ async fn execute_semantic_graph_http_query_after_routing(
         sign_released_semantic_graph_response(release_permit, packed, &state.relay_keypair)
             .map_err(map_semantic_response_packing_error)?;
     require_semantic_absolute_deadline(absolute_deadline)?;
+    // §4.1 post-check: a cancel or deadline that arrived during the
+    // synchronous signing requested a discard — the response-local signed
+    // Event is dropped instead of sent, and the latch completes either way.
+    if context.latch().discard_requested() {
+        drop(signed);
+        record_query_error(
+            SemanticGraphMetricStage::Signing,
+            SemanticGraphQueryMetricError::DeadlineExceeded,
+        );
+        return Err(semantic_query_deadline_error());
+    }
+    context.latch().complete();
     let response = serde_json::from_slice(&signed.event_array_bytes).map_err(|_| {
         record_query_error(
             SemanticGraphMetricStage::Signing,

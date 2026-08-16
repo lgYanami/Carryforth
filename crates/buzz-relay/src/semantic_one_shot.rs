@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use buzz_core::CommunityId;
 use buzz_db::semantic_query::{
-    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleaseRequest,
-    SemanticGraphQueryTicket,
+    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleasePermit,
+    SemanticGraphQueryReleaseRequest, SemanticGraphQueryTicket,
 };
 use buzz_semantic_query::SemanticGraphQueryRoutingTrust;
 use nostr::PublicKey;
@@ -19,9 +19,10 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::VolcengineSemanticProvider;
 use crate::semantic_query_runtime::{
-    execute_provider_egress, ProviderEgressObservation, ProviderEgressPlan, SemanticDeadlineWindow,
-    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
-    SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+    execute_provider_egress, propagate_relay_shutdown, ProviderEgressObservation,
+    ProviderEgressPlan, SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticEncodeOnceFailure,
+    SemanticExecutionContext, SemanticLatchOutcome, SemanticOperationAttemptClass,
+    SemanticProviderEgressFailure,
 };
 use crate::state::AppState;
 
@@ -47,7 +48,6 @@ pub(crate) enum SemanticOneShotError {
 /// Authorized, single-use execution state immediately before Provider egress.
 pub(crate) struct SemanticOneShotExecution<'a> {
     state: &'a AppState,
-    deadline: Instant,
     ticket: SemanticGraphQueryTicket,
     reader_pubkey: Vec<u8>,
     relay_pubkey: PublicKey,
@@ -70,6 +70,11 @@ impl<'a> SemanticOneShotExecution<'a> {
             return Err(SemanticOneShotError::Unavailable);
         }
         let deadline = Instant::now() + Duration::from_millis(u64::from(maximum_wall_time_ms));
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(deadline),
+        );
+        propagate_relay_shutdown(state, &context);
         let process_permit = state
             .semantic_graph_query_semaphore
             .clone()
@@ -81,22 +86,20 @@ impl<'a> SemanticOneShotExecution<'a> {
             .flatten()
             .ok_or(SemanticOneShotError::Unavailable)?;
         let relay_pubkey = state.relay_keypair.public_key();
-        let ticket = before_deadline(
-            deadline,
-            state
-                .db
-                .semantic_graph_query_ticket(community_id, reader_pubkey, &relay_pubkey),
-        )
-        .await?
-        .map_err(classify_database)?;
+        let ticket = context
+            .run_stage(
+                SemanticDeadlineWindow::Absolute,
+                state
+                    .db
+                    .semantic_graph_query_ticket(community_id, reader_pubkey, &relay_pubkey),
+            )
+            .await
+            .map_err(|_| SemanticOneShotError::Timeout)?
+            .map_err(classify_database)?;
         if provider.source_contract() != &ticket.generation.model_contract {
             return Err(SemanticOneShotError::Unavailable);
         }
 
-        let context = SemanticExecutionContext::new(
-            SemanticOperationAttemptClass::OneShot,
-            SemanticDeadlineWindows::for_one_shot_hard_deadline(deadline),
-        );
         // Unreachable under the R2 zero-policy single attempt; kept so the
         // counting ledger owns the operation-attempt dimension from R4 on.
         context
@@ -116,7 +119,6 @@ impl<'a> SemanticOneShotExecution<'a> {
 
         Ok(Self {
             state,
-            deadline,
             ticket,
             reader_pubkey: reader_pubkey.to_vec(),
             relay_pubkey,
@@ -139,7 +141,7 @@ impl<'a> SemanticOneShotExecution<'a> {
         F: Future<Output = Result<T, E>>,
     {
         crate::semantic_query_runtime::encode_once(
-            self.context.windows().window(SemanticDeadlineWindow::Work),
+            &self.context,
             ProviderEgressObservation::Silent,
             future,
         )
@@ -161,15 +163,25 @@ impl<'a> SemanticOneShotExecution<'a> {
     where
         F: Future<Output = T>,
     {
-        before_deadline(self.deadline, future).await
+        self.context
+            .run_stage(SemanticDeadlineWindow::Absolute, future)
+            .await
+            .map_err(|_| SemanticOneShotError::Timeout)
     }
 
     /// Recheck authorization, topology, generation, and Fleet after the
     /// snapshot closes and before a signed result can be released.
+    ///
+    /// When the release is permitted, the single-use permit is handed to the
+    /// caller and the latch moves to `Finalizing`: the immediately following
+    /// synchronous signing is authorized, and [`Self::finalize_completed`]
+    /// must run before the signed result may be sent. If cancellation or a
+    /// deadline won while the confirmation was in flight, the permit is
+    /// discarded here instead.
     pub(crate) async fn confirm_release(
         &self,
         snapshot: &SemanticGraphQueryTicket,
-    ) -> Result<(), SemanticOneShotError> {
+    ) -> Result<SemanticGraphQueryReleasePermit, SemanticOneShotError> {
         // Unreachable while R2 keeps the single frozen release attempt; kept
         // so the counting ledger owns the release dimension from R4 on.
         self.context
@@ -189,7 +201,17 @@ impl<'a> SemanticOneShotExecution<'a> {
             .await?
             .map_err(classify_database)?;
         match release {
-            SemanticGraphQueryReleaseConfirmation::Permitted(_permit) => Ok(()),
+            SemanticGraphQueryReleaseConfirmation::Permitted(permit) => {
+                match self.context.latch().begin_finalize() {
+                    SemanticLatchOutcome::Won(_) => Ok(permit),
+                    // Cancellation or a deadline already won the latch: the
+                    // won permit is consumed here and nothing is signed.
+                    SemanticLatchOutcome::LostTerminal(_)
+                    | SemanticLatchOutcome::LostToFinalizing(_) => {
+                        Err(SemanticOneShotError::Timeout)
+                    }
+                }
+            }
             SemanticGraphQueryReleaseConfirmation::Denied => Err(SemanticOneShotError::Restricted),
             SemanticGraphQueryReleaseConfirmation::SnapshotChanged => {
                 Err(SemanticOneShotError::Conflict)
@@ -200,19 +222,42 @@ impl<'a> SemanticOneShotExecution<'a> {
         }
     }
 
+    /// Post-check the synchronous finalization and consume the release permit
+    /// with the accepted Event signature.
+    ///
+    /// Runs after the closed surface finished building and signing its
+    /// result — with no intervening await since the permit was issued. A
+    /// cancellation or deadline that arrived during that synchronous work
+    /// requested a discard: the signed result must be dropped, the permit is
+    /// consumed anyway, and the caller observes the deadline error. Only a
+    /// clean post-check completes the latch.
+    pub(crate) fn finalize_completed(
+        &self,
+        permit: SemanticGraphQueryReleasePermit,
+    ) -> Result<(), SemanticOneShotError> {
+        if self
+            .context
+            .windows()
+            .expired_window(Instant::now())
+            .is_some()
+        {
+            let _ = self.context.deadline_expired();
+        }
+        if self.context.latch().discard_requested() {
+            // The single-use permit is consumed with the discarded result.
+            let _ = permit;
+            return Err(SemanticOneShotError::Timeout);
+        }
+        self.context.latch().complete();
+        // The single-use permit is consumed with the accepted Event signature.
+        let _ = permit;
+        Ok(())
+    }
+
     /// Relay projection signer bound into the request/result transcript.
     pub(crate) const fn relay_pubkey(&self) -> PublicKey {
         self.relay_pubkey
     }
-}
-
-async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, SemanticOneShotError>
-where
-    F: Future<Output = T>,
-{
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
-        .await
-        .map_err(|_| SemanticOneShotError::Timeout)
 }
 
 fn classify_database(error: buzz_db::DbError) -> SemanticOneShotError {
@@ -230,13 +275,16 @@ fn classify_database(error: buzz_db::DbError) -> SemanticOneShotError {
 /// `ReservationContractViolated` and `AttemptLedgerExhausted` have no
 /// pre-R2 counterpart: both are unreachable per the database egress contract
 /// and the R2 zero-policy single attempt, so they map onto the closest
-/// existing closed failures until R4 owns real retry decisions.
+/// existing closed failures until R4 owns real retry decisions. R3 adds
+/// `Cancelled`: a cancelled, disconnected, or shutting-down request keeps the
+/// deadline error, the only closed one-shot surface it can observably share.
 fn map_egress_failure(failure: SemanticProviderEgressFailure) -> SemanticOneShotError {
     match failure {
         SemanticProviderEgressFailure::DeadlineExceeded
         | SemanticProviderEgressFailure::LatestStartUnrepresentable => {
             SemanticOneShotError::Timeout
         }
+        SemanticProviderEgressFailure::Cancelled(_) => SemanticOneShotError::Timeout,
         SemanticProviderEgressFailure::Database(error) => classify_database(error),
         SemanticProviderEgressFailure::AdmissionBusy
         | SemanticProviderEgressFailure::AttemptLedgerExhausted(_) => SemanticOneShotError::Busy,
@@ -328,6 +376,12 @@ mod tests {
                 crate::semantic_query_runtime::SemanticAttemptExhausted::ProviderAttempts,
             )),
             OneShot::Busy
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::Cancelled(
+                crate::semantic_query_runtime::SemanticCancellationSource::ServerShutdown,
+            )),
+            OneShot::Timeout
         ));
     }
 }

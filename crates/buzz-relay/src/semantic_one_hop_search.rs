@@ -161,6 +161,9 @@ async fn execute_one_hop_semantic_search(
         Err(SemanticEncodeOnceFailure::Provider(error)) => {
             return Err(map_provider(error));
         }
+        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
+            return Err(OneHopSemanticExecutionError::Timeout);
+        }
     };
     let query_vector = bind_one_hop_query_vector(execution.ticket(), &encoder_input, encoded)?;
 
@@ -242,7 +245,7 @@ async fn execute_one_hop_semantic_search(
         .await
         .map_err(map_one_shot)?
         .map_err(classify_database)?;
-    execution
+    let release_permit = execution
         .confirm_release(&snapshot_ticket)
         .await
         .map_err(map_one_shot)?;
@@ -312,9 +315,17 @@ async fn execute_one_hop_semantic_search(
         }
         _ => verification_failed("result_event_builder"),
     })?;
-    builder
+    // The single-use release permit is consumed synchronously with the Event
+    // signature: the whole build/sign block above ran without an intervening
+    // await, and the post-check discards the signed result instead of sending
+    // it when cancellation or the deadline arrived during that work.
+    let signed = builder
         .sign_with_keys(&state.relay_keypair)
-        .map_err(|_| OneHopSemanticExecutionError::Signing)
+        .map_err(|_| OneHopSemanticExecutionError::Signing)?;
+    execution
+        .finalize_completed(release_permit)
+        .map_err(map_one_shot)?;
+    Ok(signed)
 }
 
 fn bind_one_hop_query_vector(

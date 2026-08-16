@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 use buzz_db::semantic_query::{
     semantic_source_identity_for_coordinate, SemanticCanonicalHydrationBatch, SemanticCurrentHead,
@@ -44,6 +45,7 @@ use crate::semantic_graph_query::{
     QueryChannelBinding, SemanticGraphRootQueryError, SemanticGraphRootQuerySession,
     SemanticGraphSelectedRoot,
 };
+use crate::semantic_query_runtime::{SemanticCancellationSource, SemanticExecutionContext};
 
 /// Completed retrieval forest before response packing and Stage D postflight.
 pub(crate) struct SemanticGraphTraversalOutcome {
@@ -57,6 +59,10 @@ pub(crate) struct SemanticGraphTraversalOutcome {
     pub(crate) completion_reason: CompletionReason,
     pub(crate) exhausted_dimensions: Vec<ExhaustedDimension>,
     pub(crate) absolute_deadline: Instant,
+    /// Reliability context of the logical request, handed back for the
+    /// release/sign fence. A cancellation that stopped traversal has already
+    /// won the latch, so that fence refuses to sign the partial forest.
+    pub(crate) context: SemanticExecutionContext,
 }
 
 impl std::fmt::Debug for SemanticGraphTraversalOutcome {
@@ -91,6 +97,8 @@ async fn complete_semantic_graph_traversal_inner(
     let query = session.query.clone();
     let mut coverage = session.outcome.coverage.clone();
     let mut exhausted_dimensions = session.outcome.exhausted_dimensions.clone();
+    let context = session.context;
+    let shutdown = session.shutdown;
     let search = {
         let mut backend = DbTraversalBackend {
             read: &mut session.read,
@@ -102,7 +110,7 @@ async fn complete_semantic_graph_traversal_inner(
             &channels,
             query.lifecycle_filter,
             query.budget,
-            session.work_deadline,
+            TraversalControl::new(&context, &shutdown),
         )?
         .search(&roots)
         .await?
@@ -141,6 +149,7 @@ async fn complete_semantic_graph_traversal_inner(
         completion_reason,
         exhausted_dimensions,
         absolute_deadline: session.absolute_deadline,
+        context,
     })
 }
 
@@ -253,6 +262,34 @@ impl TraversalChannels {
     }
 }
 
+/// Reliability control borrowed from the root session for traversal.
+///
+/// Holds the logical request's context, the host shutdown flag, and the work
+/// deadline as already frozen in that context — traversal derives no budget
+/// of its own.
+struct TraversalControl<'a> {
+    context: &'a SemanticExecutionContext,
+    shutdown: &'a std::sync::atomic::AtomicBool,
+    work_deadline: Instant,
+}
+
+impl<'a> TraversalControl<'a> {
+    fn new(
+        context: &'a SemanticExecutionContext,
+        shutdown: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        Self {
+            context,
+            shutdown,
+            work_deadline: Instant::from_std(
+                context
+                    .windows()
+                    .window(crate::semantic_query_runtime::SemanticDeadlineWindow::Work),
+            ),
+        }
+    }
+}
+
 struct TraversalEngine<'a, B> {
     backend: &'a mut B,
     ticket: &'a SemanticGraphQueryTicket,
@@ -260,7 +297,7 @@ struct TraversalEngine<'a, B> {
     channels: &'a TraversalChannels,
     lifecycle_filter: LifecycleFilter,
     budget: SemanticGraphQueryBudget,
-    work_deadline: Instant,
+    control: TraversalControl<'a>,
     materialization: MaterializationState,
     hydrated: HashMap<SemanticSourceIdentity, SemanticHydratedCurrentSource>,
     edge_cache: HashMap<EdgeKey, SemanticEdgeObservation>,
@@ -279,7 +316,7 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
         channels: &'a TraversalChannels,
         lifecycle_filter: LifecycleFilter,
         budget: SemanticGraphQueryBudget,
-        work_deadline: Instant,
+        control: TraversalControl<'a>,
     ) -> Result<Self, SemanticGraphRootQueryError> {
         if query_vectors.is_empty() {
             return Err(invalid_state("traversal requires the Q0 query vector"));
@@ -291,7 +328,7 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
             channels,
             lifecycle_filter,
             budget,
-            work_deadline,
+            control,
             materialization: MaterializationState::default(),
             hydrated: HashMap::new(),
             edge_cache: HashMap::new(),
@@ -417,7 +454,22 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
         quantum: &mut Quantum,
     ) -> Result<AdvanceOutcome, SemanticGraphRootQueryError> {
         loop {
-            if Instant::now() >= self.work_deadline {
+            if Instant::now() >= self.control.work_deadline {
+                self.wall_time_exhausted = true;
+                return Ok(AdvanceOutcome::GlobalStop(
+                    BranchStopReason::WallTimeExhausted,
+                ));
+            }
+            // Cancellation keeps the verbatim wall-time tail: the same global
+            // stop, partial forest, and completion reason, while the latch it
+            // won makes the later release/sign fence discard the result.
+            if self.control.shutdown.load(AtomicOrdering::SeqCst) {
+                let _ = self
+                    .control
+                    .context
+                    .cancel(SemanticCancellationSource::ServerShutdown);
+            }
+            if self.control.context.cancellation().cancelled().is_some() {
                 self.wall_time_exhausted = true;
                 return Ok(AdvanceOutcome::GlobalStop(
                     BranchStopReason::WallTimeExhausted,
@@ -530,8 +582,11 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
             after: work.incident_after.as_ref(),
             limit,
         };
-        let Some(outcome) =
-            run_db_before(self.work_deadline, self.backend.rank_relations(request)).await?
+        let Some(outcome) = run_db_before(
+            self.control.work_deadline,
+            self.backend.rank_relations(request),
+        )
+        .await?
         else {
             self.wall_time_exhausted = true;
             return Ok(UnitAdvance::GlobalStop(BranchStopReason::WallTimeExhausted));
@@ -748,7 +803,7 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
                     return Ok(UnitAdvance::Deferred);
                 }
                 let Some(outcome) = run_db_before(
-                    self.work_deadline,
+                    self.control.work_deadline,
                     self.backend.load_hyperedge(&target.expectation),
                 )
                 .await?
@@ -809,8 +864,11 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
             after: target.after.as_ref(),
             limit,
         };
-        let Some(outcome) =
-            run_db_before(self.work_deadline, self.backend.rank_targets(request)).await?
+        let Some(outcome) = run_db_before(
+            self.control.work_deadline,
+            self.backend.rank_targets(request),
+        )
+        .await?
         else {
             self.wall_time_exhausted = true;
             return Ok(UnitAdvance::GlobalStop(BranchStopReason::WallTimeExhausted));
@@ -1011,7 +1069,7 @@ impl<'a, B: TraversalBackend> TraversalEngine<'a, B> {
             return Ok(Some(cached.clone()));
         }
         let Some(batch) = run_db_before(
-            self.work_deadline,
+            self.control.work_deadline,
             self.backend.hydrate(std::slice::from_ref(score)),
         )
         .await?
@@ -2348,6 +2406,24 @@ fn invalid_state(reason: &'static str) -> SemanticGraphRootQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn traversal_test_control() -> TraversalControl<'static> {
+        let context: &'static SemanticExecutionContext =
+            Box::leak(Box::new(SemanticExecutionContext::new(
+                crate::semantic_query_runtime::SemanticOperationAttemptClass::CompletePath,
+                crate::semantic_query_runtime::SemanticDeadlineWindows::new(
+                    std::time::Instant::now(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .expect("ordered test windows"),
+            )));
+        TraversalControl::new(
+            context,
+            Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false))),
+        )
+    }
     use buzz_core::CommunityId;
     use buzz_db::semantic_query::SemanticExactQueryVector;
     use buzz_project_context::canonicalize_coordinates;
@@ -3019,7 +3095,7 @@ mod tests {
                 &channels,
                 LifecycleFilter::AllCurrent,
                 budget,
-                Instant::now() + std::time::Duration::from_secs(5),
+                traversal_test_control(),
             )
             .expect("synthetic traversal engine")
             .search(std::slice::from_ref(&root))
@@ -3151,7 +3227,7 @@ mod tests {
             &channels,
             LifecycleFilter::AllCurrent,
             budget,
-            Instant::now() + std::time::Duration::from_secs(5),
+            traversal_test_control(),
         )
         .expect("compatibility traversal")
         .search(std::slice::from_ref(&root))
@@ -3169,7 +3245,7 @@ mod tests {
             &channels,
             LifecycleFilter::AllCurrent,
             budget,
-            Instant::now() + std::time::Duration::from_secs(5),
+            traversal_test_control(),
         )
         .expect("migrated traversal")
         .search(std::slice::from_ref(&root))
@@ -3240,7 +3316,7 @@ mod tests {
             &channels,
             LifecycleFilter::AllCurrent,
             budget,
-            Instant::now() + std::time::Duration::from_secs(5),
+            traversal_test_control(),
         )
         .expect("synthetic traversal engine")
         .search(std::slice::from_ref(&root))

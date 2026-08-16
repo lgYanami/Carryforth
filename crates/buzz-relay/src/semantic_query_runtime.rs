@@ -15,14 +15,25 @@
 //! Ticket admission, Stage A observation, traversal, release fences, and
 //! public result contracts stay with the closed coordinators.
 //!
+//! Phase 2 R3 wires the context into stage admission: every new Provider,
+//! database, traversal, or signing stage must pass [`admit_stage`] (directly
+//! or through [`run_stage`]), which refuses work once cancellation won the
+//! latch or an operation window expired. Bounded stages race the aggregated
+//! cancellation token through the same `run_stage`, so a mid-flight future is
+//! dropped — its rollback, abort, and RAII cleanup are the mandatory cleanup
+//! that still runs in terminal states. Release finalization follows §4.1:
+//! `begin_finalize` wins the latch after the release permit is issued, the
+//! synchronous signing may complete, and a cancel or deadline that arrives
+//! during it only records a discard that the finalizer's post-check must
+//! honor by never sending the signed result.
+//!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
 
-// Cancellation aggregation, the lifecycle latch, Provider handoff
-// classification, and the retry disposition matrix are adopted by the closed
-// coordinators from R3/R4 on, so those not-yet-wired items stay explicit dead
-// code rather than being deleted by a cleanup pass.
+// The retry disposition matrix is adopted by the closed coordinators from R4
+// on; remaining not-yet-wired items stay explicit dead code rather than being
+// deleted by a cleanup pass.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -89,6 +100,11 @@ impl SemanticCancellation {
     pub(crate) fn new() -> Self {
         let (source_tx, _) = watch::channel(None);
         Self { source_tx }
+    }
+
+    /// Currently winning cancellation source, if the token was cancelled.
+    pub(crate) fn cancelled(&self) -> Option<SemanticCancellationSource> {
+        *self.source_tx.borrow()
     }
 
     /// Return a cloneable handle observing this token.
@@ -1147,6 +1163,68 @@ impl SemanticExecutionContext {
             .cancel(SemanticCancellationSource::DeadlineExceeded);
         self.latch.timeout()
     }
+
+    /// Admit one new semantic stage; refuse it once cancellation or a
+    /// deadline already won the latch.
+    ///
+    /// Mandatory cleanup (rollback, abort, transaction close, RAII drops) is
+    /// not a stage and stays allowed in every state; this gate governs only
+    /// new Provider, database, traversal, release, or signing work.
+    pub(crate) fn admit_stage(&self) -> Result<(), SemanticStageAbort> {
+        if let Some(source) = self.cancellation.cancelled() {
+            let _ = self.cancel(source);
+            return Err(SemanticStageAbort::Cancelled(source));
+        }
+        if let Some(window) = self.windows.expired_window(Instant::now()) {
+            let _ = self.deadline_expired();
+            return Err(SemanticStageAbort::Deadline(window));
+        }
+        Ok(())
+    }
+
+    /// Run one bounded stage inside `window`, racing the aggregated
+    /// cancellation token.
+    ///
+    /// The stage future is dropped when cancellation wins, so its own RAII
+    /// rollback and abort remain the mandatory cleanup path. A deadline
+    /// expiry or cancellation that wins the race is arbitrated into the latch
+    /// before returning, and cancellation wins any tie so no new value is
+    /// delivered after the request ended.
+    pub(crate) async fn run_stage<T, F>(
+        &self,
+        window: SemanticDeadlineWindow,
+        future: F,
+    ) -> Result<T, SemanticStageAbort>
+    where
+        F: Future<Output = T>,
+    {
+        self.admit_stage()?;
+        let deadline = tokio::time::Instant::from_std(self.windows.window(window));
+        let mut cancellation = self.cancellation.handle();
+        tokio::select! {
+            biased;
+            source = cancellation.wait() => {
+                let _ = self.cancel(source);
+                Err(SemanticStageAbort::Cancelled(source))
+            }
+            outcome = tokio::time::timeout_at(deadline, future) => match outcome {
+                Ok(value) => Ok(value),
+                Err(_elapsed) => {
+                    let _ = self.deadline_expired();
+                    Err(SemanticStageAbort::Deadline(window))
+                }
+            },
+        }
+    }
+}
+
+/// Why a new semantic stage was refused or aborted mid-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticStageAbort {
+    /// An operation-provided window expired before the stage finished.
+    Deadline(SemanticDeadlineWindow),
+    /// The aggregated cancellation token fired while the stage ran.
+    Cancelled(SemanticCancellationSource),
 }
 
 impl fmt::Debug for SemanticExecutionContext {
@@ -1206,6 +1284,13 @@ pub(crate) enum SemanticProviderEgressFailure {
     /// The request-level attempt ledger refused another attempt.
     #[error("semantic provider egress attempt ledger is exhausted")]
     AttemptLedgerExhausted(SemanticAttemptExhausted),
+    /// The aggregated cancellation token fired during the egress sequence.
+    ///
+    /// Carries no error detail of its own: the owning surface maps it onto
+    /// its frozen deadline-equivalent public error, because a cancelled
+    /// request has no caller left to distinguish.
+    #[error("semantic provider egress was cancelled")]
+    Cancelled(SemanticCancellationSource),
 }
 
 /// Which closed surface observes one executor attempt.
@@ -1276,15 +1361,22 @@ pub(crate) struct ProviderEgressPlan<'state, 'plan> {
     pub(crate) observation: ProviderEgressObservation,
 }
 
-/// Wrap one bounded step in the work window of the owning request.
-async fn timeout_before<T, F>(
-    deadline: Instant,
-    future: F,
-) -> Result<T, tokio::time::error::Elapsed>
-where
-    F: Future<Output = T>,
-{
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future).await
+/// Cancel `context` when the Relay process entered its controlled shutdown.
+///
+/// The shutdown flag flips before listener drain, so every semantic surface
+/// that holds serving state consults it before admitting new work.
+pub(crate) fn propagate_relay_shutdown(state: &AppState, context: &SemanticExecutionContext) {
+    if state.shutting_down.load(Ordering::SeqCst) {
+        let _ = context.cancel(SemanticCancellationSource::ServerShutdown);
+    }
+}
+
+/// Map one refused or aborted bounded step onto the neutral egress failure.
+fn egress_stage_abort(abort: SemanticStageAbort) -> SemanticProviderEgressFailure {
+    match abort {
+        SemanticStageAbort::Deadline(_) => SemanticProviderEgressFailure::DeadlineExceeded,
+        SemanticStageAbort::Cancelled(source) => SemanticProviderEgressFailure::Cancelled(source),
+    }
 }
 
 /// Derive the Provider-reservation start bound from the work window.
@@ -1316,28 +1408,32 @@ pub(crate) async fn execute_provider_egress<'state>(
     let state = plan.state;
     let work = plan.context.windows().window(SemanticDeadlineWindow::Work);
     let relay_pubkey = state.relay_keypair.public_key();
+    propagate_relay_shutdown(state, plan.context);
+    plan.context.admit_stage().map_err(egress_stage_abort)?;
     let latest_start_at = latest_start_at(work)?;
     plan.context
         .ledger()
         .begin_provider_attempt()
         .map_err(SemanticProviderEgressFailure::AttemptLedgerExhausted)?;
-    let reservation = timeout_before(
-        work,
-        state
-            .db
-            .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
-                expected_ticket: plan.ticket,
-                reader_pubkey: plan.reader_pubkey,
-                expected_projection_pubkey: &relay_pubkey,
-                expected_contexts: plan.expected_contexts,
-                provider: &plan.ticket.generation.model_contract.provider,
-                interval: state.config.semantic_worker.request_interval,
-                latest_start_at,
-            }),
-    )
-    .await
-    .map_err(|_| SemanticProviderEgressFailure::DeadlineExceeded)?
-    .map_err(SemanticProviderEgressFailure::Database)?;
+    let reservation = plan
+        .context
+        .run_stage(
+            SemanticDeadlineWindow::Work,
+            state
+                .db
+                .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
+                    expected_ticket: plan.ticket,
+                    reader_pubkey: plan.reader_pubkey,
+                    expected_projection_pubkey: &relay_pubkey,
+                    expected_contexts: plan.expected_contexts,
+                    provider: &plan.ticket.generation.model_contract.provider,
+                    interval: state.config.semantic_worker.request_interval,
+                    latest_start_at,
+                }),
+        )
+        .await
+        .map_err(egress_stage_abort)?
+        .map_err(SemanticProviderEgressFailure::Database)?;
     let reservation = match reservation {
         SemanticGraphQueryEgressReservation::Reserved(reservation) => reservation,
         SemanticGraphQueryEgressReservation::Busy => {
@@ -1357,37 +1453,47 @@ pub(crate) async fn execute_provider_egress<'state>(
     }
     let wait_started = Instant::now();
     let _wait_stage = plan.observation.provider_wait_stage();
-    if timeout_before(work, tokio::time::sleep(wait))
+    match plan
+        .context
+        .run_stage(SemanticDeadlineWindow::Work, tokio::time::sleep(wait))
         .await
-        .is_err()
     {
-        let elapsed = wait_started.elapsed();
-        plan.observation.provider_wait_deadline(elapsed);
-        return Err(SemanticProviderEgressFailure::DeadlineExceeded);
+        Ok(()) => {
+            plan.observation
+                .provider_wait_completed(wait_started.elapsed());
+        }
+        Err(SemanticStageAbort::Deadline(_)) => {
+            plan.observation
+                .provider_wait_deadline(wait_started.elapsed());
+            return Err(SemanticProviderEgressFailure::DeadlineExceeded);
+        }
+        Err(SemanticStageAbort::Cancelled(source)) => {
+            return Err(SemanticProviderEgressFailure::Cancelled(source));
+        }
     }
-    let elapsed = wait_started.elapsed();
-    plan.observation.provider_wait_completed(elapsed);
 
     // The provider-slot reservation may wait, so it cannot authorize egress.
     // The final confirmation revalidates principal, generation, graph, and
     // routing state under the shared Community writer fence.
     let routing_trust = crate::semantic_fleet::semantic_graph_query_routing_trust(state)
         .map_err(|_| SemanticProviderEgressFailure::FleetUnavailable)?;
-    let confirmation = timeout_before(
-        work,
-        state
-            .db
-            .confirm_semantic_graph_query_egress(SemanticGraphQueryEgressConfirmationRequest {
-                expected_ticket: plan.ticket,
-                reader_pubkey: plan.reader_pubkey,
-                expected_projection_pubkey: &relay_pubkey,
-                expected_contexts: plan.expected_contexts,
-                routing_trust,
-            }),
-    )
-    .await
-    .map_err(|_| SemanticProviderEgressFailure::DeadlineExceeded)?
-    .map_err(SemanticProviderEgressFailure::Database)?;
+    let confirmation = plan
+        .context
+        .run_stage(
+            SemanticDeadlineWindow::Work,
+            state.db.confirm_semantic_graph_query_egress(
+                SemanticGraphQueryEgressConfirmationRequest {
+                    expected_ticket: plan.ticket,
+                    reader_pubkey: plan.reader_pubkey,
+                    expected_projection_pubkey: &relay_pubkey,
+                    expected_contexts: plan.expected_contexts,
+                    routing_trust,
+                },
+            ),
+        )
+        .await
+        .map_err(egress_stage_abort)?
+        .map_err(SemanticProviderEgressFailure::Database)?;
     let permit = match confirmation {
         SemanticGraphQueryEgressConfirmation::Permitted(permit) => permit,
         SemanticGraphQueryEgressConfirmation::ContextChanged => {
@@ -1418,28 +1524,38 @@ pub(crate) enum SemanticEncodeOnceFailure<E> {
     /// The Provider call returned a typed failure.
     #[error("semantic provider encode call failed")]
     Provider(#[source] E),
+    /// The aggregated cancellation token fired during the single call.
+    #[error("semantic provider encode was cancelled")]
+    Cancelled(SemanticCancellationSource),
 }
 
 /// Run exactly one Provider invocation inside the work window.
 ///
 /// `encode_once` is the only sanctioned Provider handoff shape: one physical
-/// call, bounded by the frozen work window, with no internal retry, fallback,
-/// or detached follow-up work. Mapping the Provider error and every public
+/// call, admitted by and bounded to the owning context's work window, raced
+/// against its aggregated cancellation, with no internal retry, fallback, or
+/// detached follow-up work. Mapping the Provider error and every public
 /// outcome stays with the closed operation.
 pub(crate) async fn encode_once<T, E, F>(
-    work: Instant,
+    context: &SemanticExecutionContext,
     observation: ProviderEgressObservation,
     future: F,
 ) -> Result<T, SemanticEncodeOnceFailure<E>>
 where
     F: Future<Output = Result<T, E>>,
 {
-    match timeout_before(work, future).await {
+    match context
+        .run_stage(SemanticDeadlineWindow::Work, future)
+        .await
+    {
         Ok(Ok(encoded)) => Ok(encoded),
         Ok(Err(error)) => Err(SemanticEncodeOnceFailure::Provider(error)),
-        Err(_elapsed) => {
+        Err(SemanticStageAbort::Deadline(_)) => {
             observation.provider_encode_deadline();
             Err(SemanticEncodeOnceFailure::DeadlineExceeded)
+        }
+        Err(SemanticStageAbort::Cancelled(source)) => {
+            Err(SemanticEncodeOnceFailure::Cancelled(source))
         }
     }
 }
@@ -1447,6 +1563,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -1851,29 +1968,230 @@ mod tests {
 
     #[tokio::test]
     async fn encode_once_runs_exactly_one_bounded_invocation() {
-        let work = Instant::now() + Duration::from_secs(30);
-        let encoded = encode_once::<u32, u64, _>(work, ProviderEgressObservation::Silent, async {
-            Ok(7_u32)
-        })
-        .await
-        .expect("immediate success is admitted");
+        let far = Instant::now() + Duration::from_secs(30);
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+        );
+        let encoded =
+            encode_once::<u32, u64, _>(&context, ProviderEgressObservation::Silent, async {
+                Ok(7_u32)
+            })
+            .await
+            .expect("immediate success is admitted");
         assert_eq!(encoded, 7);
         assert!(matches!(
-            encode_once::<u32, u32, _>(work, ProviderEgressObservation::Silent, async {
+            encode_once::<u32, u32, _>(&context, ProviderEgressObservation::Silent, async {
                 Err(9_u32)
             })
             .await,
             Err(SemanticEncodeOnceFailure::Provider(9))
         ));
         let expired = Instant::now() - Duration::from_secs(1);
+        let expired_context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(expired),
+        );
         assert!(matches!(
             encode_once::<(), (), _>(
-                expired,
+                &expired_context,
                 ProviderEgressObservation::Silent,
                 std::future::pending()
             )
             .await,
             Err(SemanticEncodeOnceFailure::DeadlineExceeded)
         ));
+        assert_eq!(
+            expired_context.latch().state(),
+            SemanticLifecycleState::Cancelling
+        );
+        assert_eq!(
+            expired_context.cancellation().cancelled(),
+            Some(SemanticCancellationSource::DeadlineExceeded)
+        );
+        let cancelled_context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+        );
+        let _ = cancelled_context.cancel(SemanticCancellationSource::ServerShutdown);
+        assert!(matches!(
+            encode_once::<(), (), _>(
+                &cancelled_context,
+                ProviderEgressObservation::Silent,
+                std::future::pending()
+            )
+            .await,
+            Err(SemanticEncodeOnceFailure::Cancelled(
+                SemanticCancellationSource::ServerShutdown
+            ))
+        ));
+    }
+
+    #[test]
+    fn admit_stage_refuses_work_after_cancellation_won() {
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(
+                Instant::now() + Duration::from_secs(30),
+            ),
+        );
+        assert!(context.admit_stage().is_ok());
+        let _ = context.cancel(SemanticCancellationSource::CallerDisconnected);
+        assert_eq!(
+            context.admit_stage(),
+            Err(SemanticStageAbort::Cancelled(
+                SemanticCancellationSource::CallerDisconnected
+            ))
+        );
+        assert_eq!(context.latch().state(), SemanticLifecycleState::Cancelling);
+        // The refusal is stable: a later deadline does not un-cancel it.
+        assert_eq!(
+            context.admit_stage(),
+            Err(SemanticStageAbort::Cancelled(
+                SemanticCancellationSource::CallerDisconnected
+            ))
+        );
+    }
+
+    #[test]
+    fn admit_stage_refuses_expired_windows_and_arbitrates_timeout() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(expired),
+        );
+        assert_eq!(
+            context.admit_stage(),
+            Err(SemanticStageAbort::Deadline(
+                SemanticDeadlineWindow::ProviderStart
+            ))
+        );
+        // The latch stores deadline arbitration through its cancelling state;
+        // only the returned outcome is re-labelled `TimedOut`.
+        assert_eq!(context.latch().state(), SemanticLifecycleState::Cancelling);
+        assert_eq!(
+            context.cancellation().cancelled(),
+            Some(SemanticCancellationSource::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_stage_drops_pending_work_when_cancelled() {
+        struct StageGuard(Arc<AtomicBool>);
+        impl Drop for StageGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let far = Instant::now() + Duration::from_secs(30);
+        let context = Arc::new(SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+        ));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard_dropped = Arc::clone(&dropped);
+        let cancelled_context = Arc::clone(&context);
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = cancelled_context.cancel(SemanticCancellationSource::ServerShutdown);
+        });
+        let stage = Box::pin(async move {
+            let _guard = StageGuard(guard_dropped);
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(
+            context.run_stage(SemanticDeadlineWindow::Work, stage).await,
+            Err(SemanticStageAbort::Cancelled(
+                SemanticCancellationSource::ServerShutdown
+            ))
+        );
+        assert!(dropped.load(Ordering::SeqCst), "cancelled stage must drop");
+        canceller.await.expect("canceller task must finish");
+        assert_eq!(context.latch().state(), SemanticLifecycleState::Cancelling);
+    }
+
+    #[tokio::test]
+    async fn run_stage_drops_pending_work_when_window_expires() {
+        struct StageGuard(Arc<AtomicBool>);
+        impl Drop for StageGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::new(
+                Instant::now() + Duration::from_millis(10),
+                Instant::now() + Duration::from_millis(10),
+                Instant::now() + Duration::from_secs(30),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .expect("ordered windows"),
+        );
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = StageGuard(Arc::clone(&dropped));
+        let stage = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(
+            context.run_stage(SemanticDeadlineWindow::Work, stage).await,
+            Err(SemanticStageAbort::Deadline(SemanticDeadlineWindow::Work))
+        );
+        assert!(dropped.load(Ordering::SeqCst), "timed-out stage must drop");
+        assert_eq!(context.latch().state(), SemanticLifecycleState::Cancelling);
+        assert_eq!(
+            context.cancellation().cancelled(),
+            Some(SemanticCancellationSource::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn finalization_latch_discards_only_after_post_check() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+        );
+        // Cancel won before the release permit: finalization may not start.
+        let _ = context.cancel(SemanticCancellationSource::ServerShutdown);
+        assert!(matches!(
+            context.latch().begin_finalize(),
+            SemanticLatchOutcome::LostTerminal(SemanticLifecycleState::Cancelling)
+        ));
+
+        let finalizer = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+        );
+        assert!(matches!(
+            finalizer.latch().begin_finalize(),
+            SemanticLatchOutcome::Won(SemanticLifecycleState::Finalizing)
+        ));
+        // Finalization is a single winner.
+        assert!(matches!(
+            finalizer.latch().begin_finalize(),
+            SemanticLatchOutcome::LostTerminal(SemanticLifecycleState::Finalizing)
+        ));
+        // A cancel arriving during synchronous signing only requests discard.
+        assert!(matches!(
+            finalizer.cancel(SemanticCancellationSource::DeadlineExceeded),
+            SemanticLatchOutcome::LostToFinalizing(SemanticCancellationSource::DeadlineExceeded)
+        ));
+        assert!(finalizer.latch().discard_requested());
+        assert_eq!(
+            finalizer.latch().discard_source(),
+            Some(SemanticCancellationSource::DeadlineExceeded)
+        );
+        // The mandatory post-check runs before completion; the still-running
+        // synchronous signing may finish, but its result is never sent.
+        assert_eq!(
+            finalizer.latch().state(),
+            SemanticLifecycleState::Finalizing
+        );
+        assert_eq!(
+            finalizer.latch().complete(),
+            SemanticLifecycleState::Completed
+        );
     }
 }

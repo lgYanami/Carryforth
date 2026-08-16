@@ -145,6 +145,9 @@ async fn execute_coordinate_search(
         Err(SemanticEncodeOnceFailure::Provider(error)) => {
             return Err(CoordinateSearchExecutionError::Provider(error));
         }
+        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
+            return Err(CoordinateSearchExecutionError::Timeout);
+        }
     };
     if encoded.request_id() != query.request_id {
         return Err(CoordinateSearchExecutionError::Conflict);
@@ -186,7 +189,7 @@ async fn execute_coordinate_search(
         .await
         .map_err(map_one_shot)?
         .map_err(classify_database)?;
-    execution
+    let release_permit = execution
         .confirm_release(&snapshot_ticket)
         .await
         .map_err(map_one_shot)?;
@@ -238,9 +241,17 @@ async fn execute_coordinate_search(
         )
     }
     .map_err(|_| CoordinateSearchExecutionError::Signing)?;
-    builder
+    // The single-use release permit is consumed synchronously with the Event
+    // signature: the whole build/sign block above ran without an intervening
+    // await, and the post-check discards the signed result instead of sending
+    // it when cancellation or the deadline arrived during that work.
+    let signed = builder
         .sign_with_keys(&state.relay_keypair)
-        .map_err(|_| CoordinateSearchExecutionError::Signing)
+        .map_err(|_| CoordinateSearchExecutionError::Signing)?;
+    execution
+        .finalize_completed(release_permit)
+        .map_err(map_one_shot)?;
+    Ok(signed)
 }
 
 fn classify_database(error: buzz_db::DbError) -> CoordinateSearchExecutionError {
