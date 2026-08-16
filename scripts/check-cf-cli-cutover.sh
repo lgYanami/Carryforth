@@ -30,7 +30,16 @@ reject_matches \
   --glob '!scripts/check-cf-cli-cutover.sh' --glob '!docs/**' \
   --glob '!desktop/src-tauri/src/managed_agents/nest.rs' \
   --glob '!desktop/src-tauri/src/managed_agents/nest/tests.rs' \
+  --glob '!desktop/src-tauri/src/managed_agents/nest/skills.rs' \
   --glob '!**/target/**' --glob '!desktop/node_modules/**'
+
+# The managed-skill upgrader must retain this one retired coordinate so it can
+# identify and safely remove app-owned pre-cutover assets. Scan its source file
+# separately so no other retired CLI reference is allowed there.
+reject_matches \
+  "the managed Skill source references the retired CLI outside its legacy cleanup coordinate" \
+  '^(?!pub\(super\) const LEGACY_CANONICAL_SKILL_DIR: &str = "\.agents/skills/buzz-cli";$).*\b(buzz-cli|buzz_cli|crates/buzz-cli)\b' \
+  desktop/src-tauri/src/managed_agents/nest/skills.rs
 
 reject_matches \
   "the Carryforth CLI still reads a retired BUZZ_* public identity variable" \

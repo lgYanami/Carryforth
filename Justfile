@@ -244,6 +244,11 @@ _ensure-migrations: _ensure-services
     cargo run -p buzz-admin -- migrate
     ./scripts/seed-local-community.sh
 
+# Prepare the exact local Community's semantic generation and durable gates.
+# Final activation runs after Relay startup so the worker can drain rebuild jobs.
+_bootstrap-local-semantic: _configure-local-semantic _ensure-migrations
+    ./scripts/bootstrap-local-semantic.sh prepare
+
 # Run clippy on the desktop Tauri Rust crate
 desktop-tauri-clippy: _ensure-sidecar-stubs
     cargo clippy --manifest-path {{desktop_tauri_manifest}} --all-targets -- -D warnings
@@ -727,7 +732,7 @@ relay-release: _ensure-migrations
 
 
 # Run the desktop Tauri app in dev mode with a local relay (ports and identity derived from worktree)
-dev *ARGS: _configure-local-semantic _ensure-sidecar-stubs _ensure-migrations
+dev *ARGS: _ensure-sidecar-stubs _bootstrap-local-semantic
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
@@ -792,6 +797,7 @@ dev *ARGS: _configure-local-semantic _ensure-sidecar-stubs _ensure-migrations
         echo "Error: Carryforth Relay (buzz-relay) did not become healthy within 60 seconds; refusing to launch desktop." >&2
         exit 1
     fi
+    ./scripts/bootstrap-local-semantic.sh finalize
     cd {{desktop_dir}}
     [[ -d node_modules ]] || pnpm install
     source ../scripts/instance-env.sh

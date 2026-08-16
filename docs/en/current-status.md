@@ -163,12 +163,14 @@ evidence. Scores order candidates; they do not select the path or grant permissi
 environments are not guaranteed to produce disjoint paths, and a real cross-Role dependency may be
 the correct result.
 
-Source startup can enable semantic process switches, but it does not thereby enable durable
-Community index/query gates. Semantic indexing can send source type, current visible title/name,
-and an optional summary to the user-configured Provider; natural-language start and one-hop queries
-also send query text. The current foundation does not send Document bodies or chunks. The operator
-must enable the corresponding Community gates separately and explicitly acknowledge this Provider
-egress.
+The supported local source startup enables all semantic process switches and idempotently prepares
+the exact loopback Community's index/query gates and active generation. Invoking that startup path
+is the local operator's acknowledgement of Provider egress. Semantic indexing can send source type,
+current visible title/name, and an optional summary; natural-language start and one-hop queries also
+send query text. The current foundation does not send Document bodies or chunks. Project View and
+Project Context still require Human Owner initialization/signature; retrieval remains unavailable
+until that canonical state and all normal readiness fences pass. Raw Relay and production startup
+retain their fail-closed activation contract.
 
 ### 4.7 Meetings
 

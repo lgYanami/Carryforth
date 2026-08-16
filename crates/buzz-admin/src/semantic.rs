@@ -1,14 +1,19 @@
 //! Operator controls for the derived Project Context semantic index.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde_json::json;
 use uuid::Uuid;
 
 use buzz_db::semantic::{
-    CreateSemanticGeneration, SemanticRebuildScope, SemanticRebuildState, SemanticScanFamily,
+    CreateSemanticGeneration, SemanticGenerationRecord, SemanticRebuildOperation,
+    SemanticRebuildScope, SemanticRebuildState, SemanticScanFamily,
 };
 use buzz_db::semantic_fleet::WriteSemanticGraphHttpFleetAttestation;
 use buzz_semantic::{SemanticEncoder, SemanticModelContract, OVERVIEW_EXTRACTOR_VERSION};
@@ -20,6 +25,12 @@ use buzz_semantic_query::{
 
 use crate::{connect_db, resolve_admin_tenant};
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum LocalBootstrapPhase {
+    Prepare,
+    Finalize,
+}
+
 /// Semantic-index operator commands.
 #[derive(Debug, Subcommand)]
 pub enum SemanticCommand {
@@ -27,6 +38,18 @@ pub enum SemanticCommand {
     Preflight,
     /// Show the current Community gate, generations, and exact coverage.
     Status,
+    /// Idempotently prepare the exact loopback Community used by source startup.
+    LocalBootstrap {
+        /// Prepare the generation before Relay launch, or finalize it after the worker starts.
+        #[arg(long, value_enum)]
+        phase: LocalBootstrapPhase,
+        /// Confirm that local startup may send authorized semantic text to the configured Provider.
+        #[arg(long, default_value_t = false)]
+        acknowledge_local_provider_egress: bool,
+        /// Maximum worker-drain wait used by the finalize phase.
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u16).range(1..=3600))]
+        wait_seconds: u16,
+    },
     /// Create a frozen model generation.
     GenerationCreate {
         /// Stable generation UUID; generated when omitted.
@@ -159,6 +182,11 @@ pub async fn run(command: SemanticCommand) -> Result<i32> {
     match command {
         SemanticCommand::Preflight => preflight().await,
         SemanticCommand::Status => status().await,
+        SemanticCommand::LocalBootstrap {
+            phase,
+            acknowledge_local_provider_egress,
+            wait_seconds,
+        } => local_bootstrap(phase, acknowledge_local_provider_egress, wait_seconds).await,
         SemanticCommand::GenerationCreate {
             generation_id,
             fake_dimensions,
@@ -216,6 +244,335 @@ async fn tenant_db() -> Result<(buzz_db::Db, buzz_core::TenantContext)> {
     let db = connect_db().await?;
     let tenant = resolve_admin_tenant(&db).await?;
     Ok((db, tenant))
+}
+
+const LOCAL_SEMANTIC_PROCESS_SWITCHES: [&str; 4] = [
+    "BUZZ_SEMANTIC_WORKER_ENABLED",
+    "BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE",
+    "CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE",
+    "CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE",
+];
+
+fn validate_local_bootstrap_environment(acknowledge_local_provider_egress: bool) -> Result<()> {
+    if !acknowledge_local_provider_egress {
+        anyhow::bail!("semantic local-bootstrap requires --acknowledge-local-provider-egress");
+    }
+    for name in LOCAL_SEMANTIC_PROCESS_SWITCHES {
+        let value = std::env::var(name)
+            .with_context(|| format!("semantic local-bootstrap requires {name}=true"))?;
+        if !value.eq_ignore_ascii_case("true") {
+            anyhow::bail!("semantic local-bootstrap requires {name}=true");
+        }
+    }
+
+    let fleet_policy = std::env::var("BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY")
+        .unwrap_or_else(|_| "trusted-single-relay".to_owned());
+    if fleet_policy != "trusted-single-relay" {
+        anyhow::bail!(
+            "semantic local-bootstrap requires BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay"
+        );
+    }
+
+    let relay_url = std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_owned());
+    validate_local_relay_url(&relay_url)?;
+    let bind_addr = std::env::var("BUZZ_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
+    validate_local_bind_addr(&bind_addr)?;
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+    validate_local_database_url(&database_url)?;
+    validate_local_provider_configuration()?;
+
+    let relay_private_key = std::env::var("BUZZ_RELAY_PRIVATE_KEY")
+        .context("semantic local-bootstrap requires a stable BUZZ_RELAY_PRIVATE_KEY")?;
+    if relay_private_key.len() != 64
+        || !relay_private_key
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        anyhow::bail!("semantic local-bootstrap requires a 64-character Relay private key");
+    }
+    nostr::Keys::parse(&relay_private_key)
+        .context("semantic local-bootstrap requires a valid Relay private key")?;
+    Ok(())
+}
+
+fn validate_local_relay_url(raw: &str) -> Result<()> {
+    let relay_url = url::Url::parse(raw).context("RELAY_URL must be a valid URL")?;
+    if relay_url.scheme() != "ws"
+        || !relay_url.username().is_empty()
+        || relay_url.password().is_some()
+        || relay_url.query().is_some()
+        || relay_url.fragment().is_some()
+        || relay_url.path() != "/"
+    {
+        anyhow::bail!(
+            "semantic local-bootstrap requires a credential-free loopback ws:// RELAY_URL"
+        );
+    }
+    let loopback = match relay_url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        anyhow::bail!("semantic local-bootstrap requires a loopback RELAY_URL host");
+    }
+    Ok(())
+}
+
+fn validate_local_bind_addr(raw: &str) -> Result<()> {
+    let bind_addr: SocketAddr = raw
+        .parse()
+        .context("BUZZ_BIND_ADDR must be an IP socket address")?;
+    if !bind_addr.ip().is_loopback() {
+        anyhow::bail!("semantic local-bootstrap requires a loopback BUZZ_BIND_ADDR");
+    }
+    Ok(())
+}
+
+fn validate_local_database_url(raw: &str) -> Result<()> {
+    let database_url =
+        url::Url::parse(raw).context("DATABASE_URL must be a valid PostgreSQL URL")?;
+    if !matches!(database_url.scheme(), "postgres" | "postgresql") {
+        anyhow::bail!("semantic local-bootstrap requires a PostgreSQL DATABASE_URL");
+    }
+    let loopback = match database_url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        anyhow::bail!("semantic local-bootstrap requires a loopback DATABASE_URL host");
+    }
+    Ok(())
+}
+
+fn validate_local_provider_configuration() -> Result<()> {
+    let compatibility_names = [
+        "BUZZ_SEMANTIC_API_KEY",
+        "BUZZ_SEMANTIC_BASE_URL",
+        "BUZZ_SEMANTIC_REQUEST_MODEL",
+    ];
+    let shared_names = ["LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"];
+    let compatibility_selected = compatibility_names
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()));
+    let selected = if compatibility_selected {
+        compatibility_names
+    } else {
+        shared_names
+    };
+    let missing = selected
+        .iter()
+        .filter(|name| {
+            std::env::var(name)
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "semantic local-bootstrap requires complete Provider configuration: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn select_local_bootstrap_generation<'a>(
+    generations: &'a [SemanticGenerationRecord],
+    contract: &SemanticModelContract,
+) -> Option<&'a SemanticGenerationRecord> {
+    ["active", "ready", "rollback_ready", "building"]
+        .into_iter()
+        .find_map(|lifecycle| {
+            generations.iter().find(|generation| {
+                generation.lifecycle == lifecycle
+                    && generation.extractor_version == OVERVIEW_EXTRACTOR_VERSION
+                    && generation.model_contract == *contract
+            })
+        })
+}
+
+struct SemanticRebuildSummary {
+    operation: SemanticRebuildOperation,
+    observed: u64,
+    eligible: u64,
+}
+
+async fn local_bootstrap(
+    phase: LocalBootstrapPhase,
+    acknowledge_local_provider_egress: bool,
+    wait_seconds: u16,
+) -> Result<i32> {
+    validate_local_bootstrap_environment(acknowledge_local_provider_egress)?;
+    let (db, tenant) = tenant_db().await?;
+    let preflight = db.semantic_pgvector_preflight().await?;
+    if !preflight.ready()
+        || !db.semantic_schema_ready().await?
+        || !db.semantic_graph_query_schema_ready().await?
+    {
+        anyhow::bail!(
+            "semantic local-bootstrap requires migrated PostgreSQL 17 and pgvector 0.8.5+ schemas"
+        );
+    }
+
+    let contract = SemanticModelContract::volcengine_overview_v1();
+    let generations = db.list_semantic_generations(tenant.community()).await?;
+    let (generation, created) =
+        if let Some(generation) = select_local_bootstrap_generation(&generations, &contract) {
+            (generation.clone(), false)
+        } else {
+            (
+                db.create_semantic_generation(CreateSemanticGeneration {
+                    community_id: tenant.community(),
+                    generation_id: Uuid::new_v4(),
+                    extractor_version: OVERVIEW_EXTRACTOR_VERSION,
+                    model_contract: &contract,
+                    created_by: "carryforth-local-start",
+                })
+                .await?,
+                true,
+            )
+        };
+    db.set_semantic_community_enabled(tenant.community(), true)
+        .await?;
+
+    match phase {
+        LocalBootstrapPhase::Prepare => {
+            let rebuild = if generation.lifecycle == "building"
+                && generation.rebuild_completed_at.is_none()
+            {
+                Some(
+                    execute_semantic_rebuild(
+                        &db,
+                        tenant.community(),
+                        generation.generation_id,
+                        generation.generation_id,
+                        SemanticRebuildScope::All,
+                        100,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "phase": "prepare",
+                    "community_id": tenant.community().as_uuid(),
+                    "generation_id": generation.generation_id,
+                    "generation_created": created,
+                    "generation_lifecycle": generation.lifecycle,
+                    "index_enabled": true,
+                    "provider_egress_acknowledged_by": "supported-local-start",
+                    "rebuild": rebuild.map(|summary| json!({
+                        "operation_id": summary.operation.operation_id,
+                        "state": "completed",
+                        "observed": summary.observed,
+                        "eligible": summary.eligible,
+                    })),
+                }))?
+            );
+            Ok(0)
+        }
+        LocalBootstrapPhase::Finalize => {
+            let deadline = Instant::now() + Duration::from_secs(u64::from(wait_seconds));
+            let coverage = loop {
+                let coverage = db
+                    .semantic_generation_coverage(tenant.community(), generation.generation_id)
+                    .await?;
+                if coverage.poison_jobs > 0 {
+                    anyhow::bail!(
+                        "semantic local-bootstrap found {} poison job(s) in generation {}",
+                        coverage.poison_jobs,
+                        generation.generation_id
+                    );
+                }
+                if coverage.complete() {
+                    break coverage;
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "semantic local-bootstrap timed out waiting for generation {}: {}",
+                        generation.generation_id,
+                        coverage_json(&coverage)
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+
+            let current = db
+                .list_semantic_generations(tenant.community())
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.generation_id == generation.generation_id)
+                .context("semantic local-bootstrap generation disappeared")?;
+            match current.lifecycle.as_str() {
+                "building" => {
+                    db.mark_semantic_generation_ready(tenant.community(), generation.generation_id)
+                        .await?;
+                    db.activate_semantic_generation(tenant.community(), generation.generation_id)
+                        .await?;
+                }
+                "ready" | "rollback_ready" => {
+                    db.activate_semantic_generation(tenant.community(), generation.generation_id)
+                        .await?;
+                }
+                "active" => {}
+                lifecycle => anyhow::bail!(
+                    "semantic local-bootstrap generation has unsupported lifecycle {lifecycle}"
+                ),
+            }
+
+            db.arm_semantic_graph_query_for_local_bootstrap(tenant.community())
+                .await?;
+            let (index_enabled, query_enabled, active_generation_id) = db
+                .semantic_community_query_state(tenant.community())
+                .await?;
+            if !index_enabled
+                || !query_enabled
+                || active_generation_id != Some(generation.generation_id)
+            {
+                anyhow::bail!("semantic local-bootstrap final state failed verification");
+            }
+            let readiness = db
+                .semantic_graph_query_readiness(tenant.community())
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "phase": "finalize",
+                    "community_id": tenant.community().as_uuid(),
+                    "generation_id": generation.generation_id,
+                    "generation_lifecycle": "active",
+                    "index_enabled": index_enabled,
+                    "query_enabled": query_enabled,
+                    "coverage": coverage_json(&coverage),
+                    "project_context": if readiness.project_context_enabled {
+                        "ready"
+                    } else {
+                        "waiting_for_owner_initialization"
+                    },
+                }))?
+            );
+            Ok(0)
+        }
+    }
 }
 
 async fn status() -> Result<i32> {
@@ -1047,8 +1404,47 @@ async fn rebuild(
         Some(_) => unreachable!("clap validates the family"),
     };
     let operation_id = operation_id.unwrap_or_else(Uuid::new_v4);
+    let summary = execute_semantic_rebuild(
+        &db,
+        tenant.community(),
+        generation_id,
+        operation_id,
+        scope,
+        page_size,
+    )
+    .await?;
+    let operation = summary.operation;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "community_id": tenant.community().as_uuid(),
+            "generation_id": generation_id,
+            "operation_id": operation.operation_id,
+            "scope": match operation.scope {
+                SemanticRebuildScope::All => "all",
+                SemanticRebuildScope::Family(SemanticScanFamily::ProjectView) => "project_view",
+                SemanticRebuildScope::Family(SemanticScanFamily::ProjectDocument) => "project_document",
+                SemanticRebuildScope::Family(SemanticScanFamily::Meeting) => "meeting",
+            },
+            "state": "completed",
+            "observed": summary.observed,
+            "eligible": summary.eligible,
+            "jobs_coalesced": true,
+        }))?
+    );
+    Ok(0)
+}
+
+async fn execute_semantic_rebuild(
+    db: &buzz_db::Db,
+    community_id: buzz_core::CommunityId,
+    generation_id: Uuid,
+    operation_id: Uuid,
+    scope: SemanticRebuildScope,
+    page_size: u16,
+) -> Result<SemanticRebuildSummary> {
     let mut operation = db
-        .start_semantic_rebuild(tenant.community(), generation_id, operation_id, scope)
+        .start_semantic_rebuild(community_id, generation_id, operation_id, scope)
         .await?;
     if operation.state == SemanticRebuildState::Cancelled {
         anyhow::bail!("semantic rebuild operation is cancelled");
@@ -1058,7 +1454,7 @@ async fn rebuild(
     while operation.state == SemanticRebuildState::Running {
         let page = db
             .scan_current_semantic_sources(
-                tenant.community(),
+                community_id,
                 operation.current_family,
                 operation.cursor.as_ref(),
                 page_size,
@@ -1082,25 +1478,11 @@ async fn rebuild(
             .checkpoint_semantic_rebuild(&operation, page.next_cursor.as_ref(), family_complete)
             .await?;
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "community_id": tenant.community().as_uuid(),
-            "generation_id": generation_id,
-            "operation_id": operation.operation_id,
-            "scope": match operation.scope {
-                SemanticRebuildScope::All => "all",
-                SemanticRebuildScope::Family(SemanticScanFamily::ProjectView) => "project_view",
-                SemanticRebuildScope::Family(SemanticScanFamily::ProjectDocument) => "project_document",
-                SemanticRebuildScope::Family(SemanticScanFamily::Meeting) => "meeting",
-            },
-            "state": "completed",
-            "observed": observed,
-            "eligible": eligible,
-            "jobs_coalesced": true,
-        }))?
-    );
-    Ok(0)
+    Ok(SemanticRebuildSummary {
+        operation,
+        observed,
+        eligible,
+    })
 }
 
 async fn rebuild_cancel(operation_id: Uuid) -> Result<i32> {
@@ -1268,8 +1650,9 @@ mod tests {
     };
 
     use super::{
-        observe_live_query_http_runtime, parse_live_query_http_runtime, validate_relay_status_url,
-        SemanticCommand, MAX_RELAY_STATUS_BYTES,
+        observe_live_query_http_runtime, parse_live_query_http_runtime, validate_local_bind_addr,
+        validate_local_database_url, validate_local_relay_url, validate_relay_status_url,
+        LocalBootstrapPhase, SemanticCommand, MAX_RELAY_STATUS_BYTES,
     };
 
     async fn read_request_headers(stream: &mut TcpStream) {
@@ -1466,6 +1849,38 @@ mod tests {
 
     #[test]
     fn fleet_attestation_commands_have_closed_cli_shapes() {
+        let local_bootstrap = <crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "semantic",
+            "local-bootstrap",
+            "--phase",
+            "finalize",
+            "--acknowledge-local-provider-egress",
+            "--wait-seconds",
+            "30",
+        ])
+        .expect("local-bootstrap CLI");
+        assert!(matches!(
+            local_bootstrap.command,
+            crate::Command::Semantic {
+                command: SemanticCommand::LocalBootstrap {
+                    phase: LocalBootstrapPhase::Finalize,
+                    acknowledge_local_provider_egress: true,
+                    wait_seconds: 30,
+                }
+            }
+        ));
+        assert!(<crate::Cli as clap::Parser>::try_parse_from([
+            "buzz-admin",
+            "semantic",
+            "local-bootstrap",
+            "--phase",
+            "finalize",
+            "--wait-seconds",
+            "3601",
+        ])
+        .is_err());
+
         let repair = <crate::Cli as clap::Parser>::try_parse_from([
             "buzz-admin",
             "semantic",
@@ -1542,6 +1957,42 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn local_bootstrap_is_restricted_to_exact_loopback_endpoints() {
+        for accepted in [
+            "ws://localhost:3000",
+            "ws://127.0.0.1:3000",
+            "ws://[::1]:3000",
+        ] {
+            validate_local_relay_url(accepted).expect("accepted local Relay URL");
+        }
+        for rejected in [
+            "wss://localhost:3000",
+            "ws://relay.example:3000",
+            "ws://localhost:3000/path",
+            "ws://user@localhost:3000",
+        ] {
+            assert!(
+                validate_local_relay_url(rejected).is_err(),
+                "unexpectedly accepted {rejected}"
+            );
+        }
+
+        validate_local_bind_addr("127.0.0.1:3000").expect("IPv4 loopback bind");
+        validate_local_bind_addr("[::1]:3000").expect("IPv6 loopback bind");
+        assert!(validate_local_bind_addr("0.0.0.0:3000").is_err());
+        assert!(validate_local_bind_addr("192.0.2.1:3000").is_err());
+
+        validate_local_database_url("postgres://user:secret@localhost:5432/carryforth")
+            .expect("localhost database");
+        validate_local_database_url("postgresql://user:secret@127.0.0.1:5432/carryforth")
+            .expect("IPv4 loopback database");
+        assert!(validate_local_database_url(
+            "postgres://user:secret@database.example:5432/carryforth"
+        )
+        .is_err());
     }
 
     #[test]

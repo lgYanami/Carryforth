@@ -3,7 +3,10 @@
 Carryforth semantic indexing requires PostgreSQL 17 with pgvector 0.8.5 installed in
 the writer database. The extension is a database prerequisite; semantic
 indexing itself remains disabled per Community until an operator explicitly
-enables it.
+enables it. The supported loopback `start.sh` workflow is one such explicit
+local operator path: it invokes the narrowly guarded, idempotent
+`semantic local-bootstrap` lifecycle for only its resolved Community. Raw Relay
+and production deployment continue to use the manual operations below.
 
 The repository pins the official multi-architecture image as:
 

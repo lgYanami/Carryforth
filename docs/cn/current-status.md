@@ -154,10 +154,12 @@ Meeting 只有在符合生命周期和 Action Finalization 条件时才能创建
 score 只排列候选，不自动选择路径，也不产生权限。不同环境不保证得到完全不重叠的路径；真实的
 跨 Role 依赖也可能是正确结果。
 
-源码启动可以开启语义进程开关，但不会由此开启 Community durable index/query gate。语义索引可能
-将来源类型、当前可见标题/名称和可选摘要发送给用户配置的 Provider；自然语言起点与一跳查询也会
-发送 query 文本。当前 foundation 不发送 Document 正文或 chunk。operator 必须单独开启对应 Community
-gate，并明确确认这项 Provider 数据出境。
+受支持的本地源码启动默认开启全部语义进程开关，并幂等准备 loopback `RELAY_URL` 精确对应的
+Community index/query gate 与 active generation；执行该启动流程即是本地 operator 对 Provider 出境的
+确认。语义索引可能发送来源类型、当前可见标题/名称和可选摘要；自然语言起点与一跳查询也会发送
+query 文本。当前 foundation 不发送 Document 正文或 chunk。Project View 与 Project Context 仍必须由
+Human Owner 初始化并签署；在 canonical 状态及正常 readiness fence 全部通过前，检索仍不可用。
+原始 Relay 与生产启动继续遵守 fail-closed 激活合同。
 
 ### 4.7 Meetings
 

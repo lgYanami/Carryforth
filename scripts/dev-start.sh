@@ -82,6 +82,32 @@ wait_for_docker_services() {
   return 1
 }
 
+semantic_runtime_matches_configuration() {
+  local health_port="$1"
+  curl --silent --fail --max-time 2 "http://127.0.0.1:${health_port}/_status" |
+    node -e '
+      const fs = require("node:fs");
+      const status = JSON.parse(fs.readFileSync(0, "utf8"));
+      const expected = (name) => (process.env[name] ?? "false").toLowerCase() === "true";
+      const surfaces = [
+        ["BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE", "semantic_graph_query_http"],
+        ["CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE", "project_context_coordinate_search_http"],
+        ["CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE", "project_context_one_hop_semantic_search_http"],
+      ];
+      if (status?.semantic_worker?.enabled !== expected("BUZZ_SEMANTIC_WORKER_ENABLED")) {
+        process.exit(1);
+      }
+      for (const [environmentName, statusName] of surfaces) {
+        const enabled = expected(environmentName);
+        const observed = status?.[statusName];
+        if (observed?.deployment_master !== enabled) process.exit(1);
+        if (enabled && (observed?.parser_ready !== true || observed?.handler_ready !== true)) {
+          process.exit(1);
+        }
+      }
+    '
+}
+
 cd "${REPO_ROOT}"
 
 if [[ ! "${START_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -172,6 +198,9 @@ docker compose up -d
 wait_for_docker_services || fail "Docker 服务未能在 180 秒内全部就绪"
 
 if [[ -n "${existing_pid}" ]]; then
+  health_port="${BUZZ_HEALTH_PORT:-8080}"
+  semantic_runtime_matches_configuration "${health_port}" ||
+    fail "运行中的 Carryforth 与当前语义配置不一致；请先运行 ./scripts/dev-stop.sh 再重新启动"
   log "Carryforth 已在运行（PID ${existing_pid}）"
   log "日志：${existing_log_file}"
   exit 0
@@ -241,7 +270,8 @@ while ((SECONDS < deadline)); do
   fi
 
   if [[ "${desktop_running}" == "true" ]] &&
-    curl --silent --fail --max-time 1 "http://127.0.0.1:${health_port}/_readiness" >/dev/null 2>&1; then
+    curl --silent --fail --max-time 1 "http://127.0.0.1:${health_port}/_readiness" >/dev/null 2>&1 &&
+    semantic_runtime_matches_configuration "${health_port}"; then
     log "Carryforth 已启动（PID ${dev_pid}）"
     log "Relay：ws://localhost:${relay_port:-3000}"
     log "Prometheus：http://localhost:${BUZZ_PROMETHEUS_PORT:-9091}"
