@@ -781,6 +781,30 @@ pub(crate) enum SemanticContractInvalid {
 /// readable inside the runtime module without a second phase definition.
 pub(crate) use buzz_db::SemanticDbEffectPhase as SemanticDbPhase;
 
+/// Closed site that observed a snapshot or generation change.
+///
+/// The plan §4.5 matrix gives the two sites different owners: a change the
+/// operation observes while rebuilding fresh context returns for input
+/// rebuild, while a one-shot release whose expected snapshot is no longer
+/// current returns for snapshot restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SemanticSnapshotChangeSite {
+    /// Fresh operation observation changed the semantic inputs.
+    OperationObservation,
+    /// A release confirmation saw its expected snapshot no longer current.
+    ReleaseConfirmation,
+}
+
+impl SemanticSnapshotChangeSite {
+    /// Closed low-cardinality metric label for this site.
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::OperationObservation => "operation_observation",
+            Self::ReleaseConfirmation => "release_confirmation",
+        }
+    }
+}
+
 /// Typed, content-free internal failure taxonomy for semantic requests.
 ///
 /// Classification is produced at the closest source of truth and never
@@ -845,11 +869,23 @@ pub(crate) enum SemanticReliabilityFailure {
         sqlstate_class: buzz_db::SemanticDbSqlstateClass,
     },
     /// Closing a read-only snapshot ended with an unknown outcome.
+    ///
+    /// Handed back to the operation, which must first close or drop the old
+    /// read-only transaction before any snapshot restart (plan §4.5).
     #[error("semantic database snapshot close unknown")]
     DbReadSnapshotCloseUnknown,
     /// The observed snapshot or generation changed under the request.
+    ///
+    /// The observing site decides the owner (plan §4.5): a change seen while
+    /// the operation observes fresh context returns for input rebuild; a
+    /// one-shot release whose expected snapshot is no longer current returns
+    /// for snapshot restart, where the operation may drop its unsigned
+    /// result and redo the short operation.
     #[error("semantic database snapshot changed")]
-    DbSnapshotChanged,
+    DbSnapshotChanged {
+        /// Closed site that observed the change.
+        site: SemanticSnapshotChangeSite,
+    },
     /// The database denied authorization for this request.
     #[error("semantic database authorization denied")]
     DbAuthorizationDenied,
@@ -934,8 +970,6 @@ impl SemanticReliabilityFailure {
             | Self::ProviderReservationCommitOutcomeUnknown
             | Self::DbAuthorizationDenied
             | Self::DbInvariantViolation
-            | Self::DbReadSnapshotCloseUnknown
-            | Self::DbSnapshotChanged
             | Self::DbUnclassifiedTerminal { .. }
             | Self::ResultInvalid
             | Self::ResponseTooLarge
@@ -945,9 +979,15 @@ impl SemanticReliabilityFailure {
             | Self::ProviderRetryableResponse { .. } => {
                 SemanticRetryDisposition::RetryProviderWithFreshPlan
             }
-            Self::DbReadSnapshotTransient { .. } => {
+            Self::DbReadSnapshotTransient { .. } | Self::DbReadSnapshotCloseUnknown => {
                 SemanticRetryDisposition::ReturnToOperationForSnapshotRestart
             }
+            Self::DbSnapshotChanged {
+                site: SemanticSnapshotChangeSite::OperationObservation,
+            } => SemanticRetryDisposition::ReturnToOperationForInputRebuild,
+            Self::DbSnapshotChanged {
+                site: SemanticSnapshotChangeSite::ReleaseConfirmation,
+            } => SemanticRetryDisposition::ReturnToOperationForSnapshotRestart,
             Self::ReleaseConfirmationTransient { .. } | Self::ReleaseConfirmationOutcomeUnknown => {
                 SemanticRetryDisposition::RetryReleaseConfirmation
             }
@@ -973,7 +1013,7 @@ impl SemanticReliabilityFailure {
             Self::ProviderProtocolInvalid => "provider_protocol_invalid",
             Self::DbReadSnapshotTransient { .. } => "db_read_snapshot_transient",
             Self::DbReadSnapshotCloseUnknown => "db_read_snapshot_close_unknown",
-            Self::DbSnapshotChanged => "db_snapshot_changed",
+            Self::DbSnapshotChanged { .. } => "db_snapshot_changed",
             Self::DbInvariantViolation => "db_invariant_violation",
             Self::DbUnclassifiedTerminal { .. } => "db_unclassified_terminal",
             Self::ProviderReservationCommitOutcomeUnknown => {
@@ -1366,6 +1406,29 @@ mod tests {
             .retry_disposition(),
             SemanticRetryDisposition::ReturnToOperationForSnapshotRestart
         );
+        // Close-unknown hands back to the operation, which must first close
+        // or drop the old read-only transaction (plan §4.5 row condition).
+        assert_eq!(
+            SemanticReliabilityFailure::DbReadSnapshotCloseUnknown.retry_disposition(),
+            SemanticRetryDisposition::ReturnToOperationForSnapshotRestart
+        );
+        // The two snapshot-change sites have different owners: input rebuild
+        // for an operation observation, snapshot restart for a one-shot
+        // release whose expected snapshot is no longer current.
+        assert_eq!(
+            SemanticReliabilityFailure::DbSnapshotChanged {
+                site: SemanticSnapshotChangeSite::OperationObservation,
+            }
+            .retry_disposition(),
+            SemanticRetryDisposition::ReturnToOperationForInputRebuild
+        );
+        assert_eq!(
+            SemanticReliabilityFailure::DbSnapshotChanged {
+                site: SemanticSnapshotChangeSite::ReleaseConfirmation,
+            }
+            .retry_disposition(),
+            SemanticRetryDisposition::ReturnToOperationForSnapshotRestart
+        );
         assert_eq!(
             SemanticReliabilityFailure::ReleaseConfirmationOutcomeUnknown.retry_disposition(),
             SemanticRetryDisposition::RetryReleaseConfirmation
@@ -1397,7 +1460,9 @@ mod tests {
                 sqlstate_class: buzz_db::SemanticDbSqlstateClass::TransactionRollback,
             },
             SemanticReliabilityFailure::DbReadSnapshotCloseUnknown,
-            SemanticReliabilityFailure::DbSnapshotChanged,
+            SemanticReliabilityFailure::DbSnapshotChanged {
+                site: SemanticSnapshotChangeSite::ReleaseConfirmation,
+            },
             SemanticReliabilityFailure::DbAuthorizationDenied,
             SemanticReliabilityFailure::DbInvariantViolation,
             SemanticReliabilityFailure::DbUnclassifiedTerminal {
