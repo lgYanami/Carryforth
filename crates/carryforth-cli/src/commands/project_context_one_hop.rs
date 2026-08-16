@@ -4,6 +4,7 @@ use buzz_core::CommunityId;
 use buzz_project_context::EdgeKey;
 use buzz_sdk::semantic_one_hop_search::{
     parse_project_context_one_hop_semantic_search_result,
+    parse_project_context_one_hop_semantic_search_v2_result,
     ProjectContextOneHopSemanticHttpRequestObservation,
 };
 use buzz_semantic_query::{
@@ -12,13 +13,14 @@ use buzz_semantic_query::{
 use uuid::Uuid;
 
 use super::{
-    parse_coordinate_token, parse_single_semantic_result_event, read_identity,
-    read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
+    coordinate_type_filter, parse_coordinate_token, parse_single_semantic_result_event,
+    read_identity, read_verified_v3_snapshot, ProjectViewIdentity, ProjectViewSchema,
     ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
 };
 use crate::client::CarryforthClient;
+use crate::commands::project_view_snapshot::ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION;
 use crate::error::CliError;
-use crate::OutputFormat;
+use crate::{OutputFormat, ProjectContextCoordinateTypeArg};
 
 /// Rank current incident Edges through their canonical relation Documents.
 pub(super) async fn run_coordinate_edge_search(
@@ -44,16 +46,21 @@ pub(super) async fn run_edge_coordinate_search(
     client: &CarryforthClient,
     edge_key: &str,
     query: String,
+    coordinate_types: Vec<ProjectContextCoordinateTypeArg>,
     limit: u8,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
     let edge_key = EdgeKey::from_hex(edge_key)
         .map_err(|error| CliError::Usage(format!("invalid Edge key: {error}")))?;
+    let coordinate_types = coordinate_type_filter(coordinate_types)?;
     run_one_hop_search(
         client,
         query,
         limit,
-        OneHopSemanticScope::EdgeCoordinates { edge_key },
+        OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types,
+        },
         format,
     )
     .await
@@ -66,7 +73,14 @@ async fn run_one_hop_search(
     scope: OneHopSemanticScope,
     format: &OutputFormat,
 ) -> Result<(), CliError> {
-    let identity = require_one_hop_identity(client).await?;
+    let filtered = matches!(
+        scope,
+        OneHopSemanticScope::EdgeCoordinates {
+            coordinate_types: Some(_),
+            ..
+        }
+    );
+    let identity = require_one_hop_identity(client, filtered).await?;
     let project = read_verified_v3_snapshot(client, identity)
         .await
         .map_err(|error| {
@@ -88,23 +102,33 @@ async fn run_one_hop_search(
         .one_hop_semantic_search_once(&identity.relay_pubkey, request)
         .await?;
     let event = parse_single_semantic_result_event(&response.response_body)?;
-    let result = parse_project_context_one_hop_semantic_search_result(
-        &event,
-        &identity.relay_pubkey,
-        ProjectContextOneHopSemanticHttpRequestObservation {
-            project_id: CommunityId::from_uuid(project_id),
-            authenticated_caller: client.public_key(),
-            request: &response.request,
-            nip98_auth_event_id: response.nip98_auth_event_id,
-            exact_authenticated_body: &response.exact_body,
-        },
-    )
+    let observation = ProjectContextOneHopSemanticHttpRequestObservation {
+        project_id: CommunityId::from_uuid(project_id),
+        authenticated_caller: client.public_key(),
+        request: &response.request,
+        nip98_auth_event_id: response.nip98_auth_event_id,
+        exact_authenticated_body: &response.exact_body,
+    };
+    let result = if filtered {
+        parse_project_context_one_hop_semantic_search_v2_result(
+            &event,
+            &identity.relay_pubkey,
+            observation,
+        )
+    } else {
+        parse_project_context_one_hop_semantic_search_result(
+            &event,
+            &identity.relay_pubkey,
+            observation,
+        )
+    }
     .map_err(|error| integrity_error(format!("invalid one-hop semantic result: {error}")))?;
     print_result(&result, format)
 }
 
 async fn require_one_hop_identity(
     client: &CarryforthClient,
+    filtered: bool,
 ) -> Result<ProjectViewIdentity, CliError> {
     let identity = read_identity(client).await?.ok_or_else(|| {
         CliError::Unavailable("Project View v3 is not ready for one-hop semantic search".to_owned())
@@ -114,14 +138,24 @@ async fn require_one_hop_identity(
             "one-hop semantic search requires Project View v3".to_owned(),
         ));
     }
-    if !identity.one_hop_semantic_search_http_enabled {
+    let capability_available = if filtered {
+        identity.one_hop_semantic_search_v2_http_enabled
+    } else {
+        identity.one_hop_semantic_search_http_enabled
+    };
+    if !capability_available {
         if identity.extensions_temporarily_unavailable {
             return Err(CliError::Unavailable(
                 "Relay one-hop semantic capability observation could not be completed".to_owned(),
             ));
         }
+        let extension = if filtered {
+            ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION
+        } else {
+            ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION
+        };
         return Err(CliError::Usage(format!(
-            "Relay does not advertise {ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION}"
+            "Relay does not advertise {extension}"
         )));
     }
     Ok(identity)
@@ -175,6 +209,7 @@ mod tests {
             limit: 8,
             scope: OneHopSemanticScope::EdgeCoordinates {
                 edge_key: EdgeKey::from_hex(&"07".repeat(32)).expect("canonical Edge key"),
+                coordinate_types: None,
             },
         };
         let incident = serde_json::to_value(incident).expect("serialize incident scope");

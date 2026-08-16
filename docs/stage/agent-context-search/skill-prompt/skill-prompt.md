@@ -127,14 +127,34 @@ cf project-context coordinate show <TYPE:UUID>
 ```
 
 只有在当前工作、任务、Meeting和上下文环境中都没有明确且相关的 Coordinate 时，才执行一次全图起点
-语义搜索。query 必须包含当前 Role，并表达需要定位的对象，或者缺失、相关、想进一步了解的上下文；
-只有相关的其他上下文环境事实才加入 query，不要伪造硬范围：
+语义搜索。把需要定位的起点对象或责任位置作为 query 的主信号，再加入一句当前 Role 与本次定位相关的
+责任含义；只有确实能区分候选时，才额外加入至多一个环境事实。不要把完整问题、最终输出格式、后续
+Edge或路径目标、聊天历史和无关 Role Brief 内容拼成一个起点 query，也不要伪造硬范围：
+
+如果已经明确要寻找的起点对象类型，可以重复传入一个或多个`--coordinate-type`。这是排序前执行的确定性
+结构 OR 过滤，不是另一种上下文视角。它适合表达“只寻找 Work 或 Issue”这类已知结构事实；不要用它
+表达前端/后端责任或其他语义区别。对象类型不确定时就省略。闭集值为`project_profile`、`goal`、`role`、
+`plan`、`stage`、`requirement`、`issue`、`work`、`resource`、`document`和`meeting`；其中
+`document`只表示作为 Coordinate 的 Document，不表示绑定在 Edge 上的 relation Document。
 
 ```bash
 cf project-context coordinate-search \
-  --query "<需要定位的对象，或缺失、相关、想进一步了解的上下文>" \
+  --query "<目标起点对象或责任位置；简短的当前 Role 责任；可选的单一区分事实>" \
+  --coordinate-type work \
   --limit 8
 ```
+
+对象类型未知时删除`--coordinate-type`；需要一个小型 OR 集合时可重复，例如
+`--coordinate-type work --coordinate-type issue`。不要把全部类型都传入来模拟不加过滤。
+
+例如，应优先使用：
+
+```text
+目标起点：当前前端重试 Work；Role责任：维护客户端重试行为；区分事实：本次发布
+```
+
+不要在它后面继续加入完整事故叙述、根因分析要求、Edge遍历计划和最终报告格式。只有底层问题中的某个
+短语本身是定位该 Coordinate 所必需时，才把该短语压缩后加入。
 
 该命令返回的是起点候选，不是已经选定的起点。它只返回排名、Coordinate identity 和 score，不返回
 title、description 或 summary。在有界候选集中按需执行 `coordinate show`，读取每个候选的 current
@@ -158,24 +178,26 @@ K+1 个候选。它们都不能证明其他 Coordinate 不相关。
 
 ## 构造局部语义问题
 
-每次只描述当前一步需要做出的选择，不要把全部聊天记录或整个环境机械拼接进 query。保持当前问题
-稳定，每次都包含当前 Role，再加入本次选择真正需要的其他上下文环境事实：
+每次只描述当前一步需要做出的选择，不要把全部聊天记录或整个环境机械拼接进 query。底层问题保持在
+Agent的临时任务状态中，不要把完整问题复制到每个语义 query。每次都包含当前 Role 与当前选择相关的
+责任含义，再加入本次选择真正需要的其他上下文环境事实：
 
-- 选择起点时，描述要找的对象或责任位置；
+- 选择起点时，把要找的对象或责任位置作为主信号；
 - 从 Coordinate 选择 Edge 时，描述要找的关系、解释或证据；
 - 从 Edge 选择 Coordinate 时，描述下一步要到达的对象及其对当前任务的作用。
 
-Role 之外，只加入能够区分候选的环境事实。例如，同一个问题“为什么这次发布仍然失败？”可以形成：
+Role 之外，只加入能够区分候选的环境事实。例如，同一个底层问题可以形成两个不同的起点 query：
 
 ```text
-问题：为什么这次发布仍然失败？当前 Role：前端工程；相关环境：我承担前端重试 Work；寻找与该
-Work 相关的关系证据
+目标起点：当前前端重试 Work；Role责任：维护客户端重试行为
 ```
 
 ```text
-问题：为什么这次发布仍然失败？当前 Role：后端工程；相关环境：我承担后端授权预检 Work；寻找与该
-Work 相关的下一对象
+目标起点：当前后端授权预检 Work；Role责任：维护服务端授权边界
 ```
+
+起点 query 不加入最终回复要求、完整排查计划或后续关系与路径目标；这些内容保留在任务状态，并在真正
+到达相应 hop 时才转化为局部 query。
 
 不要仅依赖 query 中出现“前端”“后端”或 Role 名称来保证结果正确；始终检查候选的 canonical 轻量
 观察和关系 Document。允许任务需要真实跨 Role 依赖，不要把 Role 不同机械地视为无关。
@@ -243,6 +265,10 @@ cf project-context edge coordinate-search <EDGE_KEY> \
   --query "<下一步需要到达的对象及其作用>" \
   --limit 8
 ```
+
+如果下一跳必须属于一个或多个已知 Coordinate 类型，使用同样的重复`--coordinate-type`过滤。过滤在完整
+Edge成员范围内、top-K之前执行；它不会修改Edge、推断正确下一跳，也不能替代Agent对轻量候选的检查。
+当跨类型依赖可能相关时省略过滤。
 
 该结果返回 ranked Coordinate identities 和它们的 canonical 轻量观察；它不返回 relation Documents，
 也不返回完整 Edge DTO。根据当前环境判断：
@@ -414,7 +440,9 @@ Coordinate。
 
 正确做法：
 
-1. 执行一次 `coordinate-search`，query 同时表达发布协调 Role 的责任和要找的回滚上下文。
+1. 执行一次 `coordinate-search`，把当前回滚责任对象作为主信号，只加入简短的发布协调 Role责任和本次
+   发布这一个区分事实；因为已知起点应为 Work 或 Issue，同时传入
+   `--coordinate-type work --coordinate-type issue`，避免其他类型占用候选窗口。
 2. 按 score 安排 `coordinate show`顺序，但不直接采用第一名。
 3. 如果第一名是词汇相似但属于旧发布的 Requirement，而第三名是当前发布的 Issue，依据轻量观察选择
    第三名作为起点。
@@ -423,11 +451,16 @@ Coordinate。
 
 ```bash
 cf project-context coordinate-search \
-  --query "当前 Role：负责发布协调；寻找与本次回滚责任位置相关的 Work、Requirement 或 Issue" \
+  --query "目标起点：本次发布的回滚责任 Work 或 Issue；Role责任：协调回滚所有权和交接" \
+  --coordinate-type work \
+  --coordinate-type issue \
   --limit 8
 cf project-context coordinate show "requirement:<old-release-id>"
 cf project-context coordinate show "issue:<current-release-id>"
 ```
+
+反例是把完整发布失败叙述、根因要求、关系 Document、下一 Coordinate 和最终报告格式全部加入这一次
+起点 query；这些后续目标会稀释要定位的对象，应继续留在任务状态。
 
 收尾：记录选中起点或“没有可靠起点”。空结果或拒绝全部候选都不能证明图中不存在相关对象。
 

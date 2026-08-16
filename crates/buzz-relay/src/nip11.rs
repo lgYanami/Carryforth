@@ -28,8 +28,12 @@ pub(crate) const SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION: &str =
     "buzz-project-context-semantic-query-http";
 pub(crate) const PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION: &str =
     "carryforth-project-context-coordinate-search-http";
+pub(crate) const PROJECT_CONTEXT_COORDINATE_SEARCH_V2_HTTP_EXTENSION: &str =
+    "carryforth-project-context-coordinate-search-v2-http";
 pub(crate) const PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION: &str =
     "carryforth-project-context-one-hop-semantic-search-http";
+pub(crate) const PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION: &str =
+    "carryforth-project-context-one-hop-semantic-search-v2-http";
 pub(crate) const MEETING_V2_EXTENSION: &str = "buzz-meeting-v2";
 pub(crate) const MEETING_V2_CREATE_EXTENSION: &str = "buzz-meeting-v2-create";
 pub(crate) const MEETING_V2_DIRECT_ACTIONS_EXTENSION: &str = "buzz-meeting-v2-direct-actions";
@@ -368,6 +372,11 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
         PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION,
         coordinate_search_ready.value,
     );
+    append_extension(
+        &mut info,
+        PROJECT_CONTEXT_COORDINATE_SEARCH_V2_HTTP_EXTENSION,
+        coordinate_search_ready.value,
+    );
     let one_hop_semantic_search_ready = semantic_query_http_ready_for_tenant(
         state,
         tenant,
@@ -382,6 +391,11 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     append_extension(
         &mut info,
         PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
+        one_hop_semantic_search_ready.value,
+    );
+    append_extension(
+        &mut info,
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION,
         one_hop_semantic_search_ready.value,
     );
     let project_document_ready = project_document_ready_for_tenant(state, tenant).await;
@@ -1124,10 +1138,18 @@ mod tests {
             PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION,
             true,
         );
+        append_extension(
+            &mut info,
+            PROJECT_CONTEXT_COORDINATE_SEARCH_V2_HTTP_EXTENSION,
+            true,
+        );
         let extensions = info.supported_extensions.unwrap_or_default();
         assert!(extensions
             .iter()
             .any(|value| value == PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_EXTENSION));
+        assert!(extensions
+            .iter()
+            .any(|value| value == PROJECT_CONTEXT_COORDINATE_SEARCH_V2_HTTP_EXTENSION));
         assert!(!extensions
             .iter()
             .any(|value| value == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION));
@@ -1155,10 +1177,18 @@ mod tests {
             PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION,
             true,
         );
+        append_extension(
+            &mut info,
+            PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION,
+            true,
+        );
         let extensions = info.supported_extensions.unwrap_or_default();
         assert!(extensions
             .iter()
             .any(|value| value == PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_EXTENSION));
+        assert!(extensions
+            .iter()
+            .any(|value| value == PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_HTTP_EXTENSION));
         assert!(!extensions
             .iter()
             .any(|value| value == SEMANTIC_GRAPH_QUERY_HTTP_EXTENSION));

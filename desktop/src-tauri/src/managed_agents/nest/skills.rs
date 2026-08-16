@@ -29,7 +29,7 @@ const CARRYFORTH_MEETING_OPENAI_YAML: &str =
 pub(super) const NEST_SKILL_VERSION: u32 = 5;
 
 /// Template content version for the search-project-context SKILL.md.
-pub(super) const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 1;
+pub(super) const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 2;
 
 /// Template content version for the carryforth-meeting skill directory.
 pub(super) const CARRYFORTH_MEETING_SKILL_VERSION: u32 = 2;

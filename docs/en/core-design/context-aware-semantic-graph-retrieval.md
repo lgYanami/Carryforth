@@ -193,9 +193,15 @@ Agent run once:
 
 ```bash
 cf project-context coordinate-search \
-  --query "<current Role and context that is missing, related, or worth understanding>" \
+  --query "<desired start or responsibility; short relevant Role responsibility; optional discriminator>" \
+  --coordinate-type work \
   --limit 8
 ```
+
+When the structural type of the start is known, repeat `--coordinate-type` to form a small OR set;
+the filter is applied before semantic ranking and top-K. Omit it when the type is uncertain. The
+structural filter narrows candidates, but the Agent still evaluates them against its context
+environment.
 
 This command returns Coordinate identity, rank, and score only. Its output is a list of candidates
 to inspect, not a selected start. The Agent uses rank to order `coordinate show` observations, then
@@ -227,6 +233,9 @@ Coordinate for the Agent:
 
 Semantic commands narrow the observation set. Structural commands answer complete-set questions.
 Neither substitutes for the other.
+`edge coordinate-search` also accepts repeated `--coordinate-type` values and filters the complete
+Edge membership before ranking. `coordinate edge-search` does not accept the filter because it
+selects Edges rather than Coordinates.
 
 ### 7.1 Choose an Edge from a Coordinate
 

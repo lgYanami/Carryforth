@@ -316,6 +316,7 @@ mod tests {
                 request_id: uuid(1),
                 project_id: uuid(2),
                 query: "authorization context".to_owned(),
+                coordinate_types: None,
                 limit: DEFAULT_COORDINATE_SEARCH_LIMIT,
             })
             .expect("Coordinate input")

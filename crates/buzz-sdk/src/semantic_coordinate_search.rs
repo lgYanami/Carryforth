@@ -9,7 +9,8 @@ use buzz_core::kind::KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT;
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
-    verify_coordinate_search_http_request_binding, ProjectContextCoordinateSearchQuery,
+    verify_coordinate_search_http_request_binding,
+    verify_coordinate_search_v2_http_request_binding, ProjectContextCoordinateSearchQuery,
     ProjectContextCoordinateSearchResult, MAX_COORDINATE_SEARCH_RESPONSE_BYTES,
 };
 use nostr::{Event, EventBuilder, Kind, Tag};
@@ -20,6 +21,9 @@ use crate::SdkError;
 /// Exact marker carried by Coordinate-search result Events.
 pub const PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT_MARKER: &str =
     "carryforth-project-context-coordinate-search-result";
+/// Exact marker carried by filtered Coordinate-search v2 result Events.
+pub const PROJECT_CONTEXT_COORDINATE_SEARCH_V2_RESULT_MARKER: &str =
+    "carryforth-project-context-coordinate-search-result-v2";
 
 /// Canonical Coordinate-search HTTP request and exact serialized body.
 ///
@@ -58,6 +62,16 @@ struct ProjectContextCoordinateSearchFilter<'a> {
     carryforth_project_context_coordinate_search: &'a ProjectContextCoordinateSearchQuery,
 }
 
+#[derive(Serialize)]
+struct ProjectContextCoordinateSearchV2Filter<'a> {
+    kinds: [u32; 1],
+    authors: [String; 1],
+    #[serde(rename = "#p")]
+    caller: [String; 1],
+    limit: u8,
+    carryforth_project_context_coordinate_search_v2: &'a ProjectContextCoordinateSearchQuery,
+}
+
 /// Validate and serialize one exclusive Coordinate-search `/query` filter.
 ///
 /// The exact filter keys are `kinds`, `authors`, `#p`, `limit`, and
@@ -67,19 +81,55 @@ pub fn build_project_context_coordinate_search_http_query_request(
     expected_relay: &PublicKey,
     authenticated_caller: &PublicKey,
 ) -> Result<ProjectContextCoordinateSearchHttpQueryRequest, SdkError> {
+    build_coordinate_search_http_query_request(request, expected_relay, authenticated_caller, false)
+}
+
+/// Validate and serialize one exclusive filtered Coordinate-search v2 request.
+pub fn build_project_context_coordinate_search_v2_http_query_request(
+    request: ProjectContextCoordinateSearchQuery,
+    expected_relay: &PublicKey,
+    authenticated_caller: &PublicKey,
+) -> Result<ProjectContextCoordinateSearchHttpQueryRequest, SdkError> {
+    build_coordinate_search_http_query_request(request, expected_relay, authenticated_caller, true)
+}
+
+fn build_coordinate_search_http_query_request(
+    request: ProjectContextCoordinateSearchQuery,
+    expected_relay: &PublicKey,
+    authenticated_caller: &PublicKey,
+    filtered: bool,
+) -> Result<ProjectContextCoordinateSearchHttpQueryRequest, SdkError> {
     let request = request.validate_and_canonicalize().map_err(|error| {
         SdkError::InvalidInput(format!(
             "invalid Project Context Coordinate search: {error}"
         ))
     })?;
-    let filter = ProjectContextCoordinateSearchFilter {
-        kinds: [KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT],
-        authors: [expected_relay.to_hex()],
-        caller: [authenticated_caller.to_hex()],
-        limit: 1,
-        carryforth_project_context_coordinate_search: &request,
+    if filtered != request.coordinate_types.is_some() {
+        return Err(SdkError::InvalidInput(
+            "Coordinate-search surface does not match the type-filter contract".to_owned(),
+        ));
+    }
+    let kinds = [KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT];
+    let authors = [expected_relay.to_hex()];
+    let caller = [authenticated_caller.to_hex()];
+    let exact_body = if filtered {
+        serde_json::to_vec(&[ProjectContextCoordinateSearchV2Filter {
+            kinds,
+            authors,
+            caller,
+            limit: 1,
+            carryforth_project_context_coordinate_search_v2: &request,
+        }])
+    } else {
+        serde_json::to_vec(&[ProjectContextCoordinateSearchFilter {
+            kinds,
+            authors,
+            caller,
+            limit: 1,
+            carryforth_project_context_coordinate_search: &request,
+        }])
     };
-    let exact_body = serde_json::to_vec(&[filter]).map_err(|error| {
+    let exact_body = exact_body.map_err(|error| {
         SdkError::InvalidInput(format!(
             "serialize Project Context Coordinate search: {error}"
         ))
@@ -134,9 +184,30 @@ pub fn build_project_context_coordinate_search_result(
     result: &ProjectContextCoordinateSearchResult,
     authenticated_caller: &PublicKey,
 ) -> Result<EventBuilder, SdkError> {
+    build_coordinate_search_result(result, authenticated_caller, false)
+}
+
+/// Build the unsigned response-only Event for a filtered Coordinate-search v2 result.
+pub fn build_project_context_coordinate_search_v2_result(
+    result: &ProjectContextCoordinateSearchResult,
+    authenticated_caller: &PublicKey,
+) -> Result<EventBuilder, SdkError> {
+    build_coordinate_search_result(result, authenticated_caller, true)
+}
+
+fn build_coordinate_search_result(
+    result: &ProjectContextCoordinateSearchResult,
+    authenticated_caller: &PublicKey,
+    filtered: bool,
+) -> Result<EventBuilder, SdkError> {
     result.validate().map_err(|error| {
         SdkError::InvalidInput(format!("invalid Coordinate-search result: {error}"))
     })?;
+    if filtered != result.observations.coordinate_types.is_some() {
+        return Err(SdkError::InvalidInput(
+            "Coordinate-search result surface does not match the type-filter contract".to_owned(),
+        ));
+    }
     let content = canonical_json(result, "serialize Coordinate-search result")?;
     if content.len() > MAX_COORDINATE_SEARCH_RESPONSE_BYTES {
         return Err(SdkError::ContentTooLarge {
@@ -148,6 +219,11 @@ pub fn build_project_context_coordinate_search_result(
     let caller = authenticated_caller.to_hex();
     let request_id = result.request_id.to_string();
     let request_binding = result.request_binding_digest.to_hex();
+    let marker = if filtered {
+        PROJECT_CONTEXT_COORDINATE_SEARCH_V2_RESULT_MARKER
+    } else {
+        PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT_MARKER
+    };
     Ok(EventBuilder::new(
         Kind::Custom(KIND_PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT as u16),
         content,
@@ -156,7 +232,7 @@ pub fn build_project_context_coordinate_search_result(
         tag(["p", caller.as_str()])?,
         tag(["request_id", request_id.as_str()])?,
         tag(["request_binding", request_binding.as_str()])?,
-        tag(["t", PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT_MARKER])?,
+        tag(["t", marker])?,
     ]))
 }
 
@@ -170,6 +246,24 @@ pub fn parse_project_context_coordinate_search_result(
     expected_relay: &PublicKey,
     expected: ProjectContextCoordinateSearchHttpRequestObservation<'_>,
 ) -> Result<ProjectContextCoordinateSearchResult, SdkError> {
+    parse_coordinate_search_result(event, expected_relay, expected, false)
+}
+
+/// Verify and parse one Relay-signed filtered Coordinate-search v2 result Event.
+pub fn parse_project_context_coordinate_search_v2_result(
+    event: &Event,
+    expected_relay: &PublicKey,
+    expected: ProjectContextCoordinateSearchHttpRequestObservation<'_>,
+) -> Result<ProjectContextCoordinateSearchResult, SdkError> {
+    parse_coordinate_search_result(event, expected_relay, expected, true)
+}
+
+fn parse_coordinate_search_result(
+    event: &Event,
+    expected_relay: &PublicKey,
+    expected: ProjectContextCoordinateSearchHttpRequestObservation<'_>,
+    filtered: bool,
+) -> Result<ProjectContextCoordinateSearchResult, SdkError> {
     let request = expected
         .request
         .clone()
@@ -177,6 +271,11 @@ pub fn parse_project_context_coordinate_search_result(
         .map_err(|error| {
             SdkError::InvalidInput(format!("invalid expected Coordinate search: {error}"))
         })?;
+    if filtered != request.coordinate_types.is_some() {
+        return Err(SdkError::InvalidInput(
+            "Coordinate-search surface does not match the type-filter contract".to_owned(),
+        ));
+    }
     if request.project_id != *expected.project_id.as_uuid() {
         return Err(SdkError::InvalidInput(
             "expected Coordinate-search request disagrees with the host-derived Project".to_owned(),
@@ -207,6 +306,11 @@ pub fn parse_project_context_coordinate_search_result(
 
     let result = parse_closed_result(event)?;
     require_canonical_content(&event.content, &result)?;
+    if filtered != result.observations.coordinate_types.is_some() {
+        return Err(invalid_projection(
+            "Coordinate-search result surface does not match the type-filter contract",
+        ));
+    }
     result.validate_for_request(&request).map_err(|error| {
         invalid_projection(format!("invalid Coordinate-search result: {error}"))
     })?;
@@ -226,27 +330,40 @@ pub fn parse_project_context_coordinate_search_result(
     let caller = expected.authenticated_caller.to_hex();
     let request_id = result.request_id.to_string();
     let request_binding = result.request_binding_digest.to_hex();
+    let marker = if filtered {
+        PROJECT_CONTEXT_COORDINATE_SEARCH_V2_RESULT_MARKER
+    } else {
+        PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT_MARKER
+    };
     require_exact_tags(
         event,
         &[
             vec!["p".to_owned(), caller],
             vec!["request_id".to_owned(), request_id],
             vec!["request_binding".to_owned(), request_binding],
-            vec![
-                "t".to_owned(),
-                PROJECT_CONTEXT_COORDINATE_SEARCH_RESULT_MARKER.to_owned(),
-            ],
+            vec!["t".to_owned(), marker.to_owned()],
         ],
     )?;
 
-    verify_coordinate_search_http_request_binding(
-        result.request_binding_digest,
-        *expected.project_id.as_uuid(),
-        &expected.authenticated_caller.to_bytes(),
-        Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
-        expected.exact_authenticated_body,
-    )
-    .map_err(|_| invalid_projection("Coordinate-search request binding does not match"))?;
+    let binding_result = if filtered {
+        verify_coordinate_search_v2_http_request_binding(
+            result.request_binding_digest,
+            *expected.project_id.as_uuid(),
+            &expected.authenticated_caller.to_bytes(),
+            Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
+            expected.exact_authenticated_body,
+        )
+    } else {
+        verify_coordinate_search_http_request_binding(
+            result.request_binding_digest,
+            *expected.project_id.as_uuid(),
+            &expected.authenticated_caller.to_bytes(),
+            Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
+            expected.exact_authenticated_body,
+        )
+    };
+    binding_result
+        .map_err(|_| invalid_projection("Coordinate-search request binding does not match"))?;
 
     Ok(result)
 }
@@ -317,8 +434,10 @@ mod tests {
     use buzz_semantic::Digest32;
     use buzz_semantic_query::{
         coordinate_search_query_contract_digest, derive_coordinate_search_http_request_binding,
-        ProjectContextCoordinateSearchCandidate, ProjectContextCoordinateSearchObservations,
-        ProjectContextCoordinateSearchQuery, ProjectContextCoordinateSearchResult, Score,
+        derive_coordinate_search_v2_http_request_binding, ProjectContextCoordinateSearchCandidate,
+        ProjectContextCoordinateSearchObservations, ProjectContextCoordinateSearchQuery,
+        ProjectContextCoordinateSearchResult, ProjectContextCoordinateType,
+        ProjectContextCoordinateTypeFilter, Score,
     };
     use chrono::{TimeZone, Utc};
     use nostr::{Event, EventBuilder, Kind, Tag};
@@ -327,7 +446,10 @@ mod tests {
     use super::{
         build_project_context_coordinate_search_http_query_request,
         build_project_context_coordinate_search_result,
+        build_project_context_coordinate_search_v2_http_query_request,
+        build_project_context_coordinate_search_v2_result,
         parse_project_context_coordinate_search_result,
+        parse_project_context_coordinate_search_v2_result,
         ProjectContextCoordinateSearchHttpRequestObservation,
     };
 
@@ -362,6 +484,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 project_id: Uuid::new_v4(),
                 query: "Which work is closest to the release task?".to_owned(),
+                coordinate_types: None,
                 limit: 2,
             };
             let built = build_project_context_coordinate_search_http_query_request(
@@ -391,6 +514,7 @@ mod tests {
                     semantic_generation_id: uuid(9),
                     embedding_space_fence: Digest32::from_bytes([1; 32]),
                     query_contract_digest: coordinate_search_query_contract_digest(),
+                    coordinate_types: None,
                     projection_generation: 5,
                     project_context_revision: 7,
                     snapshot_observed_at: Utc
@@ -565,6 +689,104 @@ mod tests {
             &fixture.sign_content(canonical, true),
             &fixture.relay.public_key(),
             fixture.observation(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn filtered_v2_is_a_separate_bound_surface_and_v1_remains_closed() {
+        let relay = Keys::generate();
+        let caller = Keys::generate();
+        let filter =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter");
+        let request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            query: "Find the frontend work".to_owned(),
+            coordinate_types: Some(filter.clone()),
+            limit: 1,
+        };
+        assert!(build_project_context_coordinate_search_http_query_request(
+            request.clone(),
+            &relay.public_key(),
+            &caller.public_key(),
+        )
+        .is_err());
+        let built = build_project_context_coordinate_search_v2_http_query_request(
+            request,
+            &relay.public_key(),
+            &caller.public_key(),
+        )
+        .expect("v2 request");
+        let body: serde_json::Value = serde_json::from_slice(&built.exact_body).expect("body");
+        assert!(body[0]
+            .get("carryforth_project_context_coordinate_search_v2")
+            .is_some());
+        assert!(body[0]
+            .get("carryforth_project_context_coordinate_search")
+            .is_none());
+        let auth = EventBuilder::new(Kind::Custom(KIND_HTTP_AUTH as u16), "POST /query")
+            .sign_with_keys(&caller)
+            .expect("auth");
+        let binding = derive_coordinate_search_v2_http_request_binding(
+            built.request.project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(auth.id.to_bytes()),
+            &built.exact_body,
+        )
+        .expect("binding");
+        let result = ProjectContextCoordinateSearchResult {
+            request_id: built.request.request_id,
+            project_id: built.request.project_id,
+            request_binding_digest: binding,
+            observations: ProjectContextCoordinateSearchObservations {
+                semantic_generation_id: uuid(9),
+                embedding_space_fence: Digest32::from_bytes([1; 32]),
+                query_contract_digest: coordinate_search_query_contract_digest(),
+                coordinate_types: Some(filter),
+                projection_generation: 5,
+                project_context_revision: 7,
+                snapshot_observed_at: Utc
+                    .timestamp_opt(1_700_000_000, 0)
+                    .single()
+                    .expect("timestamp"),
+            },
+            coordinates: vec![ProjectContextCoordinateSearchCandidate {
+                rank: 1,
+                coordinate: coordinate(1),
+                score: Score::new(900_000).expect("score"),
+            }],
+            truncated: false,
+        };
+        assert!(
+            build_project_context_coordinate_search_result(&result, &caller.public_key()).is_err()
+        );
+        let event =
+            build_project_context_coordinate_search_v2_result(&result, &caller.public_key())
+                .expect("result")
+                .sign_with_keys(&relay)
+                .expect("sign");
+        let observation = ProjectContextCoordinateSearchHttpRequestObservation {
+            project_id: CommunityId::from_uuid(built.request.project_id),
+            authenticated_caller: caller.public_key(),
+            request: &built.request,
+            nip98_auth_event_id: auth.id,
+            exact_authenticated_body: &built.exact_body,
+        };
+        assert_eq!(
+            parse_project_context_coordinate_search_v2_result(
+                &event,
+                &relay.public_key(),
+                observation,
+            )
+            .expect("v2 verifies"),
+            result
+        );
+        assert!(parse_project_context_coordinate_search_result(
+            &event,
+            &relay.public_key(),
+            observation,
         )
         .is_err());
     }

@@ -9,7 +9,8 @@ use buzz_core::kind::KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT;
 use buzz_core::{CommunityId, EventId, PublicKey};
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
-    verify_one_hop_semantic_http_request_binding, ProjectContextOneHopSemanticQuery,
+    verify_one_hop_semantic_http_request_binding, verify_one_hop_semantic_v2_http_request_binding,
+    OneHopSemanticScope, OneHopSemanticSelection, ProjectContextOneHopSemanticQuery,
     ProjectContextOneHopSemanticQueryResult, MAX_ONE_HOP_SEMANTIC_EXACT_HTTP_BODY_BYTES,
     MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES,
 };
@@ -21,6 +22,9 @@ use crate::SdkError;
 /// Exact marker carried by one-hop semantic-selection result Events.
 pub const PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER: &str =
     "carryforth-project-context-one-hop-semantic-search-result";
+/// Exact marker carried by filtered one-hop semantic-selection v2 result Events.
+pub const PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_RESULT_MARKER: &str =
+    "carryforth-project-context-one-hop-semantic-search-result-v2";
 
 /// Canonical one-hop semantic HTTP request and exact serialized body.
 ///
@@ -59,6 +63,16 @@ struct ProjectContextOneHopSemanticFilter<'a> {
     carryforth_project_context_one_hop_semantic_search: &'a ProjectContextOneHopSemanticQuery,
 }
 
+#[derive(Serialize)]
+struct ProjectContextOneHopSemanticV2Filter<'a> {
+    kinds: [u32; 1],
+    authors: [String; 1],
+    #[serde(rename = "#p")]
+    caller: [String; 1],
+    limit: u8,
+    carryforth_project_context_one_hop_semantic_search_v2: &'a ProjectContextOneHopSemanticQuery,
+}
+
 /// Validate and serialize one exclusive one-hop semantic `/query` filter.
 ///
 /// The exact filter keys are `kinds`, `authors`, `#p`, `limit`, and
@@ -68,19 +82,55 @@ pub fn build_project_context_one_hop_semantic_http_query_request(
     expected_relay: &PublicKey,
     authenticated_caller: &PublicKey,
 ) -> Result<ProjectContextOneHopSemanticHttpQueryRequest, SdkError> {
+    build_one_hop_semantic_http_query_request(request, expected_relay, authenticated_caller, false)
+}
+
+/// Validate and serialize one exclusive filtered one-hop semantic v2 request.
+pub fn build_project_context_one_hop_semantic_v2_http_query_request(
+    request: ProjectContextOneHopSemanticQuery,
+    expected_relay: &PublicKey,
+    authenticated_caller: &PublicKey,
+) -> Result<ProjectContextOneHopSemanticHttpQueryRequest, SdkError> {
+    build_one_hop_semantic_http_query_request(request, expected_relay, authenticated_caller, true)
+}
+
+fn build_one_hop_semantic_http_query_request(
+    request: ProjectContextOneHopSemanticQuery,
+    expected_relay: &PublicKey,
+    authenticated_caller: &PublicKey,
+    filtered: bool,
+) -> Result<ProjectContextOneHopSemanticHttpQueryRequest, SdkError> {
     let request = request.validate_and_canonicalize().map_err(|error| {
         SdkError::InvalidInput(format!(
             "invalid Project Context one-hop semantic request: {error}"
         ))
     })?;
-    let filter = ProjectContextOneHopSemanticFilter {
-        kinds: [KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT],
-        authors: [expected_relay.to_hex()],
-        caller: [authenticated_caller.to_hex()],
-        limit: 1,
-        carryforth_project_context_one_hop_semantic_search: &request,
+    if filtered != request_is_filtered(&request) {
+        return Err(SdkError::InvalidInput(
+            "one-hop semantic surface does not match the type-filter contract".to_owned(),
+        ));
+    }
+    let kinds = [KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT];
+    let authors = [expected_relay.to_hex()];
+    let caller = [authenticated_caller.to_hex()];
+    let exact_body = if filtered {
+        serde_json::to_vec(&[ProjectContextOneHopSemanticV2Filter {
+            kinds,
+            authors,
+            caller,
+            limit: 1,
+            carryforth_project_context_one_hop_semantic_search_v2: &request,
+        }])
+    } else {
+        serde_json::to_vec(&[ProjectContextOneHopSemanticFilter {
+            kinds,
+            authors,
+            caller,
+            limit: 1,
+            carryforth_project_context_one_hop_semantic_search: &request,
+        }])
     };
-    let exact_body = serde_json::to_vec(&[filter]).map_err(|error| {
+    let exact_body = exact_body.map_err(|error| {
         SdkError::InvalidInput(format!(
             "serialize Project Context one-hop semantic request: {error}"
         ))
@@ -141,9 +191,30 @@ pub fn build_project_context_one_hop_semantic_search_result(
     result: &ProjectContextOneHopSemanticQueryResult,
     authenticated_caller: &PublicKey,
 ) -> Result<EventBuilder, SdkError> {
+    build_one_hop_semantic_search_result(result, authenticated_caller, false)
+}
+
+/// Build the unsigned response-only Event for a filtered one-hop v2 result.
+pub fn build_project_context_one_hop_semantic_search_v2_result(
+    result: &ProjectContextOneHopSemanticQueryResult,
+    authenticated_caller: &PublicKey,
+) -> Result<EventBuilder, SdkError> {
+    build_one_hop_semantic_search_result(result, authenticated_caller, true)
+}
+
+fn build_one_hop_semantic_search_result(
+    result: &ProjectContextOneHopSemanticQueryResult,
+    authenticated_caller: &PublicKey,
+    filtered: bool,
+) -> Result<EventBuilder, SdkError> {
     result.validate().map_err(|error| {
         SdkError::InvalidInput(format!("invalid one-hop semantic result: {error}"))
     })?;
+    if filtered != result_is_filtered(result) {
+        return Err(SdkError::InvalidInput(
+            "one-hop semantic result surface does not match the type-filter contract".to_owned(),
+        ));
+    }
     let content = canonical_json(result, "serialize one-hop semantic result")?;
     if content.len() > MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES {
         return Err(SdkError::ContentTooLarge {
@@ -155,6 +226,11 @@ pub fn build_project_context_one_hop_semantic_search_result(
     let caller = authenticated_caller.to_hex();
     let request_id = result.request_id.to_string();
     let request_binding = result.request_binding_digest.to_hex();
+    let marker = if filtered {
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_RESULT_MARKER
+    } else {
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER
+    };
     Ok(EventBuilder::new(
         Kind::Custom(KIND_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT as u16),
         content,
@@ -163,7 +239,7 @@ pub fn build_project_context_one_hop_semantic_search_result(
         tag(["p", caller.as_str()])?,
         tag(["request_id", request_id.as_str()])?,
         tag(["request_binding", request_binding.as_str()])?,
-        tag(["t", PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER])?,
+        tag(["t", marker])?,
     ]))
 }
 
@@ -178,6 +254,24 @@ pub fn parse_project_context_one_hop_semantic_search_result(
     expected_relay: &PublicKey,
     expected: ProjectContextOneHopSemanticHttpRequestObservation<'_>,
 ) -> Result<ProjectContextOneHopSemanticQueryResult, SdkError> {
+    parse_one_hop_semantic_search_result(event, expected_relay, expected, false)
+}
+
+/// Verify and parse one Relay-signed filtered one-hop semantic v2 result Event.
+pub fn parse_project_context_one_hop_semantic_search_v2_result(
+    event: &Event,
+    expected_relay: &PublicKey,
+    expected: ProjectContextOneHopSemanticHttpRequestObservation<'_>,
+) -> Result<ProjectContextOneHopSemanticQueryResult, SdkError> {
+    parse_one_hop_semantic_search_result(event, expected_relay, expected, true)
+}
+
+fn parse_one_hop_semantic_search_result(
+    event: &Event,
+    expected_relay: &PublicKey,
+    expected: ProjectContextOneHopSemanticHttpRequestObservation<'_>,
+    filtered: bool,
+) -> Result<ProjectContextOneHopSemanticQueryResult, SdkError> {
     let request = expected
         .request
         .clone()
@@ -187,6 +281,11 @@ pub fn parse_project_context_one_hop_semantic_search_result(
                 "invalid expected Project Context one-hop semantic request: {error}"
             ))
         })?;
+    if filtered != request_is_filtered(&request) {
+        return Err(SdkError::InvalidInput(
+            "one-hop semantic surface does not match the type-filter contract".to_owned(),
+        ));
+    }
     if request.project_id != *expected.project_id.as_uuid() {
         return Err(SdkError::InvalidInput(
             "expected one-hop request disagrees with the host-derived Project".to_owned(),
@@ -223,6 +322,11 @@ pub fn parse_project_context_one_hop_semantic_search_result(
 
     let result = parse_closed_result(event)?;
     require_canonical_content(&event.content, &result)?;
+    if filtered != result_is_filtered(&result) {
+        return Err(invalid_projection(
+            "one-hop semantic result surface does not match the type-filter contract",
+        ));
+    }
     result
         .validate_for_request(&request)
         .map_err(|error| invalid_projection(format!("invalid one-hop semantic result: {error}")))?;
@@ -237,30 +341,64 @@ pub fn parse_project_context_one_hop_semantic_search_result(
     let caller = expected.authenticated_caller.to_hex();
     let request_id = result.request_id.to_string();
     let request_binding = result.request_binding_digest.to_hex();
+    let marker = if filtered {
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_V2_RESULT_MARKER
+    } else {
+        PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER
+    };
     require_exact_tags(
         event,
         &[
             vec!["p".to_owned(), caller],
             vec!["request_id".to_owned(), request_id],
             vec!["request_binding".to_owned(), request_binding],
-            vec![
-                "t".to_owned(),
-                PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER.to_owned(),
-            ],
+            vec!["t".to_owned(), marker.to_owned()],
         ],
     )?;
 
-    verify_one_hop_semantic_http_request_binding(
-        result.request_binding_digest,
-        *expected.project_id.as_uuid(),
-        &expected.authenticated_caller.to_bytes(),
-        &expected_relay.to_bytes(),
-        Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
-        expected.exact_authenticated_body,
-    )
-    .map_err(|_| invalid_projection("one-hop semantic request binding does not match"))?;
+    let binding_result = if filtered {
+        verify_one_hop_semantic_v2_http_request_binding(
+            result.request_binding_digest,
+            *expected.project_id.as_uuid(),
+            &expected.authenticated_caller.to_bytes(),
+            &expected_relay.to_bytes(),
+            Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
+            expected.exact_authenticated_body,
+        )
+    } else {
+        verify_one_hop_semantic_http_request_binding(
+            result.request_binding_digest,
+            *expected.project_id.as_uuid(),
+            &expected.authenticated_caller.to_bytes(),
+            &expected_relay.to_bytes(),
+            Digest32::from_bytes(expected.nip98_auth_event_id.to_bytes()),
+            expected.exact_authenticated_body,
+        )
+    };
+    binding_result
+        .map_err(|_| invalid_projection("one-hop semantic request binding does not match"))?;
 
     Ok(result)
+}
+
+fn request_is_filtered(request: &ProjectContextOneHopSemanticQuery) -> bool {
+    matches!(
+        request.scope,
+        OneHopSemanticScope::EdgeCoordinates {
+            coordinate_types: Some(_),
+            ..
+        }
+    )
+}
+
+fn result_is_filtered(result: &ProjectContextOneHopSemanticQueryResult) -> bool {
+    matches!(
+        result.selection,
+        OneHopSemanticSelection::EdgeCoordinates {
+            coordinate_types: Some(_),
+            ..
+        }
+    )
 }
 
 fn parse_closed_result(event: &Event) -> Result<ProjectContextOneHopSemanticQueryResult, SdkError> {
@@ -327,11 +465,13 @@ mod tests {
         SemanticSourceBasis,
     };
     use buzz_semantic_query::{
-        derive_one_hop_semantic_http_request_binding, query_contract_digest,
+        derive_one_hop_semantic_http_request_binding,
+        derive_one_hop_semantic_v2_http_request_binding, query_contract_digest,
         EdgeCoordinateCoverage, IncidentEdgeCoverage, OneHopCandidatePreview,
         OneHopCanonicalCandidateObservation, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
         OneHopRankedCoordinate, OneHopRankedDocument, OneHopRankedEdge, OneHopSemanticObservations,
-        OneHopSemanticScope, OneHopSemanticSelection, ProjectContextOneHopSemanticQuery,
+        OneHopSemanticScope, OneHopSemanticSelection, ProjectContextCoordinateType,
+        ProjectContextCoordinateTypeFilter, ProjectContextOneHopSemanticQuery,
         ProjectContextOneHopSemanticQueryResult, Score, MAX_ONE_HOP_SEMANTIC_RESPONSE_BYTES,
     };
     use chrono::{TimeZone, Utc};
@@ -341,7 +481,10 @@ mod tests {
     use super::{
         build_project_context_one_hop_semantic_http_query_request,
         build_project_context_one_hop_semantic_search_result,
+        build_project_context_one_hop_semantic_search_v2_result,
+        build_project_context_one_hop_semantic_v2_http_query_request,
         parse_project_context_one_hop_semantic_search_result,
+        parse_project_context_one_hop_semantic_search_v2_result, request_is_filtered,
         ProjectContextOneHopSemanticHttpRequestObservation,
         PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_RESULT_MARKER,
     };
@@ -468,24 +611,43 @@ mod tests {
                 limit: 2,
                 scope,
             };
-            let built = build_project_context_one_hop_semantic_http_query_request(
-                request,
-                &relay.public_key(),
-                &caller.public_key(),
-            )
+            let filtered = request_is_filtered(&request);
+            let built = if filtered {
+                build_project_context_one_hop_semantic_v2_http_query_request(
+                    request,
+                    &relay.public_key(),
+                    &caller.public_key(),
+                )
+            } else {
+                build_project_context_one_hop_semantic_http_query_request(
+                    request,
+                    &relay.public_key(),
+                    &caller.public_key(),
+                )
+            }
             .expect("request builds");
             let auth = EventBuilder::new(Kind::Custom(KIND_HTTP_AUTH as u16), "POST /query")
                 .sign_with_keys(&caller)
                 .expect("auth signs");
             let request = built.request;
             let exact_body = built.exact_body;
-            let request_binding_digest = derive_one_hop_semantic_http_request_binding(
-                request.project_id,
-                &caller.public_key().to_bytes(),
-                &relay.public_key().to_bytes(),
-                Digest32::from_bytes(auth.id.to_bytes()),
-                &exact_body,
-            )
+            let request_binding_digest = if filtered {
+                derive_one_hop_semantic_v2_http_request_binding(
+                    request.project_id,
+                    &caller.public_key().to_bytes(),
+                    &relay.public_key().to_bytes(),
+                    Digest32::from_bytes(auth.id.to_bytes()),
+                    &exact_body,
+                )
+            } else {
+                derive_one_hop_semantic_http_request_binding(
+                    request.project_id,
+                    &caller.public_key().to_bytes(),
+                    &relay.public_key().to_bytes(),
+                    Digest32::from_bytes(auth.id.to_bytes()),
+                    &exact_body,
+                )
+            }
             .expect("binding derives");
             let selection = match &request.scope {
                 OneHopSemanticScope::IncidentEdges { coordinate } => {
@@ -519,10 +681,14 @@ mod tests {
                         truncated: false,
                     }
                 }
-                OneHopSemanticScope::EdgeCoordinates { edge_key } => {
+                OneHopSemanticScope::EdgeCoordinates {
+                    edge_key,
+                    coordinate_types,
+                } => {
                     let coordinate = work(3);
                     OneHopSemanticSelection::EdgeCoordinates {
                         edge_key: *edge_key,
+                        coordinate_types: coordinate_types.clone(),
                         ranked_coordinates: vec![OneHopRankedCoordinate {
                             rank: 1,
                             coordinate: coordinate.clone(),
@@ -531,6 +697,8 @@ mod tests {
                         }],
                         coverage: EdgeCoordinateCoverage {
                             edge_coordinate_count: 1,
+                            type_matched_coordinate_count: filtered.then_some(1),
+                            type_filtered_out_coordinates: filtered.then_some(0),
                             scorable_coordinates: 1,
                             title_only_scorable_coordinates: 0,
                             omitted_coordinates: OneHopOmittedCandidateCounts::default(),
@@ -547,11 +715,16 @@ mod tests {
                 observations: observations(ranking_contract_digest),
                 selection,
             };
-            let event =
+            let builder = if filtered {
+                build_project_context_one_hop_semantic_search_v2_result(
+                    &result,
+                    &caller.public_key(),
+                )
+            } else {
                 build_project_context_one_hop_semantic_search_result(&result, &caller.public_key())
-                    .expect("result builds")
-                    .sign_with_keys(&relay)
-                    .expect("result signs");
+            }
+            .expect("result builds");
+            let event = builder.sign_with_keys(&relay).expect("result signs");
             Self {
                 relay,
                 caller,
@@ -649,6 +822,7 @@ mod tests {
             }),
             Fixture::new(OneHopSemanticScope::EdgeCoordinates {
                 edge_key: edge(uuid(2), 3, 4),
+                coordinate_types: None,
             }),
         ] {
             let parsed = parse_project_context_one_hop_semantic_search_result(
@@ -723,6 +897,7 @@ mod tests {
     fn verifier_rejects_noncanonical_unknown_duplicate_wrong_kind_and_tags() {
         let fixture = Fixture::new(OneHopSemanticScope::EdgeCoordinates {
             edge_key: edge(uuid(2), 3, 4),
+            coordinate_types: None,
         });
         let canonical = serde_json::to_string(&fixture.result).expect("canonical result");
 
@@ -813,5 +988,47 @@ mod tests {
         ));
         let debug = format!("{result:?}");
         assert!(!debug.contains(&"s".repeat(128)));
+    }
+
+    #[test]
+    fn filtered_edge_coordinates_use_the_separate_v2_surface() {
+        let filter =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter");
+        let fixture = Fixture::new(OneHopSemanticScope::EdgeCoordinates {
+            edge_key: edge(uuid(2), 3, 4),
+            coordinate_types: Some(filter),
+        });
+        let body: serde_json::Value = serde_json::from_slice(&fixture.exact_body).expect("body");
+        assert!(body[0]
+            .get("carryforth_project_context_one_hop_semantic_search_v2")
+            .is_some());
+        assert!(body[0]
+            .get("carryforth_project_context_one_hop_semantic_search")
+            .is_none());
+        assert!(build_project_context_one_hop_semantic_http_query_request(
+            fixture.request.clone(),
+            &fixture.relay.public_key(),
+            &fixture.caller.public_key(),
+        )
+        .is_err());
+        let parsed = parse_project_context_one_hop_semantic_search_v2_result(
+            &fixture.event,
+            &fixture.relay.public_key(),
+            fixture.observation(),
+        )
+        .expect("v2 verifies");
+        assert_eq!(parsed, fixture.result);
+        assert!(parse_project_context_one_hop_semantic_search_result(
+            &fixture.event,
+            &fixture.relay.public_key(),
+            fixture.observation(),
+        )
+        .is_err());
+        let OneHopSemanticSelection::EdgeCoordinates { coverage, .. } = parsed.selection else {
+            panic!("Edge Coordinate result")
+        };
+        assert_eq!(coverage.type_matched_coordinate_count, Some(1));
+        assert_eq!(coverage.type_filtered_out_coordinates, Some(0));
     }
 }

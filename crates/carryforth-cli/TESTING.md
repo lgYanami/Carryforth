@@ -574,6 +574,8 @@ cf project-context coordinate-search \
 
 cf --format compact project-context coordinate-search \
   --query "work relevant to preparing the frontend release meeting" \
+  --coordinate-type work \
+  --coordinate-type issue \
   --limit 12 | jq -c .
 ```
 
@@ -589,8 +591,13 @@ same snapshot.
 The CLI sends one canonical natural-language Provider input through one
 NIP-98-bound, non-redirecting, non-retried HTTP attempt with a 60-second client
 timeout (45-second Relay budget plus transport grace). `--limit` is `1..=32`
-and defaults to 8. There are no Role, Work, lifecycle, context, Edge, path,
-weight, floor, or threshold request controls.
+and defaults to 8. Repeated `--coordinate-type` values form a closed OR filter
+over `project_profile`, `goal`, `role`, `plan`, `stage`, `requirement`, `issue`,
+`work`, `resource`, `document`, and `meeting`; filtering occurs before score,
+top-K, and K+1. A filtered request requires the separately advertised
+`carryforth-project-context-coordinate-search-v2-http` capability. Omitting the
+option preserves the v1 request bytes and all-type behavior. There are no Role,
+lifecycle, context, Edge, path, weight, floor, or threshold controls.
 
 ### 6.16 Project Context one-hop semantic selection
 
@@ -606,7 +613,8 @@ cf project-context coordinate edge-search "role:${ROLE_ID}" \
 
 # Rank only the complete member set of this exact active Edge.
 cf --format compact project-context edge coordinate-search "$EDGE_KEY" \
-  --query "the work responsible for the current incident" --limit 8 | jq -c .
+  --query "the work responsible for the current incident" \
+  --coordinate-type work --coordinate-type issue --limit 8 | jq -c .
 ```
 
 `coordinate edge-search` returns ranked Edge identities and the matched
@@ -629,7 +637,14 @@ Both commands send exactly one fixed Q0 Provider input through one
 NIP-98-bound, non-redirecting, non-retried HTTP attempt. `--limit` is `1..=32`
 and defaults to 8. The CLI prints only the SDK-verified Relay-signed result; it
 does not rank locally, hydrate missing fields, echo the natural-language query,
-or automatically execute the other one-hop operation. Closed Relay errors are
+or automatically execute the other one-hop operation.
+
+The CLI may apply the same repeated closed `--coordinate-type` OR filter only to
+`edge coordinate-search`. That filter is evaluated against complete Edge
+membership before scoring and requires
+`carryforth-project-context-one-hop-semantic-search-v2-http`. It is invalid on
+`coordinate edge-search`; omitting it keeps the shared one-hop v1 surface.
+Closed Relay errors are
 mapped to fixed content-free CLI errors rather than printing Relay response
 text.
 

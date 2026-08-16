@@ -15,8 +15,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    ProviderEncodedSemanticInput, Score, SemanticQueryInput, SemanticQueryInputBundle,
-    SemanticQueryInputKind,
+    ProjectContextCoordinateTypeFilter, ProviderEncodedSemanticInput, Score, SemanticQueryInput,
+    SemanticQueryInputBundle, SemanticQueryInputKind,
 };
 
 /// Default number of starting Coordinate candidates.
@@ -51,6 +51,8 @@ const QUERY_CONTRACT_DESCRIPTOR: &str = concat!(
 
 const REQUEST_BINDING_DOMAIN: &[u8] =
     b"carryforth.project-context-coordinate-search-http-request\0";
+const FILTERED_REQUEST_BINDING_DOMAIN: &[u8] =
+    b"carryforth.project-context-coordinate-search-v2-http-request\0";
 
 /// Result alias for the closed Coordinate-search contract.
 pub type CoordinateSearchResult<T> = Result<T, CoordinateSearchError>;
@@ -108,6 +110,9 @@ pub enum CoordinateSearchError {
     /// A returned Coordinate is invalid for the host-derived Project.
     #[error("invalid Coordinate search candidate: {0}")]
     InvalidCoordinate(String),
+    /// A present Coordinate type filter was empty or malformed.
+    #[error("invalid Coordinate search type filter: {0}")]
+    InvalidCoordinateTypes(String),
     /// A completed result violates a closed invariant.
     #[error("invalid Coordinate search state: {0}")]
     InvalidState(String),
@@ -126,6 +131,9 @@ pub struct ProjectContextCoordinateSearchQuery {
     pub project_id: Uuid,
     /// Natural-language candidate discovery query.
     pub query: String,
+    /// Optional closed Coordinate types; omitted preserves the v1 all-type scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_types: Option<ProjectContextCoordinateTypeFilter>,
     /// Maximum returned candidates in `1..=32`.
     pub limit: u8,
 }
@@ -138,6 +146,7 @@ impl std::fmt::Debug for ProjectContextCoordinateSearchQuery {
             .field("project_id", &self.project_id)
             .field("query", &"<redacted>")
             .field("query_bytes", &self.query.len())
+            .field("coordinate_types", &self.coordinate_types)
             .field("limit", &self.limit)
             .finish()
     }
@@ -180,6 +189,12 @@ impl ProjectContextCoordinateSearchQuery {
                 maximum: MAX_COORDINATE_SEARCH_LIMIT,
             });
         }
+        self.coordinate_types = self
+            .coordinate_types
+            .as_ref()
+            .map(ProjectContextCoordinateTypeFilter::canonicalized)
+            .transpose()
+            .map_err(|error| CoordinateSearchError::InvalidCoordinateTypes(error.to_string()))?;
         self.query = query.to_owned();
         let canonical =
             serde_json::to_vec(&self).map_err(|_| CoordinateSearchError::Serialization)?;
@@ -420,6 +435,9 @@ pub struct ProjectContextCoordinateSearchObservations {
     pub embedding_space_fence: Digest32,
     /// Coordinate-search template/serializer/input-limit digest.
     pub query_contract_digest: Digest32,
+    /// Applied v2 Coordinate type scope; omitted only for v1 all-type results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_types: Option<ProjectContextCoordinateTypeFilter>,
     /// Active Project Context projection generation.
     pub projection_generation: u64,
     /// Project Context catalog revision in the read snapshot.
@@ -483,6 +501,16 @@ impl ProjectContextCoordinateSearchResult {
                 "result query contract digest mismatch".to_owned(),
             ));
         }
+        if self
+            .observations
+            .coordinate_types
+            .as_ref()
+            .is_some_and(|filter| !filter.is_canonical())
+        {
+            return Err(CoordinateSearchError::InvalidState(
+                "result Coordinate type filter is not canonical".to_owned(),
+            ));
+        }
         if self.observations.projection_generation == 0
             || self.observations.projection_generation > MAX_SAFE_REVISION
             || self.observations.project_context_revision > MAX_SAFE_REVISION
@@ -514,6 +542,16 @@ impl ProjectContextCoordinateSearchResult {
                     "candidates must contain unique Coordinates".to_owned(),
                 ));
             }
+            if self
+                .observations
+                .coordinate_types
+                .as_ref()
+                .is_some_and(|filter| !filter.matches(&candidate.coordinate))
+            {
+                return Err(CoordinateSearchError::InvalidState(
+                    "candidate violates the applied Coordinate type filter".to_owned(),
+                ));
+            }
         }
         if self
             .coordinates
@@ -537,6 +575,11 @@ impl ProjectContextCoordinateSearchResult {
         if self.request_id != request.request_id || self.project_id != request.project_id {
             return Err(CoordinateSearchError::InvalidState(
                 "result does not belong to the request".to_owned(),
+            ));
+        }
+        if self.observations.coordinate_types != request.coordinate_types {
+            return Err(CoordinateSearchError::InvalidState(
+                "result Coordinate type filter does not match the request".to_owned(),
             ));
         }
         if self.coordinates.len() > usize::from(request.limit) {
@@ -590,6 +633,48 @@ pub fn verify_coordinate_search_http_request_binding(
     if observed != expected {
         return Err(CoordinateSearchError::InvalidState(
             "HTTP request binding digest mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the independently versioned filtered Coordinate-search transcript binding.
+pub fn derive_coordinate_search_v2_http_request_binding(
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> CoordinateSearchResult<Digest32> {
+    validate_uuid_v4(host_project_id, "host_project_id")?;
+    let body_digest: [u8; 32] = Sha256::digest(exact_authenticated_body).into();
+    Ok(hash_domain(
+        FILTERED_REQUEST_BINDING_DOMAIN,
+        &[
+            host_project_id.as_bytes(),
+            authenticated_caller_pubkey,
+            nip98_auth_event_id.as_bytes(),
+            &body_digest,
+        ],
+    ))
+}
+
+/// Verify a filtered Coordinate-search transcript against exact authenticated bytes.
+pub fn verify_coordinate_search_v2_http_request_binding(
+    observed: Digest32,
+    host_project_id: Uuid,
+    authenticated_caller_pubkey: &[u8; 32],
+    nip98_auth_event_id: Digest32,
+    exact_authenticated_body: &[u8],
+) -> CoordinateSearchResult<()> {
+    let expected = derive_coordinate_search_v2_http_request_binding(
+        host_project_id,
+        authenticated_caller_pubkey,
+        nip98_auth_event_id,
+        exact_authenticated_body,
+    )?;
+    if observed != expected {
+        return Err(CoordinateSearchError::InvalidState(
+            "filtered HTTP request binding digest mismatch".to_owned(),
         ));
     }
     Ok(())
@@ -692,6 +777,8 @@ mod tests {
     use buzz_project_view::ProjectViewObjectType;
     use chrono::Utc;
 
+    use crate::ProjectContextCoordinateType;
+
     use super::*;
 
     fn uuid(value: u128) -> Uuid {
@@ -703,6 +790,7 @@ mod tests {
             request_id: uuid(1),
             project_id: uuid(2),
             query: " why authorization failed? ".to_owned(),
+            coordinate_types: None,
             limit: DEFAULT_COORDINATE_SEARCH_LIMIT,
         }
     }
@@ -723,6 +811,7 @@ mod tests {
                 semantic_generation_id: uuid(3),
                 embedding_space_fence: Digest32::from_bytes([4; 32]),
                 query_contract_digest: coordinate_search_query_contract_digest(),
+                coordinate_types: None,
                 projection_generation: 1,
                 project_context_revision: 2,
                 snapshot_observed_at: Utc::now(),
@@ -795,6 +884,15 @@ mod tests {
         let debug = format!("{input:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("authorization"));
+
+        let mut filtered = request();
+        filtered.coordinate_types = Some(
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter"),
+        );
+        let filtered = build_coordinate_search_encoder_input(&filtered).expect("filtered input");
+        assert_eq!(filtered.text(), input.text());
+        assert_eq!(filtered.text_digest(), input.text_digest());
     }
 
     #[test]
@@ -825,6 +923,23 @@ mod tests {
         let mut limited = request();
         limited.limit = 1;
         assert!(result.validate_for_request(&limited).is_err());
+
+        let filter =
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter");
+        let mut filtered_request = request();
+        filtered_request.coordinate_types = Some(filter.clone());
+        let mut filtered_result = result.clone();
+        filtered_result.observations.coordinate_types = Some(filter);
+        filtered_result
+            .validate_for_request(&filtered_request)
+            .expect("filtered result");
+        filtered_result.coordinates[0].coordinate = ProjectContextCoordinate::Document {
+            document_id: uuid(20),
+        };
+        assert!(filtered_result
+            .validate_for_request(&filtered_request)
+            .is_err());
     }
 
     #[test]
@@ -854,6 +969,22 @@ mod tests {
             body,
         )
         .expect("verify");
+        let v2 = derive_coordinate_search_v2_http_request_binding(
+            uuid(2),
+            &[7; 32],
+            Digest32::from_bytes([8; 32]),
+            body,
+        )
+        .expect("v2 binding");
+        assert_ne!(binding, v2);
+        verify_coordinate_search_v2_http_request_binding(
+            v2,
+            uuid(2),
+            &[7; 32],
+            Digest32::from_bytes([8; 32]),
+            body,
+        )
+        .expect("verify v2");
         assert_ne!(
             binding,
             derive_coordinate_search_http_request_binding(

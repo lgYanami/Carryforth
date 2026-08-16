@@ -7,8 +7,9 @@ use buzz_semantic::{
 };
 use buzz_semantic_query::{
     build_problem_query_encoder_input, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
-    OneHopSemanticSelection, ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle,
-    QueryCompatibilityFences, Score, SemanticQueryInputBundle,
+    OneHopSemanticSelection, ProjectContextCoordinateType, ProjectContextCoordinateTypeFilter,
+    ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle, QueryCompatibilityFences,
+    Score, SemanticQueryInputBundle,
 };
 use chrono::Utc;
 use pgvector::Vector;
@@ -600,6 +601,70 @@ async fn one_hop_scoped_search_real_pgvector_is_direct_complete_and_hydrated() {
     assert_eq!(ranked_coordinates.len(), 2);
     assert_eq!(ranked_coordinates[0].score.raw(), 1_000_000);
     assert_eq!(ranked_coordinates[1].score.raw(), 500_000);
+    let complete_coordinates = ranked_coordinates.clone();
+    let complete_truncated = *truncated;
+
+    let work_only =
+        ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+            .expect("Work filter");
+    let filtered = read
+        .search_edge_coordinates_one_hop_filtered(edge_key, &vector, &work_only, 1)
+        .await
+        .expect("filtered Edge Coordinate query");
+    let SemanticEdgeCoordinateSearchOutcome::Ranked(filtered) = filtered else {
+        panic!("filtered ranked Edge Coordinates")
+    };
+    let OneHopSemanticSelection::EdgeCoordinates {
+        coordinate_types,
+        ranked_coordinates,
+        coverage,
+        truncated,
+        ..
+    } = &filtered.selection
+    else {
+        panic!("filtered Edge Coordinate selection")
+    };
+    assert_eq!(coordinate_types.as_ref(), Some(&work_only));
+    assert!(ranked_coordinates.is_empty());
+    assert!(!truncated);
+    assert_eq!(coverage.edge_coordinate_count, 3);
+    assert_eq!(coverage.type_matched_coordinate_count, Some(0));
+    assert_eq!(coverage.type_filtered_out_coordinates, Some(3));
+    assert_eq!(coverage.scorable_coordinates, 0);
+    assert_eq!(
+        coverage.omitted_coordinates,
+        OneHopOmittedCandidateCounts::default()
+    );
+
+    let document_only =
+        ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Document])
+            .expect("Document filter");
+    let filtered_complete = read
+        .search_edge_coordinates_one_hop_filtered(edge_key, &vector, &document_only, 8)
+        .await
+        .expect("all-member-type Edge Coordinate query");
+    let SemanticEdgeCoordinateSearchOutcome::Ranked(filtered_complete) = filtered_complete else {
+        panic!("filtered complete ranked Edge Coordinates")
+    };
+    let OneHopSemanticSelection::EdgeCoordinates {
+        ranked_coordinates: filtered_coordinates,
+        coverage: filtered_coverage,
+        truncated: filtered_truncated,
+        ..
+    } = &filtered_complete.selection
+    else {
+        panic!("filtered complete Edge Coordinate selection")
+    };
+    assert_eq!(filtered_coordinates, &complete_coordinates);
+    assert_eq!(*filtered_truncated, complete_truncated);
+    assert_eq!(filtered_coverage.edge_coordinate_count, 3);
+    assert_eq!(filtered_coverage.type_matched_coordinate_count, Some(3));
+    assert_eq!(filtered_coverage.type_filtered_out_coordinates, Some(0));
+    assert_eq!(filtered_coverage.scorable_coordinates, 2);
+    assert_eq!(
+        filtered_coverage.omitted_coordinates.semantic_head_missing,
+        1
+    );
     read.rollback().await.expect("one-hop fixture rollback");
 }
 

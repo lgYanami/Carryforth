@@ -8,6 +8,7 @@
 
 mod binding;
 mod contract;
+mod coordinate_filter;
 mod coordinate_search;
 mod encoder;
 mod fence;
@@ -30,6 +31,10 @@ pub use contract::{
     MAX_QUERY_REQUEST_BYTES, MAX_RECALL_PER_CHANNEL, MAX_RELATION_OPTIONS_MATERIALIZED,
     MAX_RESPONSE_BYTES, MAX_SEMANTIC_ROOTS, MAX_TARGET_OPTIONS_MATERIALIZED,
     MAX_TRUNCATION_SAMPLES, MAX_WALL_TIME_MS, RESPONSE_TAIL_RESERVE_MS, SNAPSHOT_CLOSE_RESERVE_MS,
+};
+pub use coordinate_filter::{
+    ProjectContextCoordinateType, ProjectContextCoordinateTypeFilter,
+    ProjectContextCoordinateTypeFilterError,
 };
 pub use coordinate_search::*;
 pub use encoder::{

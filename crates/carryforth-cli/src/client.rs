@@ -1084,11 +1084,20 @@ impl CarryforthClient {
         relay_pubkey: &PublicKey,
         request: ProjectContextCoordinateSearchQuery,
     ) -> Result<CoordinateSearchOnceResponse, CliError> {
-        let prepared = buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_http_query_request(
-            request,
-            relay_pubkey,
-            &self.public_key(),
-        )
+        let filtered = request.coordinate_types.is_some();
+        let prepared = if filtered {
+            buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_v2_http_query_request(
+                request,
+                relay_pubkey,
+                &self.public_key(),
+            )
+        } else {
+            buzz_sdk::semantic_coordinate_search::build_project_context_coordinate_search_http_query_request(
+                request,
+                relay_pubkey,
+                &self.public_key(),
+            )
+        }
         .map_err(|error| match error {
             buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
             other => CliError::Other(format!(
@@ -1140,11 +1149,26 @@ impl CarryforthClient {
         relay_pubkey: &PublicKey,
         request: ProjectContextOneHopSemanticQuery,
     ) -> Result<OneHopSemanticSearchOnceResponse, CliError> {
-        let prepared = buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_http_query_request(
-            request,
-            relay_pubkey,
-            &self.public_key(),
-        )
+        let filtered = matches!(
+            request.scope,
+            buzz_semantic_query::OneHopSemanticScope::EdgeCoordinates {
+                coordinate_types: Some(_),
+                ..
+            }
+        );
+        let prepared = if filtered {
+            buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_v2_http_query_request(
+                request,
+                relay_pubkey,
+                &self.public_key(),
+            )
+        } else {
+            buzz_sdk::semantic_one_hop_search::build_project_context_one_hop_semantic_http_query_request(
+                request,
+                relay_pubkey,
+                &self.public_key(),
+            )
+        }
         .map_err(|error| match error {
             buzz_sdk::SdkError::InvalidInput(message) => CliError::Usage(message),
             other => CliError::Other(format!(
@@ -2188,11 +2212,16 @@ mod semantic_query_once_tests {
     use buzz_project_view::ProjectViewObjectType;
     use buzz_semantic::Digest32;
     use buzz_semantic_query::{
-        derive_coordinate_search_http_request_binding, derive_http_request_binding,
+        derive_coordinate_search_http_request_binding,
+        derive_coordinate_search_v2_http_request_binding, derive_http_request_binding,
         derive_one_hop_semantic_http_request_binding,
-        verify_coordinate_search_http_request_binding, verify_http_request_binding,
-        verify_one_hop_semantic_http_request_binding, LifecycleFilter, OneHopSemanticScope,
-        ProjectContextCoordinateSearchQuery, ProjectContextOneHopSemanticQuery, SemanticGraphQuery,
+        derive_one_hop_semantic_v2_http_request_binding,
+        verify_coordinate_search_http_request_binding,
+        verify_coordinate_search_v2_http_request_binding, verify_http_request_binding,
+        verify_one_hop_semantic_http_request_binding,
+        verify_one_hop_semantic_v2_http_request_binding, LifecycleFilter, OneHopSemanticScope,
+        ProjectContextCoordinateSearchQuery, ProjectContextCoordinateType,
+        ProjectContextCoordinateTypeFilter, ProjectContextOneHopSemanticQuery, SemanticGraphQuery,
         SemanticGraphQueryBudget,
     };
     use futures_util::stream;
@@ -2296,6 +2325,7 @@ mod semantic_query_once_tests {
             request_id: Uuid::new_v4(),
             project_id,
             query: "authorization failure during release".to_owned(),
+            coordinate_types: None,
             limit: 8,
         }
     }
@@ -2664,6 +2694,51 @@ mod semantic_query_once_tests {
     }
 
     #[tokio::test]
+    async fn filtered_coordinate_search_selects_the_v2_exact_surface_once() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let mut request = coordinate_request(project_id);
+        request.coordinate_types = Some(
+            ProjectContextCoordinateTypeFilter::new(vec![ProjectContextCoordinateType::Work])
+                .expect("filter"),
+        );
+        let response = client
+            .coordinate_search_once(&relay.public_key(), request)
+            .await
+            .expect("filtered Coordinate request");
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&response.exact_body)
+            .expect("v2 filter JSON")
+            .try_into()
+            .expect("one v2 filter");
+        assert!(filter
+            .get("carryforth_project_context_coordinate_search_v2")
+            .is_some());
+        assert!(filter
+            .get("carryforth_project_context_coordinate_search")
+            .is_none());
+        let binding = derive_coordinate_search_v2_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("v2 binding");
+        verify_coordinate_search_v2_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("v2 binding verifies");
+    }
+
+    #[tokio::test]
     async fn one_hop_search_freezes_one_exact_filter_auth_and_binding_observation() {
         let state = state(StatusCode::OK);
         let url = spawn_server(state.clone()).await;
@@ -2755,6 +2830,63 @@ mod semantic_query_once_tests {
                 .expect_err("non-success must return without replay or redirect");
             assert_eq!(state.count.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn filtered_edge_coordinate_search_selects_the_v2_exact_surface_once() {
+        let state = state(StatusCode::OK);
+        let url = spawn_server(state.clone()).await;
+        let caller = Keys::generate();
+        let relay = Keys::generate();
+        let project_id = Uuid::new_v4();
+        let client = CarryforthClient::new(url, caller.clone(), None, None).expect("client");
+        let request = ProjectContextOneHopSemanticQuery {
+            request_id: Uuid::new_v4(),
+            project_id,
+            query: "next frontend work".to_owned(),
+            limit: 8,
+            scope: OneHopSemanticScope::EdgeCoordinates {
+                edge_key: EdgeKey::from_hex(&"44".repeat(32)).expect("Edge key"),
+                coordinate_types: Some(
+                    ProjectContextCoordinateTypeFilter::new(vec![
+                        ProjectContextCoordinateType::Work,
+                    ])
+                    .expect("filter"),
+                ),
+            },
+        };
+        let response = client
+            .one_hop_semantic_search_once(&relay.public_key(), request)
+            .await
+            .expect("filtered one-hop request");
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+        let [filter]: [Value; 1] = serde_json::from_slice::<Vec<Value>>(&response.exact_body)
+            .expect("v2 filter JSON")
+            .try_into()
+            .expect("one v2 filter");
+        assert!(filter
+            .get("carryforth_project_context_one_hop_semantic_search_v2")
+            .is_some());
+        assert!(filter
+            .get("carryforth_project_context_one_hop_semantic_search")
+            .is_none());
+        let binding = derive_one_hop_semantic_v2_http_request_binding(
+            project_id,
+            &caller.public_key().to_bytes(),
+            &relay.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("v2 binding");
+        verify_one_hop_semantic_v2_http_request_binding(
+            binding,
+            project_id,
+            &caller.public_key().to_bytes(),
+            &relay.public_key().to_bytes(),
+            Digest32::from_bytes(response.nip98_auth_event_id.to_bytes()),
+            &response.exact_body,
+        )
+        .expect("v2 binding verifies");
     }
 
     #[tokio::test]
@@ -2866,6 +2998,7 @@ mod semantic_query_once_tests {
             limit: 8,
             scope: OneHopSemanticScope::EdgeCoordinates {
                 edge_key: EdgeKey::from_hex(&"33".repeat(32)).expect("Edge key"),
+                coordinate_types: None,
             },
         };
         let value = serde_json::to_value(request).expect("scope JSON");

@@ -538,6 +538,7 @@ async fn coordinate_search_target_scale_exact_sql_qualification() {
         request_id: Uuid::new_v4(),
         project_id: community_id,
         query: "content-free target-scale starting point qualification".to_owned(),
+        coordinate_types: None,
         limit: 32,
     };
     let input = build_coordinate_search_encoder_input(&request).expect("qualification input");
