@@ -5,7 +5,7 @@
 //! place to accumulate research, plans, and logs across sessions.
 //!
 //! Static template content in AGENTS.md (above the managed-section markers)
-//! and SKILL.md is refreshed when the embedded template version changes.
+//! and managed Skill files is refreshed when an embedded template version changes.
 
 use super::{load_managed_agents, load_personas, AgentDefinition, ManagedAgentRecord};
 #[cfg(test)]
@@ -25,6 +25,8 @@ mod cli;
 pub use cli::ensure_cli_symlink;
 #[cfg(test)]
 use cli::{cli_link_name, ensure_cli_symlink_at};
+mod skills;
+use skills::*;
 
 /// Subdirectories created inside the nest.
 /// `REPOS` is intentionally absent: it is provisioned by
@@ -44,54 +46,13 @@ const NEST_DIRS: &[&str] = &[
 /// Fully static — no runtime interpolation, no secrets, no user paths.
 pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 
-/// Default SKILL.md content for the carryforth-cli skill.
-/// Written to ~/.buzz/.agents/skills/carryforth-cli/SKILL.md on first init.
-const CARRYFORTH_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
-
-/// Default SKILL.md content for progressive Project Context retrieval.
-const SEARCH_PROJECT_CONTEXT_SKILL_MD: &str = include_str!("search_project_context_skill.md");
-
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
 const NEST_AGENTS_VERSION: u32 = 5;
 
-/// Template content version for the carryforth-cli SKILL.md.
-/// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 5;
-
-/// Template content version for the search-project-context SKILL.md.
-const SEARCH_PROJECT_CONTEXT_SKILL_VERSION: u32 = 1;
-
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
-
-/// Canonical skill directory path relative to the nest root.
-const CANONICAL_SKILL_DIR: &str = ".agents/skills/carryforth-cli";
-const SEARCH_PROJECT_CONTEXT_SKILL_DIR: &str = ".agents/skills/search-project-context";
-const LEGACY_CANONICAL_SKILL_DIR: &str = ".agents/skills/buzz-cli";
-
-struct ManagedSkillTemplate {
-    name: &'static str,
-    canonical_dir: &'static str,
-    body: &'static str,
-    version: u32,
-}
-
-const MANAGED_SKILL_TEMPLATES: &[ManagedSkillTemplate] = &[
-    ManagedSkillTemplate {
-        name: "carryforth-cli",
-        canonical_dir: CANONICAL_SKILL_DIR,
-        body: CARRYFORTH_CLI_SKILL_MD,
-        version: NEST_SKILL_VERSION,
-    },
-    ManagedSkillTemplate {
-        name: "search-project-context",
-        canonical_dir: SEARCH_PROJECT_CONTEXT_SKILL_DIR,
-        body: SEARCH_PROJECT_CONTEXT_SKILL_MD,
-        version: SEARCH_PROJECT_CONTEXT_SKILL_VERSION,
-    },
-];
 
 /// Nest directory name for production builds.
 const NEST_DIR_PROD: &str = ".buzz";
@@ -251,21 +212,9 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         fs::create_dir_all(&agents_skill_dir)
             .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
 
-        let skill_md = agents_skill_dir.join("SKILL.md");
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&skill_md)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                file.write_all(skill.body.as_bytes())
-                    .map_err(|e| format!("write {}: {e}", skill_md.display()))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                return Err(format!("create {}: {e}", skill_md.display()));
-            }
+        create_managed_skill_file_if_missing(&agents_skill_dir, "SKILL.md", skill.body)?;
+        for file in skill.supporting_files {
+            create_managed_skill_file_if_missing(&agents_skill_dir, file.relative_path, file.body)?;
         }
     }
 
@@ -320,6 +269,17 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
             for component in std::path::Path::new(skill.canonical_dir).components() {
                 accumulated.push(component);
                 skill_perm_dirs.push(root.join(&accumulated));
+            }
+            for file in skill.supporting_files {
+                let relative = std::path::Path::new(skill.canonical_dir).join(file.relative_path);
+                let Some(parent) = relative.parent() else {
+                    continue;
+                };
+                let mut accumulated = std::path::PathBuf::new();
+                for component in parent.components() {
+                    accumulated.push(component);
+                    skill_perm_dirs.push(root.join(&accumulated));
+                }
             }
         }
         for skill_dir in known_skill_dirs() {
@@ -479,45 +439,6 @@ fn refresh_agents_md_if_stale(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("persist {}: {e}", agents_md.display()))?;
 
     fs::write(&version_path, format!("{NEST_AGENTS_VERSION}\n"))
-        .map_err(|e| format!("write {}: {e}", version_path.display()))?;
-
-    Ok(())
-}
-
-/// Refresh SKILL.md if the template version has changed.
-///
-/// SKILL.md has no user-editable sections — it is fully overwritten on version bump.
-fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
-    for skill in MANAGED_SKILL_TEMPLATES {
-        refresh_managed_skill_if_stale(root, skill)?;
-    }
-    Ok(())
-}
-
-fn refresh_managed_skill_if_stale(root: &Path, skill: &ManagedSkillTemplate) -> Result<(), String> {
-    let agents_skill_dir = root.join(skill.canonical_dir);
-    let version_path = agents_skill_dir.join(".skill-version");
-    if read_version_file(&version_path) >= skill.version {
-        return Ok(());
-    }
-
-    // Ensure the canonical .agents skill directory exists.
-    fs::create_dir_all(&agents_skill_dir)
-        .map_err(|e| format!("create {}: {e}", agents_skill_dir.display()))?;
-
-    // Atomic write via temp file.
-    let skill_md = agents_skill_dir.join("SKILL.md");
-    let mut tmp = tempfile::NamedTempFile::new_in(&agents_skill_dir)
-        .map_err(|e| format!("tempfile in {}: {e}", agents_skill_dir.display()))?;
-    {
-        use std::io::Write;
-        tmp.write_all(skill.body.as_bytes())
-            .map_err(|e| format!("write tempfile: {e}"))?;
-    }
-    tmp.persist(&skill_md)
-        .map_err(|e| format!("persist {}: {e}", skill_md.display()))?;
-
-    fs::write(&version_path, format!("{}\n", skill.version))
         .map_err(|e| format!("write {}: {e}", version_path.display()))?;
 
     Ok(())

@@ -23,6 +23,10 @@ fn refresh_managed_skills_write_version_files() {
             ".agents/skills/search-project-context/.skill-version",
             SEARCH_PROJECT_CONTEXT_SKILL_VERSION,
         ),
+        (
+            ".agents/skills/carryforth-meeting/.skill-version",
+            CARRYFORTH_MEETING_SKILL_VERSION,
+        ),
     ] {
         let actual = fs::read_to_string(root.join(path)).unwrap();
         assert_eq!(actual.trim(), version.to_string());
@@ -92,12 +96,18 @@ fn refresh_managed_skills_overwrite_on_version_bump() {
 
     let carryforth = root.join(".agents/skills/carryforth-cli/SKILL.md");
     let search = root.join(".agents/skills/search-project-context/SKILL.md");
+    let meeting = root.join(".agents/skills/carryforth-meeting/SKILL.md");
+    let participant =
+        root.join(".agents/skills/carryforth-meeting/references/participant-turns.md");
     fs::write(&carryforth, "stale CLI skill content").unwrap();
     fs::write(&search, "stale search skill content").unwrap();
+    fs::write(&meeting, "stale Meeting skill content").unwrap();
+    fs::write(&participant, "stale participant reference").unwrap();
 
     for version in [
         ".agents/skills/carryforth-cli/.skill-version",
         ".agents/skills/search-project-context/.skill-version",
+        ".agents/skills/carryforth-meeting/.skill-version",
     ] {
         let _ = fs::remove_file(root.join(version));
     }
@@ -111,5 +121,13 @@ fn refresh_managed_skills_overwrite_on_version_bump() {
     assert_eq!(
         fs::read_to_string(&search).unwrap(),
         SEARCH_PROJECT_CONTEXT_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(&meeting).unwrap(),
+        CARRYFORTH_MEETING_SKILL_MD
+    );
+    assert_eq!(
+        fs::read_to_string(&participant).unwrap(),
+        CARRYFORTH_MEETING_PARTICIPANT_TURNS_MD
     );
 }

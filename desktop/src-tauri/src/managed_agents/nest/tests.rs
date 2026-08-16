@@ -116,6 +116,7 @@ fn ensure_nest_creates_managed_skill_files() {
     for (name, expected) in [
         ("carryforth-cli", CARRYFORTH_CLI_SKILL_MD),
         ("search-project-context", SEARCH_PROJECT_CONTEXT_SKILL_MD),
+        ("carryforth-meeting", CARRYFORTH_MEETING_SKILL_MD),
     ] {
         let skill = root.join(".agents/skills").join(name).join("SKILL.md");
         assert!(skill.exists(), "{name}/SKILL.md should exist");
@@ -126,7 +127,11 @@ fn ensure_nest_creates_managed_skill_files() {
     #[cfg(unix)]
     {
         for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-            for name in ["carryforth-cli", "search-project-context"] {
+            for name in [
+                "carryforth-cli",
+                "search-project-context",
+                "carryforth-meeting",
+            ] {
                 let link = root.join(dir).join(name);
                 assert!(
                     link.symlink_metadata().unwrap().file_type().is_symlink(),
@@ -139,6 +144,45 @@ fn ensure_nest_creates_managed_skill_files() {
             }
         }
     }
+
+    for file in CARRYFORTH_MEETING_SUPPORTING_FILES {
+        let installed = root
+            .join(CARRYFORTH_MEETING_SKILL_DIR)
+            .join(file.relative_path);
+        assert!(
+            installed.exists(),
+            "carryforth-meeting/{} should exist",
+            file.relative_path
+        );
+        assert_eq!(fs::read_to_string(installed).unwrap(), file.body);
+    }
+}
+
+#[test]
+fn carryforth_meeting_skill_freezes_the_reviewed_workflow() {
+    assert!(
+        CARRYFORTH_MEETING_SKILL_MD.starts_with("---\nname: carryforth-meeting\ndescription: >\n")
+    );
+    for required in [
+        "meeting-context-v3",
+        "创建前判断是否需要 Meeting",
+        "participant_intent",
+        "board_maintenance",
+        "action_finalization",
+        "区分 Agent 输出、Harness 和 CLI",
+        "普通业务 CLI",
+        "references/create.md",
+        "references/participant-turns.md",
+        "references/moderator-turns.md",
+        "references/action-finalization.md",
+    ] {
+        assert!(
+            CARRYFORTH_MEETING_SKILL_MD.contains(required),
+            "missing carryforth-meeting workflow: {required}"
+        );
+    }
+    assert!(CARRYFORTH_MEETING_SKILL_MD.len() < 32 * 1024);
+    assert!(CARRYFORTH_MEETING_SKILL_MD.lines().count() < 500);
 }
 
 #[test]
@@ -175,8 +219,10 @@ fn ensure_nest_does_not_overwrite_current_managed_skill_files() {
 
     let carryforth = root.join(".agents/skills/carryforth-cli/SKILL.md");
     let search = root.join(".agents/skills/search-project-context/SKILL.md");
+    let meeting = root.join(".agents/skills/carryforth-meeting/SKILL.md");
     fs::write(&carryforth, "custom CLI skill content").unwrap();
     fs::write(&search, "custom search skill content").unwrap();
+    fs::write(&meeting, "custom Meeting skill content").unwrap();
 
     ensure_nest_at(&root).unwrap();
     assert_eq!(
@@ -186,6 +232,10 @@ fn ensure_nest_does_not_overwrite_current_managed_skill_files() {
     assert_eq!(
         fs::read_to_string(&search).unwrap(),
         "custom search skill content"
+    );
+    assert_eq!(
+        fs::read_to_string(&meeting).unwrap(),
+        "custom Meeting skill content"
     );
 }
 
@@ -203,6 +253,9 @@ fn ensure_nest_skill_dir_has_700_permissions() {
         ".agents/skills",
         ".agents/skills/carryforth-cli",
         ".agents/skills/search-project-context",
+        ".agents/skills/carryforth-meeting",
+        ".agents/skills/carryforth-meeting/references",
+        ".agents/skills/carryforth-meeting/agents",
         ".goose",
         ".goose/skills",
         ".claude",
@@ -287,6 +340,7 @@ fn ensure_skill_symlinks_are_idempotent() {
         for (name, canonical_dir) in [
             ("carryforth-cli", CANONICAL_SKILL_DIR),
             ("search-project-context", SEARCH_PROJECT_CONTEXT_SKILL_DIR),
+            ("carryforth-meeting", CARRYFORTH_MEETING_SKILL_DIR),
         ] {
             let link = root.join(dir).join(name);
             assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
