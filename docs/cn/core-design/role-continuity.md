@@ -567,7 +567,7 @@ Role Continuity 最终解决的是：
 
 - [Carryforth 核心模型](../core-model.md)
 - [核心设计：先有坐标，后有上下文](coordinate-and-context.md)
-- [核心设计：上下文环境感知的图语义检索](context-aware-semantic-graph-retrieval.md)
+- [核心设计：Agent 自主的上下文环境感知 Project Context 图检索](context-aware-semantic-graph-retrieval.md)
 - [核心设计：Meeting](meeting.md)
 - [Role Continuity 精确领域合同](../../stage/role/role-continuity.md)
 - [Role Continuity 实现设计](../../stage/role/implementation-design.md)

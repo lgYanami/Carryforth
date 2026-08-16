@@ -540,7 +540,7 @@ solves this problem:
 - [Carryforth core model](../core-model.md)
 - [Core design: Role Continuity](role-continuity.md)
 - [Core design: Coordinates before context](coordinate-and-context.md)
-- [Core design: Context-aware semantic graph retrieval](context-aware-semantic-graph-retrieval.md)
+- [Core design: Agent-directed context-aware Project Context retrieval](context-aware-semantic-graph-retrieval.md)
 - [Meeting V2](../../stage/meeting/v2/meeting-v2.md)
 - [Meeting Action Finalization](../../stage/meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
 - [Maintaining Project Context during Meeting Action Finalization](../../stage/project-context/meeting-action-finalization-context-write-implementation-design.md)

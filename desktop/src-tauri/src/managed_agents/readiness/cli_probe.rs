@@ -98,7 +98,7 @@ pub(crate) fn classify_probe_output(stderr_bytes: &[u8], exit_success: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeOutcome, CONFIG_PARSE_SIGNALS};
+    use super::{classify_probe_output, ProbeOutcome, CONFIG_PARSE_SIGNALS};
 
     #[cfg(unix)]
     #[test]
@@ -164,30 +164,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn login_probe_config_invalid_on_stderr_signal() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().expect("temp dir");
-        let bin_dir = temp.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
-
-        // Script that exits 1 and writes a codex-style config-parse error to stderr.
-        let script_path = bin_dir.join("fake-codex-bad-config");
-        fs::write(
-            &script_path,
-            "#!/bin/sh\necho 'Error loading configuration: /home/user/.codex/config.toml: unknown variant `ultra`, expected one of none/minimal/low/medium/high/xhigh' >&2\nexit 1\n",
-        )
-        .expect("write script");
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod script");
-
-        let outcome = super::login_probe(
-            &script_path,
-            &["fake-codex-bad-config", "login", "status"],
-            None,
-        );
+    fn config_invalid_on_stderr_signal() {
+        let stderr = b"Error loading configuration: /home/user/.codex/config.toml: unknown variant `ultra`, expected one of none/minimal/low/medium/high/xhigh\n";
+        let outcome = classify_probe_output(stderr, false);
         assert!(
             matches!(outcome, ProbeOutcome::ConfigInvalid { .. }),
             "stderr with 'unknown variant' should produce ConfigInvalid; got {:?}",

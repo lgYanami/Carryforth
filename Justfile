@@ -413,6 +413,14 @@ semantic-query-qualification:
 coordinate-search-qualification:
     ./scripts/qualify-coordinate-search-exact.sh
 
+# Freeze the deterministic four-operation / three-surface semantic compatibility baseline.
+semantic-retrieval-compatibility-baseline:
+    ./scripts/check-semantic-retrieval-compatibility-baseline.sh all
+
+# Verify the Phase 1 unified semantic-computation differential and protected-surface gates.
+semantic-retrieval-computation:
+    ./scripts/check-semantic-retrieval-computation.sh all
+
 # Read-only preflight for the supported local semantic PostgreSQL profile.
 semantic-local-capacity-check:
     ./scripts/check-local-semantic-capacity.sh

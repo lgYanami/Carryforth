@@ -18,6 +18,9 @@ unset_semantic_env=(
   -u BUZZ_SEMANTIC_API_KEY
   -u BUZZ_SEMANTIC_BASE_URL
   -u BUZZ_SEMANTIC_REQUEST_MODEL
+  -u LLM_API_KEY
+  -u LLM_BASE_URL
+  -u LLM_MODEL
   -u BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY
   -u BUZZ_RELAY_PRIVATE_KEY
 )
@@ -68,6 +71,22 @@ source "${missing_env}"
 [[ "$(sha256sum "${missing_env}" | awk '{print $1}')" == "${first_hash}" ]]
 [[ "$(rg -c '^BUZZ_SEMANTIC_API_KEY=' "${missing_env}")" == "1" ]]
 [[ "$(rg -c '^BUZZ_RELAY_PRIVATE_KEY=' "${missing_env}")" == "1" ]]
+
+llm_env="${TEMP_ROOT}/llm.env"
+node "${SCRIPT_DIR}/update-local-env.mjs" \
+  --target "${llm_env}" \
+  --source-template "${REPO_ROOT}/.env.example"
+printf '\nLLM_API_KEY=synthetic-shared-key\n' >>"${llm_env}"
+printf 'LLM_BASE_URL=https://shared-provider.invalid/v1/\n' >>"${llm_env}"
+printf 'LLM_MODEL=synthetic-shared-model\n' >>"${llm_env}"
+env "${unset_semantic_env[@]}" \
+  "${SCRIPT_DIR}/configure-local-semantic.sh" --env-file "${llm_env}" \
+  </dev/null >"${TEMP_ROOT}/llm.log" 2>&1
+! rg --fixed-strings --quiet 'synthetic-shared-key' "${TEMP_ROOT}/llm.log"
+rg --quiet '^LLM_API_KEY="synthetic-shared-key"$' "${llm_env}"
+rg --quiet '^LLM_BASE_URL="https://shared-provider.invalid/v1/"$' "${llm_env}"
+rg --quiet '^LLM_MODEL="synthetic-shared-model"$' "${llm_env}"
+! rg --quiet '^BUZZ_SEMANTIC_API_KEY=' "${llm_env}"
 
 legacy_bind_env="${TEMP_ROOT}/legacy-bind.env"
 cp "${REPO_ROOT}/.env.example" "${legacy_bind_env}"

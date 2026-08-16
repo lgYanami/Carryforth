@@ -83,14 +83,31 @@ BUZZ_SEMANTIC_WORKER_ENABLED=true
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
 ```
 
-When either switch is enabled, three Provider settings with no defaults must be supplied
-explicitly:
+Agent-directed start discovery and one-hop semantic selection have independent process masters.
+They remain off unless an operator explicitly adds them to the private `.env`:
 
-| Environment variable | Interactive input | Meaning |
-|---|---|---|
-| `BUZZ_SEMANTIC_API_KEY` | hidden | Provider API Key |
-| `BUZZ_SEMANTIC_BASE_URL` | visible | HTTPS Provider Base URL |
-| `BUZZ_SEMANTIC_REQUEST_MODEL` | visible | Embedding Request Model |
+```dotenv
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
+```
+
+Turning either one on uses the same Provider and semantic-index foundation; it still does not open
+the durable Community gates or advertise a capability until the remaining readiness checks pass.
+
+Whenever any semantic indexing or query process is enabled, one complete Provider setting family
+with no defaults must be supplied explicitly. The source launcher prompts for it because its Worker and
+complete-path Query switches start enabled by default:
+
+| Preferred shared variable | Compatibility variable | Interactive input | Meaning |
+|---|---|---|---|
+| `LLM_API_KEY` | `BUZZ_SEMANTIC_API_KEY` | hidden | Provider API Key |
+| `LLM_BASE_URL` | `BUZZ_SEMANTIC_BASE_URL` | visible | HTTPS Provider Base URL |
+| `LLM_MODEL` | `BUZZ_SEMANTIC_REQUEST_MODEL` | visible | Embedding Request Model |
+
+The two families cannot be mixed field by field. If any `BUZZ_SEMANTIC_*` Provider value is set,
+the Relay treats that compatibility family as authoritative and requires it to be complete;
+otherwise it uses the complete `LLM_*` family. This preserves deployed compatibility while letting
+local agents and the semantic Provider share one connection configuration.
 
 In an interactive terminal, the script asks for missing values. In a non-interactive environment,
 it fails immediately and lists the missing variable names. It never guesses a Provider or fills in
@@ -99,11 +116,13 @@ a default URL or model.
 Values are written only to the local Git-ignored `.env`. The API Key must not appear in terminal
 echo, logs, documentation, issues, or test fixtures.
 
-To avoid semantic capabilities entirely, disable both process switches in `.env`:
+To avoid semantic capabilities entirely, keep all four process switches disabled in `.env`:
 
 ```dotenv
 BUZZ_SEMANTIC_WORKER_ENABLED=false
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 ```
 
 ### 4.1 Process switches are not Community authorization
@@ -114,7 +133,7 @@ capabilities. It does not automatically perform:
 - Project View / Project Context initialization;
 - the durable Community semantic-index gate;
 - generation creation, build, verification, or activation;
-- the durable Community semantic-query gate;
+- the durable Community semantic retrieval/query gate;
 - acknowledgement that the problem and overview text (source type, current visible title/name, and
   optional summary; not Document bodies/chunks in the current foundation) leave the local system
   for the external Provider.

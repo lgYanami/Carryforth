@@ -15,14 +15,13 @@ use buzz_db::semantic_query::{
     semantic_source_identity_for_coordinate, SemanticCanonicalHydrationBatch,
     SemanticCanonicalSourceSnapshot, SemanticContextCoordinateObservation,
     SemanticContextCoordinateObservationBatch, SemanticContextEgressExpectation,
-    SemanticContextOmissionReason, SemanticCurrentSourcePair, SemanticExactQueryVector,
-    SemanticExactRecallBatch, SemanticExactRecallExhaustion, SemanticExactSourceScore,
-    SemanticGraphEmbeddingCoverageClass, SemanticGraphQueryEgressConfirmation,
-    SemanticGraphQueryEgressConfirmationRequest, SemanticGraphQueryEgressRequest,
-    SemanticGraphQueryEgressReservation, SemanticGraphQueryTicket, SemanticGraphReadTimeouts,
-    SemanticGraphReadTx, SemanticInitialCoordinateObservation,
-    SemanticInitialCoordinateObservationBatch, SemanticInitialHeadState,
-    SemanticInitialOmissionReason,
+    SemanticContextOmissionReason, SemanticCurrentSourcePair, SemanticExactRecallBatch,
+    SemanticExactRecallExhaustion, SemanticExactSourceScore, SemanticGraphEmbeddingCoverageClass,
+    SemanticGraphQueryEgressConfirmation, SemanticGraphQueryEgressConfirmationRequest,
+    SemanticGraphQueryEgressRequest, SemanticGraphQueryEgressReservation, SemanticGraphQueryTicket,
+    SemanticGraphQueryVectorBundle, SemanticGraphReadTimeouts, SemanticGraphReadTx,
+    SemanticInitialCoordinateObservation, SemanticInitialCoordinateObservationBatch,
+    SemanticInitialHeadState, SemanticInitialOmissionReason,
 };
 use buzz_project_context::ProjectContextCoordinate;
 use buzz_project_view::ProjectViewObjectType;
@@ -38,13 +37,14 @@ use buzz_semantic_query::{
     OmittedContextChannelCounts, OmittedContextCoordinateObservation,
     OmittedContextCoordinateReason, OmittedForResponseBudgetCounts,
     OmittedInitialCoordinateObservation, OmittedInitialCoordinateReason,
-    ProjectContextBindingProvenance, ProjectContextEdgeProvenance, QueryCompatibilityFences,
-    RootDiscoveryChannel, RootStructuralEntrypoint, Score, ScoreExplanation, SelectedAutomaticRoot,
-    SemanticGraphQuery, SemanticGraphQueryCoverage, SemanticGraphQueryError,
-    SemanticGraphQueryInputObservations, SemanticHeadProvenance, SemanticHeadState,
-    SemanticProvenance, SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderInput,
-    SemanticScoreRole, SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR,
-    RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS, SNAPSHOT_CLOSE_RESERVE_MS,
+    ProjectContextBindingProvenance, ProjectContextEdgeProvenance,
+    ProviderEncodedSemanticInputBundle, RootDiscoveryChannel, RootStructuralEntrypoint, Score,
+    ScoreExplanation, SelectedAutomaticRoot, SemanticComputationRoute, SemanticGraphQuery,
+    SemanticGraphQueryCoverage, SemanticGraphQueryError, SemanticGraphQueryInputObservations,
+    SemanticHeadProvenance, SemanticHeadState, SemanticInputEncoder, SemanticProvenance,
+    SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderInput, SemanticScoreRole,
+    SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR,
+    RESPONSE_TAIL_RESERVE_MS, SEMANTIC_COMPUTATION_ROUTES, SNAPSHOT_CLOSE_RESERVE_MS,
 };
 use chrono::Utc;
 use tokio::sync::OwnedSemaphorePermit;
@@ -185,6 +185,7 @@ async fn root_query_attempt(
         .map(|omitted| omitted.context_coordinate.clone())
         .collect::<HashSet<_>>();
     let channels = query_channel_bindings(&input_build.inputs);
+    let common_inputs = input_build.semantic_input_bundle()?;
     let context_expectations = stage_a_context
         .observations
         .iter()
@@ -288,16 +289,23 @@ async fn root_query_attempt(
     }
 
     metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
-        input_build
-            .inputs
+        common_inputs
+            .inputs()
             .iter()
-            .map(|input| input.text().len() as f64)
+            .map(|input| input.exact_utf8_text().len() as f64)
             .sum::<f64>(),
     );
     let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
-    let provider_result =
-        run_before_work_deadline(deadlines.work, provider.encode_queries(&input_build.inputs))
-            .await;
+    let provider_result = run_before_work_deadline(
+        deadlines.work,
+        encode_complete_path_inputs(
+            provider,
+            SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
+            &input_build.inputs,
+            &common_inputs,
+        ),
+    )
+    .await;
     let encoded = match provider_result {
         Err(error) => {
             record_provider_failure(SemanticGraphProviderFailure::Deadline);
@@ -310,7 +318,14 @@ async fn root_query_attempt(
         Ok(Ok(encoded)) => encoded,
     };
     drop(_provider_timer);
-    let query_vectors = bind_exact_query_vectors(&ticket, &input_build.inputs, encoded)?;
+    let query_vectors = match encoded {
+        CompletePathEncodedInputs::Compatibility(encoded) => {
+            bind_compatibility_query_vectors(&ticket, &input_build.inputs, encoded)?
+        }
+        CompletePathEncodedInputs::Common(encoded) => {
+            SemanticGraphQueryVectorBundle::bind(&ticket, encoded)?
+        }
+    };
     drop(input_build);
 
     let traversal_permit = state
@@ -383,7 +398,7 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) read: SemanticGraphReadTx,
     pub(crate) query: SemanticGraphQuery,
     pub(crate) outcome: SemanticGraphRootQueryOutcome,
-    pub(crate) query_vectors: Vec<SemanticExactQueryVector>,
+    pub(crate) query_vectors: SemanticGraphQueryVectorBundle,
     pub(crate) channels: Vec<QueryChannelBinding>,
     /// Last instant at which traversal may start or continue database work.
     pub(crate) work_deadline: Instant,
@@ -626,7 +641,7 @@ struct StageCRootBuild {
     read: SemanticGraphReadTx,
     traversal_permit: SemanticGraphTraversalPermit,
     outcome: SemanticGraphRootQueryOutcome,
-    query_vectors: Vec<SemanticExactQueryVector>,
+    query_vectors: SemanticGraphQueryVectorBundle,
     channels: Vec<QueryChannelBinding>,
     snapshot_started_at: std::time::Instant,
 }
@@ -1558,7 +1573,7 @@ async fn build_stage_c_roots(
     query: &SemanticGraphQuery,
     expected_context: &SemanticContextCoordinateObservationBatch,
     channels: Vec<QueryChannelBinding>,
-    query_vectors: Vec<SemanticExactQueryVector>,
+    query_vectors: SemanticGraphQueryVectorBundle,
     unsupported_conditioned: &HashSet<ProjectContextCoordinate>,
     deadlines: QueryDeadlines,
 ) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
@@ -1838,17 +1853,40 @@ fn query_channel_bindings(inputs: &[SemanticQueryEncoderInput]) -> Vec<QueryChan
         .collect()
 }
 
-fn bind_exact_query_vectors(
+async fn encode_complete_path_inputs(
+    provider: &crate::semantic_provider::VolcengineSemanticProvider,
+    route: SemanticComputationRoute,
+    inputs: &[SemanticQueryEncoderInput],
+    common_inputs: &buzz_semantic_query::SemanticQueryInputBundle,
+) -> Result<CompletePathEncodedInputs, SemanticGraphQueryError> {
+    match route {
+        SemanticComputationRoute::Legacy => SemanticQueryEncoder::encode_queries(provider, inputs)
+            .await
+            .map(CompletePathEncodedInputs::Compatibility),
+        SemanticComputationRoute::Migrated => {
+            SemanticInputEncoder::encode_semantic_inputs(provider, common_inputs)
+                .await
+                .map(CompletePathEncodedInputs::Common)
+        }
+    }
+}
+
+enum CompletePathEncodedInputs {
+    Compatibility(Vec<EncodedSemanticQuery>),
+    Common(ProviderEncodedSemanticInputBundle),
+}
+
+fn bind_compatibility_query_vectors(
     ticket: &SemanticGraphQueryTicket,
     inputs: &[SemanticQueryEncoderInput],
     encoded: Vec<EncodedSemanticQuery>,
-) -> Result<Vec<SemanticExactQueryVector>, SemanticGraphRootQueryError> {
+) -> Result<SemanticGraphQueryVectorBundle, SemanticGraphRootQueryError> {
     if encoded.len() != inputs.len() {
         return Err(invalid_state(
             "query Provider result count does not match the input batch",
         ));
     }
-    inputs
+    let vectors = inputs
         .iter()
         .zip(encoded)
         .map(|(input, encoded)| {
@@ -1860,19 +1898,14 @@ fn bind_exact_query_vectors(
                     "query Provider result does not preserve its request/channel/model binding",
                 ));
             }
-            let fences = QueryCompatibilityFences {
-                source_generation_contract_digest: encoded.source_generation_contract_digest(),
-                embedding_space_fence: encoded.embedding_space_fence(),
-                query_contract_digest: encoded.query_contract_digest(),
-            };
-            Ok(SemanticExactQueryVector::new(
+            Ok(buzz_db::semantic_query::SemanticExactQueryVector::new(
                 ticket,
-                encoded.channel_id(),
-                fences,
-                encoded.embedding().clone(),
+                encoded.into_provider_encoded(),
             )?)
         })
-        .collect()
+        .collect::<Result<Vec<_>, SemanticGraphRootQueryError>>()?;
+    SemanticGraphQueryVectorBundle::from_compatibility_vectors(ticket, vectors)
+        .map_err(SemanticGraphRootQueryError::Database)
 }
 
 fn map_encoder_error(error: SemanticGraphQueryError) -> SemanticGraphRootQueryError {

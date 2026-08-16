@@ -2,9 +2,33 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：待单独设计，不并入当前 Agent Context Search 功能阶段
+> 状态：兼容基线与第一阶段统一语义计算已交付；待设计第二阶段统一可靠性运行时
 >
-> 记录日期：2026-08-14
+> 更新日期：2026-08-16
+>
+> 概念规范：
+> [Project Context 统一语义检索引擎规范](semantic/ unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
+>
+> 兼容基线：
+> [Project Context 语义检索兼容基线记录](semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md)
+>
+> 第一阶段实现设计：
+> [Project Context 统一语义计算实现计划](semantic/ unified-engine/project-context-unified-semantic-computation-implementation-plan.md)
+>
+> 当前进展：四个逻辑operation、三个公开surface的deterministic与真实数据库兼容基线已冻结；真实
+> Provider统一canary因缺少受支持配置未运行。统一语义计算的零行为迁移设计已通过代码、currentness、
+> lifecycle与兼容性复核；历史v1 oracle和独立Phase 1差分/受保护surface门已同时闭合。共同input、
+> model-space fence、Provider-bound result与writer-DB generation-bound vector已经交付；Coordinate与graph
+> adapter也已委托同一个bounded Provider batch primitive；两个one-hop variant现通过closed explicit-source
+> facade调用原本已经共享的exact SQL。whole-graph Coordinate现也通过共同授权/current-head/distance/
+> fixed-score静态kernel执行，并保留独立模板、canonical tie和K+1；同snapshot差分与10k资格已通过。
+> bounded complete path现以专属closed Q0/Qi bundle驱动共同root/relation/target scorer，并保持原有
+> traversal、packing、retry与release语义；同快照root差分和路径差分已通过。U6已把四个operation切换为
+> 同一compiled migrated profile，并通过新fleet runtime digest拒绝旧/新profile混跑。legacy Coordinate SQL与
+> graph adapter只保留到2026-09-16的profile rollback窗口。U7 deterministic、disposable pgvector、
+> target-scale、feature/gate/fleet与全量单元资格已经关闭。后续已把完整`LLM_*`三元组接入同一Provider
+> 配置边界，并以真实Provider完成Coordinate输入和Q0/Qi bundle canary。第一阶段完成，下一步是单独设计统一可靠性运行时；统一
+> 资源治理仍排在其后。
 
 ### 背景
 
@@ -12,8 +36,8 @@ Project Context 正在形成四类语义检索面：
 
 1. 已交付的自然语言 Coordinate 起点检索；
 2. 已交付的多跳图语义路径检索；
-3. 拟议的 `Coordinate → incident Edge` 语义检索，以 Edge 绑定的关系 Documents 作为候选证据；
-4. 拟议的 `Edge → member Coordinate` 语义检索，在完整 Hyperedge 成员范围内排序Coordinate候选；
+3. 已交付的 `Coordinate → incident Edge` 语义检索，以 Edge 绑定的关系 Documents 作为候选证据；
+4. 已交付的 `Edge → member Coordinate` 语义检索，在完整 Hyperedge 成员范围内排序Coordinate候选；
    “下一步”与循环防护仍由后续Agent遍历策略决定。
 
 它们的候选范围与结果合同不同，但都可能复用以下基础设施：
@@ -56,8 +80,9 @@ Project Context 正在形成四类语义检索面：
 2. scope resolver、scorer、grouping/projector与result verifier采用哪些closed Rust types；
 3. 哪些query template、score解释和budget可以共享，哪些必须按operation独立冻结；
 4. global source snapshot、topology-scoped snapshot与multi-hop traversal如何共享同一generation/currentness合同；
-5. 两个新的一跳语义查询应共享一个内部engine到什么程度，同时是否保持独立wire/result/capability；
-6. 如何迁移现有Coordinate search和semantic graph query而不改变它们已发布的结果、权限与灰度语义；
+5. 两个已交付的一跳语义查询如何迁入统一引擎，同时保持各自的closed scope/result variant及既有共享
+   tagged wire family；
+6. 如何迁移现有三个wire surface和四个逻辑operation，而不改变已发布的结果、权限与灰度语义；
 7. 如何建立跨operation的Provider call-count、current-head、authorization、release-race、资源上限和性能回归矩阵。
 
 ### 范围边界
@@ -72,11 +97,11 @@ Project Context 正在形成四类语义检索面：
 
 后续应新建立项与实现计划，至少包含：
 
-1. 现有两条查询代码路径与重复设施的只读审计；
+1. 现有三个wire surface、四个逻辑operation与重复设施的只读审计；
 2. typed engine API和crate依赖设计；
-3. 两个拟议一跳语义操作的prototype对照；
+3. 两个已交付一跳语义操作的零行为变化迁移对照；
 4. 现有查询零行为变化的迁移方案；
 5. security/currentness/rollout review；
 6. target-scale benchmark与跨operation资格门。
 
-在该独立设计被确认前，本TODO不代表已经决定具体trait、crate、wire合并方式或迁移顺序。
+概念规范的确认不代表已经决定具体trait、crate、wire合并方式或迁移顺序。

@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::embedding_space_fence;
-use crate::Score;
+use crate::{
+    ProviderEncodedSemanticInput, Score, SemanticQueryInput, SemanticQueryInputBundle,
+    SemanticQueryInputKind,
+};
 
 /// Default number of starting Coordinate candidates.
 pub const DEFAULT_COORDINATE_SEARCH_LIMIT: u8 = 8;
@@ -194,19 +196,16 @@ impl ProjectContextCoordinateSearchQuery {
 /// One immutable, digest-bound Coordinate-search Provider input.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CoordinateSearchEncoderInput {
-    request_id: Uuid,
-    query_contract_digest: Digest32,
-    text_digest: Digest32,
-    text: String,
+    semantic_input: SemanticQueryInput,
 }
 
 impl std::fmt::Debug for CoordinateSearchEncoderInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CoordinateSearchEncoderInput")
-            .field("request_id", &self.request_id)
+            .field("request_id", &self.semantic_input.request_id())
             .field("text", &"<redacted>")
-            .field("text_bytes", &self.text.len())
+            .field("text_bytes", &self.text().len())
             .finish_non_exhaustive()
     }
 }
@@ -214,37 +213,55 @@ impl std::fmt::Debug for CoordinateSearchEncoderInput {
 impl CoordinateSearchEncoderInput {
     /// Request identity owning this one input.
     pub const fn request_id(&self) -> Uuid {
-        self.request_id
+        self.semantic_input.request_id()
     }
 
     /// Digest of the independently versioned query template.
     pub const fn query_contract_digest(&self) -> Digest32 {
-        self.query_contract_digest
+        self.semantic_input.encoding_contract_digest()
     }
 
     /// Digest of the exact Provider input bytes.
     pub const fn text_digest(&self) -> Digest32 {
-        self.text_digest
+        self.semantic_input.input_digest()
     }
 
     /// Exact canonical UTF-8 Provider input.
     pub fn text(&self) -> &str {
-        &self.text
+        self.semantic_input.exact_utf8_text()
+    }
+
+    /// Common closed input shared by every semantic Provider adapter.
+    pub const fn semantic_input(&self) -> &SemanticQueryInput {
+        &self.semantic_input
+    }
+
+    /// Build the required single-input common bundle.
+    pub fn semantic_input_bundle(&self) -> CoordinateSearchResult<SemanticQueryInputBundle> {
+        SemanticQueryInputBundle::from_closed_inputs(vec![self.semantic_input.clone()])
+            .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))
     }
 
     /// Revalidate immutable digests before crossing the Provider boundary.
     pub fn validate(&self) -> CoordinateSearchResult<()> {
-        if self.query_contract_digest != coordinate_search_query_contract_digest() {
+        if !matches!(
+            self.semantic_input.channel_kind(),
+            SemanticQueryInputKind::CoordinateSearch
+        ) || self.query_contract_digest() != coordinate_search_query_contract_digest()
+        {
             return Err(CoordinateSearchError::InvalidState(
                 "query contract digest mismatch".to_owned(),
             ));
         }
-        if self.text_digest != coordinate_search_query_text_digest(self.text.as_bytes()) {
+        if self.text_digest() != coordinate_search_query_text_digest(self.text().as_bytes()) {
             return Err(CoordinateSearchError::InvalidState(
                 "query text digest mismatch".to_owned(),
             ));
         }
-        validate_provider_input_size(&self.text)
+        self.semantic_input
+            .validate()
+            .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
+        validate_provider_input_size(self.text())
     }
 }
 
@@ -277,12 +294,16 @@ pub fn build_coordinate_search_encoder_input(
 ) -> CoordinateSearchResult<CoordinateSearchEncoderInput> {
     let request = request.clone().validate_and_canonicalize()?;
     let text = canonical_coordinate_search_query_text(&request.query)?;
-    Ok(CoordinateSearchEncoderInput {
-        request_id: request.request_id,
-        query_contract_digest: coordinate_search_query_contract_digest(),
-        text_digest: coordinate_search_query_text_digest(text.as_bytes()),
+    let semantic_input = SemanticQueryInput::new_closed(
+        request.request_id,
+        coordinate_search_channel_id(request.request_id),
+        SemanticQueryInputKind::CoordinateSearch,
+        coordinate_search_query_contract_digest(),
+        coordinate_search_query_text_digest(text.as_bytes()),
         text,
-    })
+    )
+    .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
+    Ok(CoordinateSearchEncoderInput { semantic_input })
 }
 
 /// One validated ephemeral Coordinate-search query vector.
@@ -291,13 +312,7 @@ pub fn build_coordinate_search_encoder_input(
 /// contract and to the active Foundation model space. It contains no source
 /// text and is never persisted.
 pub struct EncodedCoordinateSearchQuery {
-    request_id: Uuid,
-    source_generation_contract_digest: Digest32,
-    embedding_space_fence: Digest32,
-    query_contract_digest: Digest32,
-    query_input_digest: Digest32,
-    response_model: String,
-    embedding: EmbeddingVector,
+    inner: ProviderEncodedSemanticInput,
 }
 
 impl EncodedCoordinateSearchQuery {
@@ -309,68 +324,89 @@ impl EncodedCoordinateSearchQuery {
         source_contract: &SemanticModelContract,
     ) -> CoordinateSearchResult<Self> {
         input.validate()?;
-        source_contract
-            .validate()
-            .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
-        if response_model != source_contract.model {
+        let inner = ProviderEncodedSemanticInput::new(
+            input.semantic_input(),
+            response_model,
+            values,
+            source_contract,
+        )
+        .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
+        Self::from_provider_encoded(input, inner, source_contract)
+    }
+
+    /// Restore the Coordinate compatibility wrapper around a common result.
+    pub fn from_provider_encoded(
+        input: &CoordinateSearchEncoderInput,
+        inner: ProviderEncodedSemanticInput,
+        source_contract: &SemanticModelContract,
+    ) -> CoordinateSearchResult<Self> {
+        input.validate()?;
+        if !matches!(
+            inner.channel_kind(),
+            SemanticQueryInputKind::CoordinateSearch
+        ) || inner.request_id() != input.request_id()
+            || inner.channel_id() != input.semantic_input().channel_id()
+            || inner.encoding_contract_digest() != coordinate_search_query_contract_digest()
+            || inner.input_digest() != input.text_digest()
+            || inner.response_model() != source_contract.model
+            || inner.model_space().source_generation_contract_digest
+                != source_contract
+                    .digest()
+                    .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?
+            || inner.model_space().embedding_space_fence
+                != crate::embedding_space_fence(source_contract)
+                    .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?
+        {
             return Err(CoordinateSearchError::InvalidState(
-                "Coordinate-search Provider returned a different model".to_owned(),
+                "Coordinate-search Provider binding mismatch".to_owned(),
             ));
         }
-        let source_generation_contract_digest = source_contract
-            .digest()
-            .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
-        let embedding_space_fence = embedding_space_fence(source_contract)
-            .map_err(|error| CoordinateSearchError::InvalidState(error.to_string()))?;
-        let embedding = EmbeddingVector::new(values, source_contract).map_err(|_| {
-            CoordinateSearchError::InvalidState(
-                "Coordinate-search Provider returned an invalid vector".to_owned(),
-            )
-        })?;
-        Ok(Self {
-            request_id: input.request_id(),
-            source_generation_contract_digest,
-            embedding_space_fence,
-            query_contract_digest: input.query_contract_digest(),
-            query_input_digest: input.text_digest(),
-            response_model,
-            embedding,
-        })
+        Ok(Self { inner })
     }
 
     /// Owning request identity.
     pub const fn request_id(&self) -> Uuid {
-        self.request_id
+        self.inner.request_id()
     }
 
     /// Complete active Foundation generation contract digest.
     pub const fn source_generation_contract_digest(&self) -> Digest32 {
-        self.source_generation_contract_digest
+        self.inner.model_space().source_generation_contract_digest
     }
 
     /// Comparable model-space fence.
     pub const fn embedding_space_fence(&self) -> Digest32 {
-        self.embedding_space_fence
+        self.inner.model_space().embedding_space_fence
     }
 
     /// Coordinate-search query contract digest.
     pub const fn query_contract_digest(&self) -> Digest32 {
-        self.query_contract_digest
+        self.inner.encoding_contract_digest()
     }
 
     /// Exact canonical Provider input digest.
     pub const fn query_input_digest(&self) -> Digest32 {
-        self.query_input_digest
+        self.inner.input_digest()
     }
 
     /// Exact response model identity.
     pub fn response_model(&self) -> &str {
-        &self.response_model
+        self.inner.response_model()
     }
 
     /// Validated finite, dimensioned, non-zero query vector.
     pub fn embedding(&self) -> &EmbeddingVector {
-        &self.embedding
+        self.inner.embedding()
+    }
+
+    /// Common Provider-bound representation used by the DB ticket binder.
+    pub const fn provider_encoded(&self) -> &ProviderEncodedSemanticInput {
+        &self.inner
+    }
+
+    /// Consume this compatibility wrapper.
+    pub fn into_provider_encoded(self) -> ProviderEncodedSemanticInput {
+        self.inner
     }
 }
 
@@ -625,10 +661,17 @@ fn push_canonical_json_string_contents(output: &mut String, value: &str) {
     }
 }
 
-fn coordinate_search_query_text_digest(text: &[u8]) -> Digest32 {
+pub(crate) fn coordinate_search_query_text_digest(text: &[u8]) -> Digest32 {
     hash_domain(
         b"carryforth.project-context-coordinate-search-query-text",
         &[text],
+    )
+}
+
+fn coordinate_search_channel_id(request_id: Uuid) -> Digest32 {
+    hash_domain(
+        b"carryforth.project-context-coordinate-search-channel",
+        &[request_id.as_bytes()],
     )
 }
 

@@ -23,10 +23,10 @@ documents describe the model, runtime workflow, system boundaries, and current m
    distinct responsibilities, and how agents discover and maintain related context from their
    current work coordinates.
 
-4. [Core design: Context-aware semantic graph retrieval](core-design/context-aware-semantic-graph-retrieval.md)
+4. [Core design: Agent-directed context-aware Project Context retrieval](core-design/context-aware-semantic-graph-retrieval.md)
 
-   Understand how the same question can produce different yet related, traceable context paths
-   under different Role, Work, and other environments without private agent context graphs.
+   Understand how Agents use their current Role and relevant work environment to progressively
+   select different yet related, traceable paths through one Project-owned Context Graph.
 
 5. [Core design: Meeting](core-design/meeting.md)
 

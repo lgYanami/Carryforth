@@ -81,24 +81,42 @@ BUZZ_SEMANTIC_WORKER_ENABLED=true
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
 ```
 
-任一开关启用时，必须明确提供三个没有默认值的 Provider 配置：
+Agent 自主的起点发现和一跳语义选择使用两个独立 process master。除非 operator 明确加入本地私有
+`.env`，它们保持关闭：
 
-| 环境变量 | 交互方式 | 含义 |
-|---|---|---|
-| `BUZZ_SEMANTIC_API_KEY` | 隐藏输入 | Provider API Key |
-| `BUZZ_SEMANTIC_BASE_URL` | 明文输入 | HTTPS Provider Base URL |
-| `BUZZ_SEMANTIC_REQUEST_MODEL` | 明文输入 | Embedding Request Model |
+```dotenv
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
+```
+
+开启其中任一个会复用同一 Provider 与语义索引基础，但不会自动打开 Community durable gate；只有
+其余 readiness 校验也通过后，Relay 才会广告对应 capability。
+
+任一语义索引或查询进程启用时，都必须明确提供一组完整、没有默认值的 Provider 配置。
+由于源码启动器默认开启 Worker 和完整路径 Query 开关，它会在缺失时询问这些值：
+
+| 首选共享变量 | 兼容专用变量 | 交互方式 | 含义 |
+|---|---|---|---|
+| `LLM_API_KEY` | `BUZZ_SEMANTIC_API_KEY` | 隐藏输入 | Provider API Key |
+| `LLM_BASE_URL` | `BUZZ_SEMANTIC_BASE_URL` | 明文输入 | HTTPS Provider Base URL |
+| `LLM_MODEL` | `BUZZ_SEMANTIC_REQUEST_MODEL` | 明文输入 | Embedding Request Model |
+
+两组变量不能按字段混用。只要设置了任意一个`BUZZ_SEMANTIC_*` Provider变量，Relay就把这组兼容变量作为
+整体并要求其完整；否则使用完整的`LLM_*`三元组。这样保留既有部署兼容性，同时允许本地Agent与语义
+Provider复用同一连接配置。
 
 在交互终端中，脚本会询问缺失值。非交互环境中如有缺失，会直接失败并列出变量名，
 不会猜测 Provider，也不会填充 URL 或模型默认值。
 
 值只写入本地、被 Git 忽略的 `.env`。API Key 不应出现在终端回显、日志、文档、Issue 或测试夹具中。
 
-如完全不使用语义能力，可先在 `.env` 中同时关闭两个进程开关：
+如完全不使用语义能力，在 `.env` 中保持四个进程开关全部关闭：
 
 ```dotenv
 BUZZ_SEMANTIC_WORKER_ENABLED=false
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 ```
 
 ### 4.1 进程开关不等于 Community 授权
@@ -108,7 +126,7 @@ BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false
 - Project View / Project Context 初始化；
 - Community 的持久语义索引 gate；
 - generation 创建、构建、验证和激活；
-- Community 的持久语义查询 gate；
+- Community 的持久语义检索 / 查询 gate；
 - 将 problem 与 overview 文本（来源类型、当前可见标题/名称和可选摘要；当前 foundation 不含
   Document 正文/chunk）发往外部 Provider 的出境确认。
 

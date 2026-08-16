@@ -150,9 +150,10 @@ must retain its sources, Revision, currentness, or applicability boundary. It ca
 canonical object when they conflict, nor can it create authority, responsibility, a Project Context
 Edge, or a Project decision.
 
-A semantic-query result Event is signed by the Relay and bound to the exact request. The
-`read_commands` that `cf` derives after verifying the result are not themselves signed. The caller
-should still use those commands to read the current authoritative objects back.
+Relay-returned semantic candidates and complete-path results are signed and bound to their exact
+requests. Canonical read descriptors or commands derived after verification are navigation aids,
+not additional signed Project facts. An Agent still reads current authoritative objects through
+their owning surfaces before relying on content.
 
 ### 4.3 External facts remain with external systems of record
 
@@ -275,9 +276,9 @@ Whether an operation is allowed must be validated independently across the relev
 6. caller signature and any required exact request binding;
 7. Runtime attribution when explicitly supplied.
 
-Client event tags, UI switches, tool reachability, shared credentials, and semantic query context
-cannot create or expand authority. A Community must be resolved from a trusted host / workspace,
-not from client-controlled tags.
+Client event tags, UI switches, tool reachability, shared credentials, semantic relevance, and an
+Agent's retrieval context cannot create or expand authority. A Community must be resolved from a
+trusted host / workspace, not from client-controlled tags.
 
 ## 7. Article Five: responsibility continues through Role and Work
 
@@ -440,17 +441,22 @@ related." The current model is an undirected Edge / Hyperedge with:
 The system does not infer or create Edges automatically from conversation, titles, or textual
 similarity. See the complete [Project Context contract](../stage/project-context/project-context.md).
 
-### 10.5 Semantic graph path query
+### 10.5 Agent-directed context-aware graph retrieval
 
-Semantic graph query is an optional derived capability that operates on verified Project Context.
-A natural-language question, starting coordinates, and Role, Work, or other query context may
-affect recall and ranking. Query context is not a filter, permission, action gate, or guarantee of
-semantic correctness.
+A Managed Agent may use its current verified Role and relevant Work, Issue, Meeting purpose, or
+other task facts to progressively retrieve Project Context. It prefers a reliable Coordinate from
+current work, uses semantic discovery only when no start is known, then chooses each
+`Coordinate → Edge → Coordinate` hop from bounded semantic candidates, lightweight canonical
+observations, and relation Documents. Scores order observations; the Agent makes the selection.
 
-A query requires an independent Provider, index generation, Community index/query gates, Member
-authorization, and confirmation that question data may leave the system. It is still being
-qualified for relevance, resource isolation, long-running stability, and production deployment;
-it cannot be described as Project truth or a production commitment.
+This derived read uses the one Project-owned Context Graph. It does not create private Agent/Role
+graphs, infer Edges, rewrite relationships, or expand authority. Natural-language semantic
+operations require an external Provider, index generation, Community gates, Member authorization,
+and confirmation that query text may leave the system.
+
+The bounded complete-path `semantic-query` remains available as a supplementary query surface. Its
+soft query context may affect recall and ranking, but it is not the primary Managed Agent retrieval
+workflow and is not a filter, permission, action gate, or guarantee of semantic correctness.
 
 ## 11. Article Nine: messages and Meetings must materialize outcomes explicitly
 
@@ -625,7 +631,7 @@ data egress, or granting Member authority.
 
 The current repository remains under active development and is preparing its first public source
 snapshot. It is intended only for local source builds, evaluation, and reference learning; public
-source is not a versioned release or a packaged artifact. Semantic query, Meeting, Git Projects,
+source is not a versioned release or a packaged artifact. Semantic retrieval, Meeting, Git Projects,
 and some Desktop surfaces remain subject to
 preview or qualification boundaries. This document cannot be used to claim production readiness,
 multi-instance safety, stable upgrades, or platform support.

@@ -13,7 +13,7 @@ use buzz_semantic::{
     SemanticSourceIdentity,
 };
 use buzz_semantic_query::{
-    EdgeCoordinateCoverage, IncidentEdgeCoverage, LifecycleFilter, OneHopCandidatePreview,
+    EdgeCoordinateCoverage, IncidentEdgeCoverage, OneHopCandidatePreview,
     OneHopCanonicalCandidateObservation, OneHopCanonicalRead, OneHopOmittedCandidateCounts,
     OneHopRankedCoordinate, OneHopRankedDocument, OneHopRankedEdge, OneHopSemanticSelection,
     MAX_ONE_HOP_DOCUMENTS_PER_EDGE, MAX_ONE_HOP_EDGE_COORDINATES,
@@ -29,8 +29,8 @@ use super::{
     semantic_source_identity_for_coordinate, semantic_source_sort_key,
     validate_canonical_against_head, validate_coordinate, validate_query_vectors,
     CurrentSemanticAvailabilityClass, CurrentSemanticSourceState, IncidentRelationRef,
-    SemanticExactQueryVector, SemanticExactSourceScore, SemanticGraphReadTx,
-    SemanticGraphSnapshotBinding,
+    SemanticExactExplicitSourceScope, SemanticExactQueryVector, SemanticExactSourceScore,
+    SemanticGraphReadTx, SemanticGraphSnapshotBinding,
 };
 use crate::semantic::observe_semantic_source_preview_in_connection;
 use crate::{DbError, Result};
@@ -147,12 +147,9 @@ impl SemanticGraphReadTx {
         }
         let sources = unique_sources.into_values().collect::<Vec<_>>();
         let scores = self
-            .query_exact_source_scores(
-                LifecycleFilter::AllCurrent,
-                &[],
-                std::slice::from_ref(query_vector),
-                Some(&sources),
-                None,
+            .score_explicit_source_scope_exact(
+                query_vector,
+                SemanticExactExplicitSourceScope::OneHopIncidentDocuments(&sources),
             )
             .await?;
         let score_map = exact_score_map(scores, query_vector)?;
@@ -335,12 +332,9 @@ impl SemanticGraphReadTx {
             })
             .collect::<Result<Vec<_>>>()?;
         let scores = self
-            .query_exact_source_scores(
-                LifecycleFilter::AllCurrent,
-                &[],
-                std::slice::from_ref(query_vector),
-                Some(&sources),
-                None,
+            .score_explicit_source_scope_exact(
+                query_vector,
+                SemanticExactExplicitSourceScope::OneHopEdgeCoordinates(&sources),
             )
             .await?;
         let score_map = exact_score_map(scores, query_vector)?;

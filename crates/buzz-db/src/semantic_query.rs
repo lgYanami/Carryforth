@@ -5,8 +5,10 @@
 //! observations to the Relay query orchestrator. Raw source vectors never
 //! cross this API.
 
+mod exact_scoring;
 mod scoped_search;
 
+pub use exact_scoring::*;
 pub use scoped_search::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -16,18 +18,19 @@ use buzz_core::{CommunityId, PublicKey};
 use buzz_project_context::{EdgeKey, ProjectContextCoordinate};
 use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic::{
-    CanonicalSemanticSourceObservation, Digest32, EmbeddingVector, IneligibilityReason,
-    ProjectViewSemanticType, SemanticCoverage, SemanticEligibility, SemanticLifecycleClass,
-    SemanticSourceBasis, SemanticSourceIdentity, SemanticSourceKind,
+    CanonicalSemanticSourceObservation, Digest32, IneligibilityReason, ProjectViewSemanticType,
+    SemanticCoverage, SemanticEligibility, SemanticLifecycleClass, SemanticSourceBasis,
+    SemanticSourceIdentity, SemanticSourceKind,
 };
 use buzz_semantic_query::{
     document_score, environment_gain, harmonic_score, target_coordinate_score, ConditionedEvidence,
     ContextDocumentBindingObservation, LifecycleFilter, ProjectContextBindingProvenance,
     ProjectContextEdgeProvenance, QueryCompatibilityFences, RelationRankCursor, Score,
-    SemanticEdgeObservation, SemanticGraphQueryRoutingTrust, TargetRankCursor,
-    MAX_CONTEXT_COORDINATES, MAX_HYPEREDGE_IDENTITY_BYTES, MAX_INITIAL_COORDINATES,
-    MAX_QUERY_CHANNELS, MAX_RECALL_PER_CHANNEL, MAX_RELATION_OPTIONS_MATERIALIZED,
-    MAX_TARGET_OPTIONS_MATERIALIZED, RELATION_FLOOR, TARGET_FLOOR, TRANSITION_FLOOR,
+    SemanticEdgeObservation, SemanticGraphQueryRoutingTrust, SemanticQueryInputKind,
+    TargetRankCursor, MAX_CONTEXT_COORDINATES, MAX_HYPEREDGE_IDENTITY_BYTES,
+    MAX_INITIAL_COORDINATES, MAX_QUERY_CHANNELS, MAX_RECALL_PER_CHANNEL,
+    MAX_RELATION_OPTIONS_MATERIALIZED, MAX_TARGET_OPTIONS_MATERIALIZED, RELATION_FLOOR,
+    TARGET_FLOOR, TRANSITION_FLOOR,
 };
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
@@ -69,6 +72,13 @@ pub struct SemanticGraphQueryTicket {
     pub observed_at: DateTime<Utc>,
 }
 
+impl SemanticGraphQueryTicket {
+    /// Project this authorized ticket into the scorer-facing generation view.
+    pub fn generation_fences(&self) -> Result<SemanticGenerationFences> {
+        SemanticGenerationFences::from_ticket(self)
+    }
+}
+
 /// Server-owned transaction timeouts for one Stage C exact read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SemanticGraphReadTimeouts {
@@ -87,41 +97,6 @@ impl Default for SemanticGraphReadTimeouts {
             lock: Duration::from_millis(250),
             idle_in_transaction: Duration::from_secs(10),
         }
-    }
-}
-
-/// One validated query vector branch supplied by the query encoder.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SemanticExactQueryVector {
-    /// Stable, request-local branch identity.
-    channel_id: Digest32,
-    /// Three compatibility fences observed by the query encoder.
-    query_fences: QueryCompatibilityFences,
-    /// Finite vector already validated against the ticket model contract.
-    embedding: EmbeddingVector,
-}
-
-impl SemanticExactQueryVector {
-    /// Bind one encoded branch to the exact ticket and closed compatibility
-    /// fences before it can reach SQL.
-    pub fn new(
-        ticket: &SemanticGraphQueryTicket,
-        channel_id: Digest32,
-        query_fences: QueryCompatibilityFences,
-        embedding: EmbeddingVector,
-    ) -> Result<Self> {
-        let vector = Self {
-            channel_id,
-            query_fences,
-            embedding,
-        };
-        validate_query_vectors(ticket, std::slice::from_ref(&vector))?;
-        Ok(vector)
-    }
-
-    /// Stable request-local branch identity.
-    pub const fn channel_id(&self) -> Digest32 {
-        self.channel_id
     }
 }
 
@@ -758,8 +733,8 @@ pub struct SemanticTraversalConditionedChannel {
 /// method that consumes this value.
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticTraversalQueryChannels<'a> {
-    /// Exact query vectors, including Q0 and every retained Qi.
-    pub query_vectors: &'a [SemanticExactQueryVector],
+    /// Closed exact query bundle, including Q0 and every retained Qi.
+    pub query_vectors: &'a SemanticGraphQueryVectorBundle,
     /// Channel identity of the problem-only Q0 vector.
     pub problem_channel_id: Digest32,
     /// Exact one-to-one Qi-to-Coordinate bindings.
@@ -1762,7 +1737,7 @@ impl SemanticGraphReadTx {
         &mut self,
         lifecycle_filter: LifecycleFilter,
         explicit_initial_sources: &[SemanticSourceIdentity],
-        query_vectors: &[SemanticExactQueryVector],
+        query_vectors: &SemanticGraphQueryVectorBundle,
         recall_per_channel: u16,
     ) -> Result<SemanticExactRecallBatch> {
         if recall_per_channel == 0 || recall_per_channel > MAX_RECALL_PER_CHANNEL {
@@ -1776,7 +1751,7 @@ impl SemanticGraphReadTx {
                 DbError::InvalidData("semantic recall observation limit overflow".to_string())
             })?;
         let observed = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 lifecycle_filter,
                 explicit_initial_sources,
                 query_vectors,
@@ -1785,8 +1760,9 @@ impl SemanticGraphReadTx {
             )
             .await?;
         let channel_ids: Vec<Digest32> = query_vectors
+            .vectors()
             .iter()
-            .map(|channel| channel.channel_id)
+            .map(GenerationBoundQueryVector::channel_id)
             .collect();
         partition_exact_recall(&channel_ids, observed, recall_per_channel)
     }
@@ -1798,7 +1774,7 @@ impl SemanticGraphReadTx {
         &mut self,
         lifecycle_filter: LifecycleFilter,
         explicit_initial_sources: &[SemanticSourceIdentity],
-        query_vectors: &[SemanticExactQueryVector],
+        query_vectors: &SemanticGraphQueryVectorBundle,
         candidates: &[SemanticSourceIdentity],
     ) -> Result<Vec<SemanticExactSourceScore>> {
         if candidates.is_empty() {
@@ -1809,7 +1785,7 @@ impl SemanticGraphReadTx {
                 "semantic score matrix source count exceeds the server bound".to_string(),
             ));
         }
-        self.query_exact_source_scores(
+        self.query_graph_exact_source_scores(
             lifecycle_filter,
             explicit_initial_sources,
             query_vectors,
@@ -1886,7 +1862,7 @@ impl SemanticGraphReadTx {
             .collect::<Vec<_>>();
         validate_unique_sources(&sources, "incident relation")?;
         let matrix = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 LifecycleFilter::AllCurrent,
                 &[],
                 request.channels.query_vectors,
@@ -2062,7 +2038,7 @@ impl SemanticGraphReadTx {
             .collect::<Result<Vec<_>>>()?;
         validate_unique_sources(&sources, "Hyperedge target")?;
         let matrix = self
-            .query_exact_source_scores(
+            .query_graph_exact_source_scores(
                 request.lifecycle_filter,
                 &[],
                 request.channels.query_vectors,
@@ -2451,22 +2427,112 @@ impl SemanticGraphReadTx {
             )?;
         }
 
+        let rows = self
+            .query_generation_bound_source_score_rows(
+                lifecycle_filter,
+                explicit_initial_sources,
+                &query_vectors
+                    .iter()
+                    .map(SemanticExactQueryVector::generation_bound)
+                    .collect::<Vec<_>>(),
+                candidates,
+                top_per_channel,
+                SemanticExactScoreScope::GraphSources,
+            )
+            .await?;
+        rows.iter().map(exact_score_from_row).collect()
+    }
+
+    async fn query_graph_exact_source_scores(
+        &mut self,
+        lifecycle_filter: LifecycleFilter,
+        explicit_initial_sources: &[SemanticSourceIdentity],
+        query_vectors: &SemanticGraphQueryVectorBundle,
+        candidates: Option<&[SemanticSourceIdentity]>,
+        top_per_channel: Option<u32>,
+    ) -> Result<Vec<SemanticExactSourceScore>> {
+        validate_source_inputs(
+            self.ticket.community_id,
+            explicit_initial_sources,
+            MAX_INITIAL_COORDINATES,
+            "explicit initial source",
+        )?;
+        validate_graph_query_vectors(
+            &self.ticket,
+            query_vectors.vectors().iter(),
+            query_vectors.len(),
+        )?;
+        if let Some(candidates) = candidates {
+            validate_source_inputs(
+                self.ticket.community_id,
+                candidates,
+                MAX_TARGET_SCORE_SET,
+                "candidate source",
+            )?;
+        }
+
+        let rows = self
+            .query_generation_bound_source_score_rows(
+                lifecycle_filter,
+                explicit_initial_sources,
+                &query_vectors.vectors().iter().collect::<Vec<_>>(),
+                candidates,
+                top_per_channel,
+                SemanticExactScoreScope::GraphSources,
+            )
+            .await?;
+        rows.iter().map(exact_score_from_row).collect()
+    }
+
+    async fn query_generation_bound_source_score_rows(
+        &mut self,
+        lifecycle_filter: LifecycleFilter,
+        explicit_initial_sources: &[SemanticSourceIdentity],
+        query_vectors: &[&GenerationBoundQueryVector],
+        candidates: Option<&[SemanticSourceIdentity]>,
+        top_per_channel: Option<u32>,
+        score_scope: SemanticExactScoreScope,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        validate_source_inputs(
+            self.ticket.community_id,
+            explicit_initial_sources,
+            MAX_INITIAL_COORDINATES,
+            "explicit initial source",
+        )?;
+        validate_generation_bound_vectors(
+            &self.ticket,
+            query_vectors.iter().copied(),
+            query_vectors.len(),
+        )?;
+        if let Some(candidates) = candidates {
+            validate_source_inputs(
+                self.ticket.community_id,
+                candidates,
+                MAX_TARGET_SCORE_SET,
+                "candidate source",
+            )?;
+        }
+
         let initial = source_key_arrays(explicit_initial_sources);
         let restrict_candidates = candidates.is_some();
         let candidates = source_key_arrays(candidates.unwrap_or_default());
         let channel_ids: Vec<Vec<u8>> = query_vectors
             .iter()
-            .map(|channel| channel.channel_id.as_bytes().to_vec())
+            .map(|channel| channel.channel_id().as_bytes().to_vec())
             .collect();
         let vectors: Vec<Vector> = query_vectors
             .iter()
-            .map(|channel| Vector::from(channel.embedding.as_slice().to_vec()))
+            .map(|channel| Vector::from(channel.embedding().as_slice().to_vec()))
             .collect();
         let dimensions = i32::try_from(self.ticket.generation.model_contract.dimensions)
             .map_err(|_| DbError::InvalidData("semantic dimensions exceed int4".to_string()))?;
         let top_per_channel = top_per_channel.map(i64::from);
+        let exact_sql = match score_scope {
+            SemanticExactScoreScope::GraphSources => EXACT_SOURCE_SCORES_SQL,
+            SemanticExactScoreScope::GlobalGraphCoordinates => GLOBAL_GRAPH_COORDINATE_SCORES_SQL,
+        };
 
-        let rows = sqlx::query(EXACT_SOURCE_SCORES_SQL)
+        let rows = sqlx::query(exact_sql)
             .bind(self.ticket.community_id.as_uuid())
             .bind(self.reader_pubkey.as_slice())
             .bind(self.expected_projection_pubkey.as_bytes())
@@ -2492,9 +2558,10 @@ impl SemanticGraphReadTx {
             .bind(&candidates.subtypes)
             .bind(&candidates.ids)
             .bind(top_per_channel)
+            .bind(score_scope.coordinate_only())
             .fetch_all(&mut *self.tx)
             .await?;
-        rows.iter().map(exact_score_from_row).collect()
+        Ok(rows)
     }
 }
 
@@ -2714,28 +2781,42 @@ fn validate_traversal_channels(
     ticket: &SemanticGraphQueryTicket,
     channels: SemanticTraversalQueryChannels<'_>,
 ) -> Result<()> {
-    validate_query_vectors(ticket, channels.query_vectors)?;
+    validate_graph_query_vectors(
+        ticket,
+        channels.query_vectors.vectors().iter(),
+        channels.query_vectors.len(),
+    )?;
     if channels.conditioned.len().checked_add(1) != Some(channels.query_vectors.len()) {
         return Err(DbError::InvalidData(
             "semantic traversal Q0/Qi binding count is inconsistent".to_string(),
         ));
     }
-    let vector_ids = channels
-        .query_vectors
+    let vectors = channels.query_vectors.vectors();
+    let vector_ids = vectors
         .iter()
-        .map(SemanticExactQueryVector::channel_id)
+        .map(GenerationBoundQueryVector::channel_id)
         .collect::<BTreeSet<_>>();
-    if !vector_ids.contains(&channels.problem_channel_id) {
+    if vectors.first().map(GenerationBoundQueryVector::channel_id)
+        != Some(channels.problem_channel_id)
+    {
         return Err(DbError::InvalidData(
-            "semantic traversal channel binding lacks Q0".to_string(),
+            "semantic traversal channel binding does not identify Q0".to_string(),
         ));
     }
     let mut bound_ids = BTreeSet::from([channels.problem_channel_id]);
     let mut coordinates = BTreeSet::new();
     for conditioned in channels.conditioned {
         validate_coordinate(ticket.community_id, &conditioned.context_coordinate)?;
+        let matches_vector = vectors.iter().any(|vector| {
+            vector.channel_id() == conditioned.channel_id
+                && matches!(
+                    vector.channel_kind(),
+                    SemanticQueryInputKind::ConditionedContext { context_coordinate }
+                        if context_coordinate == &conditioned.context_coordinate
+                )
+        });
         if conditioned.channel_id == channels.problem_channel_id
-            || !vector_ids.contains(&conditioned.channel_id)
+            || !matches_vector
             || !bound_ids.insert(conditioned.channel_id)
             || !coordinates.insert(conditioned.context_coordinate.clone())
         {
@@ -3491,53 +3572,13 @@ fn validate_query_vectors(
     ticket: &SemanticGraphQueryTicket,
     query_vectors: &[SemanticExactQueryVector],
 ) -> Result<()> {
-    if query_vectors.is_empty() || query_vectors.len() > MAX_QUERY_CHANNELS {
-        return Err(DbError::InvalidData(
-            "semantic query vector count is outside the server bound".to_string(),
-        ));
-    }
-    let dimensions = ticket.generation.model_contract.dimensions;
-    for (index, channel) in query_vectors.iter().enumerate() {
-        QueryCompatibilityFences::validate_observed(
-            &ticket.generation.model_contract,
-            channel.query_fences.source_generation_contract_digest,
-            channel.query_fences.embedding_space_fence,
-            channel.query_fences.query_contract_digest,
-        )
-        .map_err(|error| {
-            DbError::InvalidData(format!(
-                "semantic query vector {index} compatibility fence mismatch: {error}"
-            ))
-        })?;
-        if channel.query_fences != ticket.query_fences {
-            return Err(DbError::InvalidData(format!(
-                "semantic query vector {index} does not match the Stage C ticket"
-            )));
-        }
-        if channel.embedding.as_slice().len() != dimensions
-            || channel
-                .embedding
-                .as_slice()
-                .iter()
-                .any(|value| !value.is_finite())
-            || vector_norm_squared(channel.embedding.as_slice()) <= 0.0
-        {
-            return Err(DbError::InvalidData(format!(
-                "semantic query vector {index} is not a finite non-zero ticket-space vector"
-            )));
-        }
-    }
-    let mut ids: Vec<Digest32> = query_vectors
-        .iter()
-        .map(|channel| channel.channel_id)
-        .collect();
-    ids.sort_unstable();
-    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(DbError::InvalidData(
-            "semantic query channel ids must be unique".to_string(),
-        ));
-    }
-    Ok(())
+    validate_graph_query_vectors(
+        ticket,
+        query_vectors
+            .iter()
+            .map(SemanticExactQueryVector::generation_bound),
+        query_vectors.len(),
+    )
 }
 
 fn vector_norm_squared(values: &[f32]) -> f64 {
@@ -4663,8 +4704,78 @@ WHERE source.eligibility = 'eligible'
 ORDER BY source.source_family, source.source_subtype, source.source_id
 "#;
 
-const EXACT_SOURCE_SCORES_SQL: &str = r#"
-WITH requested_reader(pubkey) AS (
+macro_rules! semantic_exact_current_overview_joins_sql {
+    () => {
+        r#"JOIN semantic_sources source
+  ON source.community_id = head.community_id
+ AND source.source_family = head.source_family
+ AND source.source_subtype = head.source_subtype
+ AND source.source_id = head.source_id
+ AND source.invalidation_epoch = head.source_invalidation_epoch
+ AND source.snapshot_digest = head.source_snapshot_digest
+JOIN semantic_unit_sets unit_set
+  ON unit_set.community_id = head.community_id
+ AND unit_set.unit_set_id = head.unit_set_id
+ AND unit_set.source_family = head.source_family
+ AND unit_set.source_subtype = head.source_subtype
+ AND unit_set.source_id = head.source_id
+ AND unit_set.source_invalidation_epoch = head.source_invalidation_epoch
+ AND unit_set.source_snapshot_digest = head.source_snapshot_digest
+ AND unit_set.state = 'active'
+ AND unit_set.extractor_version = head.extractor_version
+JOIN semantic_units unit
+  ON unit.community_id = unit_set.community_id
+ AND unit.unit_set_id = unit_set.unit_set_id
+ AND unit.unit_kind = 'overview'
+ AND unit.unit_key = 'overview'
+JOIN semantic_embeddings embedding
+  ON embedding.community_id = unit.community_id
+ AND embedding.unit_set_id = unit.unit_set_id
+ AND embedding.unit_key = unit.unit_key
+ AND embedding.generation_id = head.generation_id
+ AND embedding.model_contract_digest = head.model_contract_digest
+ AND embedding.dimensions = head.dimensions
+ AND embedding.response_model = head.model
+ AND vector_dims(embedding.embedding) = head.dimensions
+ AND vector_norm(embedding.embedding) > 0
+"#
+    };
+}
+
+macro_rules! semantic_exact_direct_scoring_sql {
+    () => {
+        r#"query_vectors(channel_id, query_vector) AS MATERIALIZED (
+    SELECT * FROM unnest($13::bytea[], $14::vector[])
+),
+distances AS MATERIALIZED (
+    SELECT eligible.community_id, eligible.source_family,
+           eligible.source_subtype, eligible.source_id,
+           eligible.invalidation_epoch, eligible.snapshot_digest,
+           eligible.unit_set_id, eligible.unit_key,
+           query_vectors.channel_id,
+           eligible.embedding <=> query_vectors.query_vector AS distance
+    FROM eligible CROSS JOIN query_vectors
+),
+finite_distances AS MATERIALIZED (
+    SELECT * FROM distances
+    WHERE distance > '-Infinity'::double precision
+      AND distance < 'Infinity'::double precision
+),
+scored AS NOT MATERIALIZED (
+    SELECT finite_distances.*,
+           floor((
+             (greatest(-1.0, least(1.0, 1.0 - distance)) + 1.0)
+             / 2.0
+           ) * 1000000.0 + 0.5)::bigint AS semantic_score
+    FROM finite_distances
+)
+"#
+    };
+}
+
+macro_rules! semantic_exact_authorized_generation_sql {
+    () => {
+        r#"WITH requested_reader(pubkey) AS (
     VALUES ($2::bytea)
 ),
 authorized_reader AS MATERIALIZED (
@@ -4753,6 +4864,16 @@ active_generation AS MATERIALIZED (
       AND generation.model = $7
       AND generation.dimensions = $8
       AND generation.distance_metric = 'cosine'
+)
+"#
+    };
+}
+
+pub(crate) const EXACT_SOURCE_SCORES_SQL: &str = concat!(
+    semantic_exact_authorized_generation_sql!(),
+    r#",
+graph_scope_guard AS MATERIALIZED (
+    SELECT TRUE AS allowed WHERE NOT $20
 ),
 raw_graph_roles AS MATERIALIZED (
     SELECT coordinate.community_id,
@@ -4808,6 +4929,7 @@ graph_roles AS MATERIALIZED (
              '[]'::jsonb
            ) AS bindings
     FROM raw_graph_roles
+    CROSS JOIN graph_scope_guard
     WHERE source_family IS NOT NULL AND source_subtype IS NOT NULL
     GROUP BY community_id, source_family, source_subtype, source_id
 ),
@@ -4819,125 +4941,243 @@ requested_candidates(source_family, source_subtype, source_id)
 AS MATERIALIZED (
     SELECT * FROM unnest($16::text[], $17::text[], $18::uuid[])
 ),
-eligible AS MATERIALIZED (
-    SELECT source.community_id, source.source_family, source.source_subtype, source.source_id,
-           source.invalidation_epoch, source.snapshot_digest,
-           source.source_basis, source.lifecycle_class, source.source_status,
-           unit_set.unit_set_id, unit.unit_key, unit.semantic_text_digest,
-           unit.summary_coverage, embedding.embedding,
-           role.is_coordinate,
-           role.coordinate_incident_edge_keys,
-           (role.is_coordinate AND (
-               $9 = 'all_current'
-               OR ($9 = 'non_terminal'
-                   AND source.lifecycle_class IN ('active', 'finalizing'))
-               OR ($9 = 'terminal_only'
-                   AND source.lifecycle_class = 'terminal')
-               OR initial.source_id IS NOT NULL
-           )) AS coordinate_entry_eligible,
-           role.bindings
+scoped_heads AS NOT MATERIALIZED (
+    SELECT head.community_id, head.generation_id, head.source_family,
+           head.source_subtype, head.source_id, head.unit_set_id,
+           head.source_invalidation_epoch, head.source_snapshot_digest,
+           generation.extractor_version, generation.model_contract_digest,
+           generation.model, generation.dimensions,
+           role.is_coordinate, role.coordinate_incident_edge_keys, role.bindings
     FROM active_generation generation
+    JOIN graph_roles role
+      ON role.community_id = generation.community_id
     JOIN semantic_source_generation_heads head
       ON head.community_id = generation.community_id
      AND head.generation_id = generation.generation_id
-    JOIN semantic_sources source
-      ON source.community_id = head.community_id
-     AND source.source_family = head.source_family
-     AND source.source_subtype = head.source_subtype
-     AND source.source_id = head.source_id
-     AND source.invalidation_epoch = head.source_invalidation_epoch
-     AND source.snapshot_digest = head.source_snapshot_digest
-    JOIN semantic_unit_sets unit_set
-      ON unit_set.community_id = head.community_id
-     AND unit_set.unit_set_id = head.unit_set_id
-     AND unit_set.source_family = head.source_family
-     AND unit_set.source_subtype = head.source_subtype
-     AND unit_set.source_id = head.source_id
-     AND unit_set.source_invalidation_epoch = head.source_invalidation_epoch
-     AND unit_set.source_snapshot_digest = head.source_snapshot_digest
-     AND unit_set.state = 'active'
-     AND unit_set.extractor_version = generation.extractor_version
-    JOIN semantic_units unit
-      ON unit.community_id = unit_set.community_id
-     AND unit.unit_set_id = unit_set.unit_set_id
-     AND unit.unit_kind = 'overview'
-     AND unit.unit_key = 'overview'
-    JOIN semantic_embeddings embedding
-      ON embedding.community_id = unit.community_id
-     AND embedding.unit_set_id = unit.unit_set_id
-     AND embedding.unit_key = unit.unit_key
-     AND embedding.generation_id = generation.generation_id
-     AND embedding.model_contract_digest = generation.model_contract_digest
-     AND embedding.dimensions = generation.dimensions
-     AND embedding.response_model = generation.model
-     AND vector_dims(embedding.embedding) = generation.dimensions
-     AND vector_norm(embedding.embedding) > 0
-    JOIN graph_roles role
-      ON role.community_id = source.community_id
-     AND role.source_family = source.source_family
-     AND role.source_subtype = source.source_subtype
-     AND role.source_id = source.source_id
+     AND head.source_family = role.source_family
+     AND head.source_subtype = role.source_subtype
+     AND head.source_id = role.source_id
+    WHERE NOT $15
+       OR EXISTS (
+          SELECT 1 FROM requested_candidates candidate
+          WHERE candidate.source_family = role.source_family
+            AND candidate.source_subtype = role.source_subtype
+            AND candidate.source_id = role.source_id
+       )
+),
+eligible AS MATERIALIZED (
+    SELECT source.community_id, source.source_family, source.source_subtype, source.source_id,
+           source.invalidation_epoch, source.snapshot_digest,
+           unit_set.unit_set_id, unit.unit_key, embedding.embedding
+    FROM scoped_heads head
+"#,
+    semantic_exact_current_overview_joins_sql!(),
+    r#"
     LEFT JOIN explicit_initial_sources initial
       ON initial.source_family = source.source_family
      AND initial.source_subtype = source.source_subtype
      AND initial.source_id = source.source_id
     WHERE source.eligibility = 'eligible'
       AND (
-        (role.is_coordinate AND (
+        (head.is_coordinate AND (
           $9 = 'all_current'
           OR ($9 = 'non_terminal'
               AND source.lifecycle_class IN ('active', 'finalizing'))
           OR ($9 = 'terminal_only' AND source.lifecycle_class = 'terminal')
           OR initial.source_id IS NOT NULL
         ))
-        OR jsonb_array_length(role.bindings) > 0
-      )
-      AND (
-        NOT $15
-        OR EXISTS (
-          SELECT 1 FROM requested_candidates candidate
-          WHERE candidate.source_family = source.source_family
-            AND candidate.source_subtype = source.source_subtype
-            AND candidate.source_id = source.source_id
-        )
+        OR jsonb_array_length(head.bindings) > 0
       )
 ),
-query_vectors(channel_id, query_vector) AS MATERIALIZED (
-    SELECT * FROM unnest($13::bytea[], $14::vector[])
-),
-distances AS (
-    SELECT eligible.*, query_vectors.channel_id,
-           eligible.embedding <=> query_vectors.query_vector AS distance
-    FROM eligible CROSS JOIN query_vectors
-),
-finite_distances AS MATERIALIZED (
-    SELECT * FROM distances
-    WHERE distance > '-Infinity'::double precision
-      AND distance < 'Infinity'::double precision
-),
+"#,
+    semantic_exact_direct_scoring_sql!(),
+    r#",
 ranked AS (
-    SELECT finite_distances.*,
-           floor((
-             (greatest(-1.0, least(1.0, 1.0 - distance)) + 1.0)
-             / 2.0
-           ) * 1000000.0 + 0.5)::bigint AS semantic_score,
+    SELECT scored.*,
            row_number() OVER (
              PARTITION BY channel_id
              ORDER BY distance ASC, source_family ASC,
                       source_subtype ASC, source_id ASC, unit_key ASC
            ) AS channel_rank
-    FROM finite_distances
+    FROM scored
+)
+SELECT ranked.community_id, ranked.channel_id, ranked.source_family,
+       ranked.source_subtype, ranked.source_id,
+       ranked.invalidation_epoch, ranked.snapshot_digest,
+       source.source_basis, source.lifecycle_class, source.source_status,
+       ranked.unit_set_id, ranked.unit_key,
+       unit.semantic_text_digest, unit.summary_coverage,
+       role.is_coordinate,
+       (role.is_coordinate AND (
+          $9 = 'all_current'
+          OR ($9 = 'non_terminal'
+              AND source.lifecycle_class IN ('active', 'finalizing'))
+          OR ($9 = 'terminal_only' AND source.lifecycle_class = 'terminal')
+          OR initial.source_id IS NOT NULL
+       )) AS coordinate_entry_eligible,
+       role.coordinate_incident_edge_keys, role.bindings,
+       ranked.semantic_score, ranked.channel_rank
+FROM ranked
+JOIN semantic_sources source
+  ON source.community_id = ranked.community_id
+ AND source.source_family = ranked.source_family
+ AND source.source_subtype = ranked.source_subtype
+ AND source.source_id = ranked.source_id
+ AND source.invalidation_epoch = ranked.invalidation_epoch
+ AND source.snapshot_digest = ranked.snapshot_digest
+JOIN semantic_units unit
+  ON unit.community_id = ranked.community_id
+ AND unit.unit_set_id = ranked.unit_set_id
+ AND unit.unit_key = ranked.unit_key
+JOIN graph_roles role
+  ON role.community_id = ranked.community_id
+ AND role.source_family = ranked.source_family
+ AND role.source_subtype = ranked.source_subtype
+ AND role.source_id = ranked.source_id
+LEFT JOIN explicit_initial_sources initial
+  ON initial.source_family = ranked.source_family
+ AND initial.source_subtype = ranked.source_subtype
+ AND initial.source_id = ranked.source_id
+WHERE $19::bigint IS NULL OR ranked.channel_rank <= $19
+ORDER BY ranked.channel_id, ranked.channel_rank, ranked.source_family,
+         ranked.source_subtype, ranked.source_id, ranked.unit_key
+"#
+);
+
+/// Closed global-Coordinate physical plan built from the shared authorization,
+/// current-overview, distance, and fixed-score SQL fragments.
+pub(crate) const GLOBAL_GRAPH_COORDINATE_SCORES_SQL: &str = concat!(
+    semantic_exact_authorized_generation_sql!(),
+    r#",
+coordinate_scope_guard AS MATERIALIZED (
+    SELECT TRUE AS allowed WHERE $20
+),
+coordinate_roles AS MATERIALIZED (
+    SELECT DISTINCT coordinate.community_id,
+           CASE coordinate.coordinate_type
+             WHEN 'project_view_object' THEN 'project_view'
+             WHEN 'document' THEN 'project_document'
+             WHEN 'meeting' THEN 'meeting'
+           END AS source_family,
+           CASE coordinate.coordinate_type
+             WHEN 'project_view_object' THEN coordinate.coordinate_subtype
+             WHEN 'document' THEN 'document'
+             WHEN 'meeting' THEN 'meeting'
+           END AS source_subtype,
+           coordinate.coordinate_id AS source_id
+    FROM project_context_edge_coordinates coordinate
+    JOIN project_context_edges edge
+      ON edge.community_id = coordinate.community_id
+     AND edge.edge_key = coordinate.edge_key
+     AND edge.state = 'active'
+    CROSS JOIN coordinate_scope_guard
+    WHERE coordinate.community_id = $1
+),
+scoped_heads AS NOT MATERIALIZED (
+    SELECT head.community_id, head.generation_id, head.source_family,
+           head.source_subtype, head.source_id, head.unit_set_id,
+           head.source_invalidation_epoch, head.source_snapshot_digest,
+           generation.extractor_version, generation.model_contract_digest,
+           generation.model, generation.dimensions
+    FROM active_generation generation
+    JOIN coordinate_roles role
+      ON role.community_id = generation.community_id
+    JOIN semantic_source_generation_heads head
+      ON head.community_id = generation.community_id
+     AND head.generation_id = generation.generation_id
+     AND head.source_family = role.source_family
+     AND head.source_subtype = role.source_subtype
+     AND head.source_id = role.source_id
+),
+eligible AS MATERIALIZED (
+    SELECT source.community_id, source.source_family, source.source_subtype, source.source_id,
+           source.invalidation_epoch, source.snapshot_digest,
+           unit_set.unit_set_id, unit.unit_key, embedding.embedding
+    FROM scoped_heads head
+"#,
+    semantic_exact_current_overview_joins_sql!(),
+    r#"WHERE source.eligibility = 'eligible'
+),
+"#,
+    semantic_exact_direct_scoring_sql!(),
+    r#",
+coordinate_top AS MATERIALIZED (
+    SELECT scored.*
+    FROM scored
+    ORDER BY semantic_score DESC,
+             CASE source_family
+               WHEN 'project_view' THEN 0
+               WHEN 'project_document' THEN 1
+               WHEN 'meeting' THEN 2
+               ELSE 3
+             END ASC,
+             CASE source_subtype
+               WHEN 'project_profile' THEN 0
+               WHEN 'goal' THEN 1
+               WHEN 'role' THEN 2
+               WHEN 'plan' THEN 3
+               WHEN 'stage' THEN 4
+               WHEN 'requirement' THEN 5
+               WHEN 'issue' THEN 6
+               WHEN 'work' THEN 7
+               WHEN 'resource' THEN 8
+               ELSE 0
+             END ASC,
+             source_family ASC, source_subtype ASC, source_id ASC, unit_key ASC
+    LIMIT $19
+),
+ranked AS (
+    SELECT coordinate_top.*,
+           row_number() OVER (
+             ORDER BY semantic_score DESC,
+                      CASE source_family
+                        WHEN 'project_view' THEN 0
+                        WHEN 'project_document' THEN 1
+                        WHEN 'meeting' THEN 2
+                        ELSE 3
+                      END ASC,
+                      CASE source_subtype
+                        WHEN 'project_profile' THEN 0
+                        WHEN 'goal' THEN 1
+                        WHEN 'role' THEN 2
+                        WHEN 'plan' THEN 3
+                        WHEN 'stage' THEN 4
+                        WHEN 'requirement' THEN 5
+                        WHEN 'issue' THEN 6
+                        WHEN 'work' THEN 7
+                        WHEN 'resource' THEN 8
+                        ELSE 0
+                      END ASC,
+                      source_family ASC, source_subtype ASC,
+                      source_id ASC, unit_key ASC
+           ) AS channel_rank
+    FROM coordinate_top
 )
 SELECT community_id, channel_id, source_family, source_subtype, source_id,
-       invalidation_epoch, snapshot_digest, source_basis,
-       lifecycle_class, source_status, unit_set_id, unit_key,
-       semantic_text_digest, summary_coverage, is_coordinate,
-       coordinate_entry_eligible, coordinate_incident_edge_keys,
-       bindings, semantic_score, channel_rank
+       semantic_score, channel_rank
 FROM ranked
-WHERE $19::bigint IS NULL OR channel_rank <= $19
-ORDER BY channel_id, channel_rank, source_family, source_subtype, source_id, unit_key
-"#;
+ORDER BY semantic_score DESC,
+         CASE source_family
+           WHEN 'project_view' THEN 0
+           WHEN 'project_document' THEN 1
+           WHEN 'meeting' THEN 2
+           ELSE 3
+         END ASC,
+         CASE source_subtype
+           WHEN 'project_profile' THEN 0
+           WHEN 'goal' THEN 1
+           WHEN 'role' THEN 2
+           WHEN 'plan' THEN 3
+           WHEN 'stage' THEN 4
+           WHEN 'requirement' THEN 5
+           WHEN 'issue' THEN 6
+           WHEN 'work' THEN 7
+           WHEN 'resource' THEN 8
+           ELSE 0
+         END ASC,
+         source_family ASC, source_subtype ASC, source_id ASC, unit_key ASC
+"#
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticGraphQueryEgressRecheck {
@@ -5519,9 +5759,12 @@ mod tests {
         SemanticSourceKind,
     };
     use buzz_semantic_query::{
-        ContextDocumentBindingObservation, ProjectContextBindingProvenance,
-        ProjectContextEdgeProvenance, QueryCompatibilityFences, RelationRankCursor, Score,
-        SemanticEdgeObservation, TargetRankCursor,
+        build_coordinate_search_encoder_input, build_problem_query_encoder_input,
+        build_query_encoder_inputs, ConditionedContextOverview, ContextDocumentBindingObservation,
+        LifecycleFilter, ProjectContextBindingProvenance, ProjectContextCoordinateSearchQuery,
+        ProjectContextEdgeProvenance, ProviderEncodedSemanticInput,
+        ProviderEncodedSemanticInputBundle, QueryCompatibilityFences, RelationRankCursor, Score,
+        SemanticEdgeObservation, SemanticGraphQuery, SemanticGraphQueryBudget, TargetRankCursor,
     };
     use chrono::Utc;
     use pgvector::Vector;
@@ -5537,11 +5780,13 @@ mod tests {
         validate_query_vectors, CurrentSemanticAvailabilityClass, SemanticContextEgressExpectation,
         SemanticContextOmissionReason, SemanticCurrentContextOverview, SemanticCurrentHead,
         SemanticExactQueryVector, SemanticExactRecallExhaustion, SemanticExactSourceScore,
-        SemanticGraphQueryTicket, SemanticGraphStructuralRoles, SemanticOmittedContextEvidence,
-        SemanticRankedRelationOption, SemanticRankedTargetOption, SemanticTraversalSliceExhaustion,
-        AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL, CURRENT_COORDINATE_MEMBERSHIPS_SQL,
-        CURRENT_SEMANTIC_SOURCE_STATES_SQL, EXACT_SOURCE_SCORES_SQL,
-        FINAL_CONFIRMATION_ISOLATION_SQL, INCIDENT_RELATION_REFS_SQL,
+        SemanticGraphQueryTicket, SemanticGraphQueryVectorBundle, SemanticGraphStructuralRoles,
+        SemanticOmittedContextEvidence, SemanticRankedRelationOption, SemanticRankedTargetOption,
+        SemanticTraversalConditionedChannel, SemanticTraversalQueryChannels,
+        SemanticTraversalSliceExhaustion, AUTHORIZED_TICKET_SQL, COMPLETE_HYPEREDGE_SQL,
+        CURRENT_COORDINATE_MEMBERSHIPS_SQL, CURRENT_SEMANTIC_SOURCE_STATES_SQL,
+        EXACT_SOURCE_SCORES_SQL, FINAL_CONFIRMATION_ISOLATION_SQL,
+        GLOBAL_GRAPH_COORDINATE_SCORES_SQL, INCIDENT_RELATION_REFS_SQL,
         LOCK_EGRESS_CONTEXT_STATE_SQL, LOCK_EGRESS_GENERATION_SQL,
         LOCK_FINAL_CONFIRMATION_COMMUNITY_SQL, SEMANTIC_GRAPH_COVERAGE_SQL,
     };
@@ -5569,6 +5814,23 @@ mod tests {
             project_context_revision: 1,
             observed_at: Utc::now(),
         }
+    }
+
+    fn problem_vector(
+        ticket: &SemanticGraphQueryTicket,
+        request_id: Uuid,
+        values: Vec<f32>,
+    ) -> SemanticExactQueryVector {
+        let input = build_problem_query_encoder_input(request_id, "exact score fixture")
+            .expect("problem input");
+        let encoded = ProviderEncodedSemanticInput::new(
+            input.semantic_input(),
+            ticket.generation.model_contract.model.clone(),
+            values,
+            &ticket.generation.model_contract,
+        )
+        .expect("Provider-bound input");
+        SemanticExactQueryVector::new(ticket, encoded).expect("generation-bound vector")
     }
 
     #[test]
@@ -5704,25 +5966,127 @@ mod tests {
     #[test]
     fn query_vectors_require_nonzero_values_unique_channels_and_three_fences() {
         let encoder = DeterministicFakeEncoder::new(3).expect("fake encoder");
-        let ticket = ticket(encoder.contract().clone());
-        let vector = SemanticExactQueryVector {
-            channel_id: Digest32::from_bytes([1; 32]),
-            query_fences: ticket.query_fences,
-            embedding: EmbeddingVector::new(vec![1.0, 0.0, 0.0], &ticket.generation.model_contract)
-                .expect("embedding"),
-        };
-        assert!(validate_query_vectors(&ticket, std::slice::from_ref(&vector)).is_ok());
+        let first_ticket = ticket(encoder.contract().clone());
+        let vector = problem_vector(&first_ticket, Uuid::new_v4(), vec![1.0, 0.0, 0.0]);
+        assert!(validate_query_vectors(&first_ticket, std::slice::from_ref(&vector)).is_ok());
 
         let duplicate = vec![vector.clone(), vector.clone()];
-        assert!(validate_query_vectors(&ticket, &duplicate).is_err());
+        assert!(validate_query_vectors(&first_ticket, &duplicate).is_err());
 
-        let mut wrong_fence = vector.clone();
-        wrong_fence.query_fences.query_contract_digest = Digest32::from_bytes([9; 32]);
-        assert!(validate_query_vectors(&ticket, &[wrong_fence]).is_err());
+        let coordinate_request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            query: "exact score fixture".to_owned(),
+            limit: 8,
+        };
+        let coordinate_input =
+            build_coordinate_search_encoder_input(&coordinate_request).expect("Coordinate input");
+        let wrong_contract = ProviderEncodedSemanticInput::new(
+            coordinate_input.semantic_input(),
+            first_ticket.generation.model_contract.model.clone(),
+            vec![1.0, 0.0, 0.0],
+            &first_ticket.generation.model_contract,
+        )
+        .expect("Provider-bound Coordinate input");
+        assert!(SemanticExactQueryVector::new(&first_ticket, wrong_contract).is_err());
+
+        let mut other_community = ticket(encoder.contract().clone());
+        other_community.generation.generation_id = first_ticket.generation.generation_id;
+        assert_ne!(other_community.community_id, first_ticket.community_id);
+        assert!(validate_query_vectors(&other_community, &[vector]).is_err());
 
         assert!(
-            EmbeddingVector::new(vec![0.0, 0.0, 0.0], &ticket.generation.model_contract).is_err()
+            EmbeddingVector::new(vec![0.0, 0.0, 0.0], &first_ticket.generation.model_contract)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn complete_path_common_bundle_matches_historical_graph_wrappers() {
+        let encoder = DeterministicFakeEncoder::new(3).expect("fake encoder");
+        let ticket = ticket(encoder.contract().clone());
+        let context = ProjectContextCoordinate::ProjectViewObject {
+            object_type: ProjectViewObjectType::Work,
+            object_id: Uuid::new_v4(),
+        };
+        let query = SemanticGraphQuery {
+            request_id: Uuid::new_v4(),
+            project_id: *ticket.community_id.as_uuid(),
+            problem: "complete-path adapter parity".to_owned(),
+            initial_coordinates: Vec::new(),
+            context_coordinates: vec![context.clone()],
+            lifecycle_filter: LifecycleFilter::AllCurrent,
+            budget: SemanticGraphQueryBudget::default(),
+        };
+        let inputs = build_query_encoder_inputs(
+            &query,
+            &[ConditionedContextOverview {
+                coordinate: context,
+                current_overview_semantic_text: "current Work overview".to_owned(),
+            }],
+        )
+        .expect("Q0/Qi inputs");
+        let common_inputs = inputs.semantic_input_bundle().expect("common input bundle");
+        let provider = ProviderEncodedSemanticInputBundle::new(
+            &common_inputs,
+            ticket.generation.model_contract.model.clone(),
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            &ticket.generation.model_contract,
+        )
+        .expect("Provider bundle");
+        let direct = SemanticGraphQueryVectorBundle::bind(&ticket, provider.clone())
+            .expect("direct graph bundle");
+        let compatibility = provider
+            .into_inputs()
+            .into_iter()
+            .map(|encoded| SemanticExactQueryVector::new(&ticket, encoded))
+            .collect::<crate::Result<Vec<_>>>()
+            .expect("historical graph wrappers");
+        let compatibility =
+            SemanticGraphQueryVectorBundle::from_compatibility_vectors(&ticket, compatibility)
+                .expect("compatibility graph bundle");
+
+        assert_eq!(direct, compatibility);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(
+            direct.vectors()[0].channel_id(),
+            inputs.inputs[0].channel_id()
+        );
+        assert_eq!(
+            direct.vectors()[1].channel_id(),
+            inputs.inputs[1].channel_id()
+        );
+
+        let conditioned = [SemanticTraversalConditionedChannel {
+            channel_id: inputs.inputs[1].channel_id(),
+            context_coordinate: query.context_coordinates[0].clone(),
+        }];
+        let channels = SemanticTraversalQueryChannels {
+            query_vectors: &direct,
+            problem_channel_id: inputs.inputs[0].channel_id(),
+            conditioned: &conditioned,
+        };
+        assert!(super::validate_traversal_channels(&ticket, channels).is_ok());
+        let wrong_problem = SemanticTraversalQueryChannels {
+            problem_channel_id: inputs.inputs[1].channel_id(),
+            ..channels
+        };
+        assert!(super::validate_traversal_channels(&ticket, wrong_problem).is_err());
+        let wrong_conditioned = [SemanticTraversalConditionedChannel {
+            channel_id: inputs.inputs[1].channel_id(),
+            context_coordinate: ProjectContextCoordinate::ProjectViewObject {
+                object_type: ProjectViewObjectType::Work,
+                object_id: Uuid::new_v4(),
+            },
+        }];
+        assert!(super::validate_traversal_channels(
+            &ticket,
+            SemanticTraversalQueryChannels {
+                conditioned: &wrong_conditioned,
+                ..channels
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -5731,12 +6095,19 @@ mod tests {
         let eligible = EXACT_SOURCE_SCORES_SQL.find("eligible AS MATERIALIZED");
         let distance = EXACT_SOURCE_SCORES_SQL.find("eligible.embedding <=>");
         assert!(roles < eligible && eligible < distance);
-        assert!(EXACT_SOURCE_SCORES_SQL.contains("embedding.response_model = generation.model"));
+        assert!(EXACT_SOURCE_SCORES_SQL.contains("embedding.response_model = head.model"));
         assert!(EXACT_SOURCE_SCORES_SQL.contains("vector_norm(embedding.embedding) > 0"));
         assert!(EXACT_SOURCE_SCORES_SQL.contains("semantic_graph_query_enabled"));
         assert!(EXACT_SOURCE_SCORES_SQL.contains("::bigint AS semantic_score"));
         assert!(EXACT_SOURCE_SCORES_SQL.contains("GROUP BY community_id, source_family"));
         assert!(EXACT_SOURCE_SCORES_SQL.contains("coordinate_incident_edge_keys"));
+        assert!(EXACT_SOURCE_SCORES_SQL.contains("SELECT TRUE AS allowed WHERE NOT $20"));
+        assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("SELECT TRUE AS allowed WHERE $20"));
+        assert!(
+            GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("SELECT DISTINCT coordinate.community_id")
+        );
+        assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("semantic_score DESC"));
+        assert!(GLOBAL_GRAPH_COORDINATE_SCORES_SQL.contains("LIMIT $19"));
     }
 
     #[test]

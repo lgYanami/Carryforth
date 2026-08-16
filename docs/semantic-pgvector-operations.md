@@ -88,8 +88,17 @@ Project Document, Meeting, or Project Context canonical data.
 
 ## Provider worker configuration
 
-The worker never falls back to generic `LLM_*` variables. Configure a
-semantic-specific secret and explicit process switch:
+The worker accepts one complete Provider environment family. New local setups may use the shared
+`LLM_*` names:
+
+```text
+BUZZ_SEMANTIC_WORKER_ENABLED=true
+LLM_API_KEY=<Provider secret>
+LLM_BASE_URL=<HTTPS API root>
+LLM_MODEL=<embedding request model>
+```
+
+Existing deployments may keep the compatibility-specific names:
 
 ```text
 BUZZ_SEMANTIC_WORKER_ENABLED=true
@@ -101,6 +110,11 @@ BUZZ_SEMANTIC_REQUEST_TIMEOUT_SECS=30
 BUZZ_SEMANTIC_CLAIM_SECS=60
 BUZZ_SEMANTIC_MAX_ATTEMPTS=8
 ```
+
+The families are not merged field by field. If any compatibility-specific Provider value is set,
+all three `BUZZ_SEMANTIC_*` values are required and take precedence; otherwise all three `LLM_*`
+values are required. The configured model must still satisfy the frozen embedding model contract;
+sharing variable names does not make an arbitrary chat model valid for semantic indexing.
 
 The frozen first generation requires the provider response to resolve to
 `doubao-embedding-vision-251215`, return exactly 2048 finite values, use cosine

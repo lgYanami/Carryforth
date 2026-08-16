@@ -107,6 +107,24 @@ semantic_request_model="$(effective_value BUZZ_SEMANTIC_REQUEST_MODEL)"
 fleet_policy="$(effective_value BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY)"
 semantic_api_key="$(effective_value BUZZ_SEMANTIC_API_KEY)"
 relay_private_key="$(effective_value BUZZ_RELAY_PRIVATE_KEY)"
+provider_env_family=compatibility
+provider_api_key_name=BUZZ_SEMANTIC_API_KEY
+provider_base_url_name=BUZZ_SEMANTIC_BASE_URL
+provider_model_name=BUZZ_SEMANTIC_REQUEST_MODEL
+if [[ ! "${semantic_api_key}${semantic_base_url}${semantic_request_model}" =~ [^[:space:]] ]]; then
+  llm_api_key="$(effective_value LLM_API_KEY)"
+  llm_base_url="$(effective_value LLM_BASE_URL)"
+  llm_model="$(effective_value LLM_MODEL)"
+  if [[ "${llm_api_key}${llm_base_url}${llm_model}" =~ [^[:space:]] ]]; then
+    provider_env_family=llm
+    provider_api_key_name=LLM_API_KEY
+    provider_base_url_name=LLM_BASE_URL
+    provider_model_name=LLM_MODEL
+    semantic_api_key="${llm_api_key}"
+    semantic_base_url="${llm_base_url}"
+    semantic_request_model="${llm_model}"
+  fi
+fi
 
 worker_enabled="$(normalize_boolean BUZZ_SEMANTIC_WORKER_ENABLED "${worker_enabled:-true}")"
 query_http_available="$(normalize_boolean \
@@ -117,11 +135,11 @@ fleet_policy="${fleet_policy:-trusted-single-relay}"
 if [[ "${worker_enabled}" == true || "${query_http_available}" == true ]]; then
   missing_provider_values=()
   [[ "${semantic_api_key}" =~ [^[:space:]] ]] ||
-    missing_provider_values+=("BUZZ_SEMANTIC_API_KEY")
+    missing_provider_values+=("${provider_api_key_name}")
   [[ "${semantic_base_url}" =~ [^[:space:]] ]] ||
-    missing_provider_values+=("BUZZ_SEMANTIC_BASE_URL")
+    missing_provider_values+=("${provider_base_url_name}")
   [[ "${semantic_request_model}" =~ [^[:space:]] ]] ||
-    missing_provider_values+=("BUZZ_SEMANTIC_REQUEST_MODEL")
+    missing_provider_values+=("${provider_model_name}")
 
   if ((${#missing_provider_values[@]} > 0)); then
     if [[ ! -t 0 ]]; then
@@ -157,14 +175,26 @@ fi
 export CARRYFORTH_LOCAL_WORKER_ENABLED="${worker_enabled}"
 export CARRYFORTH_LOCAL_QUERY_HTTP_AVAILABLE="${query_http_available}"
 export CARRYFORTH_LOCAL_FLEET_POLICY="${fleet_policy}"
-if [[ -n "${semantic_api_key}" ]]; then
-  export CARRYFORTH_LOCAL_SEMANTIC_API_KEY="${semantic_api_key}"
-fi
-if [[ -n "${semantic_base_url}" ]]; then
-  export CARRYFORTH_LOCAL_SEMANTIC_BASE_URL="${semantic_base_url}"
-fi
-if [[ -n "${semantic_request_model}" ]]; then
-  export CARRYFORTH_LOCAL_SEMANTIC_REQUEST_MODEL="${semantic_request_model}"
+if [[ "${provider_env_family}" == llm ]]; then
+  if [[ -n "${semantic_api_key}" ]]; then
+    export CARRYFORTH_LOCAL_LLM_API_KEY="${semantic_api_key}"
+  fi
+  if [[ -n "${semantic_base_url}" ]]; then
+    export CARRYFORTH_LOCAL_LLM_BASE_URL="${semantic_base_url}"
+  fi
+  if [[ -n "${semantic_request_model}" ]]; then
+    export CARRYFORTH_LOCAL_LLM_MODEL="${semantic_request_model}"
+  fi
+else
+  if [[ -n "${semantic_api_key}" ]]; then
+    export CARRYFORTH_LOCAL_SEMANTIC_API_KEY="${semantic_api_key}"
+  fi
+  if [[ -n "${semantic_base_url}" ]]; then
+    export CARRYFORTH_LOCAL_SEMANTIC_BASE_URL="${semantic_base_url}"
+  fi
+  if [[ -n "${semantic_request_model}" ]]; then
+    export CARRYFORTH_LOCAL_SEMANTIC_REQUEST_MODEL="${semantic_request_model}"
+  fi
 fi
 if [[ -n "${relay_private_key}" ]]; then
   export CARRYFORTH_LOCAL_RELAY_PRIVATE_KEY="${relay_private_key}"

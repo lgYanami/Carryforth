@@ -6,6 +6,54 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{query_contract_digest, QueryContractResult, SemanticGraphQueryError};
 
+/// Model-space identity shared by every closed semantic query input.
+///
+/// This type deliberately excludes a query-template digest and an active
+/// generation UUID. The Provider can prove only this model-space binding;
+/// the authorized writer-DB ticket supplies the exact generation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticModelSpaceFences {
+    /// Digest of the complete Foundation model contract.
+    pub source_generation_contract_digest: Digest32,
+    /// Digest of only the vector-comparability fields.
+    pub embedding_space_fence: Digest32,
+    /// Exact Provider response model.
+    pub model: String,
+    /// Required vector dimensions.
+    pub dimensions: usize,
+}
+
+impl SemanticModelSpaceFences {
+    /// Derive a pure model-space observation from a validated source contract.
+    pub fn for_source_contract(contract: &SemanticModelContract) -> QueryContractResult<Self> {
+        contract
+            .validate()
+            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
+        Ok(Self {
+            source_generation_contract_digest: contract
+                .digest()
+                .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?,
+            embedding_space_fence: embedding_space_fence(contract)?,
+            model: contract.model.clone(),
+            dimensions: contract.dimensions,
+        })
+    }
+
+    /// Require every observed model-space field to match one source contract.
+    pub fn validate_observed(
+        contract: &SemanticModelContract,
+        observed: &Self,
+    ) -> QueryContractResult<Self> {
+        let expected = Self::for_source_contract(contract)?;
+        if &expected != observed {
+            return Err(SemanticGraphQueryError::InvalidState(
+                "semantic model-space fence mismatch".to_owned(),
+            ));
+        }
+        Ok(expected)
+    }
+}
+
 /// Three independent fences required before encoding or exact recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryCompatibilityFences {
@@ -22,20 +70,15 @@ impl QueryCompatibilityFences {
     /// combination. Production permits the frozen Volcengine overview
     /// generation; deterministic fake contracts remain available to tests.
     pub fn for_source_contract(contract: &SemanticModelContract) -> QueryContractResult<Self> {
-        contract
-            .validate()
-            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
         if !is_approved_source_contract(contract) {
             return Err(SemanticGraphQueryError::InvalidState(
                 "source generation is not in the closed query compatibility allowlist".to_owned(),
             ));
         }
-        let source_generation_contract_digest = contract
-            .digest()
-            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
+        let model_space = SemanticModelSpaceFences::for_source_contract(contract)?;
         Ok(Self {
-            source_generation_contract_digest,
-            embedding_space_fence: embedding_space_fence(contract)?,
+            source_generation_contract_digest: model_space.source_generation_contract_digest,
+            embedding_space_fence: model_space.embedding_space_fence,
             query_contract_digest: query_contract_digest(),
         })
     }
@@ -112,7 +155,7 @@ fn hash_domain(domain: &[u8], parts: &[&[u8]]) -> Digest32 {
 mod tests {
     use buzz_semantic::SemanticModelContract;
 
-    use super::{embedding_space_fence, QueryCompatibilityFences};
+    use super::{embedding_space_fence, QueryCompatibilityFences, SemanticModelSpaceFences};
     use crate::query_contract_digest;
 
     #[test]
@@ -136,5 +179,10 @@ mod tests {
             fences.query_contract_digest,
         )
         .is_ok());
+        let model_space =
+            SemanticModelSpaceFences::for_source_contract(&contract).expect("model space");
+        assert_eq!(model_space.model, contract.model);
+        assert_eq!(model_space.dimensions, contract.dimensions);
+        assert!(SemanticModelSpaceFences::validate_observed(&contract, &model_space).is_ok());
     }
 }

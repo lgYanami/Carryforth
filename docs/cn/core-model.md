@@ -262,26 +262,23 @@ Desktop 当前提供只读关系画布、检查器和实时更新；规范的 Ed
 见[核心设计：先有坐标，后有上下文](core-design/coordinate-and-context.md)。完整领域语义见
 [Project Context](../stage/project-context/project-context.md)。
 
-### 6.1 图语义路径查询
+### 6.1 Agent 自主的上下文环境感知检索
 
-可选的图语义查询在已验证 Project Context 图上工作。调用者可以提供：
+Managed Agent 可以从已验证 Project Context 图中渐进检索上下文。当前 Role 是上下文环境的核心；
+与问题相关的 Work、Requirement、Issue、Stage、任务或 Meeting 目的会在确有影响时进一步指导选择。
 
-- 一个自然语言问题；
-- 可选的起始坐标；
-- 可选的 Role、Work 等查询上下文，用来影响召回与排序。
+Agent 通常从当前工作已经明确的 Coordinate 起步。没有可靠起点时，`coordinate-search` 只提出待观察
+候选，由 Agent 自己筛选。随后 Agent 在有界范围内交替使用 `coordinate edge-search` 和
+`edge coordinate-search`，并结合 Coordinate、Edge 与 relation Document 的结构观察。语义分数只排列
+候选；Agent 根据 canonical 轻量状态、上下文环境和关系依据逐跳选择，完整正文只在需要时回读。
 
-结果 Event 由 Relay 签名，并绑定当前 Project、调用者和精确请求正文；结果同时携带来源、
-图快照 currentness 与 Revision 证据。`cf` 验证结果后，另外派生未签名但规范化的
-`read_commands`，供调用者回读权威对象。结果 DTO 不把源文档正文直接复制出来。
+所有 Agent 使用 Project 共同持有的一张 Context Graph。检索不会建立 Role / Agent 私有图，不会推断
+新关系，也不会改写 Edge。语义操作仍需要 Provider 配置、索引 generation、Community durable gate、
+成员授权和 query 文本出境确认；project-authored 观察仍是不可信数据，相关性也不会扩大权限。
 
-这项能力需要单独配置语义 Provider、索引 generation、Community index/query gate
-和问题数据出境确认。它目前仍在相关性、资源隔离、长期稳定性和生产部署资格化中；
-“使用了 Role 或 Work 上下文”只表示它会参与召回与排序，不保证每个问题都产生人类预期的唯一答案。
-
-这项能力为什么使用统一 Project Context 图、如何区分上下文环境与上下文路径，以及为什么不建立
-Agent 私有上下文，见[核心设计：上下文环境感知的图语义检索](core-design/context-aware-semantic-graph-retrieval.md)。
-
-运维与启用边界见 [语义 pgvector 运维](../semantic-pgvector-operations.md)。
+有界完整路径型 `semantic-query` 仍作为补充查询产品保留，但不是 Managed Agent 自检索的主要入口。
+详见[核心设计：Agent 自主的上下文环境感知 Project Context 图检索](core-design/context-aware-semantic-graph-retrieval.md)
+和[语义 pgvector 运维](../semantic-pgvector-operations.md)。
 
 ## 7. Meetings
 
@@ -325,7 +322,7 @@ Meeting 为什么采用“分布式上下文、共享 Board、显式行动收口
 
 - Desktop 中 Projects、Project View（含 Documents 与 Context）和 Meetings 是预览功能；
 - Project View v3 需要 Relay operator 准备，再由 Community owner 审核并签名初始化；
-- Documents、Context、Meetings 和语义查询都有自己的 readiness 与 durable gate；
+- Documents、Context、Meetings 和语义检索都有自己的 readiness 与 durable gate；
 - `./start.sh` 只启动本地源码栈，不替代这些治理与授权动作；
 - 代码已经存在不等于完成生产资格验证。
 

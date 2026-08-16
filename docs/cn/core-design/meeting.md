@@ -413,7 +413,7 @@ Meeting 最终解决的不是“怎样让 Agent 开会”，而是：
 - [Carryforth 核心模型](../core-model.md)
 - [核心设计：Role Continuity](role-continuity.md)
 - [核心设计：先有坐标，后有上下文](coordinate-and-context.md)
-- [核心设计：上下文环境感知的图语义检索](context-aware-semantic-graph-retrieval.md)
+- [核心设计：Agent 自主的上下文环境感知 Project Context 图检索](context-aware-semantic-graph-retrieval.md)
 - [Meeting V2](../../stage/meeting/v2/meeting-v2.md)
 - [Meeting Action Finalization](../../stage/meeting/fix/meeting-action-finalization-logical-host-ack-simplification-implementation-design.md)
 - [Meeting Action Finalization 中维护 Project Context](../../stage/project-context/meeting-action-finalization-context-write-implementation-design.md)

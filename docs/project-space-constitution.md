@@ -125,8 +125,9 @@ UI cache 都是派生读取。这里不包括 Project View、Meeting 等规范�
 字段。派生读取必须保留来源、Revision、currentness 或适用边界，不能在冲突时覆盖规范对象，
 也不能创造权限、责任、Project Context Edge 或项目决定。
 
-语义查询得到的结果 Event 由 Relay 签名并绑定精确请求；`cf` 验证结果后派生的 `read_commands`
-本身不带签名。调用者仍应通过这些命令回读当前权威对象。
+Relay 返回的语义候选和完整路径结果会被签名并绑定精确请求；验证后派生的 canonical read
+descriptor 或 command 只是导航入口，不是额外的已签名 Project 事实。Agent 在依赖内容前，仍应通过
+对应 owning surface 回读当前权威对象。
 
 ### 4.3 外部事实仍属于外部权威系统
 
@@ -366,14 +367,19 @@ Project Context 显式保存“为什么这些对象相关”的二阶语义。�
 系统不会从聊天、标题或文本相似度自动推断或创建 Edge。完整合同见
 [Project Context](stage/project-context/project-context.md)。
 
-### 10.5 图语义路径查询
+### 10.5 Agent 自主的上下文环境感知图检索
 
-图语义查询是在已验证 Project Context 上运行的可选派生能力。自然语言问题、起始坐标以及 Role、
-Work 等 query context 可以影响召回和排序，但 query context 不是过滤器、权限、行动门槛或语义正确性
-保证。
+Managed Agent 可以结合当前已验证 Role，以及相关 Work、Issue、Meeting 目的等任务事实，渐进检索
+Project Context。它优先使用当前工作中的可靠 Coordinate；没有起点时才做语义发现；随后根据有界
+语义候选、canonical 轻量观察和 relation Documents，逐步选择
+`Coordinate → Edge → Coordinate`。score 只排列观察顺序，最终选择由 Agent 完成。
 
-查询需要独立 Provider、索引 generation、Community index/query gate、成员授权和问题数据出境确认。
-它目前仍在相关性、资源隔离、长期稳定性和生产部署方面资格化，不能被描述为项目真相或生产承诺。
+这项派生读取始终使用 Project 共同持有的一张 Context Graph，不建立 Agent / Role 私有图，不推断
+Edge，不改写关系，也不扩大权限。自然语言语义操作需要外部 Provider、索引 generation、Community
+gate、成员授权和 query 文本出境确认。
+
+有界完整路径型 `semantic-query` 仍作为补充查询面保留。它的软 query context 可以影响召回与排序，
+但不是 Managed Agent 的主要检索流程，也不是过滤器、权限、行动门槛或语义正确性保证。
 
 ## 11. 第九条：消息与 Meeting 必须显式物化结果
 
@@ -515,7 +521,7 @@ Context、Message、Meeting、日志或测试夹具。它们必须留在受控 s
 
 当前仓库仍处于活跃开发和首次公开源码快照准备阶段，仅供本地源码构建、评估与参考学习；
 公开源码不等于发布版本或打包制品。
-语义查询、Meeting、Git Projects 和部分 Desktop 表面仍受预览或资格化边界约束。本文不能被用来
+语义检索、Meeting、Git Projects 和部分 Desktop 表面仍受预览或资格化边界约束。本文不能被用来
 宣称生产就绪、多实例安全、稳定升级或平台支持。
 
 ## 17. 当前明确没有实现的通用治理模型

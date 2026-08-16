@@ -12,9 +12,11 @@ use buzz_semantic::{
 };
 use buzz_semantic_query::{
     CoordinateSearchEncoderInput, EncodedCoordinateSearchQuery, EncodedSemanticQuery,
-    QueryCompatibilityFences, QueryContractResult, SemanticGraphQueryError,
-    SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderFuture,
-    SemanticQueryEncoderInput, MAX_QUERY_CHANNELS,
+    ProviderEncodedSemanticInputBundle, QueryCompatibilityFences, QueryContractResult,
+    SemanticGraphQueryError, SemanticInputEncoder, SemanticInputEncoderFuture,
+    SemanticModelSpaceFences, SemanticQueryChannelKind, SemanticQueryEncoder,
+    SemanticQueryEncoderFuture, SemanticQueryEncoderInput, SemanticQueryInputBundle,
+    MAX_QUERY_CHANNELS,
 };
 use reqwest::{header::RETRY_AFTER, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -166,24 +168,21 @@ impl VolcengineSemanticProvider {
         input
             .validate()
             .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
-        let batch = self
-            .encode_text_batch(&[input.text()], &self.source_contract)
-            .await
-            .map_err(query_provider_error)?;
-        if batch.embeddings.len() != 1 {
+        let common_inputs = input.semantic_input_bundle().map_err(|error| {
+            SemanticGraphQueryError::InvalidState(format!(
+                "Coordinate-search input bundle: {error}"
+            ))
+        })?;
+        let encoded = SemanticInputEncoder::encode_semantic_inputs(self, &common_inputs).await?;
+        if encoded.inputs().len() != 1 {
             return Err(SemanticGraphQueryError::ProviderResponse);
         }
-        let mut embeddings = batch.embeddings.into_iter();
-        let Some(embedding) = embeddings.next() else {
+        let mut encoded = encoded.into_inputs().into_iter();
+        let Some(encoded) = encoded.next() else {
             return Err(SemanticGraphQueryError::ProviderResponse);
         };
-        EncodedCoordinateSearchQuery::new(
-            input,
-            batch.response_model,
-            embedding.into_values(),
-            &self.source_contract,
-        )
-        .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))
+        EncodedCoordinateSearchQuery::from_provider_encoded(input, encoded, &self.source_contract)
+            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))
     }
 }
 
@@ -316,33 +315,76 @@ impl SemanticQueryEncoder for VolcengineSemanticProvider {
         Box::pin(async move {
             validate_query_batch(inputs)?;
             QueryCompatibilityFences::for_source_contract(&self.source_contract)?;
+            let common_inputs = SemanticQueryInputBundle::from_closed_inputs(
+                inputs
+                    .iter()
+                    .map(|input| input.semantic_input().clone())
+                    .collect(),
+            )
+            .map_err(|error| {
+                SemanticGraphQueryError::InvalidState(format!(
+                    "common semantic input bundle: {error}"
+                ))
+            })?;
+            let encoded =
+                SemanticInputEncoder::encode_semantic_inputs(self, &common_inputs).await?;
+            bind_query_response(inputs, encoded, &self.source_contract)
+        })
+    }
+}
+
+impl SemanticInputEncoder for VolcengineSemanticProvider {
+    fn source_contract(&self) -> &SemanticModelContract {
+        &self.source_contract
+    }
+
+    fn encode_semantic_inputs<'a>(
+        &'a self,
+        inputs: &'a SemanticQueryInputBundle,
+    ) -> SemanticInputEncoderFuture<'a> {
+        Box::pin(async move {
+            inputs.validate().map_err(|error| {
+                SemanticGraphQueryError::InvalidState(format!(
+                    "common semantic input bundle: {error}"
+                ))
+            })?;
+            SemanticModelSpaceFences::for_source_contract(&self.source_contract)?;
             let texts = inputs
+                .inputs()
                 .iter()
-                .map(SemanticQueryEncoderInput::text)
+                .map(|input| input.exact_utf8_text())
                 .collect::<Vec<_>>();
             let batch = self
                 .encode_text_batch(&texts, &self.source_contract)
                 .await
                 .map_err(query_provider_error)?;
-            bind_query_response(inputs, batch, &self.source_contract)
+            ProviderEncodedSemanticInputBundle::new(
+                inputs,
+                batch.response_model,
+                batch
+                    .embeddings
+                    .into_iter()
+                    .map(EmbeddingVector::into_values)
+                    .collect(),
+                &self.source_contract,
+            )
         })
     }
 }
 
 fn bind_query_response(
     inputs: &[SemanticQueryEncoderInput],
-    batch: RawEmbeddingBatch,
+    provider_bundle: ProviderEncodedSemanticInputBundle,
     source_contract: &SemanticModelContract,
 ) -> QueryContractResult<Vec<EncodedSemanticQuery>> {
-    if batch.embeddings.len() != inputs.len() {
+    if provider_bundle.inputs().len() != inputs.len() {
         return Err(SemanticGraphQueryError::ProviderResponse);
     }
     let mut encoded = Vec::with_capacity(inputs.len());
-    for (input, embedding) in inputs.iter().zip(batch.embeddings) {
-        encoded.push(EncodedSemanticQuery::new(
+    for (input, provider_encoded) in inputs.iter().zip(provider_bundle.into_inputs()) {
+        encoded.push(EncodedSemanticQuery::from_provider_encoded(
             input,
-            batch.response_model.clone(),
-            embedding.into_values(),
+            provider_encoded,
             source_contract,
         )?);
     }
@@ -457,9 +499,10 @@ mod tests {
         build_coordinate_search_encoder_input, build_one_hop_semantic_query_encoder_input,
         build_query_encoder_inputs, ConditionedContextOverview, LifecycleFilter,
         OneHopSemanticScope, ProjectContextCoordinateSearchQuery,
-        ProjectContextOneHopSemanticQuery, QueryCompatibilityFences, SemanticGraphQuery,
-        SemanticGraphQueryBudget, SemanticGraphQueryError, SemanticQueryEncoder,
-        MAX_QUERY_CHANNELS,
+        ProjectContextOneHopSemanticQuery, ProviderEncodedSemanticInputBundle,
+        QueryCompatibilityFences, SemanticGraphQuery, SemanticGraphQueryBudget,
+        SemanticGraphQueryError, SemanticInputEncoder, SemanticQueryEncoder,
+        SemanticQueryInputBundle, MAX_QUERY_CHANNELS,
     };
 
     fn provider_config() -> SemanticWorkerConfig {
@@ -502,6 +545,51 @@ mod tests {
         VolcengineSemanticProvider::from_config(&config)
             .expect("provider config")
             .expect("configured provider")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly configured real embedding Provider"]
+    async fn real_provider_semantic_input_canary() {
+        let config = crate::config::Config::from_env().expect("Relay configuration");
+        let provider = VolcengineSemanticProvider::from_config(&config.semantic_worker)
+            .expect("Provider configuration")
+            .expect("configured Provider");
+        let request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0101),
+            project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0102),
+            query: "Locate work related to authorization failures".to_owned(),
+            limit: 1,
+        };
+        let input = build_coordinate_search_encoder_input(&request).expect("closed input");
+        let encoded = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.encode_coordinate_search(&input),
+        )
+        .await
+        .expect("Provider canary deadline")
+        .expect("Provider canary response");
+
+        assert_eq!(encoded.request_id(), request.request_id);
+        assert_eq!(
+            encoded.query_contract_digest(),
+            input.query_contract_digest()
+        );
+        assert_eq!(encoded.query_input_digest(), input.text_digest());
+
+        let graph_inputs = query_inputs();
+        let graph_encoded = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.encode_queries(&graph_inputs),
+        )
+        .await
+        .expect("graph Provider canary deadline")
+        .expect("graph Provider canary response");
+        assert_eq!(graph_encoded.len(), graph_inputs.len());
+        for (encoded, input) in graph_encoded.iter().zip(&graph_inputs) {
+            assert_eq!(encoded.request_id(), input.request_id());
+            assert_eq!(encoded.channel_id(), input.channel_id());
+            assert_eq!(encoded.query_input_digest(), input.text_digest());
+        }
     }
 
     fn document_input() -> SemanticEncoderInput {
@@ -724,6 +812,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn common_query_encoder_sends_one_ordered_q0_qi_batch_once() {
+        let inputs = query_inputs();
+        let common_inputs = SemanticQueryInputBundle::from_closed_inputs(
+            inputs
+                .iter()
+                .map(|input| input.semantic_input().clone())
+                .collect(),
+        )
+        .expect("common input bundle");
+        let contract = SemanticModelContract::volcengine_overview_v1();
+        let payload = serde_json::json!({
+            "model": contract.model,
+            "data": [
+                {
+                    "index": 1,
+                    "embedding": vec![0.5_f32; contract.dimensions],
+                },
+                {
+                    "index": 0,
+                    "embedding": vec![0.25_f32; contract.dimensions],
+                }
+            ],
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_body = Arc::new(Mutex::new(None));
+        let app = Router::new().route(
+            "/api/embeddings",
+            post({
+                let calls = Arc::clone(&calls);
+                let observed_body = Arc::clone(&observed_body);
+                move |Json(body): Json<serde_json::Value>| {
+                    let calls = Arc::clone(&calls);
+                    let observed_body = Arc::clone(&observed_body);
+                    let payload = payload.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        *observed_body.lock().expect("common query body lock") = Some(body);
+                        Json(payload)
+                    }
+                }
+            }),
+        );
+        let (base_url, server) = spawn_provider(app).await;
+        let provider = provider_for_base_url(base_url);
+
+        let encoded = provider
+            .encode_semantic_inputs(&common_inputs)
+            .await
+            .expect("common Provider response");
+        server.abort();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(encoded.inputs().len(), common_inputs.len());
+        let body = observed_body
+            .lock()
+            .expect("common query body lock")
+            .clone()
+            .expect("observed common query body");
+        let provider_inputs = body["input"].as_array().expect("Provider input array");
+        assert_eq!(
+            provider_inputs,
+            &common_inputs
+                .inputs()
+                .iter()
+                .map(|input| serde_json::json!(input.exact_utf8_text()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            encoded.inputs()[0].input_digest(),
+            common_inputs.inputs()[0].input_digest()
+        );
+    }
+
+    #[tokio::test]
     async fn provider_rejects_oversized_content_length_before_buffering() {
         let app = Router::new().route(
             "/api/embeddings",
@@ -927,7 +1089,25 @@ mod tests {
             &contract,
         )
         .expect("valid reordered Provider response");
-        let encoded = bind_query_response(&inputs, raw, &contract).expect("bound queries");
+        let common_inputs = SemanticQueryInputBundle::from_closed_inputs(
+            inputs
+                .iter()
+                .map(|input| input.semantic_input().clone())
+                .collect(),
+        )
+        .expect("common input bundle");
+        let provider_bundle = ProviderEncodedSemanticInputBundle::new(
+            &common_inputs,
+            raw.response_model,
+            raw.embeddings
+                .into_iter()
+                .map(buzz_semantic::EmbeddingVector::into_values)
+                .collect(),
+            &contract,
+        )
+        .expect("common Provider bundle");
+        let encoded =
+            bind_query_response(&inputs, provider_bundle, &contract).expect("bound queries");
         let fences = QueryCompatibilityFences::for_source_contract(&contract)
             .expect("approved query compatibility");
 

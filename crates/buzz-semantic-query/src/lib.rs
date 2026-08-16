@@ -18,6 +18,7 @@ mod query_text;
 mod result;
 mod root;
 mod score;
+mod semantic_input;
 
 pub use binding::{derive_http_request_binding, verify_http_request_binding};
 pub use contract::{
@@ -32,16 +33,18 @@ pub use contract::{
 };
 pub use coordinate_search::*;
 pub use encoder::{
-    DeterministicFakeQueryEncoder, EncodedSemanticQuery, SemanticQueryEncoder,
-    SemanticQueryEncoderFuture,
+    ByteDeterministicSemanticInputEncoder, DeterministicFakeQueryEncoder, EncodedSemanticQuery,
+    ProviderEncodedSemanticInput, ProviderEncodedSemanticInputBundle, SemanticInputEncoder,
+    SemanticInputEncoderFuture, SemanticQueryEncoder, SemanticQueryEncoderFuture,
 };
-pub use fence::{embedding_space_fence, QueryCompatibilityFences};
+pub use fence::{embedding_space_fence, QueryCompatibilityFences, SemanticModelSpaceFences};
 pub use fleet::{
     semantic_graph_http_runtime_digest, ParseSemanticGraphQueryFleetPolicyError,
-    SemanticGraphFleetInventoryError, SemanticGraphHttpFleetInstance,
-    SemanticGraphHttpFleetInventory, SemanticGraphQueryEnableRequirement,
-    SemanticGraphQueryFleetPolicy, SemanticGraphQueryRoutingTrust,
-    MAX_SEMANTIC_GRAPH_FLEET_INSTANCES, MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES,
+    SemanticComputationRoute, SemanticComputationRouteMatrix, SemanticGraphFleetInventoryError,
+    SemanticGraphHttpFleetInstance, SemanticGraphHttpFleetInventory,
+    SemanticGraphQueryEnableRequirement, SemanticGraphQueryFleetPolicy,
+    SemanticGraphQueryRoutingTrust, MAX_SEMANTIC_GRAPH_FLEET_INSTANCES,
+    MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES, SEMANTIC_COMPUTATION_ROUTES,
     SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT, SEMANTIC_GRAPH_HTTP_TRANSPORT,
 };
 pub use frontier::{
@@ -68,4 +71,8 @@ pub use score::{
     target_coordinate_score, weighted_score, AnchorGain, ConditionedEvidence,
     EnvironmentScoreExplanation, PathScoreExplanation, Score, ScoreError, BASE_ENTRY_FLOOR,
     DISCOUNT_FACTOR, HOP_PENALTY, RELATION_FLOOR, SCORE_SCALE, TARGET_FLOOR, TRANSITION_FLOOR,
+};
+pub use semantic_input::{
+    SemanticInputError, SemanticInputResult, SemanticQueryInput, SemanticQueryInputBundle,
+    SemanticQueryInputKind,
 };
