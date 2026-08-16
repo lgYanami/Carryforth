@@ -421,6 +421,10 @@ semantic-retrieval-compatibility-baseline:
 semantic-retrieval-computation:
     ./scripts/check-semantic-retrieval-computation.sh all
 
+# Verify the Phase 2 reliability characterization and protected-surface gates.
+semantic-retrieval-reliability:
+    ./scripts/check-semantic-retrieval-reliability.sh all
+
 # Read-only preflight for the supported local semantic PostgreSQL profile.
 semantic-local-capacity-check:
     ./scripts/check-local-semantic-capacity.sh

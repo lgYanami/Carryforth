@@ -1,6 +1,6 @@
 # Project Context 统一语义检索引擎规范
 
-> 状态：概念规范已确认；兼容基线与第一阶段统一语义计算已交付；第二阶段可靠性运行时待设计
+> 状态：概念规范已确认；兼容基线与第一阶段统一语义计算已交付；第二阶段可靠性运行时实现计划已定稿、待交付
 >
 > 日期：2026-08-16
 >
@@ -16,6 +16,7 @@
 > [语义检索兼容基线交付计划](project-context-semantic-retrieval-compatibility-baseline-plan.md)、
 > [统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)、
 > [统一语义计算资格记录](project-context-unified-semantic-computation-qualification.md)、
+> [统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)、
 > [Stage TODO](../../TODO.md)
 
 ## 1. 文档目的
@@ -245,14 +246,22 @@ deadline 覆盖请求的完整生命周期，而不只是 Provider HTTP 调用�
 进入队列不能无限延长请求寿命。任何阶段都不得在 deadline 到期后继续产生新的外发调用、数据库工作或
 可见结果。
 
+deadline 窗口的所有权固定为：每个 closed operation 从自己的总预算派生
+provider-start/work/snapshot-close/absolute deadline 窗口，包括完整路径既有的
+work/snapshot-close/absolute 尾段保留；共享可靠性运行时只接收并遵守这些窗口，不得推导、重置或
+延长它们。retry 与 operation restart 不得重置 deadline；在启用任何 Provider retry 前，one-shot
+operation 必须显式提供早于 absolute deadline 的 provider-start 窗口，为 RR、release 和收尾保留有界
+尾部。共享运行时不拥有完整路径的总预算、traversal 或部分结果策略。
+
 ### 6.3 有界等待与负载反馈
 
-统一运行时提供有界排队和等待，而不是让每个公开操作各自决定立即失败、无限等待或自行轮询。
+可靠性运行时先让现有等待和资源取得路径——admission、Provider reservation wait、数据库取得与
+traversal permit——全部受同一 operation deadline 与 cancellation 约束；下游已经无法满足请求时，尽早
+返回稳定、低基数、content-free 的负载错误。
 
-当系统仍有能力在 deadline 内完成请求时，可以等待受控资源；当队列、预算或下游状态已经无法满足请求
-时，应尽早返回稳定、低基数、content-free 的负载错误。
-
-排队不承诺所有请求最终成功，也不得削弱 feature gate、authorization 或 release-time fence。
+新的 bounded queue、队列容量治理与负载反馈 admission 不属于可靠性运行时阶段的承诺，完整移至统一
+资源治理阶段交付。等待不承诺所有请求最终成功，也不得削弱 feature gate、authorization 或
+release-time fence。
 
 ### 6.4 分类重试与 backoff
 
@@ -468,21 +477,32 @@ Provider 实际输入或排名语义的事项，必须在共同计算原语稳�
 - 哪些 snapshot 恢复可以复用 query vector；
 - 哪些变化必须重新编码或 fail closed。
 
-交付状态：第一阶段已经完成。四个逻辑operation现在共同使用closed semantic input、Provider encoding
-primitive、Community/generation-bound query vector以及current-head exact scorer；公开surface、scope、
+交付状态：第一阶段已经完成，交付物是**共享语义计算基座**，不是统一执行四个公开 operation 的万能
+Query Engine。四个逻辑operation现在共同使用closed semantic input、Provider encoding
+primitive、Community/generation-bound query vector以及current-head exact scorer；traversal、总预算、
+snapshot 恢复范围与 release 策略仍由各 closed operation 独立拥有；公开surface、scope、
 ranking、budget、result、error、snapshot与release合同保持兼容。该结论不包含新的retry、queue、circuit、
 fairness或production SLO；这些仍属于后续阶段。
 
 ### 10.3 第二阶段：统一可靠性运行时
 
-共同计算原语稳定后，再统一 admission、bounded wait、absolute deadline、cancellation、错误分类、retry、
-backoff、circuit breaker、snapshot recovery 和 release-time verification。
+共同计算原语稳定后，再统一 absolute deadline、cancellation、typed failure 分类、retry、backoff、
+circuit breaker、snapshot recovery 和 release-time verification 等可靠性原语。
 
-应先让现有 operation 接入共同生命周期并保持现有行为，再逐项启用新的等待、重试和恢复能力。这样可以
+边界与第一阶段同构：共同层只提供最小的执行上下文、Provider 可靠性执行器、typed failure 和可组合
+安全原语；它接收 operation 提供的 deadline 窗口，不拥有完整路径的总预算、traversal、frontier、hop、
+beam、root、path packing 或部分结果策略，也不新增第二份 operation 策略来源。新的 bounded queue 与
+负载反馈 admission 属于第三阶段资源治理。
+
+应先让现有 operation 接入共同生命周期并保持现有行为，再逐项启用新的重试和恢复能力。这样可以
 分别验证“接入共同运行时是否正确”和“新增可靠性策略是否正确”，避免两类变化互相掩盖。
 
 可靠性运行时必须先于资源治理，是因为公平排队和容量归还依赖统一的阶段边界、deadline、取消传播及
 资源生命周期。
+
+实现设计与交付状态由
+[统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)
+单独维护。
 
 ### 10.4 第三阶段：统一资源治理
 

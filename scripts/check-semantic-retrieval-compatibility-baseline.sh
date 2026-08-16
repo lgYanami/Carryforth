@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURE_DIR="${REPO_ROOT}/crates/buzz-semantic-query/tests/fixtures"
 MANIFEST="${FIXTURE_DIR}/semantic_retrieval_compatibility_manifest.json"
 MANIFEST_SHA="${FIXTURE_DIR}/semantic_retrieval_compatibility_manifest.sha256"
-QUALIFICATION="${REPO_ROOT}/docs/stage/semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md"
+QUALIFICATION="${REPO_ROOT}/docs/stage/semantic/unified-engine/project-context-semantic-retrieval-compatibility-baseline.md"
 BASELINE_COMMIT="e8f26d6e65"
 HISTORICAL_ORACLE_COMMIT="ab395ff6f"
 SCOPE="${1:-all}"
@@ -61,7 +61,7 @@ if jq -r '.. | strings' "$MANIFEST" |
   fail "manifest contains a credential-shaped value"
 fi
 
-rg -Fq '> 状态：兼容基线已冻结；真实 Provider canary 未运行；作为历史 v1 oracle 保留' \
+rg -Fq '> 状态：兼容基线已冻结并作为历史v1 oracle保留；后续真实Provider证据见Phase 1资格记录' \
   "$QUALIFICATION" || fail "historical qualification status is missing"
 rg -Fq '四个逻辑 operation / 三个公开 surface' "$QUALIFICATION" ||
   fail "qualification operation matrix marker is missing"

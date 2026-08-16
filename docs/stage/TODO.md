@@ -2,18 +2,21 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；待设计第二阶段统一可靠性运行时
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0 已交付，R1–R6 待实施
 >
 > 更新日期：2026-08-16
 >
 > 概念规范：
-> [Project Context 统一语义检索引擎规范](semantic/ unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
+> [Project Context 统一语义检索引擎规范](semantic/unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
 >
 > 兼容基线：
-> [Project Context 语义检索兼容基线记录](semantic/ unified-engine/project-context-semantic-retrieval-compatibility-baseline.md)
+> [Project Context 语义检索兼容基线记录](semantic/unified-engine/project-context-semantic-retrieval-compatibility-baseline.md)
 >
 > 第一阶段实现设计：
-> [Project Context 统一语义计算实现计划](semantic/ unified-engine/project-context-unified-semantic-computation-implementation-plan.md)
+> [Project Context 统一语义计算实现计划](semantic/unified-engine/project-context-unified-semantic-computation-implementation-plan.md)
+>
+> 第二阶段实现设计：
+> [Project Context 统一可靠性运行时实现计划](semantic/unified-engine/project-context-unified-semantic-reliability-runtime-implementation-plan.md)
 >
 > 当前进展：四个逻辑operation、三个公开surface的deterministic与真实数据库兼容基线已冻结；真实
 > Provider统一canary因缺少受支持配置未运行。统一语义计算的零行为迁移设计已通过代码、currentness、
@@ -27,7 +30,12 @@
 > 同一compiled migrated profile，并通过新fleet runtime digest拒绝旧/新profile混跑。legacy Coordinate SQL与
 > graph adapter只保留到2026-09-16的profile rollback窗口。U7 deterministic、disposable pgvector、
 > target-scale、feature/gate/fleet与全量单元资格已经关闭。后续已把完整`LLM_*`三元组接入同一Provider
-> 配置边界，并以真实Provider完成Coordinate输入和Q0/Qi bundle canary。第一阶段完成，下一步是单独设计统一可靠性运行时；统一
+> 配置边界，并以真实Provider完成Coordinate输入和Q0/Qi bundle canary。第一阶段完成。第二阶段统一可靠性
+> 运行时实现计划已定稿并完成R0收口：可靠性characterization manifest（四operation的Provider attempts、RR
+> 生命周期、release参数、deadline形状、现有retry，完整路径每hop零Provider调用，one-shot permit丢弃冻结为
+> known gap）、`just semantic-retrieval-reliability` gate与Phase 2 protected-surface allowlist已交付；目录
+> 迁移后的检查脚本与文档死链已同步修复，三个gate实际运行通过。上位规范已明确共同层只接收operation
+> deadline窗口、bounded queue承诺移至第三阶段。下一步实施R1 typed failure与执行上下文；统一
 > 资源治理仍排在其后。
 
 ### 背景
