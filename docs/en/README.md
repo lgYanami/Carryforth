@@ -64,6 +64,7 @@ not every planned item should be read as a currently enabled product capability.
 
 ## Development and operations references
 
+- [`cf` CLI function reference](cli-reference.md)
 - [System architecture](../../ARCHITECTURE.md)
 - [Contributing](../../CONTRIBUTING.md)
 - [Testing guide](../../TESTING.md)

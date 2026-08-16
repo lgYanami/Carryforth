@@ -58,6 +58,7 @@
 
 ## 开发与运维参考
 
+- [`cf` CLI 功能参考](cli-reference.md)
 - [系统架构](../../ARCHITECTURE.md)
 - [参与贡献](../../CONTRIBUTING.md)
 - [测试指南](../../TESTING.md)

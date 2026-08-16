@@ -1,6 +1,12 @@
 # Carryforth CLI
 
-Agent-first command-line interface for Carryforth relay. JSON in, JSON out.
+Agent-first command-line interface for the Carryforth Relay. Structured output is the default,
+with explicit raw-content and file-output modes.
+
+See the [complete `cf` CLI function reference](../../docs/en/cli-reference.md) for every current
+command path, capability boundary, output contract, and exit code. This crate guide is a shorter
+developer quick start. A [matching Chinese reference](../../docs/cn/cli-reference.md) is also
+available.
 
 ## Install
 
@@ -95,7 +101,9 @@ cf channels list | jq '.[].name'
 constraint omitted from the command is removed. `protect list` reports malformed
 stored rules in `validation_error` so an owner can remove and repair them.
 
-## Commands
+## Selected commands
+
+This table is a compact orientation, not the complete command inventory.
 
 | Group | Subcommand | Description |
 |-------|-----------|-------------|

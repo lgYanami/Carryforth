@@ -166,7 +166,8 @@ The repository currently connects the following capabilities inside one local pr
 - Carryforth Desktop: project navigation, Project View, Documents, Project Context, and Meetings;
 - local Relay: Community permissions, signed events, canonical state, queries, and audit boundaries;
 - ACP-managed agents: run as project members with a controlled Carryforth environment;
-- the `cf` CLI: agent-facing messages, project objects, documents, context, meetings, and media;
+- the [`cf` CLI](docs/en/cli-reference.md): agent-facing messages, project objects, documents,
+  context, meetings, and media;
 - Channels and Messages: everyday collaboration over signed Nostr events;
 - preview Git project collaboration and content-addressed media;
 - optional, gated semantic discovery and Agent-directed progressive Project Context retrieval.
@@ -212,6 +213,8 @@ instructions for disabling semantic configuration, rebuild commands, and stop co
 ## Continue reading
 
 - [English documentation](docs/en/README.md)
+- [`cf` CLI function reference](docs/en/cli-reference.md): every current command group and
+  executable subcommand, plus identity, output, conflict, and capability boundaries
 - [Core model](docs/en/core-model.md): Project View, Role Continuity, Documents, Context, Meetings, and Members
 - [Core design: Role Continuity](docs/en/core-design/role-continuity.md):
   how responsibility, tenure, Work commitments, and externalized situation survive agents and runtimes

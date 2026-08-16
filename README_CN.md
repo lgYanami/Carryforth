@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="README.md">English</a> ·
   <a href="docs/cn/README.md">中文文档</a> ·
   <a href="docs/project-positioning.md">项目定位</a> ·
   <a href="ARCHITECTURE.md">架构</a> ·
@@ -145,7 +146,7 @@ durable gate，并明确确认这项 Provider 数据出境。
 - Carryforth Desktop：项目导航、Project View、Documents、Project Context 和 Meetings；
 - 本地 Relay：Community 权限、签名事件、规范状态、查询和审计边界；
 - ACP 托管 Agent：以项目成员身份运行，并接收受控的 Carryforth 环境；
-- `cf` CLI：面向 Agent 的消息、项目对象、文档、上下文、会议和媒体操作；
+- [`cf` CLI](docs/cn/cli-reference.md)：面向 Agent 的消息、项目对象、文档、上下文、会议和媒体操作；
 - Channels 与 Messages：基于签名 Nostr 事件的日常协作；
 - Git 项目协作与内容寻址媒体的预览能力；
 - 可选、受门控的语义候选发现与 Agent 渐进式 Project Context 图检索。
@@ -186,6 +187,8 @@ Provider API Key、HTTPS Base URL 和 Request Model，三者都没有默认值�
 ## 继续阅读
 
 - [中文文档导航](docs/cn/README.md)
+- [`cf` CLI 功能参考](docs/cn/cli-reference.md)：全部当前命令域与可执行子命令，
+  以及身份、输出、冲突和能力边界
 - [核心模型](docs/cn/core-model.md)：Project View、Role Continuity、Documents、Context、Meetings 与成员
 - [核心设计：Role Continuity](docs/cn/core-design/role-continuity.md)：
   责任、任期、Work 承诺和外化局势如何跨 Agent 与 Runtime 持续存在
