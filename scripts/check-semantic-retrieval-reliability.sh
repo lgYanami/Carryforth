@@ -83,7 +83,9 @@ unexpected_paths="$(
       Justfile | \
       docs/stage/TODO.md | \
       docs/stage/semantic/unified-engine/* | \
+      docs/en/current-status.md | \
       crates/buzz-semantic-query/src/fleet.rs | \
+      crates/buzz-semantic-query/src/lib.rs | \
       crates/buzz-semantic-query/tests/* | \
       crates/buzz-db/src/lib.rs | \
       crates/buzz-db/src/error.rs | \

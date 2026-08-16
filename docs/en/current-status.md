@@ -147,13 +147,19 @@ Implemented:
 - the `search-project-context` Skill and Project Space routing for progressive Agent traversal;
 - NIP-98 request binding, Relay-signed semantic results, and canonical read descriptors;
 - the retained bounded complete-path `semantic-query` as a supplementary product;
-- controlled real-request paths on a local single Relay.
+- controlled real-request paths on a local single Relay;
+- a unified reliability runtime shared by all four semantic operations: typed failures, deadline
+  and cancellation arbitration, a bounded safe retry policy with full-jitter backoff,
+  request-local vector reuse, and a process-local Provider circuit that ships shadow-by-default
+  behind an isolated single-Relay canary flag and never introduces new public error codes.
 
 Still outside the current production-ready claim:
 
 - Provider/model-dependent candidate quality and drift;
 - PostgreSQL resource isolation, concurrency ladders, and long-running soak;
 - production load balancers and multi-pod deployment;
+- fleet-shared circuit state (the delivered circuit is process-local, so no multi-pod
+  anti-storm claim is made) and unified queue/fairness/capacity governance;
 - target scale, frozen SLOs, and complete recovery evidence.
 
 The primary context-aware behavior now comes from an Agent using its verified Role and relevant

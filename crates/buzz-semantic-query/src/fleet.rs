@@ -203,6 +203,35 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
     "\none-hop-search=request-one-natural-language-q0-input-limit-1-to-32-tagged-incident-edge-or-edge-coordinate-scope;result-kind-40914-canonical-preview-and-typed-read-descriptor;extensions-carryforth_project_context_one_hop_semantic_search-and-v2-filtered-edge-coordinate;v2-filter-only-edge-coordinate-members-before-score-and-top-k;direct-cosine-no-floor-no-coherence-no-path"
 );
 
+/// Explicitly bumped closed descriptor for the compiled Phase 2 reliability
+/// runtime (unified-engine plan §12.2).
+///
+/// The reliability route, retry categories, physical attempt caps, backoff,
+/// circuit, and vector-reuse contracts are hashed into the same compiled
+/// runtime digest as the wire contracts above, so an attested fleet cannot
+/// mix reliability behaviors any more than it can mix result shapes. The
+/// numeric values here mirror the compiled constants in
+/// `buzz-relay::semantic_query_runtime`; a binding test pins the two sides
+/// together, and any change to either must bump this dated descriptor.
+pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
+    "runtime-contract=semantic-query-reliability-20260817-phase2-r6-v1\n",
+    "route=server-owned-compiled-pin-per-request-no-fallback-no-dual-send-no-implementation-switch\n",
+    "retry-matrix=connect-not-started-pre-handoff;rate-limited-valid-retry-after-full-fit;retryable-definitive-5xx\n",
+    "attempt-caps=one-shot-physical-2;complete-path-physical-3;operation-attempt-2;release-confirmation-2;transport-retry-token-1-per-attempt\n",
+    "backoff=full-jitter-base-250ms;must-fully-fit-remaining-work-window\n",
+    "retry-fresh-plan=per-attempt-fresh-ticket-observation-inputs-reservation-egress-confirmation\n",
+    "circuit=process-local-single-shared-failure-domain;closed-open-halfopen;epoch-fence-on-every-transition\n",
+    "circuit-probe=half-open-single-exclusive-real-request-probe;probe-budget-reclaims-abandoned-lease\n",
+    "circuit-gate=before-reservation;no-wait-epoch-revalidate-after-wait-and-after-final-egress-confirm-adjacent-to-provider-call\n",
+    "circuit-health=connect;definitive-5xx;transport-unknown;protocol-invalid-response\n",
+    "circuit-throttle=429-retry-after-independent-window;never-counts-as-health\n",
+    "circuit-caps=health-threshold-5;open-cooldown-15s;probe-budget-15s;throttle-default-1000ms;throttle-max-60s\n",
+    "circuit-enforcement=shadow-spectator-default;single-relay-canary-flag;refusal-maps-existing-busy-only;auth-precedes-circuit-outcome\n",
+    "circuit-scope=process-local-no-fleet-shared-epoch-or-lease;no-multi-pod-anti-storm-claim\n",
+    "vector-reuse=request-local;exact-ordered-input-digest-plus-generation-identity;fresh-ticket-fence-rebind;never-cross-generation-or-input;never-persisted\n",
+    "release=permit-linear-move-consume;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline\n"
+);
+
 /// One instance asserted to be in the current HTTP load-balancer inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +395,7 @@ impl SemanticGraphHttpFleetInventory {
 /// Return the compiled semantic graph HTTP runtime digest.
 ///
 /// The value combines the explicitly bumped wire/runtime descriptor with the
+/// Phase 2 reliability contract (unified-engine plan §12.2) and the
 /// independently frozen query-input, ranking, and budget contracts.
 pub fn semantic_graph_http_runtime_digest() -> QueryContractResult<Digest32> {
     let query = query_contract_digest();
@@ -376,6 +406,7 @@ pub fn semantic_graph_http_runtime_digest() -> QueryContractResult<Digest32> {
         b"buzz.semantic-graph-http-runtime",
         &[
             SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT.as_bytes(),
+            SEMANTIC_RELIABILITY_RUNTIME_CONTRACT.as_bytes(),
             computation_routes.as_bytes(),
             query.as_bytes(),
             ranking.as_bytes(),
@@ -447,7 +478,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "d9878ff28260cc8161795ce8cd479ba879387f3f34ae35b389734fd6ea753bef",
+            "2c898e16398d8c65d10c37052f08f07178586632e8e647ad5484d0bbff8bd4ae",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

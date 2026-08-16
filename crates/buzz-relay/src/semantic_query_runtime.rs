@@ -3443,6 +3443,66 @@ mod tests {
     }
 
     #[test]
+    fn fleet_runtime_digest_binds_the_compiled_reliability_contract() {
+        // R6 qualification (plan §12.2): the reliability contract hashed into
+        // the fleet runtime digest must restate the constants compiled into
+        // this runtime, so changing either side without an explicit dated
+        // descriptor bump fails here and fails the fleet digest.
+        let contract = buzz_semantic_query::SEMANTIC_RELIABILITY_RUNTIME_CONTRACT;
+        let one_shot = SemanticOperationAttemptClass::OneShot;
+        let complete_path = SemanticOperationAttemptClass::CompletePath;
+        let expected_lines = [
+            format!(
+                "attempt-caps=one-shot-physical-{};complete-path-physical-{};operation-attempt-{}",
+                one_shot.physical_provider_attempt_cap(),
+                complete_path.physical_provider_attempt_cap(),
+                one_shot.operation_attempt_cap(),
+            ),
+            format!(
+                "backoff=full-jitter-base-{}ms",
+                PROVIDER_RETRY_FULL_JITTER_BASE_MS
+            ),
+            format!(
+                "circuit-caps=health-threshold-{};open-cooldown-{}s;probe-budget-{}s;throttle-default-{}ms;throttle-max-{}s",
+                PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
+                PROVIDER_CIRCUIT_OPEN_COOLDOWN.as_secs(),
+                PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET.as_secs(),
+                PROVIDER_CIRCUIT_THROTTLE_DEFAULT.as_millis(),
+                PROVIDER_CIRCUIT_THROTTLE_MAX.as_secs(),
+            ),
+        ];
+        for line in expected_lines {
+            assert!(
+                contract.contains(&line),
+                "fleet reliability descriptor must pin the compiled constants: missing {line}"
+            );
+        }
+
+        // The two literal ledger budgets in the descriptor are pinned by
+        // exercising the ledger itself: two release confirmations, and a
+        // single transport-retry token per operation attempt.
+        let ledger = SemanticAttemptLedger::new(SemanticOperationAttemptClass::CompletePath);
+        let mut release_budget = 0;
+        while ledger.begin_release_confirmation().is_ok() {
+            release_budget += 1;
+        }
+        assert!(contract.contains(&format!("release-confirmation-{release_budget}")));
+        assert!(
+            ledger.begin_provider_attempt().is_ok(),
+            "first physical attempt must be admitted"
+        );
+        let mut transport_tokens = 0;
+        while ledger.begin_provider_attempt().is_ok() {
+            transport_tokens += 1;
+        }
+        // One admitted retry within the attempt plus the exhausted token:
+        // the descriptor's "transport-retry-token-1-per-attempt" is the
+        // budget that stopped this loop.
+        assert_eq!(transport_tokens, 1);
+        assert!(contract.contains("transport-retry-token-1-per-attempt"));
+    }
+
+    #[test]
     fn consecutive_health_failures_trip_open_at_the_compiled_threshold() {
         let circuit = new_circuit(true);
         let t0 = Instant::now();
@@ -3793,5 +3853,133 @@ mod tests {
             ProviderCircuitPhase::Closed,
             "per-request 4xx and pre-transport input failures are not Provider health"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // R6 qualification soak (plan §8 R6): cancellation and shutdown
+    // propagation under repetition. Every iteration races one of the four
+    // closed cancellation sources against one of three lifecycle shapes and
+    // must finish inside its own small budget, drop its pending stage work,
+    // keep later stage admission refused, and never let a losing finalizer
+    // escape the post-check. A wedge or leak in the unified lifecycle shows
+    // up here as a hard iteration timeout instead of a hanging test.
+    // -------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_and_shutdown_soak_stays_bounded_and_clean() {
+        struct StageGuard(Arc<AtomicBool>);
+        impl Drop for StageGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        const ITERATIONS: usize = 240;
+        for index in 0..ITERATIONS {
+            let source = match index % 4 {
+                0 => SemanticCancellationSource::CallerDisconnected,
+                1 => SemanticCancellationSource::ServerShutdown,
+                2 => SemanticCancellationSource::DeadlineExceeded,
+                _ => SemanticCancellationSource::ExplicitCancel,
+            };
+            let shape = index % 3;
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                match shape {
+                    0 => {
+                        // Mid-stage cancellation: the pending future is
+                        // dropped, the refusal is stable, and the latch
+                        // settles in Cancelling.
+                        let far = Instant::now() + Duration::from_secs(30);
+                        let context = Arc::new(SemanticExecutionContext::new(
+                            SemanticOperationAttemptClass::OneShot,
+                            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+                        ));
+                        let dropped = Arc::new(AtomicBool::new(false));
+                        let guard_dropped = Arc::clone(&dropped);
+                        let cancelled_context = Arc::clone(&context);
+                        let canceller = tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            let _ = cancelled_context
+                                .cancel(SemanticCancellationSource::ServerShutdown);
+                        });
+                        let stage = Box::pin(async move {
+                            let _guard = StageGuard(guard_dropped);
+                            std::future::pending::<()>().await;
+                        });
+                        assert_eq!(
+                            context.run_stage(SemanticDeadlineWindow::Work, stage).await,
+                            Err(SemanticStageAbort::Cancelled(
+                                SemanticCancellationSource::ServerShutdown
+                            ))
+                        );
+                        assert!(dropped.load(Ordering::SeqCst));
+                        assert_eq!(context.latch().state(), SemanticLifecycleState::Cancelling);
+                        assert_eq!(
+                            context.admit_stage(),
+                            Err(SemanticStageAbort::Cancelled(
+                                SemanticCancellationSource::ServerShutdown
+                            ))
+                        );
+                        canceller.await.expect("canceller task must finish");
+                    }
+                    1 => {
+                        // Work-window expiry inside the stage: mandatory
+                        // cleanup still runs and the deadline source is
+                        // recorded once.
+                        let soon = Instant::now() + Duration::from_millis(1);
+                        let far = Instant::now() + Duration::from_secs(30);
+                        let context = SemanticExecutionContext::new(
+                            SemanticOperationAttemptClass::OneShot,
+                            SemanticDeadlineWindows::new(soon, soon, far, far)
+                                .expect("ordered windows"),
+                        );
+                        let dropped = Arc::new(AtomicBool::new(false));
+                        let guard = StageGuard(Arc::clone(&dropped));
+                        let stage = Box::pin(async move {
+                            let _guard = guard;
+                            std::future::pending::<()>().await;
+                        });
+                        assert_eq!(
+                            context.run_stage(SemanticDeadlineWindow::Work, stage).await,
+                            Err(SemanticStageAbort::Deadline(SemanticDeadlineWindow::Work))
+                        );
+                        assert!(dropped.load(Ordering::SeqCst));
+                        assert_eq!(
+                            context.cancellation().cancelled(),
+                            Some(SemanticCancellationSource::DeadlineExceeded)
+                        );
+                    }
+                    _ => {
+                        // Finalize/cancel race: a finalizer that already won
+                        // records the later cancellation as a discard and may
+                        // never send; the cancellation side loses cleanly.
+                        let far = Instant::now() + Duration::from_secs(30);
+                        let context = SemanticExecutionContext::new(
+                            SemanticOperationAttemptClass::OneShot,
+                            SemanticDeadlineWindows::for_one_shot_hard_deadline(far),
+                        );
+                        assert_eq!(
+                            context.latch().begin_finalize(),
+                            SemanticLatchOutcome::Won(SemanticLifecycleState::Finalizing)
+                        );
+                        assert_eq!(
+                            context.cancel(source),
+                            SemanticLatchOutcome::LostToFinalizing(source)
+                        );
+                        assert!(context.latch().discard_requested());
+                        assert_eq!(context.latch().discard_source(), Some(source));
+                        // The post-check discards the signed result; new
+                        // semantic work is still allowed only for the
+                        // finalizer itself, and the state completes.
+                        assert!(!context.latch().state().forbids_new_semantic_work());
+                        assert_eq!(
+                            context.latch().complete(),
+                            SemanticLifecycleState::Completed
+                        );
+                    }
+                }
+            })
+            .await
+            .expect("soak iteration must stay inside its budget");
+        }
     }
 }

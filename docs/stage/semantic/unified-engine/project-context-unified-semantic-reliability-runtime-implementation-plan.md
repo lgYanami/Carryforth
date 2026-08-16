@@ -1,8 +1,9 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0、R1、R2、R3、R4、R5 已交付；R6 待实施
+> 状态：R0、R1、R2、R3、R4、R5、R6 已交付；阶段关闭（资格记录见
+> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）
 >
-> 日期：2026-08-16
+> 日期：2026-08-16（R6 收口 2026-08-17）
 >
 > 代码基线：`feat/semantic-engine`，`4364deae89`
 >
@@ -1102,6 +1103,37 @@ auth优先；vector不跨generation/input；snapshot不拼接；公开错误保�
 退出门：四operation共享同一个Provider故障域；一个operation不能绕过open circuit或制造独立probe风暴。
 
 ### R6：资格、rollout与文档收口
+
+> 当前状态：已交付（2026-08-17），阶段关闭。资格门、fault matrix、
+> digest切流表与Phase 1窗口记录全部落在
+> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)，
+> 此处只记实现侧要点。（1）reliability contract（§12.2）以新公开常量
+> `SEMANTIC_RELIABILITY_RUNTIME_CONTRACT` 进入
+> `semantic_graph_http_runtime_digest()`：route、retry矩阵、attempt caps、
+> backoff、fresh-plan、circuit（状态机/probe/gate/健康集合/throttle/
+> caps/enforcement/scope）与vector-reuse/release合同逐行编码进编译
+> digest；buzz-relay侧 `fleet_runtime_digest_binds_the_compiled_reliability_contract`
+> 把descriptor数值与编译常量（250ms jitter base、阈值5、15s/15s/1000ms/60s、
+> one-shot 2/complete-path 3/operation 2）及ledger预算（release confirmation 2、
+> transport retry token 1）双向钉住，改任一侧都要求显式dated bump。
+> digest切流：`d9878ff2…`（coordinate-filter-v2）→
+> `2c898e16…`（reliability-20260817-phase2-r6-v1），characterization
+> golden/sha256同步重钉（设计内的审计机制，非静默改史）。（2）确定性
+> fault matrix：真实fake HTTP Provider驱动500/429±Retry-After/4xx/200
+> 协议违约/connect失败（绑定后即drop的listener）各行，同时钉住
+> `TrackedProviderFailure`分类、`from_attempt_failure` circuit行与R4
+> retry决策（full-fit、cap、Terminal行）三个视图；enforcing circuit以
+> 真实500恰在阈值5打开、真实429只开独立throttle窗。（3）cancellation/
+> shutdown soak：240迭代×4 source×3生命周期形状，每迭代独立预算内
+> 完成、pending stage必丢弃、拒绝稳定、finalize/cancel竞速post-check
+> 丢弃。（4）gated真实Provider canary（`#[ignore]`）只断言content-free
+> 不变量：单物理attempt、circuit admit/observe、closed失败分类，结果
+> 即弃不留query/vector/body。（5）freeze allowlist增补
+> `crates/buzz-semantic-query/src/lib.rs`（仅为re-export上述常量）。
+> （6）未运行项（disposable DB套件、`just test`、真实Provider canary、
+> 真实fleet切流）在资格记录中逐项列明原因与复跑配方，未以单元绿色
+> 替代声明。完成门：可声明"统一可靠性原语与Provider执行层已交付"；
+> 不声明统一资源治理或production SLO。
 
 交付：
 

@@ -1306,4 +1306,448 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // R6 fault-matrix qualification evidence (plan §8 R6). A real fake
+    // HTTP Provider drives every closed fault class through the tracked
+    // encode path; each row pins the attempt classification, the derived
+    // circuit observation, and the R4 retry decision together, so the
+    // three compiled views can never drift apart.
+    // -------------------------------------------------------------------
+
+    use std::time::Instant;
+
+    use crate::semantic_query_runtime::{
+        provider_retry_decision, ProviderAttemptFailureKind, ProviderCircuitAdmission,
+        ProviderCircuitObservation, ProviderCircuitRefusal, ProviderHandoffCertainty,
+        ProviderHealthFailureClass, ProviderRetryDecision, ProviderRetryRoute,
+        SemanticDeadlineWindows, SemanticExecutionContext, SemanticOperationAttemptClass,
+        SemanticProviderCircuit, PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
+        PROVIDER_RETRY_FULL_JITTER_BASE_MS,
+    };
+
+    /// Fake Provider behavior for one fault-matrix row.
+    #[derive(Clone, Copy)]
+    enum FaultResponse {
+        /// A definitive non-throttle status with an empty body.
+        Status(u16),
+        /// A 429, optionally carrying a syntactically valid `Retry-After`.
+        RateLimited { retry_after: Option<u64> },
+        /// A 200 whose body violates the closed response contract.
+        BadModelBody,
+    }
+
+    /// The retry decision the compiled policy must make for one row under a
+    /// fresh 30-second work window.
+    #[derive(Clone, Copy)]
+    enum ExpectedRetry {
+        /// Retry after a full-jitter draw over the compiled base.
+        Jittered,
+        /// Retry after exactly this backoff.
+        Exact(Duration),
+        /// No retry; the surface projects the last typed failure.
+        Terminal,
+    }
+
+    /// One closed fault-matrix row.
+    struct FaultRow {
+        name: &'static str,
+        response: FaultResponse,
+        kind: ProviderAttemptFailureKind,
+        handoff: ProviderHandoffCertainty,
+        observation: ProviderCircuitObservation,
+        retry: ExpectedRetry,
+    }
+
+    fn fault_response(response: FaultResponse) -> Response<Body> {
+        match response {
+            FaultResponse::Status(code) => Response::builder()
+                .status(
+                    StatusCode::from_u16(code)
+                        .unwrap_or_else(|_| panic!("test fault status {code}")),
+                )
+                .body(Body::empty())
+                .expect("fault response"),
+            FaultResponse::RateLimited { retry_after } => {
+                let mut builder = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
+                if let Some(seconds) = retry_after {
+                    builder = builder.header("retry-after", seconds.to_string());
+                }
+                builder.body(Body::empty()).expect("rate-limited fault")
+            }
+            FaultResponse::BadModelBody => {
+                let body = serde_json::json!({
+                    "model": "mutable-wrong-alias",
+                    "data": [{
+                        "index": 0,
+                        "embedding": vec![0.25_f32; 2_048],
+                    }],
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(body.to_string()))
+                    .expect("bad-model fault")
+            }
+        }
+    }
+
+    fn fault_router(response: FaultResponse) -> Router {
+        Router::new().route(
+            "/api/embeddings",
+            post(move || async move { fault_response(response) }),
+        )
+    }
+
+    fn fault_input() -> buzz_semantic_query::CoordinateSearchEncoderInput {
+        let request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0021),
+            project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0022),
+            query: "release confirmation fault matrix".to_owned(),
+            coordinate_types: None,
+            limit: 8,
+        };
+        build_coordinate_search_encoder_input(&request).expect("closed Coordinate input")
+    }
+
+    fn retry_context() -> SemanticExecutionContext {
+        let now = Instant::now();
+        let tail = now + Duration::from_secs(30);
+        SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::new(now, tail, tail, tail).expect("test windows"),
+        )
+    }
+
+    async fn expect_tracked_fault(
+        provider: &VolcengineSemanticProvider,
+        input: &buzz_semantic_query::CoordinateSearchEncoderInput,
+        name: &str,
+    ) -> super::TrackedProviderFailure<SemanticGraphQueryError> {
+        match provider.encode_coordinate_search_tracked(input).await {
+            Err(tracked) => tracked,
+            Ok(_) => panic!("{name}: fault must fail the tracked encode"),
+        }
+    }
+
+    fn assert_retry_decision(
+        name: &'static str,
+        row_retry: ExpectedRetry,
+        kind: ProviderAttemptFailureKind,
+        handoff: ProviderHandoffCertainty,
+    ) {
+        let failure = crate::semantic_query_runtime::ProviderAttemptFailure { kind, handoff };
+        let decision = provider_retry_decision(ProviderRetryRoute::R4, failure, &retry_context());
+        match row_retry {
+            ExpectedRetry::Jittered => match decision {
+                ProviderRetryDecision::Retry { backoff } => assert!(
+                    backoff <= Duration::from_millis(PROVIDER_RETRY_FULL_JITTER_BASE_MS),
+                    "{name}: jittered backoff must stay inside the compiled base"
+                ),
+                ProviderRetryDecision::Terminal => {
+                    panic!("{name}: compiled policy must retry this fault")
+                }
+            },
+            ExpectedRetry::Exact(expected) => assert_eq!(
+                decision,
+                ProviderRetryDecision::Retry { backoff: expected },
+                "{name}: wrong compiled backoff"
+            ),
+            ExpectedRetry::Terminal => assert_eq!(
+                decision,
+                ProviderRetryDecision::Terminal,
+                "{name}: compiled policy must not retry this fault"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_fault_matrix_classifies_real_transport_failures() {
+        let rows = [
+            FaultRow {
+                name: "definitive-5xx",
+                response: FaultResponse::Status(500),
+                kind: ProviderAttemptFailureKind::RetryableResponse { status_class: 500 },
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::HealthFailure(
+                    ProviderHealthFailureClass::ServerError,
+                ),
+                retry: ExpectedRetry::Jittered,
+            },
+            FaultRow {
+                name: "429-with-valid-retry-after",
+                response: FaultResponse::RateLimited {
+                    retry_after: Some(7),
+                },
+                kind: ProviderAttemptFailureKind::RateLimited {
+                    retry_after_seconds: Some(7),
+                },
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::Throttled {
+                    retry_after_seconds: Some(7),
+                },
+                retry: ExpectedRetry::Exact(Duration::from_secs(7)),
+            },
+            FaultRow {
+                name: "429-without-retry-after",
+                response: FaultResponse::RateLimited { retry_after: None },
+                kind: ProviderAttemptFailureKind::RateLimited {
+                    retry_after_seconds: None,
+                },
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::Throttled {
+                    retry_after_seconds: None,
+                },
+                retry: ExpectedRetry::Terminal,
+            },
+            FaultRow {
+                name: "429-retry-after-beyond-the-work-window",
+                response: FaultResponse::RateLimited {
+                    retry_after: Some(3_600),
+                },
+                kind: ProviderAttemptFailureKind::RateLimited {
+                    retry_after_seconds: Some(3_600),
+                },
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::Throttled {
+                    retry_after_seconds: Some(3_600),
+                },
+                retry: ExpectedRetry::Terminal,
+            },
+            FaultRow {
+                name: "definitive-4xx",
+                response: FaultResponse::Status(400),
+                kind: ProviderAttemptFailureKind::Rejected { status: 400 },
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::NotCounted,
+                retry: ExpectedRetry::Terminal,
+            },
+            FaultRow {
+                name: "success-status-protocol-violation",
+                response: FaultResponse::BadModelBody,
+                kind: ProviderAttemptFailureKind::ProtocolInvalid,
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+                observation: ProviderCircuitObservation::HealthFailure(
+                    ProviderHealthFailureClass::ProtocolInvalid,
+                ),
+                retry: ExpectedRetry::Terminal,
+            },
+        ];
+        let input = fault_input();
+        for row in rows {
+            let (base_url, server) = spawn_provider(fault_router(row.response)).await;
+            let provider = provider_for_base_url(base_url);
+            let tracked = expect_tracked_fault(&provider, &input, row.name).await;
+            server.abort();
+
+            assert_eq!(tracked.failure.kind, row.kind, "{}", row.name);
+            assert_eq!(tracked.failure.handoff, row.handoff, "{}", row.name);
+            assert_eq!(
+                ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+                row.observation,
+                "{}",
+                row.name
+            );
+            assert_retry_decision(row.name, row.retry, row.kind, row.handoff);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_pre_handoff_health_and_retryable() {
+        // Bind then drop a listener so the Provider endpoint provably has no
+        // server behind it: the transport's own connect knowledge must
+        // classify the failure as never-handed-off.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind transient listener");
+        let address = listener.local_addr().expect("transient address");
+        drop(listener);
+        let base_url = format!("http://{address}/api/")
+            .parse()
+            .expect("transient Provider URL");
+        let provider = provider_for_base_url(base_url);
+        let input = fault_input();
+
+        let tracked = expect_tracked_fault(&provider, &input, "connect-not-started").await;
+
+        assert_eq!(
+            tracked.failure.kind,
+            ProviderAttemptFailureKind::ConnectNotStarted
+        );
+        assert_eq!(
+            tracked.failure.handoff,
+            ProviderHandoffCertainty::NotStarted
+        );
+        assert_eq!(
+            ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+            ProviderCircuitObservation::HealthFailure(ProviderHealthFailureClass::Connect)
+        );
+        assert_retry_decision(
+            "connect-not-started",
+            ExpectedRetry::Jittered,
+            tracked.failure.kind,
+            tracked.failure.handoff,
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly configured real embedding Provider"]
+    async fn real_provider_reliability_canary_is_bounded_and_content_free() {
+        // R6 gated canary (plan §8 R6): one short real-Provider encode through
+        // the tracked reliability path. The canary asserts only content-free
+        // invariants — attempt budget, circuit admission, and the closed
+        // failure classification — and deliberately drops the encoded result
+        // without inspecting or retaining query text, vectors, or response
+        // bodies.
+        use crate::semantic_query_runtime::{
+            encode_once, ProviderCircuitAdmission, ProviderEgressObservation,
+            SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
+            SemanticOperationAttemptClass,
+        };
+
+        let config = crate::config::Config::from_env().expect("Relay configuration");
+        let provider = VolcengineSemanticProvider::from_config(&config.semantic_worker)
+            .expect("Provider configuration")
+            .expect("configured Provider");
+        let input = fault_input();
+
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(
+                Instant::now() + Duration::from_secs(60),
+            ),
+        );
+        context
+            .ledger()
+            .begin_operation_attempt()
+            .expect("first operation attempt");
+        let ProviderCircuitAdmission::Admitted { token } = provider.circuit().admit() else {
+            panic!("real Provider canary: a healthy domain must admit");
+        };
+        let ordinal = context
+            .ledger()
+            .begin_provider_attempt()
+            .expect("first physical attempt");
+        assert_eq!(ordinal, 1);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            encode_once(
+                &context,
+                ProviderEgressObservation::Silent,
+                provider.encode_coordinate_search_tracked(&input),
+            ),
+        )
+        .await
+        .expect("real Provider canary deadline");
+
+        match outcome {
+            Ok(_encoded) => {
+                // The result is dropped here; the canary never retains it.
+                provider
+                    .circuit()
+                    .observe(token, ProviderCircuitObservation::Success);
+            }
+            Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
+                provider.circuit().observe(
+                    token,
+                    ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+                );
+                panic!(
+                    "real Provider canary failed with the closed class {:?}",
+                    tracked.failure.kind
+                );
+            }
+            Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+                panic!("real Provider canary exceeded its work window")
+            }
+            Err(SemanticEncodeOnceFailure::Cancelled(source)) => {
+                panic!("real Provider canary was cancelled by {source:?}")
+            }
+        }
+        // One successful canary is exactly one physical Provider attempt, and
+        // the budget stays within the compiled cap.
+        assert_eq!(context.ledger().provider_attempts(), 1);
+        assert!(
+            context.ledger().provider_attempts()
+                <= SemanticOperationAttemptClass::OneShot.physical_provider_attempt_cap()
+        );
+    }
+
+    #[tokio::test]
+    async fn enforcing_circuit_moves_only_on_real_health_faults() {
+        // Real 500s observed through the compiled matrix trip an enforcing
+        // circuit exactly at the compiled threshold; the next admission is
+        // the existing Busy-shaped refusal, never a new public code.
+        let input = fault_input();
+        let (base_url, server) = spawn_provider(fault_router(FaultResponse::Status(500))).await;
+        let provider = provider_for_base_url(base_url);
+        let circuit = SemanticProviderCircuit::new("fault-matrix-health".to_owned(), true);
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            let ProviderCircuitAdmission::Admitted { token } = circuit.admit() else {
+                panic!("closed circuit must admit while below the threshold");
+            };
+            let tracked = expect_tracked_fault(&provider, &input, "definitive-5xx").await;
+            circuit.observe(
+                token,
+                ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+            );
+        }
+        assert!(matches!(
+            circuit.admit(),
+            ProviderCircuitAdmission::Refused {
+                reason: ProviderCircuitRefusal::Open,
+            }
+        ));
+        server.abort();
+
+        // A single real 429 opens the independent throttle window: the next
+        // admission is refused as throttled even though the domain's health
+        // gate has accumulated nothing.
+        let (base_url, server) = spawn_provider(fault_router(FaultResponse::RateLimited {
+            retry_after: Some(60),
+        }))
+        .await;
+        let provider = provider_for_base_url(base_url);
+        let circuit = SemanticProviderCircuit::new("fault-matrix-throttle".to_owned(), true);
+        let ProviderCircuitAdmission::Admitted { token } = circuit.admit() else {
+            panic!("fresh circuit must admit the first throttled request");
+        };
+        let tracked = expect_tracked_fault(&provider, &input, "rate-limited").await;
+        circuit.observe(
+            token,
+            ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+        );
+        assert!(matches!(
+            circuit.admit(),
+            ProviderCircuitAdmission::Refused {
+                reason: ProviderCircuitRefusal::Throttled,
+            }
+        ));
+        server.abort();
+
+        // Throttle observations never accumulate into health: with an
+        // immediate `Retry-After` the domain keeps admitting indefinitely and
+        // never leaves Closed, however many 429s it observes.
+        let (base_url, server) = spawn_provider(fault_router(FaultResponse::RateLimited {
+            retry_after: Some(0),
+        }))
+        .await;
+        let provider = provider_for_base_url(base_url);
+        let circuit = SemanticProviderCircuit::new("fault-matrix-throttle-health".to_owned(), true);
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD * 2 {
+            let ProviderCircuitAdmission::Admitted { token } = circuit.admit() else {
+                panic!("throttling must not close the circuit's health gate");
+            };
+            let tracked = expect_tracked_fault(&provider, &input, "rate-limited-immediate").await;
+            circuit.observe(
+                token,
+                ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+            );
+        }
+        assert!(matches!(
+            circuit.admit(),
+            ProviderCircuitAdmission::Admitted { .. }
+        ));
+        server.abort();
+    }
 }

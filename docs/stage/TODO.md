@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R5 已交付，R6 待实施
+> 状态：兼容基线、第一阶段统一语义计算与第二阶段统一可靠性运行时（R0–R6）均已交付；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-17
 >
@@ -69,8 +69,18 @@
 > Busy冻结映射（无新公开code）；shadow默认（spectator token不移动模拟
 > 状态），`BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE`为isolated single-Relay
 > canary开关；process-local circuit不宣称多Pod防惊群（fleet-shared
-> epoch/lease属第三阶段）。下一步实施R6资格、rollout与文档收口；统一资源治理
-> 仍排在其后。
+> epoch/lease属第三阶段）。R6资格、rollout与文档收口已交付，第二阶段关闭：
+> reliability contract（route/retry矩阵/attempt caps/backoff/circuit/
+> vector-reuse/release）进入编译fleet digest（`2c898e16…`），真实fake
+> Provider fault matrix把attempt分类、circuit行与retry决策三视图逐行钉住，
+> cancellation/shutdown soak（240迭代×4 source×3形状）通过，gated真实
+> Provider canary只断言content-free不变量，buzz-relay binding test把
+> descriptor与编译常量互相绑定；资格门运行记录、digest切流表（含Phase 1
+> `2026-09-16`窗口依赖与真实fleet切流模板）见
+> [统一可靠性运行时资格记录](semantic/unified-engine/project-context-unified-semantic-reliability-runtime-qualification.md)，
+> 未运行的disposable DB/真实Provider/真实fleet门逐项列明原因与复跑配方。
+> 可声明"统一可靠性原语与Provider执行层已交付"；统一资源治理（bounded
+> queue/fairness/capacity、fleet-shared circuit状态）与production SLO属第三阶段。
 
 ### 背景
 

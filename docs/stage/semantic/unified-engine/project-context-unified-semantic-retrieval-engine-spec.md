@@ -1,8 +1,11 @@
 # Project Context 统一语义检索引擎规范
 
-> 状态：概念规范已确认；兼容基线与第一阶段统一语义计算已交付；第二阶段可靠性运行时实现计划已定稿、待交付
+> 状态：概念规范已确认；兼容基线、第一阶段统一语义计算与第二阶段可靠性运行时均已交付
+> （资格记录见
+> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）；
+> 第三阶段统一资源治理未启动
 >
-> 日期：2026-08-16
+> 日期：2026-08-16（第二阶段收口 2026-08-17）
 >
 > 范围：Project Context 语义检索的统一语义计算、可靠性运行时、资源治理，以及公开
 > closed operation 的边界
@@ -17,6 +20,7 @@
 > [统一语义计算实现计划](project-context-unified-semantic-computation-implementation-plan.md)、
 > [统一语义计算资格记录](project-context-unified-semantic-computation-qualification.md)、
 > [统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)、
+> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)、
 > [Stage TODO](../../TODO.md)
 
 ## 1. 文档目的

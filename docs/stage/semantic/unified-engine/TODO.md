@@ -1,7 +1,8 @@
 # Project Context 统一语义检索引擎 TODO
 
-> 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时实现
-> 计划已定稿并交付R0、R1、R2、R3、R4、R5，R6待实施
+> 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时
+> 已按计划交付R0–R6并关闭（资格记录见
+> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）
 >
 > 日期：2026-08-17
 
@@ -76,6 +77,18 @@ refusal统一走既有Busy/Unavailable冻结映射（无新公开code）；shado
 token不能移动模拟状态），`BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE` 为isolated
 single-Relay canary开关；fast gate在reservation前、wait后与final egress confirm后
 各一次epoch-token无等待重验（最后一次紧邻Provider调用）；fleet-shared epoch/lease
-未交付，不宣称多Pod防惊群（第三阶段）。相关性验收结果只影响
+未交付，不宣称多Pod防惊群（第三阶段）。R6资格、rollout与文档收口已交付，第二阶段
+关闭：reliability contract进入编译fleet digest（`d9878ff2…`→`2c898e16…`，
+characterization golden同步重钉），真实fake Provider fault matrix把attempt分类、
+circuit行与retry决策三视图逐行钉住，cancellation/shutdown soak（240迭代×4
+source×3形状）通过，gated真实Provider canary只断言content-free不变量（不存
+query/vector/body），binding test把digest descriptor与编译常量互相绑定；资格门
+运行记录、Phase 1 `2026-09-16`窗口依赖（computation差分oracle仍以legacy为参考）
+与真实fleet切流模板见
+[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)，
+未运行的disposable DB/真实Provider/真实fleet门逐项列明原因与复跑配方。可声明
+“统一可靠性原语与Provider执行层已交付”；统一资源治理（bounded
+queue/fairness/capacity、fleet-shared circuit）与production SLO属第三阶段。
+相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

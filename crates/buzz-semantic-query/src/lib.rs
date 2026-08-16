@@ -51,6 +51,7 @@ pub use fleet::{
     SemanticGraphQueryRoutingTrust, MAX_SEMANTIC_GRAPH_FLEET_INSTANCES,
     MAX_SEMANTIC_GRAPH_FLEET_INVENTORY_BYTES, SEMANTIC_COMPUTATION_ROUTES,
     SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT, SEMANTIC_GRAPH_HTTP_TRANSPORT,
+    SEMANTIC_RELIABILITY_RUNTIME_CONTRACT,
 };
 pub use frontier::{
     first_wave_slice, highest_precedence_stop, BoundedSuccessorAccumulator, CounterAdmission,
