@@ -94,15 +94,20 @@ CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 Turning either one on uses the same Provider and semantic-index foundation; it still does not open
 the durable Community gates or advertise a capability until the remaining readiness checks pass.
 
-Whenever any semantic indexing or query process is enabled, three Provider settings with no
-defaults must be supplied explicitly. The source launcher prompts for them because its Worker and
+Whenever any semantic indexing or query process is enabled, one complete Provider setting family
+with no defaults must be supplied explicitly. The source launcher prompts for it because its Worker and
 complete-path Query switches start enabled by default:
 
-| Environment variable | Interactive input | Meaning |
-|---|---|---|
-| `BUZZ_SEMANTIC_API_KEY` | hidden | Provider API Key |
-| `BUZZ_SEMANTIC_BASE_URL` | visible | HTTPS Provider Base URL |
-| `BUZZ_SEMANTIC_REQUEST_MODEL` | visible | Embedding Request Model |
+| Preferred shared variable | Compatibility variable | Interactive input | Meaning |
+|---|---|---|---|
+| `LLM_API_KEY` | `BUZZ_SEMANTIC_API_KEY` | hidden | Provider API Key |
+| `LLM_BASE_URL` | `BUZZ_SEMANTIC_BASE_URL` | visible | HTTPS Provider Base URL |
+| `LLM_MODEL` | `BUZZ_SEMANTIC_REQUEST_MODEL` | visible | Embedding Request Model |
+
+The two families cannot be mixed field by field. If any `BUZZ_SEMANTIC_*` Provider value is set,
+the Relay treats that compatibility family as authoritative and requires it to be complete;
+otherwise it uses the complete `LLM_*` family. This preserves deployed compatibility while letting
+local agents and the semantic Provider share one connection configuration.
 
 In an interactive terminal, the script asks for missing values. In a non-interactive environment,
 it fails immediately and lists the missing variable names. It never guesses a Provider or fills in

@@ -617,7 +617,7 @@ Phase 1并另开兼容迁移。
 | U4 whole-graph Coordinate | 已完成 | 独立模板进入 shared scorer；同 snapshot legacy/shared 精确相等，10k closed physical plan 无性能退化 |
 | U5 bounded complete path | 已完成 | Q0/Qi closed bundle进入root与traversal scorer；同快照/同向量与路径差分通过 |
 | U6 默认切换与 legacy 收口 | 已完成 | 四个operation统一切到compiled migrated profile；旧实现仅保留到profile rollback截止日 |
-| U7 资格与阶段关闭 | 已完成 | deterministic、service-backed、target-scale、全量单元与文档状态关闭；真实Provider外部阻断已记录 |
+| U7 资格与阶段关闭 | 已完成 | deterministic、service-backed、target-scale、全量单元与文档状态关闭；真实Provider follow-up通过 |
 
 ### U0：设计与差分门
 
@@ -767,10 +767,10 @@ exact kernel为381.208ms，hard-cap 10k×9为822.103ms；取消、currentness、
 
 交付复核：历史compatibility manifest与Phase 1 differential manifest保持不变，aggregate gate在四项全
 `Migrated` profile上继续通过。disposable PostgreSQL/pgvector矩阵、10k Coordinate与10k graph exact-kernel
-资格、feature/gate/capability/fleet fail-closed、SDK/CLI/Relay合同和全量单元门均通过。真实Provider所需的
-`BUZZ_SEMANTIC_API_KEY`、`BUZZ_SEMANTIC_BASE_URL`与`BUZZ_SEMANTIC_REQUEST_MODEL`在环境和`.env`中均缺失，
-因此canary按既定规则记为外部阻断；没有读取或挪用`LLM_*`，没有打开任何Community gate或产生Provider
-egress。
+资格、feature/gate/capability/fleet fail-closed、SDK/CLI/Relay合同和全量单元门均通过。U7关闭时真实
+Provider配置缺失，曾按当时规则记录外部阻断。后续明确批准完整`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`
+三元组作为Provider配置回退，并用同一真实Provider完成Coordinate输入与ordered Q0/Qi bundle canary；没有
+打开Community gate，也没有运行索引、候选检索或路径遍历。
 
 上位规范、历史baseline、TODO和本资格记录已同步。`docs/{cn,en}/current-status.md`经复核无需改写：公开
 能力、实验性/受门控/非production-ready状态与Provider数据边界均未改变；本阶段只是内部零行为迁移。第一
@@ -942,7 +942,7 @@ just ci
 ~~~
 
 阶段中可以运行受影响子集；最终关闭必须运行聚合入口、service-backed资格和`just ci`。真实Provider canary
-需要受支持的`BUZZ_SEMANTIC_*`配置；缺失时必须记录为外部阻断，不能挪用`LLM_*`或冒充通过。
+可使用完整`BUZZ_SEMANTIC_*`兼容三元组，或在前者完全未设置时使用完整`LLM_*`三元组；两组不得逐字段混配。
 
 ## 14. Rollout与rollback
 

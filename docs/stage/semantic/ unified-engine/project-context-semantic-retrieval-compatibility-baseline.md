@@ -1,6 +1,6 @@
 # Project Context 语义检索兼容基线记录
 
-> 状态：兼容基线已冻结；真实 Provider canary 未运行；作为历史 v1 oracle 保留
+> 状态：兼容基线已冻结并作为历史v1 oracle保留；后续真实Provider证据见Phase 1资格记录
 >
 > 日期：2026-08-15
 >
@@ -33,9 +33,9 @@ characterization oracle。
 
 明确未完成：
 
-- 本轮没有建立或执行新的三-surface真实 Provider canary runner。预检确认当前进程和 `.env` 均没有
-  `BUZZ_SEMANTIC_API_KEY`、`BUZZ_SEMANTIC_BASE_URL`、`BUZZ_SEMANTIC_REQUEST_MODEL`；现有 `LLM_*`
-  配置不属于受支持的 2048 维 embedding 合同，未被挪用；
+- 本轮没有建立或执行新的三-surface真实Provider canary runner；这是冻结当时的历史资格边界。后续已批准
+  完整`LLM_*`三元组并完成真实Provider encoding canary，证据记录在
+  [Phase 1资格记录](project-context-unified-semantic-computation-qualification.md)，不回写本v1 oracle；
 - 三个 surface 在同一故障注入下的完整 disconnect/cancel 与 Provider/DB work-stop 对照仍是 known
   deviation；
 - 多Pod、长期Provider故障、公平性和production SLO仍不在本阶段关闭。
@@ -290,5 +290,5 @@ just semantic-retrieval-compatibility-baseline
 [资格记录](project-context-unified-semantic-computation-qualification.md)维护当前route、差分、数据库与
 target-scale证据；本记录不回填新profile或重写历史golden。
 
-真实Provider统一canary仍因缺少受支持的`BUZZ_SEMANTIC_*`配置而未运行；跨surface生产容量与完整故障恢复
-仍不属于第一阶段结论。下一阶段应单独设计统一可靠性运行时，不得借更新本基线引入retry或资源治理行为。
+真实Provider encoding follow-up已经通过；它不等于跨surface生产容量、完整故障恢复或production SLO。
+下一阶段应单独设计统一可靠性运行时，不得借更新本基线引入retry或资源治理行为。

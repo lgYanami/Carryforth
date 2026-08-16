@@ -1,6 +1,6 @@
 # Project Context 语义检索兼容基线交付计划
 
-> 状态：已执行并归档；B4 真实 Provider canary 因缺少受支持的语义 Provider 配置而明确未运行
+> 状态：已执行并归档；B4在基线冻结时未运行，后续Provider encoding证据见Phase 1资格记录
 >
 > 日期：2026-08-15
 >

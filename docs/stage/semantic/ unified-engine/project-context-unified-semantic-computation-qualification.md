@@ -1,6 +1,6 @@
 # Project Context 统一语义计算资格记录
 
-> 状态：U0–U7 已通过；第一阶段统一语义计算资格完成；真实Provider canary外部阻断
+> 状态：U0–U7 已通过；第一阶段统一语义计算及真实Provider encoding canary完成
 >
 > 日期：2026-08-16
 >
@@ -18,7 +18,7 @@
 | U4 whole-graph Coordinate | 通过 | Coordinate v1 接入共同 scorer；同 snapshot 精确差分与10k性能门通过 |
 | U5 bounded complete path | 通过 | Q0/Qi closed bundle、root/relation/target scorer与path retention零行为迁移通过 |
 | U6 默认切换与 legacy 收口 | 通过 | 四个operation默认Migrated；新fleet digest拒绝旧profile；rollback源保留到2026-09-16 |
-| U7 最终资格与文档关闭 | 通过（1项外部阻断） | deterministic、service DB、target-scale、全量单元与文档关闭；真实Provider配置缺失 |
+| U7 最终资格与文档关闭 | 通过 | deterministic、service DB、target-scale、全量单元与真实Provider encoding canary通过 |
 
 ## 2. U0 证据
 
@@ -111,7 +111,7 @@ git diff --check
 U1 只完成共同 production types 与 DB generation binder；共同 Provider encoder 与共同 exact scorer 尚未
 切换 production operation。它不代表可靠性 runtime、资源治理或 production SLO 已交付。
 
-真实 Provider canary 仍缺少受支持的 `BUZZ_SEMANTIC_*` 配置，未在 U0–U3 运行；不得挪用 `LLM_*`。
+真实Provider canary在U0–U3交付时尚未运行；后续批准并验证的`LLM_*`配置follow-up见§9.1。
 
 ## 4. U2 共同 Provider encoder
 
@@ -238,8 +238,7 @@ git diff --check
 
 aggregate gate继续通过49个`buzz-semantic-query`测试、31个相关DB测试、73个Relay语义测试及三个surface
 定向回归。Coordinate的40913 wire/capability/gate、Provider单调用、one-shot RR/release、public result和错误
-合同未变；one-hop与完整路径回归未发生policy漂移。真实Provider canary仍因缺少受支持的
-`BUZZ_SEMANTIC_*`配置未运行。
+合同未变；one-hop与完整路径回归未发生policy漂移。该阶段尚未运行真实Provider；后续follow-up见§9.1。
 
 ## 7. U5 bounded complete path
 
@@ -279,8 +278,8 @@ git diff --check
 aggregate gate通过49个`buzz-semantic-query`测试、32个相关DB测试（4 ignored）和74个Relay语义测试；
 service-backed disposable pgvector fixture额外实际执行了完整路径root、relation和target scorer。完整路径现有
 generation/context churn retry、Provider reservation/final confirm、traversal permit、唯一RR snapshot、budget、
-path identity、coverage/packing与`expected_snapshot: None` release语义均未修改。真实Provider canary仍因缺少
-受支持的`BUZZ_SEMANTIC_*`配置未运行。
+path identity、coverage/packing与`expected_snapshot: None` release语义均未修改。该阶段尚未运行真实
+Provider；后续follow-up见§9.1。
 
 ## 8. U6 默认切换与 legacy 收口
 
@@ -320,8 +319,7 @@ cargo check -p buzz-db -p buzz-relay
   98次、0 error；
 - graph exact kernel在10k×4 channel的EXPLAIN为381.208ms，在10k×9 hard-cap为822.103ms；statement
   cancellation无残留session，soak无失败事务；
-- 以上为本地合成测量，未冻结生产SLO。真实Provider canary仍留给U7，并且只接受受支持的
-  `BUZZ_SEMANTIC_*`配置。
+- 以上为本地合成测量，未冻结production SLO。真实Provider encoding canary的后续证据见§9.1。
 
 ## 9. U7 最终资格与阶段关闭
 
@@ -350,10 +348,28 @@ just ci
 - 三个公开surface的Event kind、extension、capability、CLI/SDK、query text、ranking、budget、result、错误与
   release语义未发生未批准变化。
 
-真实Provider canary未运行。资格前只检查配置是否存在，不读取或输出值；当前进程与`.env`都没有
-`BUZZ_SEMANTIC_API_KEY`、`BUZZ_SEMANTIC_BASE_URL`或`BUZZ_SEMANTIC_REQUEST_MODEL`。按照计划，这是一项明确
-外部阻断，不得由`LLM_API_KEY`、`LLM_BASE_URL`或`LLM_MODEL`替代。整个U7没有打开Community semantic gate，
-Provider egress为0。
+U7首次关闭时真实Provider canary未运行，当时记录的外部阻断是准确历史事实。之后产品明确批准使用完整
+`LLM_*`三元组，该阻断已按以下follow-up关闭。
+
+### 9.1 真实Provider encoding follow-up
+
+Relay现在接受两组互斥的完整Provider配置：既有`BUZZ_SEMANTIC_*`兼容三元组优先；只有它完全未设置时，
+才使用`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`。不得从两组逐字段补齐。配置、启动器与source-start合同测试
+均覆盖该precedence和fail-closed规则。
+
+在不输出配置值的前提下，使用本地`.env`中的`LLM_*`三元组运行了忽略型真实Provider canary：
+
+~~~text
+cargo test -p buzz-relay \
+  semantic_provider::tests::real_provider_semantic_input_canary \
+  -- --ignored --exact --nocapture
+~~~
+
+结果为`1 passed`。canary产生两个有界Provider请求：一个Coordinate-search closed input；一个按序Q0/Qi
+bundle，后者同时覆盖one-hop与完整路径使用的graph query encoding合同。两次返回都通过冻结response model、
+2048维、finite/non-zero、顺序、input digest与contract fence验证。测试未记录API key、Base URL、原始input、
+Provider response或向量；没有打开Community gate，也没有运行索引、候选检索、图遍历或结果发布。因此该
+证据关闭的是**真实Provider encoding兼容性**，不是三surface端到端production资格或SLO。
 
 ## 10. 最终结论与后续边界
 

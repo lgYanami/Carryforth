@@ -547,6 +547,51 @@ mod tests {
             .expect("configured provider")
     }
 
+    #[tokio::test]
+    #[ignore = "requires an explicitly configured real embedding Provider"]
+    async fn real_provider_semantic_input_canary() {
+        let config = crate::config::Config::from_env().expect("Relay configuration");
+        let provider = VolcengineSemanticProvider::from_config(&config.semantic_worker)
+            .expect("Provider configuration")
+            .expect("configured Provider");
+        let request = ProjectContextCoordinateSearchQuery {
+            request_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0101),
+            project_id: Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0102),
+            query: "Locate work related to authorization failures".to_owned(),
+            limit: 1,
+        };
+        let input = build_coordinate_search_encoder_input(&request).expect("closed input");
+        let encoded = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.encode_coordinate_search(&input),
+        )
+        .await
+        .expect("Provider canary deadline")
+        .expect("Provider canary response");
+
+        assert_eq!(encoded.request_id(), request.request_id);
+        assert_eq!(
+            encoded.query_contract_digest(),
+            input.query_contract_digest()
+        );
+        assert_eq!(encoded.query_input_digest(), input.text_digest());
+
+        let graph_inputs = query_inputs();
+        let graph_encoded = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.encode_queries(&graph_inputs),
+        )
+        .await
+        .expect("graph Provider canary deadline")
+        .expect("graph Provider canary response");
+        assert_eq!(graph_encoded.len(), graph_inputs.len());
+        for (encoded, input) in graph_encoded.iter().zip(&graph_inputs) {
+            assert_eq!(encoded.request_id(), input.request_id());
+            assert_eq!(encoded.channel_id(), input.channel_id());
+            assert_eq!(encoded.query_input_digest(), input.text_digest());
+        }
+    }
+
     fn document_input() -> SemanticEncoderInput {
         let observation = CanonicalSemanticSourceObservation::new(
             SemanticSourceIdentity {

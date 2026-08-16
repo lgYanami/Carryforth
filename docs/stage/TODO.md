@@ -26,8 +26,8 @@
 > traversal、packing、retry与release语义；同快照root差分和路径差分已通过。U6已把四个operation切换为
 > 同一compiled migrated profile，并通过新fleet runtime digest拒绝旧/新profile混跑。legacy Coordinate SQL与
 > graph adapter只保留到2026-09-16的profile rollback窗口。U7 deterministic、disposable pgvector、
-> target-scale、feature/gate/fleet与全量单元资格已经关闭；真实Provider canary因缺少受支持的
-> `BUZZ_SEMANTIC_*`配置明确记录为外部阻断。第一阶段完成，下一步是单独设计统一可靠性运行时；统一
+> target-scale、feature/gate/fleet与全量单元资格已经关闭。后续已把完整`LLM_*`三元组接入同一Provider
+> 配置边界，并以真实Provider完成Coordinate输入和Q0/Qi bundle canary。第一阶段完成，下一步是单独设计统一可靠性运行时；统一
 > 资源治理仍排在其后。
 
 ### 背景

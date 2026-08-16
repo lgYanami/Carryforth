@@ -6,6 +6,7 @@ FIXTURE_DIR="${REPO_ROOT}/crates/buzz-semantic-query/tests/fixtures"
 MANIFEST="${FIXTURE_DIR}/semantic_retrieval_computation_differential_v1.json"
 MANIFEST_SHA="${FIXTURE_DIR}/semantic_retrieval_computation_differential_v1.sha256"
 PHASE_BASE_COMMIT="ab395ff6f"
+PHASE_PRODUCTION_CLOSE_COMMIT="97c31fa03"
 SCOPE="${1:-all}"
 
 fail() {
@@ -60,12 +61,18 @@ if [[ "$SCOPE" == "manifest-only" ]]; then
   exit 0
 fi
 
-# Phase 1 intentionally changes only the internal semantic-computation owners.
-# Public wire, storage, CLI, UI, index, and canonical graph surfaces remain protected.
-changed_paths="$({
-  git diff --name-only "$PHASE_BASE_COMMIT" --
-  git ls-files --others --exclude-standard
-} | LC_ALL=C sort -u)"
+# Phase 1 intentionally changed only the internal semantic-computation owners.
+# Audit its frozen production range rather than all later work on this branch.
+# Current semantic behavior remains covered above by tracked manifests and
+# executable differential tests.
+git merge-base --is-ancestor "$PHASE_BASE_COMMIT" "$PHASE_PRODUCTION_CLOSE_COMMIT" ||
+  fail "Phase 1 production close is not descended from its base"
+git merge-base --is-ancestor "$PHASE_PRODUCTION_CLOSE_COMMIT" HEAD ||
+  fail "current HEAD does not contain the frozen Phase 1 production close"
+changed_paths="$(
+  git diff --name-only "$PHASE_BASE_COMMIT" "$PHASE_PRODUCTION_CLOSE_COMMIT" -- |
+    LC_ALL=C sort -u
+)"
 unexpected_paths="$(
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue

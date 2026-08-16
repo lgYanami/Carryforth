@@ -419,6 +419,40 @@ fn positive_u64_from_env(name: &str, default: u64) -> Result<u64, ConfigError> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SemanticProviderEnvironment {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    request_model: Option<String>,
+}
+
+fn optional_trimmed_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn semantic_provider_environment_from_env() -> SemanticProviderEnvironment {
+    let compatibility = SemanticProviderEnvironment {
+        api_key: optional_trimmed_env("BUZZ_SEMANTIC_API_KEY"),
+        base_url: optional_trimmed_env("BUZZ_SEMANTIC_BASE_URL"),
+        request_model: optional_trimmed_env("BUZZ_SEMANTIC_REQUEST_MODEL"),
+    };
+    if compatibility.api_key.is_some()
+        || compatibility.base_url.is_some()
+        || compatibility.request_model.is_some()
+    {
+        return compatibility;
+    }
+
+    SemanticProviderEnvironment {
+        api_key: optional_trimmed_env("LLM_API_KEY"),
+        base_url: optional_trimmed_env("LLM_BASE_URL"),
+        request_model: optional_trimmed_env("LLM_MODEL"),
+    }
+}
+
 fn database_pool_config_from_env(
     prefix: &str,
     defaults: DatabasePoolConfig,
@@ -1172,18 +1206,14 @@ impl Config {
             semantic_graph_query_deployment_id.as_deref(),
             semantic_graph_query_instance_id.as_deref(),
         )?;
-        let semantic_api_key = std::env::var("BUZZ_SEMANTIC_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let semantic_base_url = std::env::var("BUZZ_SEMANTIC_BASE_URL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        let semantic_provider_environment = semantic_provider_environment_from_env();
+        let semantic_api_key = semantic_provider_environment.api_key;
+        let semantic_base_url = semantic_provider_environment
+            .base_url
             .map(|value| {
                 let mut parsed = url::Url::parse(&value).map_err(|_| {
                     ConfigError::InvalidValue(
-                        "BUZZ_SEMANTIC_BASE_URL must be an absolute HTTPS URL".to_string(),
+                        "semantic Provider base URL must be an absolute HTTPS URL".to_string(),
                     )
                 })?;
                 if parsed.scheme() != "https"
@@ -1194,7 +1224,7 @@ impl Config {
                     || parsed.fragment().is_some()
                 {
                     return Err(ConfigError::InvalidValue(
-                        "BUZZ_SEMANTIC_BASE_URL must be an HTTPS origin/path without credentials, query, or fragment"
+                        "semantic Provider base URL must be an HTTPS origin/path without credentials, query, or fragment"
                             .to_string(),
                     ));
                 }
@@ -1205,10 +1235,7 @@ impl Config {
                 Ok(parsed)
             })
             .transpose()?;
-        let semantic_request_model = std::env::var("BUZZ_SEMANTIC_REQUEST_MODEL")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let semantic_request_model = semantic_provider_environment.request_model;
         let semantic_request_timeout_secs =
             positive_u64_from_env("BUZZ_SEMANTIC_REQUEST_TIMEOUT_SECS", 30)?;
         if !(1..=120).contains(&semantic_request_timeout_secs) {
@@ -1493,6 +1520,61 @@ mod tests {
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
     // value set by `invalid_bind_addr_returns_error`, causing a flaky failure.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn semantic_provider_accepts_llm_family_without_mixing_compatibility_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = [
+            "BUZZ_SEMANTIC_API_KEY",
+            "BUZZ_SEMANTIC_BASE_URL",
+            "BUZZ_SEMANTIC_REQUEST_MODEL",
+            "LLM_API_KEY",
+            "LLM_BASE_URL",
+            "LLM_MODEL",
+        ];
+        let previous = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for name in names {
+            std::env::remove_var(name);
+        }
+
+        std::env::set_var("LLM_API_KEY", "shared-key");
+        std::env::set_var("LLM_BASE_URL", "https://shared.example/v1/");
+        std::env::set_var("LLM_MODEL", "shared-model");
+        assert_eq!(
+            semantic_provider_environment_from_env(),
+            SemanticProviderEnvironment {
+                api_key: Some("shared-key".to_owned()),
+                base_url: Some("https://shared.example/v1/".to_owned()),
+                request_model: Some("shared-model".to_owned()),
+            }
+        );
+
+        std::env::set_var("BUZZ_SEMANTIC_API_KEY", "compatibility-key");
+        std::env::set_var(
+            "BUZZ_SEMANTIC_BASE_URL",
+            "https://compatibility.example/v1/",
+        );
+        assert_eq!(
+            semantic_provider_environment_from_env(),
+            SemanticProviderEnvironment {
+                api_key: Some("compatibility-key".to_owned()),
+                base_url: Some("https://compatibility.example/v1/".to_owned()),
+                request_model: None,
+            },
+            "a partial compatibility family must fail closed instead of borrowing LLM_MODEL"
+        );
+
+        for (name, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
 
     #[test]
     fn semantic_query_fleet_policy_is_closed_and_defaults_to_single_relay() {
