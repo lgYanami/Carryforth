@@ -102,6 +102,10 @@ normalize_boolean() {
 
 worker_enabled="$(effective_value BUZZ_SEMANTIC_WORKER_ENABLED)"
 query_http_available="$(effective_value BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE)"
+coordinate_search_http_available="$(effective_value \
+  CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE)"
+one_hop_search_http_available="$(effective_value \
+  CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE)"
 semantic_base_url="$(effective_value BUZZ_SEMANTIC_BASE_URL)"
 semantic_request_model="$(effective_value BUZZ_SEMANTIC_REQUEST_MODEL)"
 fleet_policy="$(effective_value BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY)"
@@ -130,9 +134,18 @@ worker_enabled="$(normalize_boolean BUZZ_SEMANTIC_WORKER_ENABLED "${worker_enabl
 query_http_available="$(normalize_boolean \
   BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE \
   "${query_http_available:-true}")"
+coordinate_search_http_available="$(normalize_boolean \
+  CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE \
+  "${coordinate_search_http_available:-true}")"
+one_hop_search_http_available="$(normalize_boolean \
+  CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE \
+  "${one_hop_search_http_available:-true}")"
 fleet_policy="${fleet_policy:-trusted-single-relay}"
 
-if [[ "${worker_enabled}" == true || "${query_http_available}" == true ]]; then
+if [[ "${worker_enabled}" == true ||
+      "${query_http_available}" == true ||
+      "${coordinate_search_http_available}" == true ||
+      "${one_hop_search_http_available}" == true ]]; then
   missing_provider_values=()
   [[ "${semantic_api_key}" =~ [^[:space:]] ]] ||
     missing_provider_values+=("${provider_api_key_name}")
@@ -143,7 +156,7 @@ if [[ "${worker_enabled}" == true || "${query_http_available}" == true ]]; then
 
   if ((${#missing_provider_values[@]} > 0)); then
     if [[ ! -t 0 ]]; then
-      fail "required semantic Provider values are missing: ${missing_provider_values[*]}; rerun in a terminal, set them in ${ENV_FILE}, or explicitly disable both semantic process switches"
+      fail "required semantic Provider values are missing: ${missing_provider_values[*]}; rerun in a terminal, set them in ${ENV_FILE}, or explicitly disable all four semantic process switches"
     fi
     printf 'Semantic Provider configuration is required for local semantic features.\n' >&2
     printf 'Values will be stored only in the Git-ignored %s (mode 0600).\n' \
@@ -165,7 +178,10 @@ if [[ "${worker_enabled}" == true || "${query_http_available}" == true ]]; then
   fi
 fi
 
-if [[ "${query_http_available}" == true && -z "${relay_private_key}" ]]; then
+if [[ ("${query_http_available}" == true ||
+       "${coordinate_search_http_available}" == true ||
+       "${one_hop_search_http_available}" == true) &&
+      -z "${relay_private_key}" ]]; then
   relay_private_key="$(node -e \
     'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
   [[ "${relay_private_key}" =~ ^[0-9a-f]{64}$ ]] || fail "failed to generate local Relay key"
@@ -174,6 +190,8 @@ fi
 
 export CARRYFORTH_LOCAL_WORKER_ENABLED="${worker_enabled}"
 export CARRYFORTH_LOCAL_QUERY_HTTP_AVAILABLE="${query_http_available}"
+export CARRYFORTH_LOCAL_COORDINATE_SEARCH_HTTP_AVAILABLE="${coordinate_search_http_available}"
+export CARRYFORTH_LOCAL_ONE_HOP_SEARCH_HTTP_AVAILABLE="${one_hop_search_http_available}"
 export CARRYFORTH_LOCAL_FLEET_POLICY="${fleet_policy}"
 if [[ "${provider_env_family}" == llm ]]; then
   if [[ -n "${semantic_api_key}" ]]; then
@@ -208,7 +226,9 @@ provider_status="not-required"
 if [[ -n "${semantic_api_key}" ]]; then
   provider_status="configured"
 fi
-printf '[semantic-config] Semantic Worker=%s, query HTTP=%s, Provider credentials=%s\n' \
+printf '[semantic-config] Semantic Worker=%s, graph query=%s, coordinate search=%s, one-hop search=%s, Provider credentials=%s\n' \
   "${worker_enabled}" \
   "${query_http_available}" \
+  "${coordinate_search_http_available}" \
+  "${one_hop_search_http_available}" \
   "${provider_status}"

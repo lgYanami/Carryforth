@@ -577,6 +577,9 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "service": "buzz-relay",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime_secs,
+        "semantic_worker": {
+            "enabled": state.config.semantic_worker.enabled,
+        },
         "semantic_graph_query_http": {
             "runtime_digest": semantic_query_runtime_digest.clone(),
             "parser_ready": true,

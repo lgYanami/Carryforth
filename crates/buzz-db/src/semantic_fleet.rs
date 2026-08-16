@@ -296,7 +296,7 @@ impl Db {
             ));
         }
         let mut tx = self.pool.begin().await?;
-        match enable_semantic_graph_query_in_tx(&mut tx, community_id, requirement).await {
+        match enable_semantic_graph_query_in_tx(&mut tx, community_id, requirement, true).await {
             Ok(()) => {
                 tx.commit().await?;
                 Ok(())
@@ -321,12 +321,51 @@ impl Db {
         )
         .await
     }
+
+    /// Arm the query gate for the exact trusted local-development Community
+    /// before its Owner-signed Project Context catalog exists.
+    ///
+    /// This narrow bootstrap operation defers only the Project Context gate
+    /// prerequisite. It retains the schema, index, active-generation,
+    /// queryable-head, and response-kind fences. Every query authorization SQL
+    /// still requires `project_context_edge_enabled`, so arming an empty local
+    /// Community cannot make a query executable before canonical Context is
+    /// initialized.
+    pub async fn arm_semantic_graph_query_for_local_bootstrap(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<()> {
+        if !self.semantic_graph_query_schema_ready().await? {
+            return Err(DbError::InvalidData(
+                "semantic graph query schema is not ready".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        match enable_semantic_graph_query_in_tx(
+            &mut tx,
+            community_id,
+            SemanticGraphQueryEnableRequirement::TrustedSingleRelay,
+            false,
+        )
+        .await
+        {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
 }
 
 async fn enable_semantic_graph_query_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     requirement: SemanticGraphQueryEnableRequirement<'_>,
+    require_project_context: bool,
 ) -> Result<()> {
     // Keep the global lock order aligned with Provider egress confirmation:
     // Community before generation/source/Fleet state.
@@ -365,7 +404,7 @@ async fn enable_semantic_graph_query_in_tx(
          SET semantic_graph_query_enabled=TRUE \
          WHERE community.id=$1 \
            AND community.semantic_index_enabled \
-           AND community.project_context_edge_enabled \
+           AND (NOT $2 OR community.project_context_edge_enabled) \
            AND EXISTS (SELECT 1 FROM semantic_index_generations generation \
                        WHERE generation.community_id=community.id \
                          AND generation.generation_id=community.semantic_active_generation_id \
@@ -398,6 +437,7 @@ async fn enable_semantic_graph_query_in_tx(
                        AND vector_norm(embedding.embedding)>0))",
     )
     .bind(community_id.as_uuid())
+    .bind(require_project_context)
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -1190,6 +1230,74 @@ mod tests {
             Some(SemanticGraphHttpFleetFailure::Revoked),
         );
         assert_policy_matrix_for_unready_fleet(&db, community_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scripts/test-semantic-migrations.sh disposable pgvector database"]
+    async fn local_bootstrap_arming_defers_only_the_project_context_gate() {
+        let db = semantic_test_db().await;
+        let community_id = CommunityId::from_uuid(Uuid::new_v4());
+        sqlx::query("INSERT INTO communities(id,host) VALUES ($1,$2)")
+            .bind(community_id.as_uuid())
+            .bind(format!(
+                "semantic-local-bootstrap-{}.invalid",
+                community_id.as_uuid()
+            ))
+            .execute(db.writer())
+            .await
+            .expect("local bootstrap Community");
+
+        let encoder = DeterministicFakeEncoder::new(8).expect("fake encoder");
+        let generation_id = Uuid::new_v4();
+        db.create_semantic_generation(CreateSemanticGeneration {
+            community_id,
+            generation_id,
+            extractor_version: OVERVIEW_EXTRACTOR_VERSION,
+            model_contract: encoder.contract(),
+            created_by: "semantic-local-bootstrap-test",
+        })
+        .await
+        .expect("local bootstrap generation");
+        sqlx::query(
+            "UPDATE semantic_index_generations \
+             SET lifecycle='active',ready_at=clock_timestamp(),activated_at=clock_timestamp() \
+             WHERE community_id=$1 AND generation_id=$2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(generation_id)
+        .execute(db.writer())
+        .await
+        .expect("activate local bootstrap generation");
+        sqlx::query(
+            "UPDATE communities \
+             SET semantic_index_enabled=TRUE,semantic_active_generation_id=$2 \
+             WHERE id=$1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(generation_id)
+        .execute(db.writer())
+        .await
+        .expect("publish local bootstrap generation");
+
+        db.enable_semantic_graph_query(
+            community_id,
+            SemanticGraphQueryEnableRequirement::TrustedSingleRelay,
+        )
+        .await
+        .expect_err("normal enable retains the Project Context prerequisite");
+        db.arm_semantic_graph_query_for_local_bootstrap(community_id)
+            .await
+            .expect("local bootstrap may defer only Project Context initialization");
+
+        let readiness = db
+            .semantic_graph_query_readiness(community_id)
+            .await
+            .expect("local bootstrap readiness");
+        assert!(readiness.index_enabled);
+        assert!(readiness.query_enabled);
+        assert!(readiness.active_generation_ready);
+        assert!(!readiness.project_context_enabled);
+        assert!(!readiness.database_ready());
     }
 
     #[tokio::test]

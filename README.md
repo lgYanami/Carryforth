@@ -154,8 +154,9 @@ only real undirected Hyperedges, and retrieval never creates or rewrites Project
 The semantic parts are not fully local. Indexing may send source type, current visible title/name,
 and an optional summary to the user-configured Provider; the current foundation does not send
 Document bodies or chunks. Natural-language start and one-hop searches send their query text to the
-same Provider. Source startup can prepare the semantic processes and Provider configuration, but an
-operator must separately enable the durable Community gates and acknowledge this Provider egress.
+same Provider. The supported local `start.sh` path treats startup as authorization for that Provider
+egress and idempotently prepares the exact loopback Community's semantic gates and active
+generation. Raw Relay and production startup retain their fail-closed defaults.
 
 See [Core design: Agent-directed context-aware Project Context retrieval](docs/en/core-design/context-aware-semantic-graph-retrieval.md).
 
@@ -176,9 +177,11 @@ The Relay is the current canonical state boundary. The system validates and pres
 but it does not automatically understand the whole project or promote every chat, draft, or
 model inference into project fact.
 
-**Implemented does not mean enabled by default in a new environment.** Project View, Documents,
-Project Context, Meetings, Git Projects, and semantic retrieval surfaces still have preview switches,
-Relay readiness checks, durable Community gates, or Owner-signed initialization requirements.
+**Implemented does not always mean enabled by default in a new environment.** Project View,
+Documents, Project Context, Meetings, and Git Projects still have preview switches, Relay readiness
+checks, durable Community gates, or Owner-signed initialization requirements. The supported local
+source launcher now prepares semantic state by default, while its canonical Project Context and
+coverage readiness requirements remain unchanged.
 See [Current status](docs/en/current-status.md) for exact capability and activation boundaries.
 
 ## Build from source
@@ -194,11 +197,13 @@ cd Carryforth
 
 The script only checks external system dependencies. It does not install Docker, Python, `curl`, or
 operating-system packages. On first run, it creates a private local `.env`. Source startup defaults
-the semantic Worker and Query HTTP process switches to enabled, so it prompts for a Provider API
-Key, HTTPS Base URL, and Request Model when they are missing—none has a default. You can explicitly
-disable both default-on switches before startup; the Agent start-discovery and one-hop semantic
-process masters remain default-off. Process startup does not enable either Community semantic gate
-or acknowledge Provider egress. Existing Docker volumes and project data are preserved.
+the semantic Worker, complete-path Query, Coordinate discovery, and one-hop search process switches
+to enabled, so it prompts for a Provider API Key, HTTPS Base URL, and Request Model when they are
+missing—none has a default. It then idempotently prepares the exact local Community's index/query
+gates and active generation. It does not initialize or sign Project View or Project Context on the
+Human Owner's behalf; until that canonical state exists, retrieval remains armed but unavailable.
+You can explicitly disable all four switches before startup. Existing Docker volumes and project
+data are preserved.
 
 > [!WARNING]
 > This is a trusted-machine development stack. The checked-in `.env.example` binds the Relay to

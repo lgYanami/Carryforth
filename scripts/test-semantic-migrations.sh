@@ -133,6 +133,52 @@ PGSCHEMA_PLAN_USER="$TEST_USER" \
 PGSCHEMA_PLAN_PASSWORD="$TEST_PASSWORD" \
   ./bin/pgschema apply --file schema/schema.sql --auto-approve >/dev/null
 
+# Exercise the supported source-start semantic lifecycle on a genuinely empty
+# Community. No Provider request occurs because the fresh canonical catalogs
+# contain no eligible sources. Repeating both phases must reuse one generation.
+docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
+  -U "$TEST_USER" -d "$FRESH_DATABASE" \
+  -c "INSERT INTO communities(host) VALUES ('localhost:3000')" >/dev/null
+fresh_database_url="postgres://${TEST_USER}:${TEST_PASSWORD}@127.0.0.1:${TEST_PORT}/${FRESH_DATABASE}"
+local_bootstrap_environment=(
+  DATABASE_URL="${fresh_database_url}"
+  RELAY_URL=ws://localhost:3000
+  BUZZ_BIND_ADDR=127.0.0.1:3000
+  BUZZ_SEMANTIC_WORKER_ENABLED=true
+  BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
+  CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true
+  CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true
+  BUZZ_SEMANTIC_GRAPH_QUERY_FLEET_POLICY=trusted-single-relay
+  BUZZ_SEMANTIC_API_KEY=synthetic-local-bootstrap-key
+  BUZZ_SEMANTIC_BASE_URL=https://provider.invalid/v1/
+  BUZZ_SEMANTIC_REQUEST_MODEL=synthetic-local-bootstrap-model
+  BUZZ_RELAY_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001
+)
+for _attempt in 1 2; do
+  env "${local_bootstrap_environment[@]}" \
+    cargo run -p buzz-admin -- semantic local-bootstrap \
+      --phase prepare --acknowledge-local-provider-egress >/dev/null
+  env "${local_bootstrap_environment[@]}" \
+    cargo run -p buzz-admin -- semantic local-bootstrap \
+      --phase finalize --acknowledge-local-provider-egress --wait-seconds 5 >/dev/null
+done
+
+docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
+  -U "$TEST_USER" -d "$FRESH_DATABASE" -qtA \
+  -c "SELECT CASE WHEN
+        (SELECT count(*) FROM semantic_index_generations) = 1
+        AND (SELECT count(*) FROM semantic_index_generations
+             WHERE lifecycle='active' AND rebuild_completed_at IS NOT NULL) = 1
+        AND (SELECT count(*) FROM communities
+             WHERE host='localhost:3000'
+               AND semantic_index_enabled
+               AND semantic_graph_query_enabled
+               AND NOT project_view_enabled
+               AND NOT project_context_edge_enabled
+               AND signing_key IS NULL
+               AND semantic_active_generation_id IS NOT NULL) = 1
+      THEN 'ok' ELSE 'bad' END" | grep -qx ok
+
 docker exec "$TEST_CONTAINER" psql -v ON_ERROR_STOP=1 \
   -U "$TEST_USER" -d "$FRESH_DATABASE" -qtA \
   -c "SELECT CASE WHEN

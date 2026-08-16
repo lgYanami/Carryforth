@@ -74,26 +74,20 @@ ws://localhost:3000
 
 ## 4. 语义 Provider 配置
 
-本地源码启动默认打开以下两个**进程开关**：
+受支持的 `./start.sh` 与 `just dev` 默认打开全部四个语义**进程开关**：
 
 ```dotenv
 BUZZ_SEMANTIC_WORKER_ENABLED=true
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true
 ```
 
-Agent 自主的起点发现和一跳语义选择使用两个独立 process master。除非 operator 明确加入本地私有
-`.env`，它们保持关闭：
-
-```dotenv
-CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
-CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
-```
-
-开启其中任一个会复用同一 Provider 与语义索引基础，但不会自动打开 Community durable gate；只有
-其余 readiness 校验也通过后，Relay 才会广告对应 capability。
+它们分别承载后台索引、完整路径型查询、自然语言 Coordinate 发现，以及两个方向的一跳检索。
+Relay 只有在 canonical 数据和 coverage 等全部 readiness 校验通过后，才会广告并执行对应能力。
 
 任一语义索引或查询进程启用时，都必须明确提供一组完整、没有默认值的 Provider 配置。
-由于源码启动器默认开启 Worker 和完整路径 Query 开关，它会在缺失时询问这些值：
+由于源码启动器默认开启全部四个语义进程，它会在缺失时询问这些值：
 
 | 首选共享变量 | 兼容专用变量 | 交互方式 | 含义 |
 |---|---|---|---|
@@ -119,19 +113,35 @@ CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
 CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 ```
 
-### 4.1 进程开关不等于 Community 授权
+### 4.1 受支持的本地语义 bootstrap
 
-启动 Worker 与 Query HTTP handler 只表示本机进程具备承载能力。它不会自动完成：
+运行 `./start.sh`（或 `just dev`）即表示本地 operator 授权已配置的 Provider 接收当前批准的语义
+输入：problem/query 文本，以及来源类型、当前可见标题/名称和可选摘要。当前 foundation 不发送
+Document 正文或 chunk。
 
-- Project View / Project Context 初始化；
-- Community 的持久语义索引 gate；
-- generation 创建、构建、验证和激活；
-- Community 的持久语义检索 / 查询 gate；
-- 将 problem 与 overview 文本（来源类型、当前可见标题/名称和可选摘要；当前 foundation 不含
-  Document 正文/chunk）发往外部 Provider 的出境确认。
+启动过程只针对 loopback `RELAY_URL` 精确解析出的那个 Community：
 
-这些步骤必须由 operator 和 Community owner 按当前运维合同显式完成。
-详见[语义 pgvector 运维](../semantic-pgvector-operations.md)。
+1. 复用兼容的 active generation；没有时才创建；
+2. 开启持久 semantic-index gate，并执行可恢复的 canonical scan；
+3. 启动 Relay Worker，等待 generation 达到精确 coverage；
+4. 激活 generation，并预先开启持久 query gate；
+5. 从 live Relay 验证 Worker 与三个 HTTP surface 确实已开启。
+
+bootstrap 命令会拒绝非 loopback 的 Relay、bind 或数据库坐标，也会拒绝 multi-Relay fleet policy；
+这些环境必须使用正常 operator 流程。
+重复启动是幂等的，不会扫描或修改其他 Community。直接运行原始 Relay 或生产启动仍保持 capability-off；
+这些环境应继续遵循[语义 pgvector 运维](../semantic-pgvector-operations.md)中的正式部署合同。
+Worker drain 默认等待 600 秒，可在 `.env` 中用
+`BUZZ_LOCAL_SEMANTIC_BOOTSTRAP_TIMEOUT_SECONDS` 调整为 1–3600 秒；超时会让启动失败，而不是把尚未
+完整初始化的语义栈报告为 ready。
+
+启动过程**不会**代替 Human Owner 创建、决定或签署 Project View / Project Context。若 canonical
+状态尚未初始化，query gate 只处于预开启状态；现有授权 SQL 仍会拒绝检索，Relay 也不会广告能力。
+Owner 完成初始化后，已经运行的 Worker 会索引 eligible 状态，并在 coverage 完整时通过正常
+readiness fence 开放能力。
+
+将四个开关全部显式设为 `false` 会退出并跳过本地语义 bootstrap。部分开启属于高级/手工模式：
+指定进程仍会启动，但不会自动执行完整能力的 Community bootstrap。
 
 ## 5. `just start`、`just dev` 与 `./start.sh`
 

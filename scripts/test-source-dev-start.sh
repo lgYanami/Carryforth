@@ -15,6 +15,8 @@ trap cleanup EXIT
 unset_semantic_env=(
   -u BUZZ_SEMANTIC_WORKER_ENABLED
   -u BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE
+  -u CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE
+  -u CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE
   -u BUZZ_SEMANTIC_API_KEY
   -u BUZZ_SEMANTIC_BASE_URL
   -u BUZZ_SEMANTIC_REQUEST_MODEL
@@ -53,6 +55,8 @@ source "${missing_env}"
 [[ "${BUZZ_BIND_ADDR}" == "127.0.0.1:3000" ]]
 [[ "${BUZZ_SEMANTIC_WORKER_ENABLED}" == "true" ]]
 [[ "${BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE}" == "true" ]]
+[[ "${CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE}" == "true" ]]
+[[ "${CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE}" == "true" ]]
 [[ "${BUZZ_SEMANTIC_API_KEY}" == "synthetic-provider-key" ]]
 [[ "${BUZZ_SEMANTIC_BASE_URL}" == "https://provider.invalid/v1/" ]]
 [[ "${BUZZ_SEMANTIC_REQUEST_MODEL}" == "synthetic-embedding-model" ]]
@@ -131,6 +135,7 @@ semantic_config = text.index('"${SCRIPT_DIR}/configure-local-semantic.sh"')
 compose_start = text.index("docker compose up -d")
 managed_launch = text.index("nohup python3")
 assert curl_preflight < semantic_config < compose_start < managed_launch
+assert 'semantic_runtime_matches_configuration "${health_port}"' in text
 PY
 
 disabled_env="${TEMP_ROOT}/disabled.env"
@@ -139,6 +144,10 @@ node "${SCRIPT_DIR}/update-local-env.mjs" \
   --source-template "${REPO_ROOT}/.env.example"
 printf '\nBUZZ_SEMANTIC_WORKER_ENABLED=false\n' >>"${disabled_env}"
 printf 'BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=false\n' >>"${disabled_env}"
+printf 'CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false\n' \
+  >>"${disabled_env}"
+printf 'CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false\n' \
+  >>"${disabled_env}"
 env "${unset_semantic_env[@]}" \
   "${SCRIPT_DIR}/configure-local-semantic.sh" --env-file "${disabled_env}" \
   </dev/null >/dev/null
@@ -146,6 +155,8 @@ env "${unset_semantic_env[@]}" \
 source "${disabled_env}"
 [[ "${BUZZ_SEMANTIC_WORKER_ENABLED}" == "false" ]]
 [[ "${BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE}" == "false" ]]
+[[ "${CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE}" == "false" ]]
+[[ "${CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE}" == "false" ]]
 ! rg --quiet '^BUZZ_SEMANTIC_API_KEY=' "${disabled_env}"
 ! rg --quiet '^BUZZ_RELAY_PRIVATE_KEY=' "${disabled_env}"
 
@@ -156,11 +167,15 @@ BUZZ_SEMANTIC_API_KEY="${special_key}" \
   BUZZ_SEMANTIC_REQUEST_MODEL=synthetic-special-model \
   BUZZ_SEMANTIC_WORKER_ENABLED=true \
   BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true \
+  CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true \
+  CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true \
   "${SCRIPT_DIR}/configure-local-semantic.sh" --env-file "${special_env}" \
   </dev/null >"${TEMP_ROOT}/special.log" 2>&1
 ! rg --fixed-strings --quiet "${special_key}" "${TEMP_ROOT}/special.log"
 unset BUZZ_SEMANTIC_API_KEY BUZZ_SEMANTIC_WORKER_ENABLED
 unset BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE BUZZ_RELAY_PRIVATE_KEY
+unset CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE
+unset CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE
 # shellcheck disable=SC1090
 source "${special_env}"
 [[ "${BUZZ_SEMANTIC_API_KEY}" == "${special_key}" ]]
@@ -172,6 +187,8 @@ BUZZ_SEMANTIC_API_KEY=synthetic-xtrace-secret \
   BUZZ_SEMANTIC_REQUEST_MODEL=synthetic-xtrace-model \
   BUZZ_SEMANTIC_WORKER_ENABLED=true \
   BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true \
+  CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true \
+  CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true \
   bash -x "${SCRIPT_DIR}/configure-local-semantic.sh" --env-file "${xtrace_env}" \
   </dev/null >"${xtrace_log}" 2>&1
 ! rg --fixed-strings --quiet 'synthetic-xtrace-secret' "${xtrace_log}"
@@ -230,12 +247,25 @@ rg --quiet '^"\$\{SCRIPT_DIR\}/configure-local-semantic\.sh"$' \
   "${REPO_ROOT}/scripts/dev-rebuild-start.sh"
 rg --quiet '^_configure-local-semantic: bootstrap$' "${REPO_ROOT}/Justfile"
 rg --quiet '^\s*\./scripts/configure-local-semantic\.sh$' "${REPO_ROOT}/Justfile"
+rg --quiet '^_bootstrap-local-semantic: _configure-local-semantic _ensure-migrations$' \
+  "${REPO_ROOT}/Justfile"
+rg --quiet '^dev \*ARGS: _ensure-sidecar-stubs _bootstrap-local-semantic$' \
+  "${REPO_ROOT}/Justfile"
+rg --quiet '^\s*\./scripts/bootstrap-local-semantic\.sh finalize$' \
+  "${REPO_ROOT}/Justfile"
+rg --quiet --fixed-strings \
+  'CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE' \
+  "${REPO_ROOT}/scripts/bootstrap-local-semantic.sh"
+rg --quiet --fixed-strings \
+  'CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE' \
+  "${REPO_ROOT}/scripts/bootstrap-local-semantic.sh"
 grep -Fqx '.env' "${REPO_ROOT}/.gitignore"
 ! rg --ignore-case --quiet \
   '(apt(-get)?|brew|dnf|yum|pacman|snap)[[:space:]]+.*install' \
   "${REPO_ROOT}/start.sh" \
   "${REPO_ROOT}/scripts/dev-start.sh" \
-  "${REPO_ROOT}/scripts/configure-local-semantic.sh"
+  "${REPO_ROOT}/scripts/configure-local-semantic.sh" \
+  "${REPO_ROOT}/scripts/bootstrap-local-semantic.sh"
 ! rg --quiet 'ark\.cn-beijing|doubao-embedding-vision' \
   "${REPO_ROOT}/scripts/configure-local-semantic.sh" \
   "${REPO_ROOT}/.env.example" \

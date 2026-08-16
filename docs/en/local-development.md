@@ -76,27 +76,23 @@ ws://localhost:3000
 
 ## 4. Semantic Provider configuration
 
-Local source startup enables these two **process switches** by default:
+The supported `./start.sh` and `just dev` paths enable all four semantic
+**process switches** by default:
 
 ```dotenv
 BUZZ_SEMANTIC_WORKER_ENABLED=true
 BUZZ_SEMANTIC_GRAPH_QUERY_HTTP_AVAILABLE=true
+CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=true
+CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=true
 ```
 
-Agent-directed start discovery and one-hop semantic selection have independent process masters.
-They remain off unless an operator explicitly adds them to the private `.env`:
-
-```dotenv
-CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
-CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
-```
-
-Turning either one on uses the same Provider and semantic-index foundation; it still does not open
-the durable Community gates or advertise a capability until the remaining readiness checks pass.
+These switches host the background indexer, bounded complete-path query, natural-language
+Coordinate discovery, and both one-hop directions. Relay capability advertisement and execution
+still require every canonical-data and coverage readiness check to pass.
 
 Whenever any semantic indexing or query process is enabled, one complete Provider setting family
-with no defaults must be supplied explicitly. The source launcher prompts for it because its Worker and
-complete-path Query switches start enabled by default:
+with no defaults must be supplied explicitly. The source launcher prompts for it because all four
+semantic processes start enabled by default:
 
 | Preferred shared variable | Compatibility variable | Interactive input | Meaning |
 |---|---|---|---|
@@ -125,21 +121,39 @@ CARRYFORTH_PROJECT_CONTEXT_COORDINATE_SEARCH_HTTP_AVAILABLE=false
 CARRYFORTH_PROJECT_CONTEXT_ONE_HOP_SEMANTIC_SEARCH_HTTP_AVAILABLE=false
 ```
 
-### 4.1 Process switches are not Community authorization
+### 4.1 Supported local semantic bootstrap
 
-Starting the Worker and Query HTTP handler only means that the local processes can host those
-capabilities. It does not automatically perform:
+Running `./start.sh` (or `just dev`) is the local operator's authorization for the configured
+Provider to receive the currently approved semantic inputs: problem/query text plus source type,
+current visible title/name, and optional summary. The current foundation does not send Document
+bodies or chunks.
 
-- Project View / Project Context initialization;
-- the durable Community semantic-index gate;
-- generation creation, build, verification, or activation;
-- the durable Community semantic retrieval/query gate;
-- acknowledgement that the problem and overview text (source type, current visible title/name, and
-  optional summary; not Document bodies/chunks in the current foundation) leave the local system
-  for the external Provider.
+For only the Community resolved from the loopback `RELAY_URL`, startup then:
 
-An operator and Community owner must perform those steps explicitly under the current operations
-contract. See [Semantic pgvector operations](../semantic-pgvector-operations.md).
+1. reuses a compatible active generation, or creates one when none exists;
+2. enables the durable semantic-index gate and performs a resumable canonical scan;
+3. starts the Relay worker and waits for exact generation coverage;
+4. activates the generation and arms the durable query gate;
+5. verifies the live Relay reports the Worker and all three HTTP surfaces enabled.
+
+The bootstrap command refuses non-loopback Relay, bind, or database coordinates and refuses a
+multi-Relay fleet policy; those environments must use the normal operator workflow.
+The operation is idempotent across restarts. It never sweeps other Communities. Raw Relay and
+production startup remain capability-off unless an operator follows the normal deployment
+contract in [Semantic pgvector operations](../semantic-pgvector-operations.md).
+The worker-drain deadline defaults to 600 seconds and can be adjusted in `.env` with
+`BUZZ_LOCAL_SEMANTIC_BOOTSTRAP_TIMEOUT_SECONDS` (1–3600); timeout fails startup instead of claiming
+a partially initialized semantic stack is ready.
+
+Startup does **not** create, decide, or sign Project View / Project Context state for the Human
+Owner. When that canonical state is absent, the query gate is armed but existing authorization SQL
+continues to reject retrieval and Relay capability advertisement remains off. After the Owner
+initializes it, the already-running Worker indexes eligible state and the normal readiness fences
+open the capabilities when coverage is complete.
+
+Setting all four switches to `false` explicitly opts out and skips local semantic bootstrap. A
+partial switch configuration is treated as an advanced/manual mode: the requested processes start,
+but automatic full-capability Community bootstrap is skipped.
 
 ## 5. `just start`, `just dev`, and `./start.sh`
 
