@@ -94,7 +94,9 @@ pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
 
-pub use error::{DbError, Result};
+pub use error::{
+    DbError, Result, SemanticDbEffectPhase, SemanticDbFailureKind, SemanticDbSqlstateClass,
+};
 pub use event::{EventQuery, ReactionEventInsertOutcome};
 
 use chrono::{DateTime, Utc};

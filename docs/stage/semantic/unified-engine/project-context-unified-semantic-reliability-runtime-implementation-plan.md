@@ -1,6 +1,6 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0 已交付；R1–R6 待实施
+> 状态：R0、R1 已交付；R2–R6 待实施
 >
 > 日期：2026-08-16
 >
@@ -799,6 +799,29 @@ snapshot attempt count
 退出门：文档、manifest和当前代码事实一致；不修改生产行为。
 
 ### R1：typed failure与执行上下文
+
+> 当前状态：已交付（2026-08-16）。`crates/buzz-relay/src/semantic_query_runtime.rs`
+> 落地 §4 typed execution-context layer（15 unit tests）：
+> `SemanticCancellation`/`Handle` first-wins聚合、`SemanticLifecycleLatch`
+> 单CAS仲裁（Finalizing先赢则post-check丢弃）、`SemanticDeadlineWindows`
+> （`provider_start_before ≤ work ≤ snapshot_close ≤ absolute`，含R2零策略
+> one-shot全等窗口构造）、`SemanticAttemptLedger`（one-shot物理2 /
+> complete-path物理3、transport retry token跨operation restart共享、
+> operation attempts 2、release confirmation 2）、
+> `ProviderHandoffCertainty`+`ProviderAttemptFailure`（当前
+> `ProviderTransport`保守映射为OutcomeUnknown）、`SemanticReliabilityFailure`
+> 全变体与closed retry disposition矩阵、content-free
+> `failure_class`标签、`SemanticExecutionContext`聚合。
+> `crates/buzz-db/src/error.rs` 落地 `SemanticDbEffectPhase`、
+> `SemanticDbSqlstateClass`（冻结SQLSTATE allowlist）、
+> `SemanticDbFailureKind` 与 `DbError::semantic_failure_kind`（3 unit
+> tests），经 `buzz_db` 根re-export。
+> 对计划的一处偏离：交付项1的fake clock未引入——deadline windows以
+> `Instant` 为合同、测试用确定性显式Instant构造，无任何sleep；clock
+> 抽象推迟到R2执行器真实需要注入时再设计。
+> 零行为验证：模块未接线（`#![allow(dead_code)]`，R2起逐operation接入），
+> 本工作树三个gate（compatibility、computation、reliability `all`，含
+> freeze-diff）+ `cargo clippy -D warnings` + `cargo fmt` 全部实际运行通过。
 
 目标：建立可靠性判断所需类型，不启用retry。
 

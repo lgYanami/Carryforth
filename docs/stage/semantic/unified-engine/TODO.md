@@ -1,7 +1,7 @@
 # Project Context 统一语义检索引擎 TODO
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时实现
-> 计划已定稿并交付R0，R1–R6待实施
+> 计划已定稿并交付R0、R1，R2–R6待实施
 >
 > 日期：2026-08-16
 
@@ -51,6 +51,7 @@ target-only query。至少记录Recall@1/3/8、MRR、平均候选观察数、跨
 
 这项相关性工作与统一可靠性运行时分开验收。第二阶段可靠性运行时已按
 [统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)
-恢复实施：R0 characterization收口已交付，R1起为typed failure与执行上下文。相关性验收结果只影响
+恢复实施：R0 characterization收口与R1 typed failure/执行上下文类型层（零行为、未接线）已交付，
+R2起把四operation逐个接入共享Provider可靠性执行器。相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

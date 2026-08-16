@@ -48,6 +48,8 @@ mod semantic_one_hop_search;
 mod semantic_one_shot;
 /// Approved shared semantic Provider adapters.
 pub mod semantic_provider;
+/// Shared interactive reliability primitives for semantic query operations.
+mod semantic_query_runtime;
 /// Derived Project Context semantic worker.
 pub mod semantic_runtime;
 /// Shared application state.

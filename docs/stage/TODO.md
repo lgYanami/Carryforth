@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0 已交付，R1–R6 待实施
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0 与 R1 已交付，R2–R6 待实施
 >
 > 更新日期：2026-08-16
 >
@@ -35,7 +35,10 @@
 > 生命周期、release参数、deadline形状、现有retry，完整路径每hop零Provider调用，one-shot permit丢弃冻结为
 > known gap）、`just semantic-retrieval-reliability` gate与Phase 2 protected-surface allowlist已交付；目录
 > 迁移后的检查脚本与文档死链已同步修复，三个gate实际运行通过。上位规范已明确共同层只接收operation
-> deadline窗口、bounded queue承诺移至第三阶段。下一步实施R1 typed failure与执行上下文；统一
+> deadline窗口、bounded queue承诺移至第三阶段。R1 typed failure与执行上下文已零行为交付：
+> `semantic_query_runtime.rs` execution-context类型层（cancellation/latch/deadline windows/attempt
+> ledger/Provider handoff/failure taxonomy与closed retry disposition）与 `buzz-db` SQLSTATE分类
+> 均未接线，R2起逐operation接入共享执行器。下一步实施R2共享Provider可靠性执行器零策略迁移；统一
 > 资源治理仍排在其后。
 
 ### 背景
