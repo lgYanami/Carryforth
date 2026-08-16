@@ -7,9 +7,9 @@ MANIFEST="${FIXTURE_DIR}/semantic_retrieval_reliability_characterization_v1.json
 MANIFEST_SHA="${FIXTURE_DIR}/semantic_retrieval_reliability_characterization_v1.sha256"
 SCOPE="${1:-all}"
 
-# R0 closes with the working tree; every later reliability change is audited
-# from the committed R0 anchor. Pin this to the R0 commit hash once it exists.
-FREEZE_BASE="${SEMANTIC_RELIABILITY_FREEZE_BASE:-HEAD}"
+# R0 anchor. Every later reliability change is audited from this commit;
+# override only for explicit qualification reruns against a different base.
+FREEZE_BASE="${SEMANTIC_RELIABILITY_FREEZE_BASE:-db6c8c1d5}"
 
 fail() {
   printf 'semantic retrieval reliability gate failed: %s\n' "$*" >&2
