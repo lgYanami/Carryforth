@@ -18,6 +18,7 @@ use buzz_semantic_query::{
 use nostr::Event;
 
 use crate::semantic_one_shot::{SemanticOneShotError, SemanticOneShotExecution};
+use crate::semantic_query_runtime::SemanticEncodeOnceFailure;
 use crate::state::AppState;
 
 /// Closed, content-free failures for the Coordinate-search HTTP surface.
@@ -129,15 +130,22 @@ async fn execute_coordinate_search(
 
     metrics::histogram!("carryforth_coordinate_search_provider_input_bytes")
         .record(encoder_input.text().len() as f64);
-    let encoded = execution
-        .before_deadline(
+    let encoded = match execution
+        .encode_once(
             execution
                 .provider()
                 .encode_coordinate_search(&encoder_input),
         )
         .await
-        .map_err(map_one_shot)?
-        .map_err(CoordinateSearchExecutionError::Provider)?;
+    {
+        Ok(encoded) => encoded,
+        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+            return Err(CoordinateSearchExecutionError::Timeout);
+        }
+        Err(SemanticEncodeOnceFailure::Provider(error)) => {
+            return Err(CoordinateSearchExecutionError::Provider(error));
+        }
+    };
     if encoded.request_id() != query.request_id {
         return Err(CoordinateSearchExecutionError::Conflict);
     }

@@ -1,6 +1,6 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0、R1 已交付；R2–R6 待实施
+> 状态：R0、R1、R2 已交付；R3–R6 待实施
 >
 > 日期：2026-08-16
 >
@@ -837,6 +837,43 @@ snapshot attempt count
 退出门：三个surface的Provider bytes、attempt数、RR数、result/error逐项与baseline一致。
 
 ### R2：共享Provider可靠性执行器，零策略迁移
+
+> 当前状态：已交付（2026-08-16）。`crates/buzz-relay/src/semantic_query_runtime.rs`
+> 在R1类型层上新增共享Provider执行器：`SemanticProviderEgressFailure`
+> （neutral admission判别，executor不选择公开错误）、
+> `ProviderEgressObservation`（Silent/CompletePathQuery观测钩子——
+> metrics是观测不是策略）、`ProviderEgressPlan`、`execute_provider_egress`
+> （latest_start_at → DB reservation → reserved-generation不变量 →
+> deadline-aware wait → routing trust → final no-wait confirmation →
+> permit不变量，全部步骤包在work window内）、`encode_once`（唯一认可的
+> Provider handoff形状：单次物理调用+deadline wrap，无内部retry/fallback）。
+> 四operation全部接线：one-shot envelope
+> `SemanticOneShotExecution::prepare` 换用执行器（`expected_contexts=[]`、
+> Silent观测），新增 `SemanticOneShotExecution::encode_once`，coordinate与
+> one-hop两variant的encode调用切至该primitive；complete-path在
+> `begin_semantic_graph_root_query_inner` 创建per-request context
+> （CompletePath类，work/work/snapshot_close/absolute窗口来自
+> `QueryDeadlines`），`root_query_attempt` 每次进入执行
+> `begin_operation_attempt`（churn loop 2次=cap）、经执行器
+> （CompletePathQuery观测：Busy/Deadline failure metrics、provider-wait
+> stage）后用 `encode_once`；`ProviderUnavailable` 保留原有
+> `classify_ticket_failure` ticket重读。R1类型激活：deadline windows、
+> attempt ledger（operation/provider/release三计数，零策略下均不触顶）与
+> execution context进入四operation生产路径；cancellation/latch/handoff
+> 分类仍留给R3/R4。路由pin：provider每次逻辑请求只在envelope/inner解析
+> 一次，执行器不解析provider、无fallback。公开错误零差异由neutral→冻结
+> 错误的映射表保证，golden测试pin（one-shot与complete-path各一张映射表、
+> contract reason逐字、encode_once单次调用、content-free标签）。已知内部
+> 边界差异（公开不可见）：complete-path原在latest_start_at前用zero-filter
+> `remaining_work()` 拒绝零剩余，现统一为one-shot规则（零剩余放行、由下一
+> bounded wrap立即超时），公开错误同为QueryDeadlineExceeded，该方法删除；
+> one-shot envelope新获得reserved-generation防御不变量（按DB合同不可达，
+> 映射VerificationFailed）；ledger耗尽映射Busy/QueryProviderBusy（零策略下
+> 不可达）。零行为验证：三个gate（compatibility、computation、
+> reliability `all`，含freeze-diff）+ `cargo clippy -D warnings` +
+> `cargo fmt` + `cargo test -p buzz-relay --lib semantic_`（96 tests）实际
+> 运行通过；`just test-unit` 通过（另有8个media/admin DB依赖测试因本环境
+> 无Postgres以PoolTimedOut失败，属`just test`集成层、与语义无关）。
 
 迁移顺序：
 

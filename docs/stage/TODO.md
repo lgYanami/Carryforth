@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0 与 R1 已交付，R2–R6 待实施
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R2 已交付，R3–R6 待实施
 >
 > 更新日期：2026-08-16
 >
@@ -38,7 +38,11 @@
 > deadline窗口、bounded queue承诺移至第三阶段。R1 typed failure与执行上下文已零行为交付：
 > `semantic_query_runtime.rs` execution-context类型层（cancellation/latch/deadline windows/attempt
 > ledger/Provider handoff/failure taxonomy与closed retry disposition）与 `buzz-db` SQLSTATE分类
-> 均未接线，R2起逐operation接入共享执行器。下一步实施R2共享Provider可靠性执行器零策略迁移；统一
+> 已交付。R2共享Provider可靠性执行器零策略迁移已完成：四operation（whole-graph Coordinate、
+> one-hop两variant、complete-path每个root attempt）接入同一reservation/wait/egress/
+> encode-once primitive，neutral判别经冻结映射表还原各surface公开错误，production行为零差异；
+> deadline windows与attempt ledger进入生产路径，cancellation/latch/retry留给R3/R4，三个gate
+> 实际运行通过。下一步实施R3 deadline、cancellation与release-finalize；统一
 > 资源治理仍排在其后。
 
 ### 背景

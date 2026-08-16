@@ -1,32 +1,50 @@
 //! Shared interactive reliability primitives for semantic query operations.
 //!
-//! Phase 2 R1 delivers only the typed execution-context layer described by
-//! the unified reliability runtime plan §4: operation-provided deadline
-//! windows, aggregated cancellation, the lifecycle latch, request-level
-//! attempt ledgers, the Provider handoff-aware attempt failure, the internal
-//! failure taxonomy, and its closed retry disposition matrix.
+//! Phase 2 R1 delivered the typed execution-context layer described by the
+//! unified reliability runtime plan §4: operation-provided deadline windows,
+//! aggregated cancellation, the lifecycle latch, request-level attempt
+//! ledgers, the Provider handoff-aware attempt failure, the internal failure
+//! taxonomy, and its closed retry disposition matrix.
 //!
-//! Nothing in this module executes a Provider call, owns a transaction, or
-//! changes any public surface. Closed operation coordinators keep owning
-//! total budgets, repeatable-read transactions, traversal, restart scope,
-//! and public errors; R2 wires these types into the shared executor with
-//! zero policy.
+//! Phase 2 R2 adds the shared Provider reliability executor over that layer:
+//! one `reservation -> wait -> routing trust -> egress confirmation` sequence
+//! plus one deadline-bounded `encode_once` handoff, adopted by all four
+//! semantic operations with zero policy. The executor never retries, backs
+//! off, opens a circuit, or chooses a public error; every neutral outcome is
+//! mapped by the owning closed operation into its own frozen public surface.
+//! Ticket admission, Stage A observation, traversal, release fences, and
+//! public result contracts stay with the closed coordinators.
 //!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
 
-// Zero-behavior R1 type layer: the closed operation coordinators adopt these
-// types from R2 on, so the not-yet-wired items below stay explicit dead code
-// rather than being deleted by a cleanup pass.
+// Cancellation aggregation, the lifecycle latch, Provider handoff
+// classification, and the retry disposition matrix are adopted by the closed
+// coordinators from R3/R4 on, so those not-yet-wired items stay explicit dead
+// code rather than being deleted by a cleanup pass.
 #![allow(dead_code)]
 
 use std::fmt;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use buzz_db::semantic_query::{
+    SemanticContextEgressExpectation, SemanticGraphQueryEgressConfirmation,
+    SemanticGraphQueryEgressConfirmationRequest, SemanticGraphQueryEgressRequest,
+    SemanticGraphQueryEgressReservation, SemanticGraphQueryTicket,
+};
 use buzz_semantic::SemanticError;
+use buzz_semantic_query::SemanticGraphQueryRoutingTrust;
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
+
+use crate::semantic_graph_observability::{
+    record_provider_failure, record_provider_wait, stage_timer, SemanticGraphMetricStage,
+    SemanticGraphProviderFailure, SemanticGraphStageTimer,
+};
+use crate::state::AppState;
 
 /// Closed source that ended a semantic request before normal completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1142,6 +1160,290 @@ impl fmt::Debug for SemanticExecutionContext {
     }
 }
 
+// ---------------------------------------------------------------------------
+// R2 shared Provider reliability executor (zero policy).
+// ---------------------------------------------------------------------------
+
+/// Neutral admission failure of the shared Provider egress executor.
+///
+/// Every discriminator is mapped by the owning closed operation into its own
+/// frozen public error; the executor never chooses a public surface.
+///
+/// `AttemptLedgerExhausted` is unreachable while R2 runs with zero retry
+/// policy — no operation begins more physical attempts than its compiled cap
+/// — and exists so the counting ledger has a total, fail-closed mapping once
+/// R4 owns real retry decisions.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SemanticProviderEgressFailure {
+    /// The work window expired before an admitted step could finish.
+    #[error("semantic provider egress deadline exceeded")]
+    DeadlineExceeded,
+    /// A reservation or confirmation database call failed at the transport.
+    #[error("semantic provider egress database operation failed")]
+    Database(#[source] buzz_db::DbError),
+    /// The Provider slot could not start before the request deadline.
+    #[error("semantic provider egress admission is busy")]
+    AdmissionBusy,
+    /// A conditioned context head changed before the egress point.
+    #[error("semantic provider egress context state changed")]
+    ContextChanged,
+    /// No routing assertion is currently available for this serving instance.
+    #[error("semantic provider egress routing fleet assertion is unavailable")]
+    FleetUnavailable,
+    /// Principal, capability, generation, fence, or graph readiness no longer
+    /// matches the ticket.
+    #[error("semantic provider egress authorization or readiness no longer matches")]
+    ProviderUnavailable,
+    /// The committed reservation did not carry the ticket's generation.
+    #[error("semantic provider reservation violated its ticket contract")]
+    ReservationContractViolated,
+    /// The final egress permit did not match its committed reservation.
+    #[error("semantic provider egress permit violated its reservation contract")]
+    PermitContractViolated,
+    /// The remaining work window cannot be represented as a wall-clock bound.
+    #[error("semantic provider egress latest start cannot be represented")]
+    LatestStartUnrepresentable,
+    /// The request-level attempt ledger refused another attempt.
+    #[error("semantic provider egress attempt ledger is exhausted")]
+    AttemptLedgerExhausted(SemanticAttemptExhausted),
+}
+
+/// Which closed surface observes one executor attempt.
+///
+/// The one-shot envelopes stay silent exactly as they are today; the bounded
+/// complete path keeps recording its existing Provider failure and wait
+/// metrics. Observation is not a policy: it never changes an outcome.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ProviderEgressObservation {
+    /// One-shot coordinate and one-hop envelopes: no Provider metrics.
+    Silent,
+    /// The bounded complete path: record its existing Provider metrics.
+    CompletePathQuery,
+}
+
+impl ProviderEgressObservation {
+    fn provider_admission_busy(self) {
+        if matches!(self, Self::CompletePathQuery) {
+            record_provider_failure(SemanticGraphProviderFailure::Busy);
+        }
+    }
+
+    fn provider_wait_stage(self) -> Option<SemanticGraphStageTimer> {
+        match self {
+            Self::Silent => None,
+            Self::CompletePathQuery => Some(stage_timer(SemanticGraphMetricStage::ProviderWait)),
+        }
+    }
+
+    fn provider_wait_completed(self, elapsed: Duration) {
+        if matches!(self, Self::CompletePathQuery) {
+            record_provider_wait(elapsed);
+        }
+    }
+
+    fn provider_wait_deadline(self, elapsed: Duration) {
+        if matches!(self, Self::CompletePathQuery) {
+            record_provider_wait(elapsed);
+            record_provider_failure(SemanticGraphProviderFailure::Deadline);
+        }
+    }
+
+    fn provider_encode_deadline(self) {
+        if matches!(self, Self::CompletePathQuery) {
+            record_provider_failure(SemanticGraphProviderFailure::Deadline);
+        }
+    }
+}
+
+/// Borrowed inputs for one shared Provider egress admission.
+///
+/// `'state` outlives the per-attempt borrows so the returned routing trust
+/// can live in the caller's execution state after the plan's own borrows
+/// end.
+pub(crate) struct ProviderEgressPlan<'state, 'plan> {
+    /// Serving state owning the database, fleet, and relay signer.
+    pub(crate) state: &'state AppState,
+    /// Execution context of the logical request owning this attempt.
+    pub(crate) context: &'plan SemanticExecutionContext,
+    /// Exact authorized ticket being revalidated.
+    pub(crate) ticket: &'plan SemanticGraphQueryTicket,
+    /// Current authenticated principal pubkey bytes.
+    pub(crate) reader_pubkey: &'plan [u8],
+    /// Complete accepted/omitted context state that shaped the Provider
+    /// channel set; one-shot envelopes pass an empty slice.
+    pub(crate) expected_contexts: &'plan [SemanticContextEgressExpectation],
+    /// Which surface observes this attempt.
+    pub(crate) observation: ProviderEgressObservation,
+}
+
+/// Wrap one bounded step in the work window of the owning request.
+async fn timeout_before<T, F>(
+    deadline: Instant,
+    future: F,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future).await
+}
+
+/// Derive the Provider-reservation start bound from the work window.
+///
+/// R2 keeps the historical one-shot rule — a zero-length remainder is still
+/// admitted and fails at the next bounded step — so all four operations share
+/// one shape without changing any public deadline behavior.
+fn latest_start_at(work: Instant) -> Result<DateTime<Utc>, SemanticProviderEgressFailure> {
+    let remaining = work
+        .checked_duration_since(Instant::now())
+        .ok_or(SemanticProviderEgressFailure::DeadlineExceeded)?;
+    let duration = chrono::Duration::from_std(remaining)
+        .map_err(|_| SemanticProviderEgressFailure::LatestStartUnrepresentable)?;
+    Ok(Utc::now() + duration)
+}
+
+/// Run the shared `reservation -> wait -> routing trust -> egress
+/// confirmation` admission sequence for exactly one physical Provider
+/// attempt.
+///
+/// This is the R2 zero-policy primitive: it adds no retry, backoff, circuit,
+/// or route fallback, and it never chooses a public error. Ticket admission,
+/// Stage A observation, and the Provider encode call stay with the closed
+/// operation. The returned routing trust belongs to the caller's later
+/// release fence.
+pub(crate) async fn execute_provider_egress<'state>(
+    plan: ProviderEgressPlan<'state, '_>,
+) -> Result<SemanticGraphQueryRoutingTrust<'state>, SemanticProviderEgressFailure> {
+    let state = plan.state;
+    let work = plan.context.windows().window(SemanticDeadlineWindow::Work);
+    let relay_pubkey = state.relay_keypair.public_key();
+    let latest_start_at = latest_start_at(work)?;
+    plan.context
+        .ledger()
+        .begin_provider_attempt()
+        .map_err(SemanticProviderEgressFailure::AttemptLedgerExhausted)?;
+    let reservation = timeout_before(
+        work,
+        state
+            .db
+            .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
+                expected_ticket: plan.ticket,
+                reader_pubkey: plan.reader_pubkey,
+                expected_projection_pubkey: &relay_pubkey,
+                expected_contexts: plan.expected_contexts,
+                provider: &plan.ticket.generation.model_contract.provider,
+                interval: state.config.semantic_worker.request_interval,
+                latest_start_at,
+            }),
+    )
+    .await
+    .map_err(|_| SemanticProviderEgressFailure::DeadlineExceeded)?
+    .map_err(SemanticProviderEgressFailure::Database)?;
+    let reservation = match reservation {
+        SemanticGraphQueryEgressReservation::Reserved(reservation) => reservation,
+        SemanticGraphQueryEgressReservation::Busy => {
+            plan.observation.provider_admission_busy();
+            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+        }
+        SemanticGraphQueryEgressReservation::ContextChanged => {
+            return Err(SemanticProviderEgressFailure::ContextChanged);
+        }
+        SemanticGraphQueryEgressReservation::Unavailable => {
+            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+        }
+    };
+    let (wait, reserved_generation, reserved_context_digest) = reservation.into_parts();
+    if reserved_generation != plan.ticket.generation.generation_id {
+        return Err(SemanticProviderEgressFailure::ReservationContractViolated);
+    }
+    let wait_started = Instant::now();
+    let _wait_stage = plan.observation.provider_wait_stage();
+    if timeout_before(work, tokio::time::sleep(wait))
+        .await
+        .is_err()
+    {
+        let elapsed = wait_started.elapsed();
+        plan.observation.provider_wait_deadline(elapsed);
+        return Err(SemanticProviderEgressFailure::DeadlineExceeded);
+    }
+    let elapsed = wait_started.elapsed();
+    plan.observation.provider_wait_completed(elapsed);
+
+    // The provider-slot reservation may wait, so it cannot authorize egress.
+    // The final confirmation revalidates principal, generation, graph, and
+    // routing state under the shared Community writer fence.
+    let routing_trust = crate::semantic_fleet::semantic_graph_query_routing_trust(state)
+        .map_err(|_| SemanticProviderEgressFailure::FleetUnavailable)?;
+    let confirmation = timeout_before(
+        work,
+        state
+            .db
+            .confirm_semantic_graph_query_egress(SemanticGraphQueryEgressConfirmationRequest {
+                expected_ticket: plan.ticket,
+                reader_pubkey: plan.reader_pubkey,
+                expected_projection_pubkey: &relay_pubkey,
+                expected_contexts: plan.expected_contexts,
+                routing_trust,
+            }),
+    )
+    .await
+    .map_err(|_| SemanticProviderEgressFailure::DeadlineExceeded)?
+    .map_err(SemanticProviderEgressFailure::Database)?;
+    let permit = match confirmation {
+        SemanticGraphQueryEgressConfirmation::Permitted(permit) => permit,
+        SemanticGraphQueryEgressConfirmation::ContextChanged => {
+            return Err(SemanticProviderEgressFailure::ContextChanged);
+        }
+        SemanticGraphQueryEgressConfirmation::FleetUnavailable => {
+            return Err(SemanticProviderEgressFailure::FleetUnavailable);
+        }
+        SemanticGraphQueryEgressConfirmation::Unavailable => {
+            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+        }
+    };
+    let (permitted_generation, permitted_context_digest) = permit.into_parts();
+    if permitted_generation != reserved_generation
+        || permitted_context_digest != reserved_context_digest
+    {
+        return Err(SemanticProviderEgressFailure::PermitContractViolated);
+    }
+    Ok(routing_trust)
+}
+
+/// Failure of one deadline-bounded single Provider invocation.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SemanticEncodeOnceFailure<E> {
+    /// The work window expired before the single call completed.
+    #[error("semantic provider encode deadline exceeded")]
+    DeadlineExceeded,
+    /// The Provider call returned a typed failure.
+    #[error("semantic provider encode call failed")]
+    Provider(#[source] E),
+}
+
+/// Run exactly one Provider invocation inside the work window.
+///
+/// `encode_once` is the only sanctioned Provider handoff shape: one physical
+/// call, bounded by the frozen work window, with no internal retry, fallback,
+/// or detached follow-up work. Mapping the Provider error and every public
+/// outcome stays with the closed operation.
+pub(crate) async fn encode_once<T, E, F>(
+    work: Instant,
+    observation: ProviderEgressObservation,
+    future: F,
+) -> Result<T, SemanticEncodeOnceFailure<E>>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    match timeout_before(work, future).await {
+        Ok(Ok(encoded)) => Ok(encoded),
+        Ok(Err(error)) => Err(SemanticEncodeOnceFailure::Provider(error)),
+        Err(_elapsed) => {
+            observation.provider_encode_deadline();
+            Err(SemanticEncodeOnceFailure::DeadlineExceeded)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,5 +1807,73 @@ mod tests {
             context.deadline_expired(),
             SemanticLatchOutcome::LostTerminal(SemanticLifecycleState::Cancelling)
         );
+    }
+
+    #[test]
+    fn egress_failure_labels_are_content_free() {
+        let failures = [
+            SemanticProviderEgressFailure::DeadlineExceeded,
+            SemanticProviderEgressFailure::Database(buzz_db::DbError::AccessDenied(
+                "denied".to_owned(),
+            )),
+            SemanticProviderEgressFailure::AdmissionBusy,
+            SemanticProviderEgressFailure::ContextChanged,
+            SemanticProviderEgressFailure::FleetUnavailable,
+            SemanticProviderEgressFailure::ProviderUnavailable,
+            SemanticProviderEgressFailure::ReservationContractViolated,
+            SemanticProviderEgressFailure::PermitContractViolated,
+            SemanticProviderEgressFailure::LatestStartUnrepresentable,
+            SemanticProviderEgressFailure::AttemptLedgerExhausted(
+                SemanticAttemptExhausted::ProviderAttempts,
+            ),
+        ];
+        let mut labels = std::collections::BTreeSet::new();
+        for failure in &failures {
+            let rendered = failure.to_string();
+            assert!(
+                labels.insert(rendered.clone()),
+                "duplicate failure label {rendered}"
+            );
+            assert!(!rendered.contains("query"), "content leaked: {rendered}");
+            assert!(!rendered.contains("vector"), "content leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn latest_start_at_rejects_expired_work_window() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(
+            latest_start_at(expired),
+            Err(SemanticProviderEgressFailure::DeadlineExceeded)
+        ));
+        assert!(latest_start_at(Instant::now() + Duration::from_secs(30)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn encode_once_runs_exactly_one_bounded_invocation() {
+        let work = Instant::now() + Duration::from_secs(30);
+        let encoded = encode_once::<u32, u64, _>(work, ProviderEgressObservation::Silent, async {
+            Ok(7_u32)
+        })
+        .await
+        .expect("immediate success is admitted");
+        assert_eq!(encoded, 7);
+        assert!(matches!(
+            encode_once::<u32, u32, _>(work, ProviderEgressObservation::Silent, async {
+                Err(9_u32)
+            })
+            .await,
+            Err(SemanticEncodeOnceFailure::Provider(9))
+        ));
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(
+            encode_once::<(), (), _>(
+                expired,
+                ProviderEgressObservation::Silent,
+                std::future::pending()
+            )
+            .await,
+            Err(SemanticEncodeOnceFailure::DeadlineExceeded)
+        ));
     }
 }

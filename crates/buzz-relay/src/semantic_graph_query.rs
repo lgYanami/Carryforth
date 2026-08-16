@@ -17,11 +17,10 @@ use buzz_db::semantic_query::{
     SemanticContextCoordinateObservationBatch, SemanticContextEgressExpectation,
     SemanticContextOmissionReason, SemanticCurrentSourcePair, SemanticExactRecallBatch,
     SemanticExactRecallExhaustion, SemanticExactSourceScore, SemanticGraphEmbeddingCoverageClass,
-    SemanticGraphQueryEgressConfirmation, SemanticGraphQueryEgressConfirmationRequest,
-    SemanticGraphQueryEgressRequest, SemanticGraphQueryEgressReservation, SemanticGraphQueryTicket,
-    SemanticGraphQueryVectorBundle, SemanticGraphReadTimeouts, SemanticGraphReadTx,
-    SemanticInitialCoordinateObservation, SemanticInitialCoordinateObservationBatch,
-    SemanticInitialHeadState, SemanticInitialOmissionReason,
+    SemanticGraphQueryTicket, SemanticGraphQueryVectorBundle, SemanticGraphReadTimeouts,
+    SemanticGraphReadTx, SemanticInitialCoordinateObservation,
+    SemanticInitialCoordinateObservationBatch, SemanticInitialHeadState,
+    SemanticInitialOmissionReason,
 };
 use buzz_project_context::ProjectContextCoordinate;
 use buzz_project_view::ProjectViewObjectType;
@@ -46,14 +45,18 @@ use buzz_semantic_query::{
     SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR,
     RESPONSE_TAIL_RESERVE_MS, SEMANTIC_COMPUTATION_ROUTES, SNAPSHOT_CLOSE_RESERVE_MS,
 };
-use chrono::Utc;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 
 use crate::semantic_graph_observability::{
-    record_db_distance_rows, record_generation_retry, record_provider_failure,
-    record_provider_wait, stage_timer, SemanticGraphDistanceStage, SemanticGraphMetricStage,
-    SemanticGraphProviderFailure, SemanticGraphQueryMetricError,
+    record_db_distance_rows, record_generation_retry, record_provider_failure, stage_timer,
+    SemanticGraphDistanceStage, SemanticGraphMetricStage, SemanticGraphProviderFailure,
+    SemanticGraphQueryMetricError,
+};
+use crate::semantic_query_runtime::{
+    encode_once, execute_provider_egress, ProviderEgressObservation, ProviderEgressPlan,
+    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
+    SemanticOperationAttemptClass, SemanticProviderEgressFailure,
 };
 use crate::AppState;
 
@@ -95,6 +98,16 @@ async fn begin_semantic_graph_root_query_inner(
     }
     let started_at = Instant::now();
     let deadlines = QueryDeadlines::new(started_at, query.budget.max_wall_time_ms)?;
+    let context = SemanticExecutionContext::new(
+        SemanticOperationAttemptClass::CompletePath,
+        SemanticDeadlineWindows::new(
+            deadlines.work.into_std(),
+            deadlines.work.into_std(),
+            deadlines.snapshot_close.into_std(),
+            deadlines.absolute.into_std(),
+        )
+        .map_err(|_| invalid_state("query deadline windows cannot be frozen"))?,
+    );
     let process_permit = state
         .semantic_graph_query_semaphore
         .clone()
@@ -117,6 +130,7 @@ async fn begin_semantic_graph_root_query_inner(
             reader_pubkey,
             &query,
             deadlines,
+            &context,
         )
         .await
         {
@@ -155,7 +169,15 @@ async fn root_query_attempt(
     reader_pubkey: &[u8],
     query: &SemanticGraphQuery,
     deadlines: QueryDeadlines,
+    context: &SemanticExecutionContext,
 ) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
+    // Unreachable while the churn loop above bounds root attempts at the
+    // compiled cap; kept so the counting ledger owns the restart dimension
+    // from R4 on.
+    context
+        .ledger()
+        .begin_operation_attempt()
+        .map_err(|_| SemanticGraphRootQueryError::QueryProviderBusy)?;
     let bootstrap_ticket = run_before_work_deadline(
         deadlines.work,
         state.db.semantic_graph_query_ticket(
@@ -191,101 +213,26 @@ async fn root_query_attempt(
         .iter()
         .map(SemanticContextEgressExpectation::from_observation)
         .collect::<Vec<_>>();
-    let remaining = deadlines.remaining_work()?;
-    let latest_start_at = Utc::now()
-        + chrono::Duration::from_std(remaining)
-            .map_err(|_| invalid_state("query Provider deadline cannot be represented"))?;
-    let reservation = run_before_work_deadline(
-        deadlines.work,
-        state
-            .db
-            .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
-                expected_ticket: &ticket,
-                reader_pubkey,
-                expected_projection_pubkey: &state.relay_keypair.public_key(),
-                expected_contexts: &context_expectations,
-                provider: &ticket.generation.model_contract.provider,
-                interval: state.config.semantic_worker.request_interval,
-                latest_start_at,
-            }),
-    )
-    .await?;
-    let permit = match reservation {
-        Ok(SemanticGraphQueryEgressReservation::Reserved(permit)) => permit,
-        Ok(SemanticGraphQueryEgressReservation::Busy) => {
-            record_provider_failure(SemanticGraphProviderFailure::Busy);
-            return Err(SemanticGraphRootQueryError::QueryProviderBusy);
-        }
-        Ok(SemanticGraphQueryEgressReservation::ContextChanged) => {
-            return Err(SemanticGraphRootQueryError::ContextSourceChanged);
-        }
-        Ok(SemanticGraphQueryEgressReservation::Unavailable) => {
-            return Err(
-                classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work).await,
-            );
-        }
-        Err(error) => return Err(SemanticGraphRootQueryError::Database(error)),
-    };
-    let (wait, reserved_generation, reserved_context_head_set_digest) = permit.into_parts();
-    if reserved_generation != ticket.generation.generation_id {
-        return Err(invalid_state(
-            "query Provider reservation generation does not match its ticket",
-        ));
-    }
-    let wait_started = std::time::Instant::now();
-    let _wait_timer = stage_timer(SemanticGraphMetricStage::ProviderWait);
-    if let Err(error) = run_before_work_deadline(deadlines.work, tokio::time::sleep(wait)).await {
-        record_provider_wait(wait_started.elapsed());
-        record_provider_failure(SemanticGraphProviderFailure::Deadline);
-        return Err(error);
-    }
-    record_provider_wait(wait_started.elapsed());
-    drop(_wait_timer);
-
-    // The provider-slot reservation may wait, so it cannot authorize egress.
-    // Revalidate the complete principal, query, generation, graph,
-    // conditioned-source, and policy-specific routing state after acquiring
-    // the shared Community writer fence under READ COMMITTED. This deliberately
-    // forms authorization snapshots only after any exclusive revocation writer
-    // that already held the fence has committed.
-    let Ok(routing_trust) = crate::semantic_fleet::semantic_graph_query_routing_trust(state) else {
-        return Err(SemanticGraphRootQueryError::QueryFleetUnavailable);
-    };
-    let confirmation = run_before_work_deadline(
-        deadlines.work,
-        state
-            .db
-            .confirm_semantic_graph_query_egress(SemanticGraphQueryEgressConfirmationRequest {
-                expected_ticket: &ticket,
-                reader_pubkey,
-                expected_projection_pubkey: &state.relay_keypair.public_key(),
-                expected_contexts: &context_expectations,
-                routing_trust,
-            }),
-    )
-    .await?;
-    let permit = match confirmation {
-        Ok(SemanticGraphQueryEgressConfirmation::Permitted(permit)) => permit,
-        Ok(SemanticGraphQueryEgressConfirmation::ContextChanged) => {
-            return Err(SemanticGraphRootQueryError::ContextSourceChanged);
-        }
-        Ok(SemanticGraphQueryEgressConfirmation::FleetUnavailable) => {
-            return Err(SemanticGraphRootQueryError::QueryFleetUnavailable);
-        }
-        Ok(SemanticGraphQueryEgressConfirmation::Unavailable) => {
-            return Err(
-                classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work).await,
-            );
-        }
-        Err(error) => return Err(SemanticGraphRootQueryError::Database(error)),
-    };
-    let (permit_generation, permit_context_head_set_digest) = permit.into_parts();
-    if permit_generation != reserved_generation
-        || permit_context_head_set_digest != reserved_context_head_set_digest
+    // Shared R2 Provider egress executor: reservation, deadline-aware wait,
+    // routing trust, and final no-wait confirmation in one zero-policy
+    // sequence. Its neutral outcome maps back onto this surface's frozen
+    // public errors; `ProviderUnavailable` keeps its pre-R2 ticket re-read.
+    if let Err(failure) = execute_provider_egress(ProviderEgressPlan {
+        state,
+        context,
+        ticket: &ticket,
+        reader_pubkey,
+        expected_contexts: &context_expectations,
+        observation: ProviderEgressObservation::CompletePathQuery,
+    })
+    .await
     {
-        return Err(invalid_state(
-            "query egress permit does not match its Provider reservation",
-        ));
+        return Err(match failure {
+            SemanticProviderEgressFailure::ProviderUnavailable => {
+                classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work).await
+            }
+            failure => map_provider_egress_failure(failure),
+        });
     }
 
     metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
@@ -296,8 +243,9 @@ async fn root_query_attempt(
             .sum::<f64>(),
     );
     let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
-    let provider_result = run_before_work_deadline(
-        deadlines.work,
+    let encoded = match encode_once(
+        deadlines.work.into_std(),
+        ProviderEgressObservation::CompletePathQuery,
         encode_complete_path_inputs(
             provider,
             SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
@@ -305,17 +253,16 @@ async fn root_query_attempt(
             &common_inputs,
         ),
     )
-    .await;
-    let encoded = match provider_result {
-        Err(error) => {
-            record_provider_failure(SemanticGraphProviderFailure::Deadline);
-            return Err(error);
+    .await
+    {
+        Ok(encoded) => encoded,
+        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+            return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
         }
-        Ok(Err(error)) => {
+        Err(SemanticEncodeOnceFailure::Provider(error)) => {
             record_provider_failure(provider_failure_class(&error));
             return Err(map_encoder_error(error));
         }
-        Ok(Ok(encoded)) => encoded,
     };
     drop(_provider_timer);
     let query_vectors = match encoded {
@@ -386,6 +333,50 @@ async fn classify_ticket_failure(
             SemanticGraphRootQueryError::AuthorizationChanged
         }
         Ok(Err(error)) => SemanticGraphRootQueryError::Database(error),
+    }
+}
+
+/// Map one neutral shared-executor outcome onto the frozen complete-path
+/// public error.
+///
+/// The caller intercepts `ProviderUnavailable` first and re-reads the ticket
+/// through [`classify_ticket_failure`], exactly as in the pre-R2 inline
+/// sequence; this arm only mirrors that classifier's terminal fallback.
+/// `AttemptLedgerExhausted` has no pre-R2 counterpart — it is unreachable
+/// under the R2 zero-policy caps and maps onto the admission failure until
+/// R4 owns real retry decisions.
+fn map_provider_egress_failure(
+    failure: SemanticProviderEgressFailure,
+) -> SemanticGraphRootQueryError {
+    match failure {
+        SemanticProviderEgressFailure::DeadlineExceeded => {
+            SemanticGraphRootQueryError::QueryDeadlineExceeded
+        }
+        SemanticProviderEgressFailure::Database(error) => {
+            SemanticGraphRootQueryError::Database(error)
+        }
+        SemanticProviderEgressFailure::AdmissionBusy
+        | SemanticProviderEgressFailure::AttemptLedgerExhausted(_) => {
+            SemanticGraphRootQueryError::QueryProviderBusy
+        }
+        SemanticProviderEgressFailure::ContextChanged => {
+            SemanticGraphRootQueryError::ContextSourceChanged
+        }
+        SemanticProviderEgressFailure::FleetUnavailable => {
+            SemanticGraphRootQueryError::QueryFleetUnavailable
+        }
+        SemanticProviderEgressFailure::ProviderUnavailable => {
+            SemanticGraphRootQueryError::AuthorizationChanged
+        }
+        SemanticProviderEgressFailure::ReservationContractViolated => {
+            invalid_state("query Provider reservation generation does not match its ticket")
+        }
+        SemanticProviderEgressFailure::PermitContractViolated => {
+            invalid_state("query egress permit does not match its Provider reservation")
+        }
+        SemanticProviderEgressFailure::LatestStartUnrepresentable => {
+            invalid_state("query Provider deadline cannot be represented")
+        }
     }
 }
 
@@ -1975,13 +1966,6 @@ impl QueryDeadlines {
             absolute: started_at + total,
         })
     }
-
-    fn remaining_work(self) -> Result<Duration, SemanticGraphRootQueryError> {
-        self.work
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(SemanticGraphRootQueryError::QueryDeadlineExceeded)
-    }
 }
 
 async fn run_before_work_deadline<F, T>(
@@ -2003,6 +1987,81 @@ fn invalid_state(reason: &'static str) -> SemanticGraphRootQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_failures_keep_the_frozen_complete_path_public_errors() {
+        use SemanticGraphRootQueryError as Query;
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::DeadlineExceeded),
+            Query::QueryDeadlineExceeded
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::Database(
+                buzz_db::DbError::AccessDenied("denied".to_owned())
+            )),
+            Query::Database(_)
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::AdmissionBusy),
+            Query::QueryProviderBusy
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::ContextChanged),
+            Query::ContextSourceChanged
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::FleetUnavailable),
+            Query::QueryFleetUnavailable
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::ProviderUnavailable),
+            Query::AuthorizationChanged
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::ReservationContractViolated),
+            Query::Contract(SemanticGraphQueryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::PermitContractViolated),
+            Query::Contract(SemanticGraphQueryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::LatestStartUnrepresentable),
+            Query::Contract(SemanticGraphQueryError::InvalidState(_))
+        ));
+        assert!(matches!(
+            map_provider_egress_failure(SemanticProviderEgressFailure::AttemptLedgerExhausted(
+                crate::semantic_query_runtime::SemanticAttemptExhausted::OperationAttempts,
+            )),
+            Query::QueryProviderBusy
+        ));
+    }
+
+    #[test]
+    fn egress_contract_violation_reasons_are_verbatim() {
+        match map_provider_egress_failure(
+            SemanticProviderEgressFailure::ReservationContractViolated,
+        ) {
+            SemanticGraphRootQueryError::Contract(error) => match error {
+                SemanticGraphQueryError::InvalidState(reason) => assert_eq!(
+                    reason,
+                    "query Provider reservation generation does not match its ticket"
+                ),
+                other => panic!("unexpected contract error: {other:?}"),
+            },
+            other => panic!("unexpected public error: {other:?}"),
+        }
+        match map_provider_egress_failure(SemanticProviderEgressFailure::PermitContractViolated) {
+            SemanticGraphRootQueryError::Contract(error) => match error {
+                SemanticGraphQueryError::InvalidState(reason) => assert_eq!(
+                    reason,
+                    "query egress permit does not match its Provider reservation"
+                ),
+                other => panic!("unexpected contract error: {other:?}"),
+            },
+            other => panic!("unexpected public error: {other:?}"),
+        }
+    }
 
     fn score(value: u32) -> Score {
         Score::new(value).expect("score fixture")

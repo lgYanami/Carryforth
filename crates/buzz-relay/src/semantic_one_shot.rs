@@ -10,17 +10,19 @@ use std::time::{Duration, Instant};
 
 use buzz_core::CommunityId;
 use buzz_db::semantic_query::{
-    SemanticGraphQueryEgressConfirmation, SemanticGraphQueryEgressConfirmationRequest,
-    SemanticGraphQueryEgressRequest, SemanticGraphQueryEgressReservation,
     SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleaseRequest,
     SemanticGraphQueryTicket,
 };
 use buzz_semantic_query::SemanticGraphQueryRoutingTrust;
-use chrono::Utc;
 use nostr::PublicKey;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::VolcengineSemanticProvider;
+use crate::semantic_query_runtime::{
+    execute_provider_egress, ProviderEgressObservation, ProviderEgressPlan, SemanticDeadlineWindow,
+    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
+    SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+};
 use crate::state::AppState;
 
 /// Content-free failures shared by one-shot semantic surfaces.
@@ -51,6 +53,7 @@ pub(crate) struct SemanticOneShotExecution<'a> {
     relay_pubkey: PublicKey,
     routing_trust: SemanticGraphQueryRoutingTrust<'a>,
     provider: &'a VolcengineSemanticProvider,
+    context: SemanticExecutionContext,
     _process_permit: OwnedSemaphorePermit,
 }
 
@@ -90,73 +93,26 @@ impl<'a> SemanticOneShotExecution<'a> {
             return Err(SemanticOneShotError::Unavailable);
         }
 
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(SemanticOneShotError::Timeout)?;
-        let latest_start_at = Utc::now()
-            + chrono::Duration::from_std(remaining).map_err(|_| SemanticOneShotError::Timeout)?;
-        let reservation = before_deadline(
-            deadline,
-            state
-                .db
-                .reserve_semantic_graph_query_egress(SemanticGraphQueryEgressRequest {
-                    expected_ticket: &ticket,
-                    reader_pubkey,
-                    expected_projection_pubkey: &relay_pubkey,
-                    expected_contexts: &[],
-                    provider: &ticket.generation.model_contract.provider,
-                    interval: state.config.semantic_worker.request_interval,
-                    latest_start_at,
-                }),
-        )
-        .await?
-        .map_err(classify_database)?;
-        let provider_reservation = match reservation {
-            SemanticGraphQueryEgressReservation::Reserved(reservation) => reservation,
-            SemanticGraphQueryEgressReservation::Busy => return Err(SemanticOneShotError::Busy),
-            SemanticGraphQueryEgressReservation::ContextChanged => {
-                return Err(SemanticOneShotError::Conflict);
-            }
-            SemanticGraphQueryEgressReservation::Unavailable => {
-                return Err(SemanticOneShotError::Unavailable);
-            }
-        };
-        let (wait, reserved_generation, reserved_context_digest) =
-            provider_reservation.into_parts();
-        before_deadline(deadline, tokio::time::sleep(wait)).await?;
-
-        let routing_trust = crate::semantic_fleet::semantic_graph_query_routing_trust(state)
-            .map_err(|_| SemanticOneShotError::Unavailable)?;
-        let egress = before_deadline(
-            deadline,
-            state.db.confirm_semantic_graph_query_egress(
-                SemanticGraphQueryEgressConfirmationRequest {
-                    expected_ticket: &ticket,
-                    reader_pubkey,
-                    expected_projection_pubkey: &relay_pubkey,
-                    expected_contexts: &[],
-                    routing_trust,
-                },
-            ),
-        )
-        .await?
-        .map_err(classify_database)?;
-        let permit = match egress {
-            SemanticGraphQueryEgressConfirmation::Permitted(permit) => permit,
-            SemanticGraphQueryEgressConfirmation::ContextChanged => {
-                return Err(SemanticOneShotError::Conflict);
-            }
-            SemanticGraphQueryEgressConfirmation::FleetUnavailable
-            | SemanticGraphQueryEgressConfirmation::Unavailable => {
-                return Err(SemanticOneShotError::Unavailable);
-            }
-        };
-        let (permitted_generation, permitted_context_digest) = permit.into_parts();
-        if permitted_generation != reserved_generation
-            || permitted_context_digest != reserved_context_digest
-        {
-            return Err(SemanticOneShotError::Conflict);
-        }
+        let context = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(deadline),
+        );
+        // Unreachable under the R2 zero-policy single attempt; kept so the
+        // counting ledger owns the operation-attempt dimension from R4 on.
+        context
+            .ledger()
+            .begin_operation_attempt()
+            .map_err(|_| SemanticOneShotError::Busy)?;
+        let routing_trust = execute_provider_egress(ProviderEgressPlan {
+            state,
+            context: &context,
+            ticket: &ticket,
+            reader_pubkey,
+            expected_contexts: &[],
+            observation: ProviderEgressObservation::Silent,
+        })
+        .await
+        .map_err(map_egress_failure)?;
 
         Ok(Self {
             state,
@@ -166,8 +122,28 @@ impl<'a> SemanticOneShotExecution<'a> {
             relay_pubkey,
             routing_trust,
             provider,
+            context,
             _process_permit: process_permit,
         })
+    }
+
+    /// Run exactly one Provider invocation inside this request's work window.
+    ///
+    /// This is the only sanctioned Provider handoff for a one-shot surface;
+    /// every other database step keeps using [`Self::before_deadline`].
+    pub(crate) async fn encode_once<T, E, F>(
+        &self,
+        future: F,
+    ) -> Result<T, SemanticEncodeOnceFailure<E>>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        crate::semantic_query_runtime::encode_once(
+            self.context.windows().window(SemanticDeadlineWindow::Work),
+            ProviderEgressObservation::Silent,
+            future,
+        )
+        .await
     }
 
     /// Active generation and topology observation authorized for egress.
@@ -194,6 +170,12 @@ impl<'a> SemanticOneShotExecution<'a> {
         &self,
         snapshot: &SemanticGraphQueryTicket,
     ) -> Result<(), SemanticOneShotError> {
+        // Unreachable while R2 keeps the single frozen release attempt; kept
+        // so the counting ledger owns the release dimension from R4 on.
+        self.context
+            .ledger()
+            .begin_release_confirmation()
+            .map_err(|_| SemanticOneShotError::Busy)?;
         let release = self
             .before_deadline(self.state.db.confirm_semantic_graph_query_release(
                 SemanticGraphQueryReleaseRequest {
@@ -241,9 +223,38 @@ fn classify_database(error: buzz_db::DbError) -> SemanticOneShotError {
     }
 }
 
+/// Map one neutral shared-executor outcome onto the frozen one-shot envelope
+/// error.
+///
+/// This table preserves every public mapping of the pre-R2 inline envelope.
+/// `ReservationContractViolated` and `AttemptLedgerExhausted` have no
+/// pre-R2 counterpart: both are unreachable per the database egress contract
+/// and the R2 zero-policy single attempt, so they map onto the closest
+/// existing closed failures until R4 owns real retry decisions.
+fn map_egress_failure(failure: SemanticProviderEgressFailure) -> SemanticOneShotError {
+    match failure {
+        SemanticProviderEgressFailure::DeadlineExceeded
+        | SemanticProviderEgressFailure::LatestStartUnrepresentable => {
+            SemanticOneShotError::Timeout
+        }
+        SemanticProviderEgressFailure::Database(error) => classify_database(error),
+        SemanticProviderEgressFailure::AdmissionBusy
+        | SemanticProviderEgressFailure::AttemptLedgerExhausted(_) => SemanticOneShotError::Busy,
+        SemanticProviderEgressFailure::ContextChanged => SemanticOneShotError::Conflict,
+        SemanticProviderEgressFailure::FleetUnavailable
+        | SemanticProviderEgressFailure::ProviderUnavailable => SemanticOneShotError::Unavailable,
+        SemanticProviderEgressFailure::ReservationContractViolated => {
+            SemanticOneShotError::VerificationFailed
+        }
+        SemanticProviderEgressFailure::PermitContractViolated => SemanticOneShotError::Conflict,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SemanticOneShotError;
+    use super::{
+        map_egress_failure, SemanticOneShotError, SemanticProviderEgressFailure as EgressFailure,
+    };
 
     #[test]
     fn shared_failures_are_content_free() {
@@ -259,5 +270,64 @@ mod tests {
             assert!(!rendered.contains("query="));
             assert!(!rendered.contains("scope="));
         }
+    }
+
+    #[test]
+    fn egress_failures_keep_the_frozen_one_shot_public_errors() {
+        use SemanticOneShotError as OneShot;
+        assert!(matches!(
+            map_egress_failure(EgressFailure::DeadlineExceeded),
+            OneShot::Timeout
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::LatestStartUnrepresentable),
+            OneShot::Timeout
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::Database(buzz_db::DbError::AccessDenied(
+                "denied".to_owned()
+            ))),
+            OneShot::Restricted
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::Database(buzz_db::DbError::InvalidData(
+                "invalid".to_owned()
+            ))),
+            OneShot::VerificationFailed
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::Database(buzz_db::DbError::AuthEventRejected)),
+            OneShot::Database(_)
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::AdmissionBusy),
+            OneShot::Busy
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::ContextChanged),
+            OneShot::Conflict
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::FleetUnavailable),
+            OneShot::Unavailable
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::ProviderUnavailable),
+            OneShot::Unavailable
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::PermitContractViolated),
+            OneShot::Conflict
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::ReservationContractViolated),
+            OneShot::VerificationFailed
+        ));
+        assert!(matches!(
+            map_egress_failure(EgressFailure::AttemptLedgerExhausted(
+                crate::semantic_query_runtime::SemanticAttemptExhausted::ProviderAttempts,
+            )),
+            OneShot::Busy
+        ));
     }
 }

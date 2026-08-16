@@ -21,6 +21,7 @@ use buzz_semantic_query::{
 use nostr::Event;
 
 use crate::semantic_one_shot::{SemanticOneShotError, SemanticOneShotExecution};
+use crate::semantic_query_runtime::SemanticEncodeOnceFailure;
 use crate::state::AppState;
 
 /// Closed, content-free failures for the one-hop semantic HTTP surface.
@@ -145,15 +146,22 @@ async fn execute_one_hop_semantic_search(
         .map_err(OneHopSemanticExecutionError::Provider)?;
     metrics::histogram!("carryforth_one_hop_semantic_provider_input_bytes")
         .record(encoder_input.text().len() as f64);
-    let encoded = execution
-        .before_deadline(
+    let encoded = match execution
+        .encode_once(
             execution
                 .provider()
                 .encode_queries(std::slice::from_ref(&encoder_input)),
         )
         .await
-        .map_err(map_one_shot)?
-        .map_err(map_provider)?;
+    {
+        Ok(encoded) => encoded,
+        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+            return Err(OneHopSemanticExecutionError::Timeout);
+        }
+        Err(SemanticEncodeOnceFailure::Provider(error)) => {
+            return Err(map_provider(error));
+        }
+    };
     let query_vector = bind_one_hop_query_vector(execution.ticket(), &encoder_input, encoded)?;
 
     let mut read = execution
