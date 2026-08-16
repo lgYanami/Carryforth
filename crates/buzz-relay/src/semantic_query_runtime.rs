@@ -27,13 +27,21 @@
 //! during it only records a discard that the finalizer's post-check must
 //! honor by never sending the signed result.
 //!
+//! Phase 2 R4 adds the closed retry policy core: the per-item Provider retry
+//! route, the disposition-and-budget decision, and the deadline-raced
+//! backoff. The policy is owned here in one place; the closed coordinators
+//! run the mechanical retry loops because only they can assemble a fresh
+//! plan (fresh ticket, fresh observations, fresh inputs) from their own
+//! state. Every retry still passes through the R2 executor's reservation and
+//! confirmation and the R3 admission, so the attempt ledger caps, the
+//! cancellation latch, and the frozen public error projections stay binding.
+//!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
 
-// The retry disposition matrix is adopted by the closed coordinators from R4
-// on; remaining not-yet-wired items stay explicit dead code rather than being
-// deleted by a cleanup pass.
+// The remaining not-yet-wired taxonomy items stay explicit dead code rather
+// than being deleted by a cleanup pass.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -553,6 +561,14 @@ impl SemanticOperationAttemptClass {
     pub(crate) const fn operation_attempt_cap(self) -> u32 {
         2
     }
+
+    /// Closed low-cardinality metric label for this class.
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::CompletePath => "complete_path",
+        }
+    }
 }
 
 /// Closed attempt counter that was exhausted.
@@ -683,6 +699,31 @@ impl SemanticAttemptLedger {
             .map_err(|_| SemanticAttemptExhausted::ReleaseConfirmationRetry)?;
         Ok(previous + 1)
     }
+
+    /// Whether one more physical Provider attempt fits the compiled caps.
+    ///
+    /// The decision core consults this before advising a retry so a retry is
+    /// never begun that the very next [`Self::begin_provider_attempt`] would
+    /// refuse (plan §9.1: an insufficient remaining budget never starts an
+    /// attempt).
+    pub(crate) fn can_begin_provider_attempt(&self) -> bool {
+        if self.provider_attempts.load(Ordering::SeqCst)
+            >= self.class.physical_provider_attempt_cap()
+        {
+            return false;
+        }
+        if self.provider_attempts_in_operation.load(Ordering::SeqCst) > 0
+            && self.provider_transport_retries.load(Ordering::SeqCst) >= 1
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Whether one more operation or root attempt fits the compiled cap.
+    pub(crate) fn can_begin_operation_attempt(&self) -> bool {
+        self.operation_attempts.load(Ordering::SeqCst) < self.class.operation_attempt_cap()
+    }
 }
 
 impl fmt::Debug for SemanticAttemptLedger {
@@ -722,8 +763,9 @@ pub(crate) enum ProviderAttemptFailureKind {
     ConnectNotStarted,
     /// The Provider throttled the attempt.
     RateLimited {
-        /// Whether a syntactically valid `Retry-After` was present.
-        valid_retry_after: bool,
+        /// The syntactically valid `Retry-After` delay, when the Provider
+        /// supplied one.
+        retry_after_seconds: Option<u64>,
     },
     /// A definitive Provider 5xx response.
     RetryableResponse {
@@ -768,7 +810,7 @@ impl ProviderAttemptFailure {
                 retry_after_seconds,
             } => Self {
                 kind: ProviderAttemptFailureKind::RateLimited {
-                    valid_retry_after: retry_after_seconds.is_some(),
+                    retry_after_seconds: *retry_after_seconds,
                 },
                 handoff: ProviderHandoffCertainty::ConfirmedResponse,
             },
@@ -796,6 +838,28 @@ impl ProviderAttemptFailure {
                 kind: ProviderAttemptFailureKind::ProtocolInvalid,
                 handoff: ProviderHandoffCertainty::NotStarted,
             },
+        }
+    }
+
+    /// Classify one `.send()`-phase transport failure using the transport's
+    /// own connect knowledge (plan §4.4).
+    ///
+    /// The pre-R4 adapter collapsed every send failure into the conservative
+    /// outcome-unknown classification. A reqwest connect error provably never
+    /// handed the request off, which is exactly the closed precondition the
+    /// R4 connect retry item requires; every other send-phase failure keeps
+    /// the conservative outcome-unknown treatment.
+    pub(crate) fn transport_send_failure(connect_phase: bool) -> Self {
+        if connect_phase {
+            Self {
+                kind: ProviderAttemptFailureKind::ConnectNotStarted,
+                handoff: ProviderHandoffCertainty::NotStarted,
+            }
+        } else {
+            Self {
+                kind: ProviderAttemptFailureKind::OutcomeUnknown,
+                handoff: ProviderHandoffCertainty::OutcomeUnknown,
+            }
         }
     }
 }
@@ -1560,6 +1624,178 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// R4 closed retry policy core.
+// ---------------------------------------------------------------------------
+
+/// Compiled per-item Provider retry route (plan §8 R4).
+///
+/// Each flag enables exactly one row of the closed §4.5 retry matrix and is
+/// meant to roll out with its own failure matrix and canary; nothing outside
+/// these rows may retry, and every enabled retry still passes through the
+/// R2 executor admission and the R3 stage arbitration, so the ledger caps,
+/// the cancellation latch, and the frozen public error projections remain
+/// binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderRetryRoute {
+    /// Item 1: a connect-phase failure that provably never left this process
+    /// may retry with a freshly authorized plan.
+    pub(crate) connect_not_started: bool,
+    /// Item 2: a 429 may retry when a syntactically valid `Retry-After`
+    /// fully fits the remaining work window.
+    pub(crate) rate_limited_full_retry_after: bool,
+    /// Item 3: a definitive 5xx response may retry under the bounded
+    /// Provider retry ledger.
+    pub(crate) retryable_server_error: bool,
+}
+
+impl ProviderRetryRoute {
+    /// The compiled R4 route matrix: every closed item enabled.
+    ///
+    /// The route and its bounds enter the compiled reliability runtime
+    /// digest together with the attempt caps and the backoff contract; a
+    /// later route change is a digest change, never a silent policy edit.
+    pub(crate) const R4: Self = Self {
+        connect_not_started: true,
+        rate_limited_full_retry_after: true,
+        retryable_server_error: true,
+    };
+}
+
+/// Server-owned full-jitter base for Provider retries that carry no
+/// `Retry-After` (plan §4.5).
+///
+/// The backoff draw is uniform over `0..=base` (full jitter) so concurrent
+/// retried requests cannot phase-lock onto the Provider. This constant is
+/// part of the compiled reliability runtime contract digest.
+pub(crate) const PROVIDER_RETRY_FULL_JITTER_BASE_MS: u64 = 250;
+
+/// What the closed retry policy decided for one failed Provider attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRetryDecision {
+    /// Retry with a freshly authorized plan after this bounded backoff.
+    Retry { backoff: Duration },
+    /// Do not retry; project the last typed failure through the surface.
+    Terminal,
+}
+
+/// Closed outcome label for the vector-reuse observability (plan §4.6/§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticVectorReuseOutcome {
+    /// A restart or root attempt reused its exact-compatible vector.
+    Reused,
+    /// The operation re-encoded because no compatible vector was stashed.
+    Reencoded,
+    /// A stashed vector failed its fresh revalidation fence.
+    ReuseRejected,
+}
+
+impl SemanticVectorReuseOutcome {
+    /// Closed low-cardinality metric label for this outcome.
+    pub(crate) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Reencoded => "reencoded",
+            Self::ReuseRejected => "reuse_rejected",
+        }
+    }
+}
+
+/// Record one closed vector-reuse outcome (content-free; plan §7).
+pub(crate) fn record_vector_reuse(
+    class: SemanticOperationAttemptClass,
+    outcome: SemanticVectorReuseOutcome,
+) {
+    metrics::counter!(
+        "buzz_semantic_vector_reuse_total",
+        "class" => class.metric_label(),
+        "outcome" => outcome.metric_label(),
+    )
+    .increment(1);
+}
+
+/// Record one closed retry-policy decision (content-free; plan §7).
+pub(crate) fn record_provider_retry_decision(retry: bool) {
+    metrics::counter!(
+        "buzz_semantic_provider_retry_total",
+        "disposition" => if retry {
+            SemanticRetryDisposition::RetryProviderWithFreshPlan.metric_label()
+        } else {
+            SemanticRetryDisposition::Terminal.metric_label()
+        },
+    )
+    .increment(1);
+}
+
+/// Decide the closed disposition for one failed physical Provider attempt.
+///
+/// This is the single owner of the retry policy: it applies the §4.5 matrix
+/// row selected by `route`, the request ledger budgets, and the operation's
+/// own work window. A `Retry` advises the coordinator to assemble a fresh
+/// plan and re-enter the executor; anything else must project the last typed
+/// failure exactly as the pre-R4 single attempt did.
+pub(crate) fn provider_retry_decision(
+    route: ProviderRetryRoute,
+    failure: ProviderAttemptFailure,
+    context: &SemanticExecutionContext,
+) -> ProviderRetryDecision {
+    let backoff = match failure.kind {
+        ProviderAttemptFailureKind::ConnectNotStarted if route.connect_not_started => {
+            full_jitter_backoff()
+        }
+        ProviderAttemptFailureKind::RateLimited {
+            retry_after_seconds: Some(seconds),
+        } if route.rate_limited_full_retry_after => Duration::from_secs(seconds),
+        ProviderAttemptFailureKind::RetryableResponse { .. } if route.retryable_server_error => {
+            full_jitter_backoff()
+        }
+        _ => {
+            record_provider_retry_decision(false);
+            return ProviderRetryDecision::Terminal;
+        }
+    };
+    if !context.ledger().can_begin_provider_attempt() {
+        record_provider_retry_decision(false);
+        return ProviderRetryDecision::Terminal;
+    }
+    let work = context.windows().window(SemanticDeadlineWindow::Work);
+    let Some(remaining) = work.checked_duration_since(Instant::now()) else {
+        record_provider_retry_decision(false);
+        return ProviderRetryDecision::Terminal;
+    };
+    // The backoff must fully fit the remaining window and still leave
+    // nonzero execution time after it (plan §4.5: a `Retry-After` that
+    // cannot fully fit is not requested early).
+    if remaining <= backoff {
+        record_provider_retry_decision(false);
+        return ProviderRetryDecision::Terminal;
+    }
+    record_provider_retry_decision(true);
+    ProviderRetryDecision::Retry { backoff }
+}
+
+/// Draw one full-jitter backoff over the compiled base.
+fn full_jitter_backoff() -> Duration {
+    let bound = PROVIDER_RETRY_FULL_JITTER_BASE_MS;
+    let millis = rand::random::<u64>() % (bound + 1);
+    Duration::from_millis(millis)
+}
+
+/// Sleep one retry backoff inside the work window, racing the request's
+/// aggregated cancellation (plan §6.3: retry sleeps never detach).
+///
+/// The sleep holds no repeatable-read transaction and no traversal permit by
+/// construction — the closed coordinators only back off between executor
+/// admissions, before those resources exist.
+pub(crate) async fn provider_retry_backoff(
+    context: &SemanticExecutionContext,
+    backoff: Duration,
+) -> Result<(), SemanticStageAbort> {
+    context
+        .run_stage(SemanticDeadlineWindow::Work, tokio::time::sleep(backoff))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1781,7 +2017,7 @@ mod tests {
             limited,
             ProviderAttemptFailure {
                 kind: ProviderAttemptFailureKind::RateLimited {
-                    valid_retry_after: true
+                    retry_after_seconds: Some(3)
                 },
                 handoff: ProviderHandoffCertainty::ConfirmedResponse,
             }
@@ -2193,5 +2429,244 @@ mod tests {
             finalizer.latch().complete(),
             SemanticLifecycleState::Completed
         );
+    }
+
+    // -------------------------------------------------------------------
+    // R4 closed retry policy.
+    // -------------------------------------------------------------------
+
+    fn retry_context(
+        class: SemanticOperationAttemptClass,
+        work: Duration,
+    ) -> SemanticExecutionContext {
+        SemanticExecutionContext::new(
+            class,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(Instant::now() + work),
+        )
+    }
+
+    fn connect_not_started() -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::ConnectNotStarted,
+            handoff: ProviderHandoffCertainty::NotStarted,
+        }
+    }
+
+    fn rate_limited(retry_after_seconds: Option<u64>) -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::RateLimited {
+                retry_after_seconds,
+            },
+            handoff: ProviderHandoffCertainty::ConfirmedResponse,
+        }
+    }
+
+    fn retryable_server_error() -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::RetryableResponse { status_class: 500 },
+            handoff: ProviderHandoffCertainty::ConfirmedResponse,
+        }
+    }
+
+    #[test]
+    fn retry_matrix_enables_exactly_the_compiled_route_rows() {
+        let context = retry_context(
+            SemanticOperationAttemptClass::OneShot,
+            Duration::from_secs(60),
+        );
+        // Item 1: connect-not-started retries with a full-jitter backoff.
+        match provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &context) {
+            ProviderRetryDecision::Retry { backoff } => assert!(
+                backoff <= Duration::from_millis(PROVIDER_RETRY_FULL_JITTER_BASE_MS),
+                "jittered backoff must stay within the compiled base"
+            ),
+            ProviderRetryDecision::Terminal => {
+                panic!("connect-not-started must retry under the R4 route")
+            }
+        }
+        // Item 2: only a syntactically valid Retry-After retries, verbatim.
+        assert_eq!(
+            provider_retry_decision(ProviderRetryRoute::R4, rate_limited(Some(3)), &context),
+            ProviderRetryDecision::Retry {
+                backoff: Duration::from_secs(3)
+            }
+        );
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, rate_limited(None), &context),
+            ProviderRetryDecision::Terminal
+        ));
+        // Item 3: a definitive 5xx retries with a full-jitter backoff.
+        match provider_retry_decision(ProviderRetryRoute::R4, retryable_server_error(), &context) {
+            ProviderRetryDecision::Retry { backoff } => assert!(
+                backoff <= Duration::from_millis(PROVIDER_RETRY_FULL_JITTER_BASE_MS),
+                "jittered backoff must stay within the compiled base"
+            ),
+            ProviderRetryDecision::Terminal => panic!("5xx must retry under the R4 route"),
+        }
+
+        // Each disabled route flag keeps its row terminal.
+        let no_connect = ProviderRetryRoute {
+            connect_not_started: false,
+            rate_limited_full_retry_after: true,
+            retryable_server_error: true,
+        };
+        assert!(matches!(
+            provider_retry_decision(no_connect, connect_not_started(), &context),
+            ProviderRetryDecision::Terminal
+        ));
+        let no_rate_limit = ProviderRetryRoute {
+            connect_not_started: true,
+            rate_limited_full_retry_after: false,
+            retryable_server_error: true,
+        };
+        assert!(matches!(
+            provider_retry_decision(no_rate_limit, rate_limited(Some(3)), &context),
+            ProviderRetryDecision::Terminal
+        ));
+        let no_server_error = ProviderRetryRoute {
+            connect_not_started: true,
+            rate_limited_full_retry_after: true,
+            retryable_server_error: false,
+        };
+        assert!(matches!(
+            provider_retry_decision(no_server_error, retryable_server_error(), &context),
+            ProviderRetryDecision::Terminal
+        ));
+
+        // Nothing outside the matrix retries, whatever the route says.
+        for kind in [
+            ProviderAttemptFailureKind::Rejected { status: 400 },
+            ProviderAttemptFailureKind::OutcomeUnknown,
+            ProviderAttemptFailureKind::ProtocolInvalid,
+        ] {
+            let failure = ProviderAttemptFailure {
+                kind,
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+            };
+            assert!(
+                matches!(
+                    provider_retry_decision(ProviderRetryRoute::R4, failure, &context),
+                    ProviderRetryDecision::Terminal
+                ),
+                "kind {kind:?} must stay terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_must_fully_fit_the_remaining_work_window() {
+        // A Retry-After longer than the remaining window is not honored.
+        let short = retry_context(
+            SemanticOperationAttemptClass::OneShot,
+            Duration::from_secs(2),
+        );
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, rate_limited(Some(5)), &short),
+            ProviderRetryDecision::Terminal
+        ));
+        // An expired window never retries, even for the jittered rows.
+        let expired = SemanticExecutionContext::new(
+            SemanticOperationAttemptClass::OneShot,
+            SemanticDeadlineWindows::for_one_shot_hard_deadline(
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &expired),
+            ProviderRetryDecision::Terminal
+        ));
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, retryable_server_error(), &expired),
+            ProviderRetryDecision::Terminal
+        ));
+    }
+
+    #[test]
+    fn retry_requires_remaining_ledger_budget() {
+        let context = retry_context(
+            SemanticOperationAttemptClass::OneShot,
+            Duration::from_secs(60),
+        );
+        let ledger = context.ledger();
+        assert!(ledger.begin_provider_attempt().is_ok());
+        // The single transport-retry token is still available.
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &context),
+            ProviderRetryDecision::Retry { .. }
+        ));
+        assert!(ledger.begin_provider_attempt().is_ok());
+        assert!(!ledger.can_begin_provider_attempt());
+        assert!(matches!(
+            provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &context),
+            ProviderRetryDecision::Terminal
+        ));
+    }
+
+    #[test]
+    fn ledger_probes_agree_with_the_begin_outcomes() {
+        // One-shot: the physical cap covers the initial send plus the single
+        // transport retry.
+        let one_shot = retry_context(
+            SemanticOperationAttemptClass::OneShot,
+            Duration::from_secs(60),
+        );
+        let one_shot_ledger = one_shot.ledger();
+        assert!(one_shot_ledger.can_begin_provider_attempt());
+        assert!(one_shot_ledger.begin_provider_attempt().is_ok());
+        assert!(one_shot_ledger.can_begin_provider_attempt());
+        assert!(one_shot_ledger.begin_provider_attempt().is_ok());
+        assert!(!one_shot_ledger.can_begin_provider_attempt());
+        assert!(one_shot_ledger.begin_provider_attempt().is_err());
+
+        // Complete path: three physical attempts across two root attempts —
+        // two in the first attempt (initial plus the transport retry), then
+        // one more after the fresh root restart resets the per-attempt
+        // transport token.
+        let complete = retry_context(
+            SemanticOperationAttemptClass::CompletePath,
+            Duration::from_secs(60),
+        );
+        let complete_ledger = complete.ledger();
+        assert!(complete_ledger.begin_operation_attempt().is_ok());
+        assert!(complete_ledger.begin_provider_attempt().is_ok());
+        assert!(complete_ledger.begin_provider_attempt().is_ok());
+        assert!(!complete_ledger.can_begin_provider_attempt());
+        assert!(complete_ledger.begin_operation_attempt().is_ok());
+        assert!(complete_ledger.can_begin_provider_attempt());
+        assert!(complete_ledger.begin_provider_attempt().is_ok());
+        assert!(!complete_ledger.can_begin_provider_attempt());
+        assert!(complete_ledger.begin_provider_attempt().is_err());
+
+        // Operation restart budget: the first attempt is free, exactly one
+        // restart is allowed, and further restarts exhaust the ledger.
+        let restarts = retry_context(
+            SemanticOperationAttemptClass::OneShot,
+            Duration::from_secs(60),
+        );
+        let restart_ledger = restarts.ledger();
+        assert!(restart_ledger.can_begin_operation_attempt());
+        assert!(restart_ledger.begin_operation_attempt().is_ok());
+        assert!(restart_ledger.can_begin_operation_attempt());
+        assert!(restart_ledger.begin_operation_attempt().is_ok());
+        assert!(!restart_ledger.can_begin_operation_attempt());
+        assert!(restart_ledger.begin_operation_attempt().is_err());
+    }
+
+    #[test]
+    fn transport_send_failure_uses_the_transports_connect_knowledge() {
+        let connect = ProviderAttemptFailure::transport_send_failure(true);
+        assert_eq!(connect.kind, ProviderAttemptFailureKind::ConnectNotStarted);
+        assert_eq!(connect.handoff, ProviderHandoffCertainty::NotStarted);
+        let unknown = ProviderAttemptFailure::transport_send_failure(false);
+        assert_eq!(unknown.kind, ProviderAttemptFailureKind::OutcomeUnknown);
+        assert_eq!(unknown.handoff, ProviderHandoffCertainty::OutcomeUnknown);
+    }
+
+    #[test]
+    fn full_jitter_backoff_stays_within_the_compiled_base() {
+        for _ in 0..256 {
+            let backoff = full_jitter_backoff();
+            assert!(backoff <= Duration::from_millis(PROVIDER_RETRY_FULL_JITTER_BASE_MS));
+        }
     }
 }

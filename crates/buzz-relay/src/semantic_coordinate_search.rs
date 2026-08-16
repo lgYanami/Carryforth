@@ -6,7 +6,7 @@
 //! signs one response-only Event after current release authorization passes.
 
 use buzz_db::semantic_coordinate_search::SemanticCoordinateSearchVector;
-use buzz_db::semantic_query::SemanticGraphReadTimeouts;
+use buzz_db::semantic_query::{SemanticGraphQueryTicket, SemanticGraphReadTimeouts};
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
     build_coordinate_search_encoder_input, derive_coordinate_search_http_request_binding,
@@ -17,8 +17,14 @@ use buzz_semantic_query::{
 };
 use nostr::Event;
 
-use crate::semantic_one_shot::{SemanticOneShotError, SemanticOneShotExecution};
-use crate::semantic_query_runtime::SemanticEncodeOnceFailure;
+use crate::semantic_one_shot::{
+    read_snapshot_transient, SemanticOneShotEncodeFailure, SemanticOneShotError,
+    SemanticOneShotExecution,
+};
+use crate::semantic_query_runtime::{
+    record_vector_reuse, ProviderRetryRoute, SemanticOperationAttemptClass,
+    SemanticVectorReuseOutcome,
+};
 use crate::state::AppState;
 
 /// Closed, content-free failures for the Coordinate-search HTTP surface.
@@ -114,7 +120,7 @@ async fn execute_coordinate_search(
     }
 
     let reader_pubkey = authenticated_caller.to_bytes();
-    let execution = SemanticOneShotExecution::prepare(
+    let mut execution = SemanticOneShotExecution::prepare(
         state,
         community_id,
         &reader_pubkey,
@@ -131,22 +137,21 @@ async fn execute_coordinate_search(
     metrics::histogram!("carryforth_coordinate_search_provider_input_bytes")
         .record(encoder_input.text().len() as f64);
     let encoded = match execution
-        .encode_once(
-            execution
-                .provider()
-                .encode_coordinate_search(&encoder_input),
-        )
+        .encode_with_retry(ProviderRetryRoute::R4, |provider| {
+            provider.encode_coordinate_search_tracked(&encoder_input)
+        })
         .await
     {
         Ok(encoded) => encoded,
-        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+        Err(SemanticOneShotEncodeFailure::DeadlineExceeded)
+        | Err(SemanticOneShotEncodeFailure::Cancelled(_)) => {
             return Err(CoordinateSearchExecutionError::Timeout);
         }
-        Err(SemanticEncodeOnceFailure::Provider(error)) => {
-            return Err(CoordinateSearchExecutionError::Provider(error));
+        Err(SemanticOneShotEncodeFailure::Provider(tracked)) => {
+            return Err(CoordinateSearchExecutionError::Provider(tracked.error));
         }
-        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
-            return Err(CoordinateSearchExecutionError::Timeout);
+        Err(SemanticOneShotEncodeFailure::FreshPlan(error)) => {
+            return Err(map_one_shot(error));
         }
     };
     if encoded.request_id() != query.request_id {
@@ -155,40 +160,36 @@ async fn execute_coordinate_search(
     let query_vector = SemanticCoordinateSearchVector::new(execution.ticket(), encoded)
         .map_err(classify_database)?;
 
-    let mut read = execution
-        .before_deadline(state.db.begin_semantic_graph_read(
-            execution.ticket(),
-            &reader_pubkey,
-            execution.relay_pubkey(),
-            SemanticGraphReadTimeouts::default(),
-        ))
-        .await
-        .map_err(map_one_shot)?
-        .map_err(classify_database)?;
-    let search = async {
-        match query.coordinate_types.as_ref() {
-            Some(coordinate_types) => {
-                read.search_coordinate_starts_filtered(&query_vector, coordinate_types, query.limit)
-                    .await
+    // R4 items 4 and 6: one classified read transient reopens the short
+    // snapshot and reuses the exact-compatible bound vector. The loop is
+    // bounded by the ledger's single restart; every other failure keeps its
+    // frozen projection. The old repeatable-read transaction is dropped
+    // before the restart (plan §4.5), and the reopened read re-fences the
+    // ticket while the search re-validates the vector against it.
+    let (batch, snapshot_ticket, snapshot_projection_generation) = loop {
+        match coordinate_short_snapshot(state, &execution, &reader_pubkey, &query_vector, &query)
+            .await
+        {
+            ShortSnapshotOutcome::Ranked(payload) => {
+                let (batch, snapshot_ticket) = *payload;
+                let snapshot_projection_generation = snapshot_ticket.projection_generation;
+                break (batch, snapshot_ticket, snapshot_projection_generation);
             }
-            None => {
-                read.search_coordinate_starts(&query_vector, query.limit)
-                    .await
+            ShortSnapshotOutcome::Transient(db_error) => {
+                if !execution.read_transient_restart_available() {
+                    return Err(classify_database(db_error));
+                }
+                execution
+                    .begin_read_transient_restart()
+                    .map_err(map_one_shot)?;
+                record_vector_reuse(
+                    SemanticOperationAttemptClass::OneShot,
+                    SemanticVectorReuseOutcome::Reused,
+                );
             }
+            ShortSnapshotOutcome::Failed(error) => return Err(error),
         }
     };
-    let batch = execution
-        .before_deadline(search)
-        .await
-        .map_err(map_one_shot)?
-        .map_err(classify_database)?;
-    let snapshot_ticket = read.ticket().clone();
-    let snapshot_projection_generation = snapshot_ticket.projection_generation;
-    execution
-        .before_deadline(read.commit())
-        .await
-        .map_err(map_one_shot)?
-        .map_err(classify_database)?;
     let release_permit = execution
         .confirm_release(&snapshot_ticket)
         .await
@@ -252,6 +253,92 @@ async fn execute_coordinate_search(
         .finalize_completed(release_permit)
         .map_err(map_one_shot)?;
     Ok(signed)
+}
+
+/// Outcome of one short-snapshot attempt for the Coordinate-search surface.
+enum ShortSnapshotOutcome {
+    /// The ranked batch with its closed snapshot ticket.
+    Ranked(
+        Box<(
+            buzz_db::semantic_coordinate_search::SemanticCoordinateSearchBatch,
+            SemanticGraphQueryTicket,
+        )>,
+    ),
+    /// A classified read transient; the caller may consume its single
+    /// restart budget and reopen the snapshot.
+    Transient(buzz_db::DbError),
+    /// A terminal failure with its frozen public projection.
+    Failed(CoordinateSearchExecutionError),
+}
+
+/// Open one short repeatable-read snapshot, rank, and close it.
+///
+/// A classified transient surfaces as [`ShortSnapshotOutcome::Transient`]
+/// only after the still-open transaction was explicitly dropped, which is the
+/// plan §4.5 precondition for handing control back to the operation.
+async fn coordinate_short_snapshot(
+    state: &AppState,
+    execution: &SemanticOneShotExecution<'_>,
+    reader_pubkey: &[u8],
+    query_vector: &SemanticCoordinateSearchVector,
+    query: &ProjectContextCoordinateSearchQuery,
+) -> ShortSnapshotOutcome {
+    let mut read = match execution
+        .before_deadline(state.db.begin_semantic_graph_read(
+            execution.ticket(),
+            reader_pubkey,
+            execution.relay_pubkey(),
+            SemanticGraphReadTimeouts::default(),
+        ))
+        .await
+    {
+        Ok(Ok(read)) => read,
+        Ok(Err(db_error)) => {
+            return if read_snapshot_transient(&db_error) {
+                ShortSnapshotOutcome::Transient(db_error)
+            } else {
+                ShortSnapshotOutcome::Failed(classify_database(db_error))
+            };
+        }
+        Err(_) => return ShortSnapshotOutcome::Failed(CoordinateSearchExecutionError::Timeout),
+    };
+    let search = async {
+        match query.coordinate_types.as_ref() {
+            Some(coordinate_types) => {
+                read.search_coordinate_starts_filtered(query_vector, coordinate_types, query.limit)
+                    .await
+            }
+            None => {
+                read.search_coordinate_starts(query_vector, query.limit)
+                    .await
+            }
+        }
+    };
+    let batch = match execution.before_deadline(search).await {
+        Ok(Ok(batch)) => batch,
+        Ok(Err(db_error)) => {
+            // The failed read transaction is dropped before control returns.
+            drop(read);
+            return if read_snapshot_transient(&db_error) {
+                ShortSnapshotOutcome::Transient(db_error)
+            } else {
+                ShortSnapshotOutcome::Failed(classify_database(db_error))
+            };
+        }
+        Err(_) => return ShortSnapshotOutcome::Failed(CoordinateSearchExecutionError::Timeout),
+    };
+    let snapshot_ticket = read.ticket().clone();
+    match execution.before_deadline(read.commit()).await {
+        Ok(Ok(())) => ShortSnapshotOutcome::Ranked(Box::new((batch, snapshot_ticket))),
+        Ok(Err(db_error)) => {
+            if read_snapshot_transient(&db_error) {
+                ShortSnapshotOutcome::Transient(db_error)
+            } else {
+                ShortSnapshotOutcome::Failed(classify_database(db_error))
+            }
+        }
+        Err(_) => ShortSnapshotOutcome::Failed(CoordinateSearchExecutionError::Timeout),
+    }
 }
 
 fn classify_database(error: buzz_db::DbError) -> CoordinateSearchExecutionError {

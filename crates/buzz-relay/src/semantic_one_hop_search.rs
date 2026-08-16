@@ -5,8 +5,8 @@
 //! scoring, canonical preview hydration, and coverage accounting.
 
 use buzz_db::semantic_query::{
-    SemanticEdgeCoordinateSearchOutcome, SemanticExactQueryVector, SemanticGraphReadTimeouts,
-    SemanticIncidentEdgeSearchOutcome,
+    SemanticEdgeCoordinateSearchOutcome, SemanticExactQueryVector, SemanticGraphQueryTicket,
+    SemanticGraphReadTimeouts, SemanticIncidentEdgeSearchOutcome, SemanticOneHopSearchBatch,
 };
 use buzz_semantic::Digest32;
 use buzz_semantic_query::{
@@ -15,13 +15,19 @@ use buzz_semantic_query::{
     edge_coordinate_filtered_ranking_contract_digest, edge_coordinate_ranking_contract_digest,
     incident_edge_ranking_contract_digest, OneHopSemanticError, OneHopSemanticObservations,
     OneHopSemanticScope, ProjectContextOneHopSemanticQuery,
-    ProjectContextOneHopSemanticQueryResult, SemanticGraphQueryError, SemanticQueryEncoder,
+    ProjectContextOneHopSemanticQueryResult, SemanticGraphQueryError,
     MAX_ONE_HOP_SEMANTIC_WALL_TIME_MS,
 };
 use nostr::Event;
 
-use crate::semantic_one_shot::{SemanticOneShotError, SemanticOneShotExecution};
-use crate::semantic_query_runtime::SemanticEncodeOnceFailure;
+use crate::semantic_one_shot::{
+    read_snapshot_transient, SemanticOneShotEncodeFailure, SemanticOneShotError,
+    SemanticOneShotExecution,
+};
+use crate::semantic_query_runtime::{
+    record_vector_reuse, ProviderRetryRoute, SemanticOperationAttemptClass,
+    SemanticVectorReuseOutcome,
+};
 use crate::state::AppState;
 
 /// Closed, content-free failures for the one-hop semantic HTTP surface.
@@ -130,7 +136,7 @@ async fn execute_one_hop_semantic_search(
         return Err(OneHopSemanticExecutionError::InvalidRequest);
     }
     let reader_pubkey = authenticated_caller.to_bytes();
-    let execution = SemanticOneShotExecution::prepare(
+    let mut execution = SemanticOneShotExecution::prepare(
         state,
         community_id,
         &reader_pubkey,
@@ -147,104 +153,51 @@ async fn execute_one_hop_semantic_search(
     metrics::histogram!("carryforth_one_hop_semantic_provider_input_bytes")
         .record(encoder_input.text().len() as f64);
     let encoded = match execution
-        .encode_once(
-            execution
-                .provider()
-                .encode_queries(std::slice::from_ref(&encoder_input)),
-        )
+        .encode_with_retry(ProviderRetryRoute::R4, |provider| {
+            provider.encode_queries_tracked(std::slice::from_ref(&encoder_input))
+        })
         .await
     {
         Ok(encoded) => encoded,
-        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+        Err(SemanticOneShotEncodeFailure::DeadlineExceeded)
+        | Err(SemanticOneShotEncodeFailure::Cancelled(_)) => {
             return Err(OneHopSemanticExecutionError::Timeout);
         }
-        Err(SemanticEncodeOnceFailure::Provider(error)) => {
-            return Err(map_provider(error));
+        Err(SemanticOneShotEncodeFailure::Provider(tracked)) => {
+            return Err(map_provider(tracked.error));
         }
-        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
-            return Err(OneHopSemanticExecutionError::Timeout);
+        Err(SemanticOneShotEncodeFailure::FreshPlan(error)) => {
+            return Err(map_one_shot(error));
         }
     };
     let query_vector = bind_one_hop_query_vector(execution.ticket(), &encoder_input, encoded)?;
 
-    let mut read = execution
-        .before_deadline(state.db.begin_semantic_graph_read(
-            execution.ticket(),
-            &reader_pubkey,
-            execution.relay_pubkey(),
-            SemanticGraphReadTimeouts::default(),
-        ))
-        .await
-        .map_err(map_one_shot)?
-        .map_err(classify_database)?;
-    if read.ticket().projection_generation != execution.ticket().projection_generation
-        || read.ticket().project_context_revision != execution.ticket().project_context_revision
-    {
-        return Err(OneHopSemanticExecutionError::Conflict);
-    }
-
-    let batch = match &query.scope {
-        OneHopSemanticScope::IncidentEdges { coordinate } => execution
-            .before_deadline(read.search_incident_edges_one_hop(
-                coordinate,
-                &query_vector,
-                query.limit,
-            ))
-            .await
-            .map_err(map_one_shot)?
-            .map_err(classify_database)
-            .and_then(|outcome| match outcome {
-                SemanticIncidentEdgeSearchOutcome::Ranked(batch) => Ok(batch),
-                SemanticIncidentEdgeSearchOutcome::NotFound => {
-                    Err(OneHopSemanticExecutionError::NotFound)
+    // R4 items 4 and 6: one classified read transient reopens the short
+    // snapshot and reuses the exact-compatible bound vector, bounded by the
+    // ledger's single restart. The old repeatable-read transaction is
+    // dropped before the restart (plan §4.5).
+    let (batch, snapshot_ticket) = loop {
+        match one_hop_short_snapshot(state, &execution, &reader_pubkey, &query_vector, &query).await
+        {
+            OneHopSnapshotOutcome::Ranked(payload) => {
+                let (batch, ticket) = *payload;
+                break (batch, ticket);
+            }
+            OneHopSnapshotOutcome::Transient(db_error) => {
+                if !execution.read_transient_restart_available() {
+                    return Err(classify_database(db_error));
                 }
-                SemanticIncidentEdgeSearchOutcome::ScopeTooLarge { .. } => {
-                    Err(OneHopSemanticExecutionError::ScopeTooLarge)
-                }
-            })?,
-        OneHopSemanticScope::EdgeCoordinates {
-            edge_key,
-            coordinate_types,
-        } => execution
-            .before_deadline(async {
-                match coordinate_types.as_ref() {
-                    Some(coordinate_types) => {
-                        read.search_edge_coordinates_one_hop_filtered(
-                            *edge_key,
-                            &query_vector,
-                            coordinate_types,
-                            query.limit,
-                        )
-                        .await
-                    }
-                    None => {
-                        read.search_edge_coordinates_one_hop(*edge_key, &query_vector, query.limit)
-                            .await
-                    }
-                }
-            })
-            .await
-            .map_err(map_one_shot)?
-            .map_err(classify_database)
-            .and_then(|outcome| match outcome {
-                SemanticEdgeCoordinateSearchOutcome::Ranked(batch) => Ok(batch),
-                SemanticEdgeCoordinateSearchOutcome::NotFound => {
-                    Err(OneHopSemanticExecutionError::NotFound)
-                }
-                SemanticEdgeCoordinateSearchOutcome::ScopeTooLarge { .. } => {
-                    Err(OneHopSemanticExecutionError::ScopeTooLarge)
-                }
-                SemanticEdgeCoordinateSearchOutcome::HyperedgeTooLarge { .. } => {
-                    Err(OneHopSemanticExecutionError::HyperedgeTooLarge)
-                }
-            })?,
+                execution
+                    .begin_read_transient_restart()
+                    .map_err(map_one_shot)?;
+                record_vector_reuse(
+                    SemanticOperationAttemptClass::OneShot,
+                    SemanticVectorReuseOutcome::Reused,
+                );
+            }
+            OneHopSnapshotOutcome::Failed(error) => return Err(error),
+        }
     };
-    let snapshot_ticket = read.ticket().clone();
-    execution
-        .before_deadline(read.commit())
-        .await
-        .map_err(map_one_shot)?
-        .map_err(classify_database)?;
     let release_permit = execution
         .confirm_release(&snapshot_ticket)
         .await
@@ -326,6 +279,168 @@ async fn execute_one_hop_semantic_search(
         .finalize_completed(release_permit)
         .map_err(map_one_shot)?;
     Ok(signed)
+}
+
+/// Outcome of one short-snapshot attempt for the one-hop surface.
+enum OneHopSnapshotOutcome {
+    /// The ranked batch with its closed snapshot ticket.
+    Ranked(Box<(Box<SemanticOneHopSearchBatch>, SemanticGraphQueryTicket)>),
+    /// A classified read transient; the caller may consume its single
+    /// restart budget and reopen the snapshot.
+    Transient(buzz_db::DbError),
+    /// A terminal failure with its frozen public projection.
+    Failed(OneHopSemanticExecutionError),
+}
+
+/// Open one short repeatable-read snapshot, rank, and close it.
+///
+/// A classified transient surfaces as [`OneHopSnapshotOutcome::Transient`]
+/// only after the still-open transaction was explicitly dropped, which is the
+/// plan §4.5 precondition for handing control back to the operation.
+async fn one_hop_short_snapshot(
+    state: &AppState,
+    execution: &SemanticOneShotExecution<'_>,
+    reader_pubkey: &[u8],
+    query_vector: &SemanticExactQueryVector,
+    query: &ProjectContextOneHopSemanticQuery,
+) -> OneHopSnapshotOutcome {
+    let mut read = match execution
+        .before_deadline(state.db.begin_semantic_graph_read(
+            execution.ticket(),
+            reader_pubkey,
+            execution.relay_pubkey(),
+            SemanticGraphReadTimeouts::default(),
+        ))
+        .await
+    {
+        Ok(Ok(read)) => read,
+        Ok(Err(db_error)) => {
+            return if read_snapshot_transient(&db_error) {
+                OneHopSnapshotOutcome::Transient(db_error)
+            } else {
+                OneHopSnapshotOutcome::Failed(classify_database(db_error))
+            };
+        }
+        Err(_) => return OneHopSnapshotOutcome::Failed(OneHopSemanticExecutionError::Timeout),
+    };
+    if read.ticket().projection_generation != execution.ticket().projection_generation
+        || read.ticket().project_context_revision != execution.ticket().project_context_revision
+    {
+        return OneHopSnapshotOutcome::Failed(OneHopSemanticExecutionError::Conflict);
+    }
+
+    let batch = match &query.scope {
+        OneHopSemanticScope::IncidentEdges { coordinate } => {
+            match execution
+                .before_deadline(read.search_incident_edges_one_hop(
+                    coordinate,
+                    query_vector,
+                    query.limit,
+                ))
+                .await
+            {
+                Ok(Ok(outcome)) => match outcome {
+                    SemanticIncidentEdgeSearchOutcome::Ranked(batch) => batch,
+                    SemanticIncidentEdgeSearchOutcome::NotFound => {
+                        return OneHopSnapshotOutcome::Failed(
+                            OneHopSemanticExecutionError::NotFound,
+                        )
+                    }
+                    SemanticIncidentEdgeSearchOutcome::ScopeTooLarge { .. } => {
+                        return OneHopSnapshotOutcome::Failed(
+                            OneHopSemanticExecutionError::ScopeTooLarge,
+                        )
+                    }
+                },
+                Ok(Err(db_error)) => {
+                    // The failed read transaction is dropped before control
+                    // returns.
+                    drop(read);
+                    return if read_snapshot_transient(&db_error) {
+                        OneHopSnapshotOutcome::Transient(db_error)
+                    } else {
+                        OneHopSnapshotOutcome::Failed(classify_database(db_error))
+                    };
+                }
+                Err(_) => {
+                    return OneHopSnapshotOutcome::Failed(OneHopSemanticExecutionError::Timeout)
+                }
+            }
+        }
+        OneHopSemanticScope::EdgeCoordinates {
+            edge_key,
+            coordinate_types,
+        } => {
+            match execution
+                .before_deadline(async {
+                    match coordinate_types.as_ref() {
+                        Some(coordinate_types) => {
+                            read.search_edge_coordinates_one_hop_filtered(
+                                *edge_key,
+                                query_vector,
+                                coordinate_types,
+                                query.limit,
+                            )
+                            .await
+                        }
+                        None => {
+                            read.search_edge_coordinates_one_hop(
+                                *edge_key,
+                                query_vector,
+                                query.limit,
+                            )
+                            .await
+                        }
+                    }
+                })
+                .await
+            {
+                Ok(Ok(outcome)) => match outcome {
+                    SemanticEdgeCoordinateSearchOutcome::Ranked(batch) => batch,
+                    SemanticEdgeCoordinateSearchOutcome::NotFound => {
+                        return OneHopSnapshotOutcome::Failed(
+                            OneHopSemanticExecutionError::NotFound,
+                        )
+                    }
+                    SemanticEdgeCoordinateSearchOutcome::ScopeTooLarge { .. } => {
+                        return OneHopSnapshotOutcome::Failed(
+                            OneHopSemanticExecutionError::ScopeTooLarge,
+                        )
+                    }
+                    SemanticEdgeCoordinateSearchOutcome::HyperedgeTooLarge { .. } => {
+                        return OneHopSnapshotOutcome::Failed(
+                            OneHopSemanticExecutionError::HyperedgeTooLarge,
+                        )
+                    }
+                },
+                Ok(Err(db_error)) => {
+                    // The failed read transaction is dropped before control
+                    // returns.
+                    drop(read);
+                    return if read_snapshot_transient(&db_error) {
+                        OneHopSnapshotOutcome::Transient(db_error)
+                    } else {
+                        OneHopSnapshotOutcome::Failed(classify_database(db_error))
+                    };
+                }
+                Err(_) => {
+                    return OneHopSnapshotOutcome::Failed(OneHopSemanticExecutionError::Timeout)
+                }
+            }
+        }
+    };
+    let snapshot_ticket = read.ticket().clone();
+    match execution.before_deadline(read.commit()).await {
+        Ok(Ok(())) => OneHopSnapshotOutcome::Ranked(Box::new((batch, snapshot_ticket))),
+        Ok(Err(db_error)) => {
+            if read_snapshot_transient(&db_error) {
+                OneHopSnapshotOutcome::Transient(db_error)
+            } else {
+                OneHopSnapshotOutcome::Failed(classify_database(db_error))
+            }
+        }
+        Err(_) => OneHopSnapshotOutcome::Failed(OneHopSemanticExecutionError::Timeout),
+    }
 }
 
 fn bind_one_hop_query_vector(

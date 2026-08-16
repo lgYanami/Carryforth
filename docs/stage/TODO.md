@@ -2,9 +2,9 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R3 已交付，R4–R6 待实施
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R4 已交付，R5–R6 待实施
 >
-> 更新日期：2026-08-16
+> 更新日期：2026-08-17
 >
 > 概念规范：
 > [Project Context 统一语义检索引擎规范](semantic/unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
@@ -45,8 +45,19 @@
 > deadline、cancellation与release-finalize已交付：stage准入/run_stage统一仲裁（cancellation
 > biased赢得平局、mid-flight future drop即mandatory cleanup）、shutdown/disconnect传播、
 > one-shot release permit同步消费到Event签名（R0 known gap关闭）、complete-path
-> partial-result tails逐字保持、latch post-check拒绝发送已取消的签名结果。下一步实施R4
-> 安全retry、backoff与request-local vector复用；统一资源治理仍排在其后。
+> partial-result tails逐字保持、latch post-check拒绝发送已取消的签名结果。R4
+> 安全retry、backoff与request-local vector复用已交付：runtime独占closed retry
+> policy（每item独立route flag、§4.5矩阵行、ledger预算探测、work窗口
+> full-fit、full-jitter backoff经run_stage与cancellation竞速），coordinator
+> 运行机械循环组装fresh plan（§4.3 fresh ticket/reservation逐attempt重建）；
+> transport handoff certainty在私有边界产生（connect失败pre-handoff可重试）；
+> one-shot read transient同ticket重开RR并复用bound vector（单restart预算）；
+> complete-path churn接入同一ledger并以content-free identity stash实现
+> exact-compatible vector复用（不跨generation/input、不持久化）；release
+> confirmation仅unsigned/permit-less transient原地重试（上限2次，
+> Denied/FleetUnavailable不重试）；declined/exhausted一律返回最后typed
+> failure走冻结公开映射。下一步实施R5共享Provider circuit；统一资源治理
+> 仍排在其后。
 
 ### 背景
 

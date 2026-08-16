@@ -36,14 +36,14 @@ use buzz_semantic_query::{
     OmittedContextChannelCounts, OmittedContextCoordinateObservation,
     OmittedContextCoordinateReason, OmittedForResponseBudgetCounts,
     OmittedInitialCoordinateObservation, OmittedInitialCoordinateReason,
-    ProjectContextBindingProvenance, ProjectContextEdgeProvenance,
+    ProjectContextBindingProvenance, ProjectContextEdgeProvenance, ProviderEncodedSemanticInput,
     ProviderEncodedSemanticInputBundle, RootDiscoveryChannel, RootStructuralEntrypoint, Score,
     ScoreExplanation, SelectedAutomaticRoot, SemanticComputationRoute, SemanticGraphQuery,
     SemanticGraphQueryCoverage, SemanticGraphQueryError, SemanticGraphQueryInputObservations,
-    SemanticHeadProvenance, SemanticHeadState, SemanticInputEncoder, SemanticProvenance,
-    SemanticQueryChannelKind, SemanticQueryEncoder, SemanticQueryEncoderInput, SemanticScoreRole,
-    SemanticSourcePreview, TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR,
-    RESPONSE_TAIL_RESERVE_MS, SEMANTIC_COMPUTATION_ROUTES, SNAPSHOT_CLOSE_RESERVE_MS,
+    SemanticHeadProvenance, SemanticHeadState, SemanticProvenance, SemanticQueryChannelKind,
+    SemanticQueryEncoderInput, SemanticScoreRole, SemanticSourcePreview,
+    TruncationCountsByDimension, BASE_ENTRY_FLOOR, RELATION_FLOOR, RESPONSE_TAIL_RESERVE_MS,
+    SEMANTIC_COMPUTATION_ROUTES, SNAPSHOT_CLOSE_RESERVE_MS,
 };
 use std::sync::Arc;
 
@@ -55,11 +55,13 @@ use crate::semantic_graph_observability::{
     SemanticGraphDistanceStage, SemanticGraphMetricStage, SemanticGraphProviderFailure,
     SemanticGraphQueryMetricError,
 };
+use crate::semantic_provider::TrackedProviderFailure;
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, propagate_relay_shutdown, ProviderEgressObservation,
-    ProviderEgressPlan, SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticEncodeOnceFailure,
-    SemanticExecutionContext, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
-    SemanticStageAbort,
+    encode_once, execute_provider_egress, propagate_relay_shutdown, provider_retry_backoff,
+    provider_retry_decision, record_vector_reuse, ProviderEgressObservation, ProviderEgressPlan,
+    ProviderRetryDecision, ProviderRetryRoute, SemanticDeadlineWindow, SemanticDeadlineWindows,
+    SemanticEncodeOnceFailure, SemanticExecutionContext, SemanticOperationAttemptClass,
+    SemanticProviderEgressFailure, SemanticStageAbort, SemanticVectorReuseOutcome,
 };
 use crate::AppState;
 
@@ -124,17 +126,24 @@ async fn begin_semantic_graph_root_query_inner(
         }
     };
 
+    // R4 items 5 and 6: the churn restart reuses the failed attempt's
+    // exact-compatible encoded vectors when the fresh observation rebuilds
+    // byte-identical inputs under the same generation. The stash lives only
+    // inside this request (plan §4.6): nothing is persisted and nothing is
+    // shared across requests, pods, or processes.
+    let mut reusable = None;
     let mut last_churn = None;
     for attempt in 0..=1_u8 {
-        match root_query_attempt(
+        match root_query_attempt(RootQueryAttemptPlan {
             state,
             provider,
             community_id,
             reader_pubkey,
-            &query,
+            query: &query,
             deadlines,
-            &context,
-        )
+            context: &context,
+            reusable: &mut reusable,
+        })
         .await
         {
             Ok(stage) => {
@@ -166,15 +175,31 @@ async fn begin_semantic_graph_root_query_inner(
     Err(last_churn.unwrap_or(SemanticGraphRootQueryError::ContextSourceChanged))
 }
 
-async fn root_query_attempt(
-    state: &AppState,
-    provider: &crate::semantic_provider::VolcengineSemanticProvider,
+/// One root-attempt plan: everything a fresh operation attempt needs.
+struct RootQueryAttemptPlan<'a> {
+    state: &'a AppState,
+    provider: &'a crate::semantic_provider::VolcengineSemanticProvider,
     community_id: CommunityId,
-    reader_pubkey: &[u8],
-    query: &SemanticGraphQuery,
+    reader_pubkey: &'a [u8],
+    query: &'a SemanticGraphQuery,
     deadlines: QueryDeadlines,
-    context: &SemanticExecutionContext,
+    context: &'a SemanticExecutionContext,
+    reusable: &'a mut Option<ReusableQueryVectors>,
+}
+
+async fn root_query_attempt(
+    plan: RootQueryAttemptPlan<'_>,
 ) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
+    let RootQueryAttemptPlan {
+        state,
+        provider,
+        community_id,
+        reader_pubkey,
+        query,
+        deadlines,
+        context,
+        reusable,
+    } = plan;
     // Unreachable while the churn loop above bounds root attempts at the
     // compiled cap; kept so the counting ledger owns the restart dimension
     // from R4 on.
@@ -190,135 +215,293 @@ async fn root_query_attempt(
             }
         });
     }
-    let bootstrap_ticket = run_root_stage(
-        context,
-        state.db.semantic_graph_query_ticket(
-            community_id,
+    let mut prior_vectors = reusable.take();
+    loop {
+        // Every physical Provider attempt assembles its own fresh plan
+        // (plan §4.3): fresh authorized ticket, fresh context observation,
+        // and — whenever it actually encodes — a fresh reservation with its
+        // egress confirmation. No ticket, observation, reservation, permit,
+        // or routing decision is carried across attempts.
+        let bootstrap_ticket = run_root_stage(
+            context,
+            state.db.semantic_graph_query_ticket(
+                community_id,
+                reader_pubkey,
+                &state.relay_keypair.public_key(),
+            ),
+        )
+        .await?
+        .map_err(map_ticket_error)?;
+        let (ticket, stage_a_context) = observe_context_snapshot(
+            state,
+            &bootstrap_ticket,
             reader_pubkey,
-            &state.relay_keypair.public_key(),
-        ),
-    )
-    .await?
-    .map_err(map_ticket_error)?;
-    let (ticket, stage_a_context) = observe_context_snapshot(
-        state,
-        &bootstrap_ticket,
-        reader_pubkey,
-        &query.context_coordinates,
-        context,
-    )
-    .await?;
-    if provider.source_contract() != &ticket.generation.model_contract {
-        record_provider_failure(SemanticGraphProviderFailure::Unavailable);
-        return Err(SemanticGraphRootQueryError::QueryEncoderUnavailable);
-    }
-    let input_build = build_query_encoder_inputs(query, &conditioned_overviews(&stage_a_context))?;
-    let unsupported_conditioned = input_build
-        .omitted_contexts
-        .iter()
-        .map(|omitted| omitted.context_coordinate.clone())
-        .collect::<HashSet<_>>();
-    let channels = query_channel_bindings(&input_build.inputs);
-    let common_inputs = input_build.semantic_input_bundle()?;
-    let context_expectations = stage_a_context
-        .observations
-        .iter()
-        .map(SemanticContextEgressExpectation::from_observation)
-        .collect::<Vec<_>>();
-    // Shared R2 Provider egress executor: reservation, deadline-aware wait,
-    // routing trust, and final no-wait confirmation in one zero-policy
-    // sequence. Its neutral outcome maps back onto this surface's frozen
-    // public errors; `ProviderUnavailable` keeps its pre-R2 ticket re-read.
-    if let Err(failure) = execute_provider_egress(ProviderEgressPlan {
-        state,
-        context,
-        ticket: &ticket,
-        reader_pubkey,
-        expected_contexts: &context_expectations,
-        observation: ProviderEgressObservation::CompletePathQuery,
-    })
-    .await
-    {
-        return Err(match failure {
-            SemanticProviderEgressFailure::ProviderUnavailable => {
-                classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work).await
-            }
-            failure => map_provider_egress_failure(failure),
-        });
-    }
-
-    metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
-        common_inputs
-            .inputs()
+            &query.context_coordinates,
+            context,
+        )
+        .await?;
+        if provider.source_contract() != &ticket.generation.model_contract {
+            record_provider_failure(SemanticGraphProviderFailure::Unavailable);
+            return Err(SemanticGraphRootQueryError::QueryEncoderUnavailable);
+        }
+        let input_build =
+            build_query_encoder_inputs(query, &conditioned_overviews(&stage_a_context))?;
+        let unsupported_conditioned = input_build
+            .omitted_contexts
             .iter()
-            .map(|input| input.exact_utf8_text().len() as f64)
-            .sum::<f64>(),
-    );
-    let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
-    let encoded = match encode_once(
-        context,
-        ProviderEgressObservation::CompletePathQuery,
-        encode_complete_path_inputs(
-            provider,
-            SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
-            &input_build.inputs,
-            &common_inputs,
-        ),
-    )
-    .await
-    {
-        Ok(encoded) => encoded,
-        Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
-            return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
-        }
-        Err(SemanticEncodeOnceFailure::Provider(error)) => {
-            record_provider_failure(provider_failure_class(&error));
-            return Err(map_encoder_error(error));
-        }
-        Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
-            return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
-        }
-    };
-    drop(_provider_timer);
-    let query_vectors = match encoded {
-        CompletePathEncodedInputs::Compatibility(encoded) => {
-            bind_compatibility_query_vectors(&ticket, &input_build.inputs, encoded)?
-        }
-        CompletePathEncodedInputs::Common(encoded) => {
-            SemanticGraphQueryVectorBundle::bind(&ticket, encoded)?
-        }
-    };
-    drop(input_build);
+            .map(|omitted| omitted.context_coordinate.clone())
+            .collect::<HashSet<_>>();
+        let channels = query_channel_bindings(&input_build.inputs);
+        let common_inputs = input_build.semantic_input_bundle()?;
+        let context_expectations = stage_a_context
+            .observations
+            .iter()
+            .map(SemanticContextEgressExpectation::from_observation)
+            .collect::<Vec<_>>();
 
-    let traversal_permit = state
-        .semantic_graph_traversal_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            metrics::counter!("buzz_semantic_graph_traversal_admission_total", "outcome" => "busy")
+        // R4 items 5 and 6: exactly one reuse decision per attempt. The
+        // churned attempt's stash is offered once; an exact identity match
+        // re-binds its vectors under the fresh ticket with no Provider
+        // egress at all, while anything else falls through to a full encode.
+        let mut reused_vectors = None;
+        if let Some(stash) = prior_vectors.take() {
+            if stash.identity == QueryVectorReuseIdentity::of(&input_build.inputs, &ticket) {
+                match rebind_reusable_query_vectors(&ticket, stash.encoded) {
+                    Ok(vectors) => {
+                        record_vector_reuse(
+                            SemanticOperationAttemptClass::CompletePath,
+                            SemanticVectorReuseOutcome::Reused,
+                        );
+                        reused_vectors = Some(vectors);
+                    }
+                    Err(_) => {
+                        record_vector_reuse(
+                            SemanticOperationAttemptClass::CompletePath,
+                            SemanticVectorReuseOutcome::ReuseRejected,
+                        );
+                    }
+                }
+            } else {
+                record_vector_reuse(
+                    SemanticOperationAttemptClass::CompletePath,
+                    SemanticVectorReuseOutcome::Reencoded,
+                );
+            }
+        }
+
+        let query_vectors = match reused_vectors {
+            Some(vectors) => vectors,
+            None => {
+                // Shared R2 Provider egress executor: reservation,
+                // deadline-aware wait, routing trust, and final no-wait
+                // confirmation in one zero-policy sequence. Its neutral
+                // outcome maps back onto this surface's frozen public
+                // errors; `ProviderUnavailable` keeps its pre-R2 ticket
+                // re-read.
+                if let Err(failure) = execute_provider_egress(ProviderEgressPlan {
+                    state,
+                    context,
+                    ticket: &ticket,
+                    reader_pubkey,
+                    expected_contexts: &context_expectations,
+                    observation: ProviderEgressObservation::CompletePathQuery,
+                })
+                .await
+                {
+                    return Err(match failure {
+                        SemanticProviderEgressFailure::ProviderUnavailable => {
+                            classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work)
+                                .await
+                        }
+                        failure => map_provider_egress_failure(failure),
+                    });
+                }
+
+                metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
+                    common_inputs
+                        .inputs()
+                        .iter()
+                        .map(|input| input.exact_utf8_text().len() as f64)
+                        .sum::<f64>(),
+                );
+                let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
+                // R4 items 1-3: the closed runtime policy owns the retry
+                // decision. A sanctioned retry backoffs inside the work
+                // window and restarts this loop — which re-reads the ticket,
+                // re-observes the context, and takes a fresh reservation —
+                // so no stale plan fragment survives. A declined or
+                // exhausted retry returns the last typed failure through
+                // the frozen single-attempt projection.
+                let encoded = match encode_once(
+                    context,
+                    ProviderEgressObservation::CompletePathQuery,
+                    encode_complete_path_inputs(
+                        provider,
+                        SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
+                        &input_build.inputs,
+                        &common_inputs,
+                    ),
+                )
+                .await
+                {
+                    Ok(encoded) => encoded,
+                    Err(SemanticEncodeOnceFailure::DeadlineExceeded)
+                    | Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
+                        return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+                    }
+                    Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
+                        match provider_retry_decision(
+                            ProviderRetryRoute::R4,
+                            tracked.failure,
+                            context,
+                        ) {
+                            ProviderRetryDecision::Terminal => {
+                                let TrackedProviderFailure { error, .. } = tracked;
+                                record_provider_failure(provider_failure_class(&error));
+                                return Err(map_encoder_error(error));
+                            }
+                            ProviderRetryDecision::Retry { backoff } => {
+                                if provider_retry_backoff(context, backoff).await.is_err() {
+                                    return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                };
+                drop(_provider_timer);
+                let (query_vectors, stash) = match encoded {
+                    CompletePathEncodedInputs::Compatibility(encoded) => {
+                        let values = encoded
+                            .into_iter()
+                            .map(EncodedSemanticQuery::into_provider_encoded)
+                            .collect::<Vec<_>>();
+                        (
+                            bind_compatibility_query_vectors(
+                                &ticket,
+                                &input_build.inputs,
+                                &values,
+                            )?,
+                            ReusableEncodedInputs::Compatibility(values),
+                        )
+                    }
+                    CompletePathEncodedInputs::Common(encoded) => (
+                        SemanticGraphQueryVectorBundle::bind(&ticket, encoded.clone())?,
+                        ReusableEncodedInputs::Common(encoded),
+                    ),
+                };
+                // Offer this attempt's exact-compatible vectors to a possible
+                // churn restart of the same request (plan §4.6).
+                *reusable = Some(ReusableQueryVectors {
+                    identity: QueryVectorReuseIdentity::of(&input_build.inputs, &ticket),
+                    encoded: stash,
+                });
+                query_vectors
+            }
+        };
+        drop(input_build);
+
+        let traversal_permit = state
+            .semantic_graph_traversal_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                metrics::counter!(
+                    "buzz_semantic_graph_traversal_admission_total",
+                    "outcome" => "busy"
+                )
                 .increment(1);
-            SemanticGraphRootQueryError::TraversalBusy
-        })?;
-    metrics::counter!("buzz_semantic_graph_traversal_admission_total", "outcome" => "admitted")
-        .increment(1);
-    metrics::histogram!("buzz_semantic_graph_traversal_admission_wait_seconds").record(0.0);
-    metrics::gauge!("buzz_semantic_graph_traversal_limit")
-        .set(state.config.semantic_graph_traversal_max_in_flight as f64);
-    let traversal_permit = SemanticGraphTraversalPermit::new(traversal_permit);
-    let read = begin_generation_bound_read(state, &ticket, reader_pubkey, context).await?;
-    build_stage_c_roots(
-        StageCReadAdmission {
-            read,
-            traversal_permit,
-        },
-        query,
-        &stage_a_context,
-        channels,
-        query_vectors,
-        &unsupported_conditioned,
-        context,
-    )
-    .await
+                SemanticGraphRootQueryError::TraversalBusy
+            })?;
+        metrics::counter!("buzz_semantic_graph_traversal_admission_total", "outcome" => "admitted")
+            .increment(1);
+        metrics::histogram!("buzz_semantic_graph_traversal_admission_wait_seconds").record(0.0);
+        metrics::gauge!("buzz_semantic_graph_traversal_limit")
+            .set(state.config.semantic_graph_traversal_max_in_flight as f64);
+        let traversal_permit = SemanticGraphTraversalPermit::new(traversal_permit);
+        let read = begin_generation_bound_read(state, &ticket, reader_pubkey, context).await?;
+        return build_stage_c_roots(
+            StageCReadAdmission {
+                read,
+                traversal_permit,
+            },
+            query,
+            &stage_a_context,
+            channels,
+            query_vectors,
+            &unsupported_conditioned,
+            context,
+        )
+        .await;
+    }
+}
+
+/// Request-local identity of one encoded query-input batch (R4 item 6).
+///
+/// The ordered exact text digests of the encoder inputs plus the semantic
+/// generation they were encoded under: equal identities mean a rebuilt batch
+/// would send byte-identical Provider inputs under the same generation, so
+/// the already encoded vectors may be re-bound instead of re-sent. The
+/// identity is content-free — digests only, never query text.
+#[derive(PartialEq)]
+struct QueryVectorReuseIdentity {
+    input_digests: Vec<Digest32>,
+    generation_id: uuid::Uuid,
+}
+
+impl QueryVectorReuseIdentity {
+    fn of(inputs: &[SemanticQueryEncoderInput], ticket: &SemanticGraphQueryTicket) -> Self {
+        Self {
+            input_digests: inputs.iter().map(|input| input.text_digest()).collect(),
+            generation_id: ticket.generation.generation_id,
+        }
+    }
+}
+
+/// Pre-bind Provider-encoded values stashed for one churn restart.
+enum ReusableEncodedInputs {
+    /// Compatibility route values in input order.
+    Compatibility(Vec<ProviderEncodedSemanticInput>),
+    /// Migrated common-route bundle.
+    Common(ProviderEncodedSemanticInputBundle),
+}
+
+/// R4 items 5 and 6: request-local vector reuse stash (plan §4.6).
+///
+/// Only pre-bind encoded values and their content-free identity are kept —
+/// nothing crosses requests, pods, or processes and nothing is persisted.
+/// The rebind under a fresh ticket revalidates every fence, so a generation
+/// or contract movement rejects the reuse instead of reusing stale vectors.
+struct ReusableQueryVectors {
+    identity: QueryVectorReuseIdentity,
+    encoded: ReusableEncodedInputs,
+}
+
+/// Re-bind stashed Provider-encoded values under one fresh ticket.
+///
+/// The matching reuse identity already proved the rebuilt inputs equal the
+/// stashed batch byte-for-byte and in order, so only the fresh-ticket fence
+/// validation runs here; its failure rejects the reuse and the caller
+/// re-encodes.
+fn rebind_reusable_query_vectors(
+    ticket: &SemanticGraphQueryTicket,
+    encoded: ReusableEncodedInputs,
+) -> Result<SemanticGraphQueryVectorBundle, SemanticGraphRootQueryError> {
+    match encoded {
+        ReusableEncodedInputs::Common(bundle) => {
+            SemanticGraphQueryVectorBundle::bind(ticket, bundle)
+                .map_err(SemanticGraphRootQueryError::Database)
+        }
+        ReusableEncodedInputs::Compatibility(values) => {
+            let vectors = values
+                .into_iter()
+                .map(|value| buzz_db::semantic_query::SemanticExactQueryVector::new(ticket, value))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SemanticGraphRootQueryError::Database)?;
+            SemanticGraphQueryVectorBundle::from_compatibility_vectors(ticket, vectors)
+                .map_err(SemanticGraphRootQueryError::Database)
+        }
+    }
 }
 
 async fn classify_ticket_failure(
@@ -1863,21 +2046,27 @@ fn query_channel_bindings(inputs: &[SemanticQueryEncoderInput]) -> Vec<QueryChan
         .collect()
 }
 
+/// Encode the complete-path input batch with transport handoff certainty.
+///
+/// The tracked failure keeps the frozen public `SemanticGraphQueryError`
+/// value while carrying the R4 transport-class observation the closed retry
+/// policy needs; coordinators collapse it back onto the frozen error when
+/// their retry budget is declined or exhausted.
 async fn encode_complete_path_inputs(
     provider: &crate::semantic_provider::VolcengineSemanticProvider,
     route: SemanticComputationRoute,
     inputs: &[SemanticQueryEncoderInput],
     common_inputs: &buzz_semantic_query::SemanticQueryInputBundle,
-) -> Result<CompletePathEncodedInputs, SemanticGraphQueryError> {
+) -> Result<CompletePathEncodedInputs, TrackedProviderFailure<SemanticGraphQueryError>> {
     match route {
-        SemanticComputationRoute::Legacy => SemanticQueryEncoder::encode_queries(provider, inputs)
+        SemanticComputationRoute::Legacy => provider
+            .encode_queries_tracked(inputs)
             .await
             .map(CompletePathEncodedInputs::Compatibility),
-        SemanticComputationRoute::Migrated => {
-            SemanticInputEncoder::encode_semantic_inputs(provider, common_inputs)
-                .await
-                .map(CompletePathEncodedInputs::Common)
-        }
+        SemanticComputationRoute::Migrated => provider
+            .encode_semantic_inputs_tracked(common_inputs)
+            .await
+            .map(CompletePathEncodedInputs::Common),
     }
 }
 
@@ -1889,7 +2078,7 @@ enum CompletePathEncodedInputs {
 fn bind_compatibility_query_vectors(
     ticket: &SemanticGraphQueryTicket,
     inputs: &[SemanticQueryEncoderInput],
-    encoded: Vec<EncodedSemanticQuery>,
+    encoded: &[ProviderEncodedSemanticInput],
 ) -> Result<SemanticGraphQueryVectorBundle, SemanticGraphRootQueryError> {
     if encoded.len() != inputs.len() {
         return Err(invalid_state(
@@ -1910,7 +2099,7 @@ fn bind_compatibility_query_vectors(
             }
             Ok(buzz_db::semantic_query::SemanticExactQueryVector::new(
                 ticket,
-                encoded.into_provider_encoded(),
+                encoded.clone(),
             )?)
         })
         .collect::<Result<Vec<_>, SemanticGraphRootQueryError>>()?;

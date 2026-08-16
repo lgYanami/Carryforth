@@ -1,9 +1,9 @@
 # Project Context 统一语义检索引擎 TODO
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时实现
-> 计划已定稿并交付R0、R1、R2、R3，R4–R6待实施
+> 计划已定稿并交付R0、R1、R2、R3、R4，R5–R6待实施
 >
-> 日期：2026-08-16
+> 日期：2026-08-17
 
 ## Coordinate 起点检索的目标意图与上下文信号
 
@@ -59,6 +59,12 @@ reservation/wait/egress/encode-once primitive，neutral判别经冻结映射表�
 run_stage统一仲裁deadline与cancellation（biased平局、future drop即mandatory cleanup），
 shutdown/disconnect传播至全部等待边界，one-shot release permit同步消费到Event签名
 （R0 known gap关闭），complete-path partial-result tails逐字保持，latch post-check拒绝
-发送已取消的签名结果。R4起retry/circuit策略另行逐项启用。相关性验收结果只影响
+发送已取消的签名结果。R4安全retry、backoff与request-local vector复用已交付——runtime
+独占closed retry policy（每item独立route flag、§4.5矩阵行、ledger预算探测、work窗口
+full-fit、full-jitter backoff），coordinator运行机械循环逐attempt组装fresh plan；transport
+handoff certainty在私有边界产生；one-shot read transient同ticket重开RR复用bound vector；
+complete-path churn以content-free identity stash实现exact-compatible复用；release
+confirmation仅unsigned/permit-less transient原地重试；一切declined/exhausted返回最后
+typed failure走冻结公开映射。R5起共享Provider circuit另行交付。相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

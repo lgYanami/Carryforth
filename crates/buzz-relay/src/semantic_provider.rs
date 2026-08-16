@@ -22,6 +22,7 @@ use reqwest::{header::RETRY_AFTER, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SemanticWorkerConfig;
+use crate::semantic_query_runtime::{ProviderAttemptFailure, ProviderHandoffCertainty};
 
 /// Maximum successful Provider JSON body accepted by either current adapter.
 ///
@@ -38,6 +39,76 @@ const _: () = assert!(
     SEMANTIC_PROVIDER_SUCCESS_RESPONSE_MAX_BYTES
         > MAX_QUERY_CHANNELS * 2_048 * 48 + MAX_QUERY_CHANNELS * 256 + 4_096
 );
+
+/// One Provider encode failure with its handoff certainty classified at this
+/// private transport boundary (plan §4.4: classification is produced at the
+/// closest source of truth, never reverse-engineered from public errors).
+///
+/// `error` is byte-for-byte the error the frozen adapter contract always
+/// produced; `failure` is the closed classification the R4 retry policy
+/// consumes. The interactive encode paths take the tracked form, while the
+/// shared encoder traits keep their frozen error shape by collapsing it.
+#[derive(Debug, thiserror::Error)]
+#[error("semantic provider encode attempt failed")]
+pub(crate) struct TrackedProviderFailure<E> {
+    /// Closed classification of the failed physical attempt.
+    pub(crate) failure: ProviderAttemptFailure,
+    /// Frozen surface error, identical to the untracked adapter's.
+    pub(crate) error: E,
+}
+
+impl TrackedProviderFailure<SemanticError> {
+    /// Classify one failure with a known semantic error shape.
+    fn classified(error: SemanticError) -> Self {
+        Self {
+            failure: ProviderAttemptFailure::from_semantic_error(&error),
+            error,
+        }
+    }
+
+    /// Classify one `.send()`-phase failure using the transport's own connect
+    /// knowledge; this is the only site that can distinguish a pre-handoff
+    /// connect failure from an unknown-outcome send.
+    fn send_failure(error: reqwest::Error) -> Self {
+        Self {
+            failure: ProviderAttemptFailure::transport_send_failure(error.is_connect()),
+            error: SemanticError::ProviderTransport,
+        }
+    }
+
+    /// Project onto the frozen graph-query adapter error without losing the
+    /// classification.
+    fn map_query_error(self) -> TrackedProviderFailure<SemanticGraphQueryError> {
+        TrackedProviderFailure {
+            failure: self.failure,
+            error: query_provider_error(self.error),
+        }
+    }
+}
+
+impl<E> TrackedProviderFailure<E> {
+    /// A failure raised before any transport work left this process.
+    fn pre_transport(error: E) -> Self {
+        Self {
+            failure: ProviderAttemptFailure {
+                kind: crate::semantic_query_runtime::ProviderAttemptFailureKind::ProtocolInvalid,
+                handoff: ProviderHandoffCertainty::NotStarted,
+            },
+            error,
+        }
+    }
+
+    /// A contract failure raised after a full Provider response arrived.
+    fn post_response(error: E) -> Self {
+        Self {
+            failure: ProviderAttemptFailure {
+                kind: crate::semantic_query_runtime::ProviderAttemptFailureKind::ProtocolInvalid,
+                handoff: ProviderHandoffCertainty::ConfirmedResponse,
+            },
+            error,
+        }
+    }
+}
 
 /// Failure to construct the configured semantic Provider client.
 #[derive(Debug, thiserror::Error)]
@@ -106,9 +177,11 @@ impl VolcengineSemanticProvider {
         &self,
         texts: &[&str],
         expected_contract: &SemanticModelContract,
-    ) -> Result<RawEmbeddingBatch, SemanticError> {
+    ) -> Result<RawEmbeddingBatch, TrackedProviderFailure<SemanticError>> {
         if texts.is_empty() || expected_contract != &self.source_contract {
-            return Err(SemanticError::ExternalProviderBoundary);
+            return Err(TrackedProviderFailure::classified(
+                SemanticError::ExternalProviderBoundary,
+            ));
         }
         let request = EmbeddingRequest {
             model: &self.request_model,
@@ -123,7 +196,7 @@ impl VolcengineSemanticProvider {
             .json(&request)
             .send()
             .await
-            .map_err(|_| SemanticError::ProviderTransport)?;
+            .map_err(TrackedProviderFailure::send_failure)?;
         let status = response.status();
         let retry_after_seconds = response
             .headers()
@@ -135,25 +208,34 @@ impl VolcengineSemanticProvider {
         } else {
             SEMANTIC_PROVIDER_ERROR_RESPONSE_MAX_BYTES
         };
-        let response_body = read_bounded_provider_response(response, maximum_body_bytes).await?;
+        let response_body = read_bounded_provider_response(response, maximum_body_bytes)
+            .await
+            .map_err(TrackedProviderFailure::classified)?;
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(SemanticError::ProviderRateLimited {
-                retry_after_seconds,
-            });
+            return Err(TrackedProviderFailure::classified(
+                SemanticError::ProviderRateLimited {
+                    retry_after_seconds,
+                },
+            ));
         }
         if status.is_server_error() {
-            return Err(SemanticError::ProviderRetryable {
-                status: status.as_u16(),
-            });
+            return Err(TrackedProviderFailure::classified(
+                SemanticError::ProviderRetryable {
+                    status: status.as_u16(),
+                },
+            ));
         }
         if !status.is_success() {
-            return Err(SemanticError::ProviderRejected {
-                status: status.as_u16(),
-            });
+            return Err(TrackedProviderFailure::classified(
+                SemanticError::ProviderRejected {
+                    status: status.as_u16(),
+                },
+            ));
         }
-        let body: EmbeddingResponse =
-            serde_json::from_slice(&response_body).map_err(|_| SemanticError::ProviderResponse)?;
+        let body: EmbeddingResponse = serde_json::from_slice(&response_body)
+            .map_err(|_| TrackedProviderFailure::classified(SemanticError::ProviderResponse))?;
         decode_embedding_response(texts.len(), body, expected_contract)
+            .map_err(TrackedProviderFailure::classified)
     }
 
     /// Encode exactly one natural-language Coordinate-search input.
@@ -165,24 +247,45 @@ impl VolcengineSemanticProvider {
         &self,
         input: &CoordinateSearchEncoderInput,
     ) -> QueryContractResult<EncodedCoordinateSearchQuery> {
-        input
-            .validate()
-            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))?;
-        let common_inputs = input.semantic_input_bundle().map_err(|error| {
-            SemanticGraphQueryError::InvalidState(format!(
-                "Coordinate-search input bundle: {error}"
+        self.encode_coordinate_search_tracked(input)
+            .await
+            .map_err(|tracked| tracked.error)
+    }
+
+    /// `encode_coordinate_search` with the transport handoff certainty
+    /// preserved for the R4 retry policy.
+    pub(crate) async fn encode_coordinate_search_tracked(
+        &self,
+        input: &CoordinateSearchEncoderInput,
+    ) -> Result<EncodedCoordinateSearchQuery, TrackedProviderFailure<SemanticGraphQueryError>> {
+        input.validate().map_err(|error| {
+            TrackedProviderFailure::pre_transport(SemanticGraphQueryError::InvalidState(
+                error.to_string(),
             ))
         })?;
-        let encoded = SemanticInputEncoder::encode_semantic_inputs(self, &common_inputs).await?;
+        let common_inputs = input.semantic_input_bundle().map_err(|error| {
+            TrackedProviderFailure::pre_transport(SemanticGraphQueryError::InvalidState(format!(
+                "Coordinate-search input bundle: {error}"
+            )))
+        })?;
+        let encoded = self.encode_semantic_inputs_tracked(&common_inputs).await?;
         if encoded.inputs().len() != 1 {
-            return Err(SemanticGraphQueryError::ProviderResponse);
+            return Err(TrackedProviderFailure::post_response(
+                SemanticGraphQueryError::ProviderResponse,
+            ));
         }
         let mut encoded = encoded.into_inputs().into_iter();
         let Some(encoded) = encoded.next() else {
-            return Err(SemanticGraphQueryError::ProviderResponse);
+            return Err(TrackedProviderFailure::post_response(
+                SemanticGraphQueryError::ProviderResponse,
+            ));
         };
         EncodedCoordinateSearchQuery::from_provider_encoded(input, encoded, &self.source_contract)
-            .map_err(|error| SemanticGraphQueryError::InvalidState(error.to_string()))
+            .map_err(|error| {
+                TrackedProviderFailure::post_response(SemanticGraphQueryError::InvalidState(
+                    error.to_string(),
+                ))
+            })
     }
 }
 
@@ -282,7 +385,8 @@ impl SemanticEncoder for VolcengineSemanticProvider {
                 .collect::<Vec<_>>();
             let batch = self
                 .encode_text_batch(&texts, &self.source_contract)
-                .await?;
+                .await
+                .map_err(|tracked| tracked.error)?;
             let mut encoded = Vec::with_capacity(inputs.len());
             for (input, embedding) in inputs.iter().zip(batch.embeddings) {
                 let unit = SemanticUnit {
@@ -313,22 +417,9 @@ impl SemanticQueryEncoder for VolcengineSemanticProvider {
         inputs: &'a [SemanticQueryEncoderInput],
     ) -> SemanticQueryEncoderFuture<'a> {
         Box::pin(async move {
-            validate_query_batch(inputs)?;
-            QueryCompatibilityFences::for_source_contract(&self.source_contract)?;
-            let common_inputs = SemanticQueryInputBundle::from_closed_inputs(
-                inputs
-                    .iter()
-                    .map(|input| input.semantic_input().clone())
-                    .collect(),
-            )
-            .map_err(|error| {
-                SemanticGraphQueryError::InvalidState(format!(
-                    "common semantic input bundle: {error}"
-                ))
-            })?;
-            let encoded =
-                SemanticInputEncoder::encode_semantic_inputs(self, &common_inputs).await?;
-            bind_query_response(inputs, encoded, &self.source_contract)
+            self.encode_queries_tracked(inputs)
+                .await
+                .map_err(|tracked| tracked.error)
         })
     }
 }
@@ -343,32 +434,73 @@ impl SemanticInputEncoder for VolcengineSemanticProvider {
         inputs: &'a SemanticQueryInputBundle,
     ) -> SemanticInputEncoderFuture<'a> {
         Box::pin(async move {
-            inputs.validate().map_err(|error| {
-                SemanticGraphQueryError::InvalidState(format!(
-                    "common semantic input bundle: {error}"
-                ))
-            })?;
-            SemanticModelSpaceFences::for_source_contract(&self.source_contract)?;
-            let texts = inputs
-                .inputs()
-                .iter()
-                .map(|input| input.exact_utf8_text())
-                .collect::<Vec<_>>();
-            let batch = self
-                .encode_text_batch(&texts, &self.source_contract)
+            self.encode_semantic_inputs_tracked(inputs)
                 .await
-                .map_err(query_provider_error)?;
-            ProviderEncodedSemanticInputBundle::new(
-                inputs,
-                batch.response_model,
-                batch
-                    .embeddings
-                    .into_iter()
-                    .map(EmbeddingVector::into_values)
-                    .collect(),
-                &self.source_contract,
-            )
+                .map_err(|tracked| tracked.error)
         })
+    }
+}
+
+impl VolcengineSemanticProvider {
+    /// `SemanticInputEncoder::encode_semantic_inputs` with the transport
+    /// handoff certainty preserved for the R4 retry policy.
+    pub(crate) async fn encode_semantic_inputs_tracked<'a>(
+        &'a self,
+        inputs: &'a SemanticQueryInputBundle,
+    ) -> Result<ProviderEncodedSemanticInputBundle, TrackedProviderFailure<SemanticGraphQueryError>>
+    {
+        inputs.validate().map_err(|error| {
+            TrackedProviderFailure::pre_transport(SemanticGraphQueryError::InvalidState(format!(
+                "common semantic input bundle: {error}"
+            )))
+        })?;
+        SemanticModelSpaceFences::for_source_contract(&self.source_contract)
+            .map_err(TrackedProviderFailure::pre_transport)?;
+        let texts = inputs
+            .inputs()
+            .iter()
+            .map(|input| input.exact_utf8_text())
+            .collect::<Vec<_>>();
+        let batch = self
+            .encode_text_batch(&texts, &self.source_contract)
+            .await
+            .map_err(|tracked| tracked.map_query_error())?;
+        ProviderEncodedSemanticInputBundle::new(
+            inputs,
+            batch.response_model,
+            batch
+                .embeddings
+                .into_iter()
+                .map(EmbeddingVector::into_values)
+                .collect(),
+            &self.source_contract,
+        )
+        .map_err(TrackedProviderFailure::post_response)
+    }
+
+    /// `SemanticQueryEncoder::encode_queries` with the transport handoff
+    /// certainty preserved for the R4 retry policy.
+    pub(crate) async fn encode_queries_tracked<'a>(
+        &'a self,
+        inputs: &'a [SemanticQueryEncoderInput],
+    ) -> Result<Vec<EncodedSemanticQuery>, TrackedProviderFailure<SemanticGraphQueryError>> {
+        validate_query_batch(inputs).map_err(TrackedProviderFailure::pre_transport)?;
+        QueryCompatibilityFences::for_source_contract(&self.source_contract)
+            .map_err(TrackedProviderFailure::pre_transport)?;
+        let common_inputs = SemanticQueryInputBundle::from_closed_inputs(
+            inputs
+                .iter()
+                .map(|input| input.semantic_input().clone())
+                .collect(),
+        )
+        .map_err(|error| {
+            TrackedProviderFailure::pre_transport(SemanticGraphQueryError::InvalidState(format!(
+                "common semantic input bundle: {error}"
+            )))
+        })?;
+        let encoded = self.encode_semantic_inputs_tracked(&common_inputs).await?;
+        bind_query_response(inputs, encoded, &self.source_contract)
+            .map_err(TrackedProviderFailure::post_response)
     }
 }
 

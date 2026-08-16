@@ -1,6 +1,6 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0、R1、R2、R3 已交付；R4–R6 待实施
+> 状态：R0、R1、R2、R3、R4 已交付；R5–R6 待实施
 >
 > 日期：2026-08-16
 >
@@ -953,6 +953,68 @@ snapshot attempt count
 `Finalizing`先赢，允许同步签名完成但cancelled/timed-out结果不得发送。所有公开timeout/error保持兼容。
 
 ### R4：安全retry、backoff与request-local vector复用
+
+> 当前状态：已交付（2026-08-17）。`crates/buzz-relay/src/semantic_query_runtime.rs`
+> 新增closed retry policy core：`ProviderRetryRoute`（每item一个独立flag，
+> 编译期route；`ProviderRetryRoute::R4`为全开矩阵，逐行on/off均有测试，
+> 任一flag关闭即回到该行terminal，满足"独立route、不静默改策略"——
+> route变更即reliability digest变更）、`provider_retry_decision`
+> （§4.5矩阵行→ledger预算探测`can_begin_provider_attempt`→work窗口
+> full-fit检查：`remaining <= backoff`即terminal，绝不吃work/close/finalize
+> reserve）、`provider_retry_backoff`（`run_stage(Work, sleep)`：与聚合
+> cancellation竞速，不detach；backoff期间按构造不持有任何RR事务或
+> traversal permit）、`PROVIDER_RETRY_FULL_JITTER_BASE_MS = 250`
+> full-jitter（并发重试不锁相）。**记录实现形态偏差**（同R1 fake-clock
+> 先例）：retry机械循环由closed coordinator运行而非executor回调——
+> 只有coordinator能从自己的state组装fresh plan（fresh ticket、fresh
+> observation、fresh inputs），runtime独占策略本体（decision+backoff+
+> ledger探测），每次retry仍过R2 reservation/confirmation与R3 admission，
+> ledger上限、latch、冻结公开错误投影全部保持绑定。Transport handoff
+> certainty在私有transport边界产生（§4.4）：buzz-semantic冻结故
+> handoff分类搭载relay侧 `TrackedProviderFailure<E>`（`failure`=closed
+>分类、`error`=逐字节原冻结错误）；`.send()`阶段以reqwest
+> `is_connect()`区分connect失败（`ConnectNotStarted`/`NotStarted`）与其
+> 余send失败（保守`OutcomeUnknown`）；`encode_queries`/`encode_semantic_inputs`/
+> `encode_coordinate_search` trait实现折叠tracked→原错误，公开行为零变化。
+> 交付项逐条：（1–3）one-shot经 `SemanticOneShotExecution::encode_with_retry`：
+> 每次attempt是一次sanctioned `encode_once`；Retry决策后sleep有界backoff
+> 再由envelope组装fresh plan（fresh authorized ticket+contract检查+
+> fresh reservation/egress confirmation，§4.3），exhausted/declined返回
+> 最后typed failure走冻结投影；complete-path `root_query_attempt`内层
+> loop：Retry→backoff→`continue`重启[bootstrap ticket→observe→inputs→
+> egress→encode]整段（循环重启即fresh plan，无stale ticket/reservation/
+> routing残留），Terminal→原 `record_provider_failure(provider_failure_class)`+
+> `map_encoder_error` 逐字保持。（4+6）one-shot两surface的short
+> snapshot read transient（`read_snapshot_transient`：仅closed SQLSTATE
+> allowlist经 `semantic_failure_kind(SnapshotRead)`）以同ticket重开RR：
+> 旧事务先显式drop（§4.5前置），DB重fence ticket、search对read ticket
+> 重验vector fence、release writer fence终验——无Provider调用故无需
+> reservation，仅消耗 `begin_operation_attempt` 单次restart预算
+> （`can_begin_operation_attempt`前置探测），bound vector原样复用
+> （metric `Reused`）。（5）complete-path既有 `0..=1` churn loop接入同一
+> ledger并加request-local vector stash：成功encode后保存pre-bind值+
+> content-free identity（有序 `text_digest()`+`generation_id`，§4.6：
+> 同一逻辑请求内、原始absolute deadline下、不跨request/pod/process、
+> 不持久化）；restart attempt恰好一次reuse决策——identity全等则在fresh
+> ticket下rebind（DB fence重验，generation变化即identity不等→必然
+> re-encode，vector永不跨generation/input），rebind失败记
+> `ReuseRejected`后落回正常encode；复用路径零Provider egress。
+> （7）`confirm_release`：仅DB分类的release-confirmation transient
+> （`release_confirmation_transient`，同SQLSTATE allowlist）原地重试，
+> 仅限未签名未持permit的失败DB调用路径；ledger上限2次，耗尽投影最后
+> typed failure；`Denied`/`FleetUnavailable`/`SnapshotChanged`永不重试；
+> retry期间新见的denial覆盖早先transient（§4.5固定优先级）。新增
+> content-free指标：`buzz_semantic_provider_retry_total{disposition}`、
+> `buzz_semantic_vector_reuse_total{class,outcome}`、
+> `buzz_semantic_release_retry_total{disposition}`。公开错误兼容：一切
+> declined/exhausted路径返回最后typed failure经冻结映射（one-shot
+> `Provider(tracked.error)`、complete-path `map_encoder_error`），唯一
+> 行为差异是新增的受限重试本身。验证：`cargo clippy -D warnings` +
+> `cargo fmt` + `cargo test -p buzz-relay --lib semantic`（110 tests，
+> +9）+ 三个gate（compatibility、computation、reliability `all`，含
+> freeze-diff）实际运行通过；`just test-unit` 全量通过（本环境无
+> Postgres的8个media/admin DB依赖测试属集成层、与语义无关、与R3基线
+> 一致）。
 
 启用顺序：
 
