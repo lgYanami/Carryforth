@@ -66,6 +66,11 @@ pub struct SemanticWorkerConfig {
     pub claim_seconds: u16,
     /// Attempts before a job becomes poison.
     pub max_attempts: u32,
+    /// R5 Provider circuit enforcement switch (shadow by default).
+    ///
+    /// The circuit always runs and records its decisions; this flag is the
+    /// isolated single-Relay canary switch that makes refusals binding.
+    pub provider_circuit_enforce: bool,
 }
 
 impl std::fmt::Debug for SemanticWorkerConfig {
@@ -80,6 +85,7 @@ impl std::fmt::Debug for SemanticWorkerConfig {
             .field("request_interval", &self.request_interval)
             .field("claim_seconds", &self.claim_seconds)
             .field("max_attempts", &self.max_attempts)
+            .field("provider_circuit_enforce", &self.provider_circuit_enforce)
             .finish()
     }
 }
@@ -1289,6 +1295,8 @@ impl Config {
                     .to_string(),
             ));
         }
+        let semantic_provider_circuit_enforce =
+            parse_bool("BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE", false)?;
         let semantic_worker = SemanticWorkerConfig {
             enabled: semantic_worker_enabled,
             api_key: semantic_api_key,
@@ -1298,6 +1306,7 @@ impl Config {
             request_interval: Duration::from_millis(semantic_request_interval_millis),
             claim_seconds: semantic_claim_seconds,
             max_attempts: semantic_max_attempts,
+            provider_circuit_enforce: semantic_provider_circuit_enforce,
         };
         let join_policy = if terms_markdown.is_none()
             && privacy_markdown.is_none()

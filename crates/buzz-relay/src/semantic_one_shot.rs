@@ -19,9 +19,10 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::{TrackedProviderFailure, VolcengineSemanticProvider};
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, propagate_relay_shutdown, provider_retry_backoff,
-    provider_retry_decision, ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision,
-    ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
+    encode_once, execute_provider_egress, observe_provider_circuit, propagate_relay_shutdown,
+    provider_retry_backoff, provider_retry_decision, ProviderCircuitObservation,
+    ProviderCircuitToken, ProviderEgressAdmission, ProviderEgressObservation, ProviderEgressPlan,
+    ProviderRetryDecision, ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
     SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
     SemanticLatchOutcome, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
     SemanticStageAbort,
@@ -55,6 +56,9 @@ pub(crate) struct SemanticOneShotExecution<'a> {
     relay_pubkey: PublicKey,
     routing_trust: SemanticGraphQueryRoutingTrust<'a>,
     provider: &'a VolcengineSemanticProvider,
+    /// R5 circuit token of the current physical attempt; refreshed together
+    /// with the ticket by every retry's fresh egress admission.
+    circuit_token: Option<ProviderCircuitToken>,
     context: SemanticExecutionContext,
     _process_permit: OwnedSemaphorePermit,
 }
@@ -126,7 +130,7 @@ impl<'a> SemanticOneShotExecution<'a> {
             .ledger()
             .begin_operation_attempt()
             .map_err(|_| SemanticOneShotError::Busy)?;
-        let routing_trust = execute_provider_egress(ProviderEgressPlan {
+        let admission = execute_provider_egress(ProviderEgressPlan {
             state,
             context: &context,
             ticket: &ticket,
@@ -136,6 +140,10 @@ impl<'a> SemanticOneShotExecution<'a> {
         })
         .await
         .map_err(map_egress_failure)?;
+        let ProviderEgressAdmission {
+            routing_trust,
+            circuit,
+        } = admission;
 
         Ok(Self {
             state,
@@ -144,6 +152,7 @@ impl<'a> SemanticOneShotExecution<'a> {
             relay_pubkey,
             routing_trust,
             provider,
+            circuit_token: circuit,
             context,
             _process_permit: process_permit,
         })
@@ -176,14 +185,31 @@ impl<'a> SemanticOneShotExecution<'a> {
             )
             .await
             {
-                Ok(encoded) => return Ok(encoded),
+                Ok(encoded) => {
+                    // R5: report the one completed physical attempt to the
+                    // shared circuit. Deadline and cancellation outcomes
+                    // report nothing (plan §4.7).
+                    observe_provider_circuit(
+                        self.provider,
+                        self.circuit_token,
+                        ProviderCircuitObservation::Success,
+                    );
+                    return Ok(encoded);
+                }
                 Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
                     return Err(SemanticOneShotEncodeFailure::DeadlineExceeded);
                 }
                 Err(SemanticEncodeOnceFailure::Cancelled(source)) => {
                     return Err(SemanticOneShotEncodeFailure::Cancelled(source));
                 }
-                Err(SemanticEncodeOnceFailure::Provider(tracked)) => tracked,
+                Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
+                    observe_provider_circuit(
+                        self.provider,
+                        self.circuit_token,
+                        ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+                    );
+                    tracked
+                }
             };
             match provider_retry_decision(route, tracked.failure, &self.context) {
                 ProviderRetryDecision::Terminal => {
@@ -232,7 +258,7 @@ impl<'a> SemanticOneShotExecution<'a> {
         if self.provider.source_contract() != &fresh.generation.model_contract {
             return Err(SemanticOneShotError::Unavailable);
         }
-        self.routing_trust = execute_provider_egress(ProviderEgressPlan {
+        let admission = execute_provider_egress(ProviderEgressPlan {
             state: self.state,
             context: &self.context,
             ticket: &fresh,
@@ -242,6 +268,12 @@ impl<'a> SemanticOneShotExecution<'a> {
         })
         .await
         .map_err(map_egress_failure)?;
+        let ProviderEgressAdmission {
+            routing_trust,
+            circuit,
+        } = admission;
+        self.routing_trust = routing_trust;
+        self.circuit_token = circuit;
         self.ticket = fresh;
         Ok(())
     }

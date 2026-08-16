@@ -57,8 +57,9 @@ use crate::semantic_graph_observability::{
 };
 use crate::semantic_provider::TrackedProviderFailure;
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, propagate_relay_shutdown, provider_retry_backoff,
-    provider_retry_decision, record_vector_reuse, ProviderEgressObservation, ProviderEgressPlan,
+    encode_once, execute_provider_egress, observe_provider_circuit, propagate_relay_shutdown,
+    provider_retry_backoff, provider_retry_decision, record_vector_reuse,
+    ProviderCircuitObservation, ProviderEgressObservation, ProviderEgressPlan,
     ProviderRetryDecision, ProviderRetryRoute, SemanticDeadlineWindow, SemanticDeadlineWindows,
     SemanticEncodeOnceFailure, SemanticExecutionContext, SemanticOperationAttemptClass,
     SemanticProviderEgressFailure, SemanticStageAbort, SemanticVectorReuseOutcome,
@@ -292,13 +293,14 @@ async fn root_query_attempt(
         let query_vectors = match reused_vectors {
             Some(vectors) => vectors,
             None => {
-                // Shared R2 Provider egress executor: reservation,
-                // deadline-aware wait, routing trust, and final no-wait
-                // confirmation in one zero-policy sequence. Its neutral
-                // outcome maps back onto this surface's frozen public
-                // errors; `ProviderUnavailable` keeps its pre-R2 ticket
-                // re-read.
-                if let Err(failure) = execute_provider_egress(ProviderEgressPlan {
+                // Shared R2 Provider egress executor: circuit gate,
+                // reservation, deadline-aware wait, routing trust, and final
+                // no-wait confirmation in one zero-policy sequence. Its
+                // neutral outcome maps back onto this surface's frozen
+                // public errors; `ProviderUnavailable` keeps its pre-R2
+                // ticket re-read. The R5 admission's circuit token is
+                // reported back after the encode below.
+                let circuit_token = match execute_provider_egress(ProviderEgressPlan {
                     state,
                     context,
                     ticket: &ticket,
@@ -308,14 +310,22 @@ async fn root_query_attempt(
                 })
                 .await
                 {
-                    return Err(match failure {
-                        SemanticProviderEgressFailure::ProviderUnavailable => {
-                            classify_ticket_failure(state, &ticket, reader_pubkey, deadlines.work)
+                    Ok(admission) => admission.circuit,
+                    Err(failure) => {
+                        return Err(match failure {
+                            SemanticProviderEgressFailure::ProviderUnavailable => {
+                                classify_ticket_failure(
+                                    state,
+                                    &ticket,
+                                    reader_pubkey,
+                                    deadlines.work,
+                                )
                                 .await
-                        }
-                        failure => map_provider_egress_failure(failure),
-                    });
-                }
+                            }
+                            failure => map_provider_egress_failure(failure),
+                        });
+                    }
+                };
 
                 metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
                     common_inputs
@@ -344,12 +354,27 @@ async fn root_query_attempt(
                 )
                 .await
                 {
-                    Ok(encoded) => encoded,
+                    Ok(encoded) => {
+                        // R5: report the one completed physical attempt to
+                        // the shared circuit (plan §4.7); deadline and
+                        // cancellation outcomes report nothing.
+                        observe_provider_circuit(
+                            provider,
+                            circuit_token,
+                            ProviderCircuitObservation::Success,
+                        );
+                        encoded
+                    }
                     Err(SemanticEncodeOnceFailure::DeadlineExceeded)
                     | Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
                         return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
                     }
                     Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
+                        observe_provider_circuit(
+                            provider,
+                            circuit_token,
+                            ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
+                        );
                         match provider_retry_decision(
                             ProviderRetryRoute::R4,
                             tracked.failure,

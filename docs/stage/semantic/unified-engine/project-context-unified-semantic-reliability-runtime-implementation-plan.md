@@ -1,6 +1,6 @@
 # Project Context 统一可靠性运行时实现计划
 
-> 状态：R0、R1、R2、R3、R4 已交付；R5–R6 待实施
+> 状态：R0、R1、R2、R3、R4、R5 已交付；R6 待实施
 >
 > 日期：2026-08-16
 >
@@ -1033,6 +1033,59 @@ snapshot attempt count
 auth优先；vector不跨generation/input；snapshot不拼接；公开错误保持兼容。
 
 ### R5：共享Provider circuit
+
+> 当前状态：已交付（2026-08-17）。circuit本体落在
+> `crates/buzz-relay/src/semantic_query_runtime.rs` 的R5段，由
+> `VolcengineSemanticProvider`持有（`Arc<SemanticProviderCircuit>`，所有
+> clone共享；四operation与每次retry都取自 `AppState::semantic_provider()`
+> 的同一进程级实例，退出门"共享同一故障域、无人可绕过"由此结构性成立，
+> 不依赖各coordinator自觉传参）。交付项逐条：（1）failure-domain key =
+> SHA-256 digest over endpoint identity + request model + config epoch
+> （`provider_failure_domain_key`，仅digest hex、永不落endpoint URL/model
+> 文本；config epoch为进程内 `PROVIDER_CONFIG_EPOCH` 每次构造+1，重配即
+> 新domain、全新Closed状态，不继承健康历史）。（2）`Closed/Open/HalfOpen`
+> 状态机全部转移在单一mutex内线性化并bump epoch：late旧epoch成功被
+> epoch fence拒绝（不能关闭新circuit）；half-open probe为独占lease
+> （cooldown到期后第一个admit获得，其余 `HalfOpenProbeBusy`），probe即
+> 真实请求、无合成query；probe持有者不观察（deadline/cancel/丢任务）由
+> `PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET` 回收为带新cooldown的Open，
+> 不永久卡死HalfOpen。（3）429进独立throttle：
+> `apply_throttle` 以Retry-After为窗口（cap 60s，无头则默认1s，只延长
+> 不缩短），不触碰consecutive health计数——与R4自洽：full-fit重试睡的
+> 就是同一Retry-After，重入gate时throttle恰好过期；health集合恰为
+> connect（`ConnectNotStarted`）、明确5xx（`RetryableResponse`）、
+> transport unknown（`OutcomeUnknown`）、protocol-invalid且
+> `ConfirmedResponse`；pre-transport input/boundary与4xx为 `NotCounted`；
+> DB/snapshot/auth/empty/cancel不进circuit（它们不经observation报告）。
+> （4）shadow metrics+故障注入：五个content-free计数器
+> （gate/transition/probe/observation/recheck，§7要求的circuit state
+> transition、half-open probe、epoch全覆盖）；状态机测试以注入 `now`
+> 的 `admit_at`/`observe_at` 驱动全部转移与边界（阈值、cooldown边界、
+> probe独占、probe失败/超时/被429释放、epoch fence、throttle cap、
+> shadow spectator、classification矩阵、key content-free与三要素fence）。
+> （5）process-local isolated canary：`BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE`
+> （默认false）。shadow模式下本会拒绝的admit改为发spectator token
+> （请求照常执行、公开行为零变化），spectator的outcome不能移动模拟
+> 状态——shadow展示的状态机与enforce逐bit一致；enforce后refusal统一走
+> 既有 `AdmissionBusy` neutral失败，经one-shot `Busy`/complete-path
+> `QueryProviderBusy` 冻结映射，无新公开code。（6）capability/gate/auth
+> 先于caller可观察circuit outcome：gate在executor内、位于ticket admission
+> 与principal capability检查之后（coordinator已在executor前完成授权），
+> 未授权caller只会看到授权失败，永不见circuit状态；circuit状态与指标
+> 不含query、Community、caller或项目内容。（7）接线点全部在共享executor
+> `execute_provider_egress` 内：fast gate/half-open lease在reservation
+> 之前取得（gate从serving state自取，coordinator无法漏接）；wait后与
+> final egress confirm后各一次epoch-token无等待重验，最后一次紧邻
+> Provider调用（confirmation是encode前最后一个await）；stale且enforce即
+> 返回 `AdmissionBusy`、Provider delta 0——被消费的slot本就是DB合同里的
+> rate-limit容量而非授权。attempt outcome由coordinator经
+> `observe_provider_circuit` 恰好一次报告（one-shot envelope与
+> complete-path encode臂；reuse路径无物理egress故不报告；deadline/cancel
+> 不报告）。（8）fleet-wide限制：本circuit为process-local，无fleet共享
+> epoch/lease，不宣称防止多Pod half-open惊群；共享fleet容量与lease属
+> 第三阶段。验证：clippy `-D warnings` + fmt +
+> `cargo test -p buzz-relay --lib semantic`（122 tests，+12）+
+> `just semantic-retrieval-reliability`（含freeze-diff）实际运行通过。
 
 交付：
 

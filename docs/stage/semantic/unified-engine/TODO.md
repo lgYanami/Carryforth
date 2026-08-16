@@ -1,7 +1,7 @@
 # Project Context 统一语义检索引擎 TODO
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时实现
-> 计划已定稿并交付R0、R1、R2、R3、R4，R5–R6待实施
+> 计划已定稿并交付R0、R1、R2、R3、R4、R5，R6待实施
 >
 > 日期：2026-08-17
 
@@ -65,6 +65,17 @@ full-fit、full-jitter backoff），coordinator运行机械循环逐attempt组�
 handoff certainty在私有边界产生；one-shot read transient同ticket重开RR复用bound vector；
 complete-path churn以content-free identity stash实现exact-compatible复用；release
 confirmation仅unsigned/permit-less transient原地重试；一切declined/exhausted返回最后
-typed failure走冻结公开映射。R5起共享Provider circuit另行交付。相关性验收结果只影响
+typed failure走冻结公开映射。R5共享Provider circuit已交付：circuit由Provider持有
+（`Arc`共享，四operation与每次retry同域，executor内接线、coordinator无法绕过），
+failure-domain key为endpoint+model+config epoch的content-free digest；
+`Closed/Open/HalfOpen`全转移bump epoch（late旧epoch成功不能关闭新circuit），
+half-open为独占真实请求probe（持有者不观察由probe budget回收）；429走独立
+throttle（Retry-After、cap 60s、只延长）不计入健康；健康集合=connect/明确5xx/
+transport unknown/protocol-invalid response，input/4xx/DB/snapshot/cancel不计入；
+refusal统一走既有Busy/Unavailable冻结映射（无新公开code）；shadow默认（spectator
+token不能移动模拟状态），`BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE` 为isolated
+single-Relay canary开关；fast gate在reservation前、wait后与final egress confirm后
+各一次epoch-token无等待重验（最后一次紧邻Provider调用）；fleet-shared epoch/lease
+未交付，不宣称多Pod防惊群（第三阶段）。相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

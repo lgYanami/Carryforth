@@ -2,7 +2,7 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R4 已交付，R5–R6 待实施
+> 状态：兼容基线与第一阶段统一语义计算已交付；第二阶段统一可靠性运行时实现计划已定稿、R0–R5 已交付，R6 待实施
 >
 > 更新日期：2026-08-17
 >
@@ -56,7 +56,20 @@
 > exact-compatible vector复用（不跨generation/input、不持久化）；release
 > confirmation仅unsigned/permit-less transient原地重试（上限2次，
 > Denied/FleetUnavailable不重试）；declined/exhausted一律返回最后typed
-> failure走冻结公开映射。下一步实施R5共享Provider circuit；统一资源治理
+> failure走冻结公开映射。R5共享Provider circuit已交付：circuit由Provider
+> 实例持有（Arc共享，四operation与每次retry同属一个故障域），gate/重验
+> 全部接线在共享executor内（reservation前fast gate、wait后与final egress
+> confirm后各一次epoch-token无等待重验，最后一次紧邻Provider调用），
+> coordinator无法绕过；failure-domain key为endpoint+model+config epoch的
+> content-free SHA-256 digest（config epoch每次构造+1，重配即新domain）；
+> Closed/Open/HalfOpen全转移bump epoch（late旧epoch成功不能关闭新circuit），
+> half-open为独占真实请求probe、持有者不观察由probe budget回收为Open；
+> 429走独立throttle（Retry-After、cap 60s）不计入健康，健康集合=connect/
+> 明确5xx/transport unknown/protocol-invalid response；refusal统一走既有
+> Busy冻结映射（无新公开code）；shadow默认（spectator token不移动模拟
+> 状态），`BUZZ_SEMANTIC_PROVIDER_CIRCUIT_ENFORCE`为isolated single-Relay
+> canary开关；process-local circuit不宣称多Pod防惊群（fleet-shared
+> epoch/lease属第三阶段）。下一步实施R6资格、rollout与文档收口；统一资源治理
 > 仍排在其后。
 
 ### 背景

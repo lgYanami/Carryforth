@@ -5,6 +5,8 @@
 //! callers cannot use this module as a general-purpose text egress client.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use buzz_semantic::{
     EmbeddingVector, EncodedSemanticUnit, SemanticEncoder, SemanticEncoderFuture,
@@ -22,7 +24,10 @@ use reqwest::{header::RETRY_AFTER, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
 use crate::config::SemanticWorkerConfig;
-use crate::semantic_query_runtime::{ProviderAttemptFailure, ProviderHandoffCertainty};
+use crate::semantic_query_runtime::{
+    provider_failure_domain_key, ProviderAttemptFailure, ProviderHandoffCertainty,
+    SemanticProviderCircuit,
+};
 
 /// Maximum successful Provider JSON body accepted by either current adapter.
 ///
@@ -132,7 +137,12 @@ pub struct VolcengineSemanticProvider {
     api_key: String,
     request_model: String,
     source_contract: SemanticModelContract,
+    circuit: Arc<SemanticProviderCircuit>,
 }
+
+/// Process-local failure-domain epoch, incremented on every Provider
+/// construction so a reconfigured Provider is a new circuit domain.
+static PROVIDER_CONFIG_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 impl VolcengineSemanticProvider {
     /// Construct the Provider when all optional credentials are configured.
@@ -140,6 +150,13 @@ impl VolcengineSemanticProvider {
     /// Configuration loading already enforces that an enabled worker or query
     /// deployment master supplies all three values. Returning `None` keeps
     /// capability-off development and tests free of Provider configuration.
+    ///
+    /// Every construction builds the R5 circuit for this Provider's physical
+    /// failure domain — a content-free digest of the endpoint identity, the
+    /// request model, and a fresh config epoch — behind an `Arc`, so all
+    /// clones (and therefore all four semantic operations, which share the
+    /// one process-wide instance from `AppState::semantic_provider`) admit
+    /// through the same circuit state.
     pub fn from_config(
         config: &SemanticWorkerConfig,
     ) -> Result<Option<Self>, SemanticProviderConfigError> {
@@ -159,13 +176,24 @@ impl VolcengineSemanticProvider {
             .timeout(config.request_timeout)
             .build()
             .map_err(|_| SemanticProviderConfigError::ClientUnavailable)?;
+        let config_epoch = PROVIDER_CONFIG_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+        let circuit = Arc::new(SemanticProviderCircuit::new(
+            provider_failure_domain_key(&endpoint, &request_model, config_epoch),
+            config.provider_circuit_enforce,
+        ));
         Ok(Some(Self {
             client,
             endpoint,
             api_key: api_key.to_owned(),
             request_model,
             source_contract: SemanticModelContract::volcengine_overview_v1(),
+            circuit,
         }))
+    }
+
+    /// Shared process-local circuit for this Provider's failure domain.
+    pub(crate) fn circuit(&self) -> &SemanticProviderCircuit {
+        &self.circuit
     }
 
     /// Frozen source-generation contract emitted by this Provider.
@@ -651,6 +679,7 @@ mod tests {
             request_interval: Duration::from_secs(1),
             claim_seconds: 60,
             max_attempts: 2,
+            provider_circuit_enforce: false,
         }
     }
 

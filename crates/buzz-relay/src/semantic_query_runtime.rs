@@ -36,6 +36,22 @@
 //! confirmation and the R3 admission, so the attempt ledger caps, the
 //! cancellation latch, and the frozen public error projections stay binding.
 //!
+//! Phase 2 R5 adds the shared process-local Provider circuit over the one
+//! physical failure domain all four operations encode into. The circuit is
+//! owned by the Provider client (so every clone shares it), keyed by a
+//! content-free digest of the endpoint identity, request model, and a
+//! config epoch that increments on every construction, and gated inside the
+//! shared executor — before the reservation, revalidated with no wait after
+//! the reservation wait and again after the final egress confirmation, the
+//! last check adjacent to the Provider call. No coordinator can bypass an
+//! open circuit because no Provider egress exists outside the executor.
+//! Refusals ride the existing `AdmissionBusy` neutral failure, authorization
+//! always runs first at ticket admission, and 429s feed an independent
+//! throttle that never touches the health-failure count. Enforcement is
+//! shadow-first: the flag admits spectators whose outcomes cannot move the
+//! simulated state, so the canary observes exactly what enforcement would
+//! have done.
+//!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
@@ -1425,6 +1441,19 @@ pub(crate) struct ProviderEgressPlan<'state, 'plan> {
     pub(crate) observation: ProviderEgressObservation,
 }
 
+/// One completed shared Provider egress admission.
+pub(crate) struct ProviderEgressAdmission<'state> {
+    /// Routing trust for the caller's later release fence.
+    pub(crate) routing_trust: SemanticGraphQueryRoutingTrust<'state>,
+    /// Epoch-fenced circuit token for the admitted physical attempt.
+    ///
+    /// `None` only when this process has no configured Provider (unreachable
+    /// behind the coordinators' own Provider resolution). The coordinator
+    /// reports the attempt's outcome through [`observe_provider_circuit`]
+    /// exactly once; a deadline or cancellation reports nothing.
+    pub(crate) circuit: Option<ProviderCircuitToken>,
+}
+
 /// Cancel `context` when the Relay process entered its controlled shutdown.
 ///
 /// The shutdown flag flips before listener drain, so every semantic surface
@@ -1457,18 +1486,28 @@ fn latest_start_at(work: Instant) -> Result<DateTime<Utc>, SemanticProviderEgres
     Ok(Utc::now() + duration)
 }
 
-/// Run the shared `reservation -> wait -> routing trust -> egress
-/// confirmation` admission sequence for exactly one physical Provider
+/// Run the shared `circuit gate -> reservation -> wait -> routing trust ->
+/// egress confirmation` admission sequence for exactly one physical Provider
 /// attempt.
 ///
-/// This is the R2 zero-policy primitive: it adds no retry, backoff, circuit,
-/// or route fallback, and it never chooses a public error. Ticket admission,
-/// Stage A observation, and the Provider encode call stay with the closed
-/// operation. The returned routing trust belongs to the caller's later
-/// release fence.
+/// This is the R2 zero-policy primitive grown by R5's circuit fence: it adds
+/// no retry, backoff, or route fallback, and it never chooses a public
+/// error. Ticket admission, Stage A observation, and the Provider encode
+/// call stay with the closed operation. The returned routing trust belongs
+/// to the caller's later release fence.
+///
+/// The circuit gate is taken here — not in any coordinator — because this is
+/// the only Provider egress path: no operation can bypass an open circuit,
+/// and authorization always precedes it (the ticket was admitted and the
+/// principal capability-checked by the closed coordinator before this
+/// executor runs, so a caller without authorization never observes a circuit
+/// outcome). Every refusal rides the existing `AdmissionBusy` neutral
+/// failure, which each surface already projects onto its frozen Busy public
+/// error; the gate is fetched from the serving state itself so a coordinator
+/// cannot forget to pass it.
 pub(crate) async fn execute_provider_egress<'state>(
     plan: ProviderEgressPlan<'state, '_>,
-) -> Result<SemanticGraphQueryRoutingTrust<'state>, SemanticProviderEgressFailure> {
+) -> Result<ProviderEgressAdmission<'state>, SemanticProviderEgressFailure> {
     let state = plan.state;
     let work = plan.context.windows().window(SemanticDeadlineWindow::Work);
     let relay_pubkey = state.relay_keypair.public_key();
@@ -1479,6 +1518,23 @@ pub(crate) async fn execute_provider_egress<'state>(
         .ledger()
         .begin_provider_attempt()
         .map_err(SemanticProviderEgressFailure::AttemptLedgerExhausted)?;
+    // R5 fast gate: take the circuit admission (and, when the cooldown has
+    // elapsed, the exclusive half-open probe lease) before any reservation
+    // is taken (plan §4.7).
+    let circuit = state
+        .semantic_provider()
+        .ok()
+        .flatten()
+        .map(crate::semantic_provider::VolcengineSemanticProvider::circuit);
+    let circuit_token = match circuit {
+        Some(circuit) => match circuit.admit() {
+            ProviderCircuitAdmission::Admitted { token } => Some(token),
+            ProviderCircuitAdmission::Refused { .. } => {
+                return Err(SemanticProviderEgressFailure::AdmissionBusy);
+            }
+        },
+        None => None,
+    };
     let reservation = plan
         .context
         .run_stage(
@@ -1536,6 +1592,18 @@ pub(crate) async fn execute_provider_egress<'state>(
         }
     }
 
+    // R5 no-wait epoch revalidation after the reservation wait: a circuit
+    // that transitioned while this attempt was waiting is no longer one this
+    // attempt may speak for. A refused revalidation abandons the already
+    // consumed slot — the database contract already treats a reserved slot
+    // as rate-limit capacity, not authorization — leaving Provider delta
+    // zero.
+    if let (Some(circuit), Some(token)) = (circuit, circuit_token) {
+        if !circuit.revalidate(token) && circuit.enforce() {
+            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+        }
+    }
+
     // The provider-slot reservation may wait, so it cannot authorize egress.
     // The final confirmation revalidates principal, generation, graph, and
     // routing state under the shared Community writer fence.
@@ -1576,7 +1644,19 @@ pub(crate) async fn execute_provider_egress<'state>(
     {
         return Err(SemanticProviderEgressFailure::PermitContractViolated);
     }
-    Ok(routing_trust)
+    // R5 final no-wait epoch revalidation, adjacent to the Provider call:
+    // this confirmation is the last await before the coordinator's
+    // `encode_once`, so a stale attempt is refused here with Provider delta
+    // zero rather than speaking for a circuit that already transitioned.
+    if let (Some(circuit), Some(token)) = (circuit, circuit_token) {
+        if !circuit.revalidate(token) && circuit.enforce() {
+            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+        }
+    }
+    Ok(ProviderEgressAdmission {
+        routing_trust,
+        circuit: circuit_token,
+    })
 }
 
 /// Failure of one deadline-bounded single Provider invocation.
@@ -1794,6 +1874,584 @@ pub(crate) async fn provider_retry_backoff(
     context
         .run_stage(SemanticDeadlineWindow::Work, tokio::time::sleep(backoff))
         .await
+}
+
+// ---------------------------------------------------------------------------
+// R5 shared Provider circuit (process-local failure domain).
+// ---------------------------------------------------------------------------
+
+/// Compiled consecutive health-failure count that trips the circuit Open.
+///
+/// Part of the compiled reliability runtime contract: changing it is a
+/// behavior change that must ride a new route/digest, not a silent tune.
+pub(crate) const PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD: u32 = 5;
+
+/// Compiled Open cooldown before one exclusive half-open probe may start.
+pub(crate) const PROVIDER_CIRCUIT_OPEN_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Compiled budget granted to one half-open probe before it is reclaimed.
+///
+/// A probe holder that never observes (deadline, cancellation, or a lost
+/// task) must not wedge the circuit in `HalfOpen` forever, so the lease is
+/// reclaimed into a fresh Open cooldown once this budget expires.
+pub(crate) const PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Compiled throttle cooldown when the Provider 429s without a syntactically
+/// valid `Retry-After` (plan §4.7: the throttle is independent of health).
+pub(crate) const PROVIDER_CIRCUIT_THROTTLE_DEFAULT: Duration = Duration::from_millis(1_000);
+
+/// Compiled cap applied to a Provider-supplied `Retry-After` throttle window.
+///
+/// A `Retry-After` longer than this cap can never fit a request work window
+/// anyway (the R4 full-fit rule declines it), so capping keeps a hostile or
+/// misbehaving header from parking the shared domain for minutes.
+pub(crate) const PROVIDER_CIRCUIT_THROTTLE_MAX: Duration = Duration::from_secs(60);
+
+/// Phase of one shared Provider failure-domain circuit (plan §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCircuitPhase {
+    /// The domain is serving; consecutive health failures accumulate.
+    Closed,
+    /// The domain refused admission until the cooldown elapses.
+    Open,
+    /// One exclusive real-request probe is deciding the domain's health.
+    HalfOpen,
+}
+
+/// Epoch-fenced admission token for one physical Provider attempt.
+///
+/// Every state transition bumps the circuit epoch, so a token only ever
+/// speaks for the phase it was admitted into; a late outcome from an older
+/// epoch is ignored (the epoch fence of plan §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderCircuitToken {
+    epoch: u64,
+    /// Shadow admission that enforcement would have refused. Spectators run
+    /// (shadow never changes production behavior) but their outcomes cannot
+    /// move the simulated state, keeping the shadow state machine exactly
+    /// what enforcement would have produced.
+    spectator: bool,
+}
+
+/// What the circuit fast gate decided for one new physical attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCircuitAdmission {
+    /// The attempt may proceed; the token fences its later observation.
+    Admitted { token: ProviderCircuitToken },
+    /// The enforcing circuit refused the attempt.
+    Refused { reason: ProviderCircuitRefusal },
+}
+
+/// Closed reason the circuit refused one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCircuitRefusal {
+    /// The domain is Open and cooling down.
+    Open,
+    /// The domain is HalfOpen and the exclusive probe is in flight.
+    HalfOpenProbeBusy,
+    /// The independent 429 throttle window is active.
+    Throttled,
+}
+
+impl ProviderCircuitRefusal {
+    /// Closed low-cardinality metric label for this refusal.
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Open => "refused_open",
+            Self::HalfOpenProbeBusy => "refused_half_open_probe_busy",
+            Self::Throttled => "refused_throttled",
+        }
+    }
+}
+
+/// Closed health classification of one failed Provider attempt (plan §4.7).
+///
+/// Only connect failures, definitive 5xx responses, transport failures of
+/// unknown outcome, and protocol-invalid responses are Provider health;
+/// authorization, input, empty-result, database, snapshot, and cancellation
+/// outcomes never touch the circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderHealthFailureClass {
+    /// A connect-phase failure that never handed the request off.
+    Connect,
+    /// A definitive Provider 5xx response.
+    ServerError,
+    /// A transport failure whose delivery outcome is unknown.
+    TransportUnknown,
+    /// A response that violated the closed Provider response contract.
+    ProtocolInvalid,
+}
+
+impl ProviderHealthFailureClass {
+    /// Closed low-cardinality metric label for this health class.
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Connect => "health_connect",
+            Self::ServerError => "health_server_error",
+            Self::TransportUnknown => "health_transport_unknown",
+            Self::ProtocolInvalid => "health_protocol_invalid",
+        }
+    }
+}
+
+/// What one completed physical attempt reports to its circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCircuitObservation {
+    /// The Provider answered within the closed response contract.
+    Success,
+    /// The attempt failed with a Provider health failure.
+    HealthFailure(ProviderHealthFailureClass),
+    /// The Provider throttled the attempt (429); independent of health.
+    Throttled {
+        /// The syntactically valid `Retry-After` delay, when supplied.
+        retry_after_seconds: Option<u64>,
+    },
+    /// The attempt failed in a way that is not Provider health.
+    NotCounted,
+}
+
+impl ProviderCircuitObservation {
+    /// Classify one failed attempt through the closed §4.7 matrix.
+    pub(crate) fn from_attempt_failure(failure: &ProviderAttemptFailure) -> Self {
+        match failure.kind {
+            ProviderAttemptFailureKind::RateLimited {
+                retry_after_seconds,
+            } => Self::Throttled {
+                retry_after_seconds,
+            },
+            ProviderAttemptFailureKind::ConnectNotStarted => {
+                Self::HealthFailure(ProviderHealthFailureClass::Connect)
+            }
+            ProviderAttemptFailureKind::RetryableResponse { .. } => {
+                Self::HealthFailure(ProviderHealthFailureClass::ServerError)
+            }
+            ProviderAttemptFailureKind::OutcomeUnknown => {
+                Self::HealthFailure(ProviderHealthFailureClass::TransportUnknown)
+            }
+            ProviderAttemptFailureKind::ProtocolInvalid
+                if failure.handoff == ProviderHandoffCertainty::ConfirmedResponse =>
+            {
+                Self::HealthFailure(ProviderHealthFailureClass::ProtocolInvalid)
+            }
+            // Pre-transport contract violations are input/boundary failures,
+            // and a definitive 4xx rejection is per-request: neither says
+            // anything about the shared domain's health.
+            ProviderAttemptFailureKind::ProtocolInvalid
+            | ProviderAttemptFailureKind::Rejected { .. } => Self::NotCounted,
+        }
+    }
+
+    /// Closed low-cardinality metric label for this observation.
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::HealthFailure(class) => class.metric_label(),
+            Self::Throttled { .. } => "throttled",
+            Self::NotCounted => "not_counted",
+        }
+    }
+}
+
+/// Mutable core of one circuit; every transition happens under this lock and
+/// bumps the epoch, so the lock is the linearization point of the fence.
+struct ProviderCircuitCore {
+    phase: ProviderCircuitPhase,
+    epoch: u64,
+    consecutive_health_failures: u32,
+    open_until: Instant,
+    probe_deadline: Instant,
+    probe_held: bool,
+    throttle_until: Option<Instant>,
+}
+
+/// Process-local circuit over one shared Provider physical failure domain.
+///
+/// The circuit is owned by the Provider client and shared by every clone, so
+/// all four semantic operations — and every retry attempt of each — admit
+/// through the same domain state. It is deliberately process-local (plan
+/// §4.7): without fleet-shared epoch/lease state it cannot claim to prevent
+/// multi-Pod half-open probe storms, and that limitation is recorded in the
+/// qualification notes rather than papered over.
+pub(crate) struct SemanticProviderCircuit {
+    failure_domain: String,
+    enforce: bool,
+    core: std::sync::Mutex<ProviderCircuitCore>,
+}
+
+impl SemanticProviderCircuit {
+    /// Build the circuit for one failure-domain key.
+    pub(crate) fn new(failure_domain: String, enforce: bool) -> Self {
+        Self {
+            failure_domain,
+            enforce,
+            core: std::sync::Mutex::new(ProviderCircuitCore {
+                phase: ProviderCircuitPhase::Closed,
+                epoch: 1,
+                consecutive_health_failures: 0,
+                open_until: Instant::now(),
+                probe_deadline: Instant::now(),
+                probe_held: false,
+                throttle_until: None,
+            }),
+        }
+    }
+
+    /// Content-free failure-domain identity (a digest, never the URL).
+    pub(crate) fn failure_domain(&self) -> &str {
+        &self.failure_domain
+    }
+
+    /// Whether this process enforces circuit refusals (canary flag).
+    ///
+    /// Shadow mode still runs the full state machine and records every
+    /// decision; it just never refuses a request.
+    pub(crate) fn enforce(&self) -> bool {
+        self.enforce
+    }
+
+    fn lock_core(&self) -> std::sync::MutexGuard<'_, ProviderCircuitCore> {
+        // A poisoned lock can only follow a panic while holding it; this
+        // module never panics under the lock, and recovering the (still
+        // structurally valid) core keeps the circuit serving instead of
+        // failing every subsequent admission.
+        self.core
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Current phase snapshot (used by `Debug` and the tests).
+    fn phase(&self) -> ProviderCircuitPhase {
+        self.lock_core().phase
+    }
+
+    /// Fast gate / half-open probe lease for one new physical attempt.
+    pub(crate) fn admit(&self) -> ProviderCircuitAdmission {
+        self.admit_at(Instant::now())
+    }
+
+    fn admit_at(&self, now: Instant) -> ProviderCircuitAdmission {
+        let admission = self.admit_locked(now);
+        let decision = match admission {
+            ProviderCircuitAdmission::Admitted { token } => {
+                if token.spectator {
+                    "shadow_admitted_spectator"
+                } else {
+                    "admitted"
+                }
+            }
+            ProviderCircuitAdmission::Refused { reason } => reason.metric_label(),
+        };
+        record_circuit_gate(decision);
+        admission
+    }
+
+    fn admit_locked(&self, now: Instant) -> ProviderCircuitAdmission {
+        let mut core = self.lock_core();
+        if let Some(throttle_until) = core.throttle_until {
+            if throttle_until > now {
+                return self.refuse(&core, ProviderCircuitRefusal::Throttled);
+            }
+        }
+        match core.phase {
+            ProviderCircuitPhase::Closed => ProviderCircuitAdmission::Admitted {
+                token: ProviderCircuitToken {
+                    epoch: core.epoch,
+                    spectator: false,
+                },
+            },
+            ProviderCircuitPhase::Open => {
+                if now < core.open_until {
+                    return self.refuse(&core, ProviderCircuitRefusal::Open);
+                }
+                // The cooldown elapsed: this admission is the one exclusive
+                // real-request probe (plan §4.7 — no synthetic queries).
+                core.phase = ProviderCircuitPhase::HalfOpen;
+                core.epoch += 1;
+                core.probe_held = true;
+                core.probe_deadline = now + PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET;
+                record_circuit_transition("open_to_half_open");
+                record_circuit_probe("granted");
+                ProviderCircuitAdmission::Admitted {
+                    token: ProviderCircuitToken {
+                        epoch: core.epoch,
+                        spectator: false,
+                    },
+                }
+            }
+            ProviderCircuitPhase::HalfOpen => {
+                if core.probe_held {
+                    if now < core.probe_deadline {
+                        return self.refuse(&core, ProviderCircuitRefusal::HalfOpenProbeBusy);
+                    }
+                    // The probe holder never observed; reclaim the lease and
+                    // cool down again rather than staying wedged in HalfOpen.
+                    core.phase = ProviderCircuitPhase::Open;
+                    core.epoch += 1;
+                    core.open_until = now + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+                    core.probe_held = false;
+                    record_circuit_transition("half_open_probe_timeout");
+                    record_circuit_probe("timeout");
+                    return self.refuse(&core, ProviderCircuitRefusal::Open);
+                }
+                // The previous probe was throttled and released without a
+                // transition; the next real request probes again.
+                core.probe_held = true;
+                core.probe_deadline = now + PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET;
+                record_circuit_probe("granted");
+                ProviderCircuitAdmission::Admitted {
+                    token: ProviderCircuitToken {
+                        epoch: core.epoch,
+                        spectator: false,
+                    },
+                }
+            }
+        }
+    }
+
+    /// Record one would-be refusal: enforced refusals return [`Refused`],
+    /// shadow mode admits the request anyway as a spectator.
+    fn refuse(
+        &self,
+        core: &ProviderCircuitCore,
+        reason: ProviderCircuitRefusal,
+    ) -> ProviderCircuitAdmission {
+        if self.enforce {
+            ProviderCircuitAdmission::Refused { reason }
+        } else {
+            ProviderCircuitAdmission::Admitted {
+                token: ProviderCircuitToken {
+                    epoch: core.epoch,
+                    spectator: true,
+                },
+            }
+        }
+    }
+
+    /// No-wait epoch revalidation for one in-flight admitted attempt.
+    ///
+    /// Staleness means the circuit transitioned after this attempt was
+    /// admitted; the caller decides whether that refusal is binding
+    /// (enforcement) or shadow-recorded.
+    pub(crate) fn revalidate(&self, token: ProviderCircuitToken) -> bool {
+        let core = self.lock_core();
+        let current = token.epoch == core.epoch;
+        record_circuit_recheck(current);
+        current
+    }
+
+    /// Report one completed physical attempt to the circuit.
+    pub(crate) fn observe(
+        &self,
+        token: ProviderCircuitToken,
+        observation: ProviderCircuitObservation,
+    ) {
+        self.observe_at(token, observation, Instant::now());
+    }
+
+    fn observe_at(
+        &self,
+        token: ProviderCircuitToken,
+        observation: ProviderCircuitObservation,
+        now: Instant,
+    ) {
+        let mut core = self.lock_core();
+        if token.spectator {
+            record_circuit_observation("spectator_ignored");
+            return;
+        }
+        if token.epoch != core.epoch {
+            // Epoch fence (plan §4.7): a late success from before a
+            // transition cannot close the circuit that transition opened.
+            record_circuit_observation("stale_epoch");
+            return;
+        }
+        match core.phase {
+            ProviderCircuitPhase::Closed => match observation {
+                ProviderCircuitObservation::Success => {
+                    core.consecutive_health_failures = 0;
+                    record_circuit_observation(observation.metric_label());
+                }
+                ProviderCircuitObservation::HealthFailure(_) => {
+                    core.consecutive_health_failures += 1;
+                    record_circuit_observation(observation.metric_label());
+                    if core.consecutive_health_failures >= PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD
+                    {
+                        core.phase = ProviderCircuitPhase::Open;
+                        core.epoch += 1;
+                        core.open_until = now + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+                        core.probe_held = false;
+                        record_circuit_transition("closed_to_open");
+                    }
+                }
+                ProviderCircuitObservation::Throttled {
+                    retry_after_seconds,
+                } => {
+                    self.apply_throttle(&mut core, retry_after_seconds, now);
+                    record_circuit_observation(observation.metric_label());
+                }
+                ProviderCircuitObservation::NotCounted => {
+                    record_circuit_observation(observation.metric_label());
+                }
+            },
+            ProviderCircuitPhase::HalfOpen => match observation {
+                // Only the exclusive probe holder can carry a current-epoch
+                // token in HalfOpen, so these outcomes are the probe's.
+                ProviderCircuitObservation::Success => {
+                    core.phase = ProviderCircuitPhase::Closed;
+                    core.epoch += 1;
+                    core.consecutive_health_failures = 0;
+                    core.probe_held = false;
+                    record_circuit_transition("half_open_to_closed");
+                    record_circuit_probe("succeeded");
+                    record_circuit_observation(observation.metric_label());
+                }
+                ProviderCircuitObservation::HealthFailure(_) => {
+                    core.phase = ProviderCircuitPhase::Open;
+                    core.epoch += 1;
+                    core.open_until = now + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+                    core.probe_held = false;
+                    record_circuit_transition("half_open_to_open");
+                    record_circuit_probe("failed");
+                    record_circuit_observation(observation.metric_label());
+                }
+                ProviderCircuitObservation::Throttled {
+                    retry_after_seconds,
+                } => {
+                    // A throttled probe proves neither health nor sickness:
+                    // release the lease, wait out the throttle, and let the
+                    // next real request probe again.
+                    core.probe_held = false;
+                    self.apply_throttle(&mut core, retry_after_seconds, now);
+                    record_circuit_probe("throttled");
+                    record_circuit_observation(observation.metric_label());
+                }
+                ProviderCircuitObservation::NotCounted => {
+                    // A per-request failure (input or 4xx) resolves nothing;
+                    // the probe lease simply times out if the holder is done.
+                    record_circuit_observation(observation.metric_label());
+                }
+            },
+            ProviderCircuitPhase::Open => {
+                // Unreachable with a current epoch: entering Open bumps the
+                // epoch and Open admits nothing. Kept as a safe fence no-op.
+                record_circuit_observation("stale_epoch");
+            }
+        }
+    }
+
+    /// Extend the independent 429 throttle window (never shorten one).
+    ///
+    /// The window is exactly the `Retry-After` when it is present and within
+    /// the compiled cap, which keeps it self-consistent with the R4 full-fit
+    /// retry: a retried 429 re-enters the gate only after sleeping the same
+    /// delay, so the throttle has already expired by then.
+    fn apply_throttle(
+        &self,
+        core: &mut ProviderCircuitCore,
+        retry_after_seconds: Option<u64>,
+        now: Instant,
+    ) {
+        let delay = match retry_after_seconds {
+            Some(seconds) => Duration::from_secs(seconds).min(PROVIDER_CIRCUIT_THROTTLE_MAX),
+            None => PROVIDER_CIRCUIT_THROTTLE_DEFAULT,
+        };
+        let until = now + delay;
+        if core.throttle_until.is_none_or(|current| current < until) {
+            core.throttle_until = Some(until);
+        }
+    }
+}
+
+impl fmt::Debug for SemanticProviderCircuit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SemanticProviderCircuit")
+            .field("failure_domain", &self.failure_domain)
+            .field("enforce", &self.enforce)
+            .field("phase", &self.phase())
+            .finish()
+    }
+}
+
+/// Derive the content-free identity of one Provider physical failure domain
+/// (plan §4.7: endpoint identity + config epoch + request model).
+///
+/// The key is a SHA-256 digest: the circuit never stores, logs, or labels
+/// the endpoint URL itself. The config epoch is process-local and increments
+/// on every Provider construction, so a reconfigured Provider is a new
+/// failure domain with fresh `Closed` state rather than an inherited one.
+pub(crate) fn provider_failure_domain_key(
+    endpoint: &url::Url,
+    request_model: &str,
+    config_epoch: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"buzz-semantic-provider-failure-domain-v1");
+    hasher.update([0]);
+    hasher.update(endpoint.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(request_model.as_bytes());
+    hasher.update([0]);
+    hasher.update(config_epoch.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Record one closed circuit gate decision (content-free; plan §7).
+fn record_circuit_gate(decision: &'static str) {
+    metrics::counter!("buzz_semantic_provider_circuit_gate_total", "decision" => decision)
+        .increment(1);
+}
+
+/// Record one closed circuit state transition (content-free; plan §7).
+fn record_circuit_transition(transition: &'static str) {
+    metrics::counter!(
+        "buzz_semantic_provider_circuit_transition_total",
+        "transition" => transition,
+    )
+    .increment(1);
+}
+
+/// Record one closed half-open probe outcome (content-free; plan §7).
+fn record_circuit_probe(outcome: &'static str) {
+    metrics::counter!("buzz_semantic_provider_circuit_probe_total", "outcome" => outcome)
+        .increment(1);
+}
+
+/// Record one closed circuit observation disposition (content-free; §7).
+fn record_circuit_observation(disposition: &'static str) {
+    metrics::counter!(
+        "buzz_semantic_provider_circuit_observation_total",
+        "disposition" => disposition,
+    )
+    .increment(1);
+}
+
+/// Record one closed epoch-revalidation outcome (content-free; plan §7).
+fn record_circuit_recheck(current: bool) {
+    metrics::counter!(
+        "buzz_semantic_provider_circuit_recheck_total",
+        "outcome" => if current { "current" } else { "stale" },
+    )
+    .increment(1);
+}
+
+/// Report one completed physical Provider attempt to its circuit.
+///
+/// Reporting exactly once per physical attempt is the coordinator's duty:
+/// the one-shot envelope observes after each sanctioned `encode_once`, the
+/// complete path observes after its root-attempt encode, and the reuse path
+/// (no physical egress) observes nothing. Deadline and cancellation outcomes
+/// observe nothing — plan §4.7 excludes them from Provider health, and an
+/// abandoned half-open probe is reclaimed by its lease budget instead.
+pub(crate) fn observe_provider_circuit(
+    provider: &crate::semantic_provider::VolcengineSemanticProvider,
+    token: Option<ProviderCircuitToken>,
+    observation: ProviderCircuitObservation,
+) {
+    if let Some(token) = token {
+        provider.circuit().observe(token, observation);
+    }
 }
 
 #[cfg(test)]
@@ -2668,5 +3326,472 @@ mod tests {
             let backoff = full_jitter_backoff();
             assert!(backoff <= Duration::from_millis(PROVIDER_RETRY_FULL_JITTER_BASE_MS));
         }
+    }
+
+    // -------------------------------------------------------------------
+    // R5 shared Provider circuit.
+    // -------------------------------------------------------------------
+
+    fn transport_unknown() -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::OutcomeUnknown,
+            handoff: ProviderHandoffCertainty::OutcomeUnknown,
+        }
+    }
+
+    fn protocol_invalid(handoff: ProviderHandoffCertainty) -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::ProtocolInvalid,
+            handoff,
+        }
+    }
+
+    fn rejected() -> ProviderAttemptFailure {
+        ProviderAttemptFailure {
+            kind: ProviderAttemptFailureKind::Rejected { status: 400 },
+            handoff: ProviderHandoffCertainty::ConfirmedResponse,
+        }
+    }
+
+    fn new_circuit(enforce: bool) -> SemanticProviderCircuit {
+        SemanticProviderCircuit::new("test-failure-domain".to_owned(), enforce)
+    }
+
+    fn admitted(admission: ProviderCircuitAdmission) -> ProviderCircuitToken {
+        match admission {
+            ProviderCircuitAdmission::Admitted { token } => token,
+            ProviderCircuitAdmission::Refused { reason } => {
+                panic!("expected an admission, got refused: {reason:?}")
+            }
+        }
+    }
+
+    fn refused_reason(admission: ProviderCircuitAdmission) -> ProviderCircuitRefusal {
+        match admission {
+            ProviderCircuitAdmission::Refused { reason } => reason,
+            ProviderCircuitAdmission::Admitted { token } => {
+                panic!("expected a refusal, got admitted: {token:?}")
+            }
+        }
+    }
+
+    /// Drive one full (admit, observe) physical attempt at `now`.
+    fn attempt(
+        circuit: &SemanticProviderCircuit,
+        observation: ProviderCircuitObservation,
+        now: Instant,
+    ) -> ProviderCircuitAdmission {
+        let admission = circuit.admit_at(now);
+        if let ProviderCircuitAdmission::Admitted { token } = admission {
+            circuit.observe_at(token, observation, now);
+        }
+        admission
+    }
+
+    #[test]
+    fn health_classification_matches_the_compiled_circuit_rows() {
+        use ProviderCircuitObservation::*;
+        use ProviderHealthFailureClass::*;
+        let cases = [
+            (connect_not_started(), HealthFailure(Connect)),
+            (retryable_server_error(), HealthFailure(ServerError)),
+            (transport_unknown(), HealthFailure(TransportUnknown)),
+            (
+                protocol_invalid(ProviderHandoffCertainty::ConfirmedResponse),
+                HealthFailure(ProtocolInvalid),
+            ),
+            (
+                protocol_invalid(ProviderHandoffCertainty::NotStarted),
+                NotCounted,
+            ),
+            (rejected(), NotCounted),
+            (
+                rate_limited(Some(2)),
+                Throttled {
+                    retry_after_seconds: Some(2),
+                },
+            ),
+            (
+                rate_limited(None),
+                Throttled {
+                    retry_after_seconds: None,
+                },
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(
+                ProviderCircuitObservation::from_attempt_failure(&failure),
+                expected,
+                "wrong circuit classification for {failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn circuit_constants_form_the_compiled_contract() {
+        assert_eq!(PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD, 5);
+        assert_eq!(PROVIDER_CIRCUIT_OPEN_COOLDOWN, Duration::from_secs(15));
+        assert_eq!(
+            PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET,
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            PROVIDER_CIRCUIT_THROTTLE_DEFAULT,
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(PROVIDER_CIRCUIT_THROTTLE_MAX, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn consecutive_health_failures_trip_open_at_the_compiled_threshold() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD - 1 {
+            // Interspersed non-health outcomes neither reset nor extend the
+            // consecutive streak.
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&rejected()),
+                t0,
+            );
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+        attempt(
+            &circuit,
+            ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+            t0,
+        );
+        assert_eq!(
+            refused_reason(circuit.admit_at(t0 + Duration::from_secs(1))),
+            ProviderCircuitRefusal::Open,
+            "the threshold-th consecutive health failure must trip Open"
+        );
+        // A success resets the streak, so the same count is needed again.
+        let healthy = new_circuit(true);
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &healthy,
+                ProviderCircuitObservation::from_attempt_failure(&connect_not_started()),
+                t0,
+            );
+            attempt(&healthy, ProviderCircuitObservation::Success, t0);
+        }
+        assert_eq!(healthy.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn late_old_epoch_success_cannot_close_the_new_circuit() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        // Hold a token from the Closed epoch across the trip to Open.
+        let stale = admitted(circuit.admit_at(t0));
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Open);
+        circuit.observe_at(stale, ProviderCircuitObservation::Success, t0);
+        assert_eq!(
+            circuit.phase(),
+            ProviderCircuitPhase::Open,
+            "a late old-epoch success must not close the new circuit"
+        );
+        assert!(!circuit.revalidate(stale));
+        // Even after the cooldown the circuit probes rather than trusting
+        // the stale success.
+        let probe = admitted(circuit.admit_at(t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN));
+        circuit.observe_at(probe, ProviderCircuitObservation::Success, t0);
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn open_circuit_grants_exactly_one_half_open_probe() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        let after_cooldown = t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+        let first = circuit.admit_at(after_cooldown);
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::HalfOpen);
+        assert_eq!(
+            refused_reason(circuit.admit_at(after_cooldown + Duration::from_millis(1))),
+            ProviderCircuitRefusal::HalfOpenProbeBusy,
+            "the half-open probe must be exclusive"
+        );
+        // The probe holder succeeds: the domain closes for everyone.
+        circuit.observe_at(
+            admitted(first),
+            ProviderCircuitObservation::Success,
+            after_cooldown,
+        );
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+        assert!(matches!(
+            circuit.admit_at(after_cooldown + Duration::from_millis(2)),
+            ProviderCircuitAdmission::Admitted { .. }
+        ));
+    }
+
+    #[test]
+    fn probe_failure_reopens_and_probe_timeout_reclaims_the_lease() {
+        let t0 = Instant::now();
+        // A failing probe reopens with a fresh cooldown.
+        let failed = new_circuit(true);
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &failed,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        let probe_at = t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+        failed.observe_at(
+            admitted(failed.admit_at(probe_at)),
+            ProviderCircuitObservation::from_attempt_failure(&connect_not_started()),
+            probe_at,
+        );
+        assert_eq!(failed.phase(), ProviderCircuitPhase::Open);
+        assert_eq!(
+            refused_reason(failed.admit_at(probe_at + Duration::from_secs(1))),
+            ProviderCircuitRefusal::Open
+        );
+
+        // A probe holder that never observes is reclaimed by its budget.
+        let wedged = new_circuit(true);
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &wedged,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        let probe_start = t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+        let _lease = wedged.admit_at(probe_start);
+        assert_eq!(
+            refused_reason(wedged.admit_at(probe_start + Duration::from_secs(1))),
+            ProviderCircuitRefusal::HalfOpenProbeBusy
+        );
+        let expired = probe_start + PROVIDER_CIRCUIT_HALF_OPEN_PROBE_BUDGET;
+        assert_eq!(
+            refused_reason(wedged.admit_at(expired)),
+            ProviderCircuitRefusal::Open,
+            "an abandoned probe must be reclaimed into a fresh Open cooldown"
+        );
+        let reprobe = wedged.admit_at(expired + PROVIDER_CIRCUIT_OPEN_COOLDOWN);
+        wedged.observe_at(
+            admitted(reprobe),
+            ProviderCircuitObservation::Success,
+            expired,
+        );
+        assert_eq!(wedged.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn rate_limiting_feeds_the_independent_throttle_not_health() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        // Far more 429s than the health threshold never trip Open.
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD * 20 {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&rate_limited(None)),
+                t0,
+            );
+        }
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+        // The throttle window itself still sheds load...
+        assert_eq!(
+            refused_reason(circuit.admit_at(t0 + Duration::from_millis(1))),
+            ProviderCircuitRefusal::Throttled
+        );
+        // ...expires on schedule...
+        assert!(matches!(
+            circuit.admit_at(t0 + PROVIDER_CIRCUIT_THROTTLE_DEFAULT + Duration::from_millis(1)),
+            ProviderCircuitAdmission::Admitted { .. }
+        ));
+        // ...and the health streak is untouched: the full threshold is
+        // still required to trip Open.
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD - 1 {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn throttle_windows_use_retry_after_within_the_compiled_cap() {
+        let t0 = Instant::now();
+        // A supplied Retry-After sets the window verbatim (within the cap),
+        // which is exactly the delay an R4 full-fit retry sleeps.
+        let supplied = new_circuit(true);
+        attempt(
+            &supplied,
+            ProviderCircuitObservation::Throttled {
+                retry_after_seconds: Some(3),
+            },
+            t0,
+        );
+        assert_eq!(
+            refused_reason(supplied.admit_at(t0 + Duration::from_secs(2))),
+            ProviderCircuitRefusal::Throttled
+        );
+        assert!(matches!(
+            supplied.admit_at(t0 + Duration::from_secs(3)),
+            ProviderCircuitAdmission::Admitted { .. }
+        ));
+        // A hostile Retry-After is capped, and a later shorter window never
+        // shortens an active one.
+        let capped = new_circuit(true);
+        attempt(
+            &capped,
+            ProviderCircuitObservation::Throttled {
+                retry_after_seconds: Some(3_600),
+            },
+            t0,
+        );
+        assert_eq!(
+            refused_reason(
+                capped.admit_at(t0 + PROVIDER_CIRCUIT_THROTTLE_MAX - Duration::from_millis(1))
+            ),
+            ProviderCircuitRefusal::Throttled
+        );
+        assert!(matches!(
+            capped.admit_at(t0 + PROVIDER_CIRCUIT_THROTTLE_MAX + Duration::from_millis(1)),
+            ProviderCircuitAdmission::Admitted { .. }
+        ));
+    }
+
+    #[test]
+    fn throttled_probe_releases_the_lease_without_transition() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        let probe_at = t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN;
+        circuit.observe_at(
+            admitted(circuit.admit_at(probe_at)),
+            ProviderCircuitObservation::Throttled {
+                retry_after_seconds: Some(1),
+            },
+            probe_at,
+        );
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::HalfOpen);
+        assert_eq!(
+            refused_reason(circuit.admit_at(probe_at + Duration::from_millis(1))),
+            ProviderCircuitRefusal::Throttled,
+            "the throttle window gates the next probe too"
+        );
+        let reprobe = circuit.admit_at(probe_at + Duration::from_secs(1));
+        circuit.observe_at(
+            admitted(reprobe),
+            ProviderCircuitObservation::Success,
+            probe_at,
+        );
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn shadow_mode_admits_spectators_and_keeps_the_simulated_state() {
+        let circuit = new_circuit(false);
+        let t0 = Instant::now();
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&retryable_server_error()),
+                t0,
+            );
+        }
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Open);
+        assert!(!circuit.enforce());
+        // Shadow still serves the request, but as a spectator whose outcome
+        // cannot move the simulated state.
+        let spectator = admitted(circuit.admit_at(t0 + Duration::from_secs(1)));
+        assert!(spectator.spectator);
+        circuit.observe_at(spectator, ProviderCircuitObservation::Success, t0);
+        assert_eq!(
+            circuit.phase(),
+            ProviderCircuitPhase::Open,
+            "a spectator outcome must not close the simulated circuit"
+        );
+        // The simulation matches enforcement: after the cooldown exactly
+        // one probe decides.
+        let probe = admitted(circuit.admit_at(t0 + PROVIDER_CIRCUIT_OPEN_COOLDOWN));
+        assert!(!probe.spectator);
+        circuit.observe_at(probe, ProviderCircuitObservation::Success, t0);
+        assert_eq!(circuit.phase(), ProviderCircuitPhase::Closed);
+    }
+
+    #[test]
+    fn failure_domain_key_is_content_free_and_fenced_by_config_epoch() {
+        let endpoint: url::Url = "https://provider.example/api/"
+            .parse()
+            .expect("valid test URL");
+        let key = provider_failure_domain_key(&endpoint, "model-a", 1);
+        assert_eq!(key.len(), 64, "the key must be a SHA-256 digest hex");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit()),
+            "the key must be hex"
+        );
+        assert!(
+            !key.contains("provider.example") && !key.contains("model-a"),
+            "the key must not embed the endpoint or model text"
+        );
+        assert_eq!(key, provider_failure_domain_key(&endpoint, "model-a", 1));
+        // Endpoint identity, request model, and config epoch each fence the
+        // domain: any change is a new failure domain, never a shared one.
+        let other_endpoint: url::Url = "https://other.example/api/"
+            .parse()
+            .expect("valid test URL");
+        assert_ne!(
+            key,
+            provider_failure_domain_key(&other_endpoint, "model-a", 1)
+        );
+        assert_ne!(key, provider_failure_domain_key(&endpoint, "model-b", 1));
+        assert_ne!(key, provider_failure_domain_key(&endpoint, "model-a", 2));
+    }
+
+    #[test]
+    fn not_counted_outcomes_never_trip_the_circuit() {
+        let circuit = new_circuit(true);
+        let t0 = Instant::now();
+        for _ in 0..PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD * 10 {
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&rejected()),
+                t0,
+            );
+            attempt(
+                &circuit,
+                ProviderCircuitObservation::from_attempt_failure(&protocol_invalid(
+                    ProviderHandoffCertainty::NotStarted,
+                )),
+                t0,
+            );
+        }
+        assert_eq!(
+            circuit.phase(),
+            ProviderCircuitPhase::Closed,
+            "per-request 4xx and pre-transport input failures are not Provider health"
+        );
     }
 }
