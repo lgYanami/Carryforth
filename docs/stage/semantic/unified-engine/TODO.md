@@ -6,10 +6,12 @@
 > RFX-03 关闭，unsigned result 验证前移、permit 按值消费进单一同步 signer、complete-path 迁入
 > 同一形状；F3 已交付：RFX-04/RFX-05 关闭，统一 `execute_provider_attempt` 执行器、circuit
 > 拒绝经 fresh-authorization 复核后可见、单一同步 handoff 点、non-counting 预算 token 只计
-> 真实 handoff——rfx 红色基线清零；F4（RFX-06）待 test-first、F5 资格收口未开始；见
+> 真实 handoff——rfx 红色基线清零；F4 已交付：RFX-06 关闭，fresh-plan 有序输入恒等门 +
+> typed operation restart、两 surface 共享 bounded release confirmation（上限 2、closed
+> outcome 永不重试）；仅剩 F5 资格收口；见
 > [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)
 > 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)
-> §10–§12 F1/F2/F3 交付记录）
+> §10–§13 F1/F2/F3/F4 交付记录）
 >
 > 日期：2026-08-18
 
@@ -135,6 +137,25 @@ timeout兜底（`ProviderCircuitToken`为Copy、无Drop路径，不变量成立�
 `94b3912f…→745ca584…`（资格记录§5第五行/§12）。三个确定性门复跑绿色；`buzz-relay --lib
 semantic_` 128绿、全量972绿（8个环境性DB失败）、`just test-unit` exit 0；剩余修复：F4
 （RFX-06，DB依赖路径test-first）、F5（资格收口）。
+
+**2026-08-18 F4 交付**：Retry与恢复边界修复完成（修复计划§3.5/§2.6）——complete-path每个
+root attempt以`RootAttemptInputIdentity`钉住有序输入束恒等（channel kinds含conditioned
+context坐标、精确input digests、顺序、contract-bearing generation），Provider retry的fresh
+plan重建后恒等变化即返回typed `ReturnToOperationForInputRebuild`交回outer coordinator消费
+operation restart（同一共享attempt ledger，无嵌套预算；预算耗尽浮出冻结
+`ContextSourceChanged`），旧ticket/reservation/circuit token/egress permit一律不复用；
+release确认抽出共享`confirm_release_with_bounded_retry`（`begin_release_confirmation`
+ledger上限2，仅no-permit/no-unknown-side-effect的ReleaseConfirmationTransient原地重试，
+Denied/SnapshotChanged/FleetUnavailable/非transient DB错误/deadline/cancel立即返回），
+one-shot保持`expected_snapshot=Some`+SnapshotClose窗口与冻结映射，complete-path保持
+`None`+Absolute窗口与冻结映射（Denied→403、SnapshotChanged→409、FleetUnavailable→503
+readiness、DB/Busy→503 postflight fail-closed），RFX-06关闭。rfx06两项（真实canonical
+encoder inputs钉恒等四维；共享confirmation两transient耗尽无第三次调用）加入
+`reliability_fix_regressions`（16/16绿），DB依赖coordinator集成半按资格记录§9条件式保持
+env-gated。digest轮换`745ca584…→8dc7f5e8…`（资格记录§5第六行/§13，retry-fresh-plan与
+release两行合同更新）。三个确定性门复跑绿色；`buzz-relay --lib semantic_` 132绿、全量978绿
+（8个环境性DB失败）、`buzz-semantic-query --lib` 53绿、`just test-unit` exit 0；剩余修复：
+F5（资格收口）。
 相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

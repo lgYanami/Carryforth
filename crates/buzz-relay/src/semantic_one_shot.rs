@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 
 use buzz_core::CommunityId;
 use buzz_db::semantic_query::{
-    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleasePermit,
-    SemanticGraphQueryReleaseRequest, SemanticGraphQueryTicket,
+    SemanticGraphQueryReleasePermit, SemanticGraphQueryReleaseRequest, SemanticGraphQueryTicket,
 };
 use buzz_semantic_query::{SemanticGraphQueryError, SemanticGraphQueryRoutingTrust};
 use nostr::PublicKey;
@@ -21,13 +20,14 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::{TrackedProviderFailure, VolcengineSemanticProvider};
 use crate::semantic_query_runtime::{
-    caller_disconnect_guard, egress_stage_abort, execute_provider_attempt,
-    propagate_relay_shutdown, provider_retry_backoff, provider_retry_decision,
-    subscribe_relay_shutdown, ProviderAttemptEncoded, ProviderAttemptError,
-    ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision, ProviderRetryRoute,
-    SemanticCancellationSource, SemanticDeadlineWindow, SemanticDeadlineWindows,
-    SemanticEncodeOnceFailure, SemanticExecutionContext, SemanticOperationAttemptClass,
-    SemanticProviderEgressFailure, SemanticStageAbort,
+    caller_disconnect_guard, confirm_release_with_bounded_retry, egress_stage_abort,
+    execute_provider_attempt, propagate_relay_shutdown, provider_retry_backoff,
+    provider_retry_decision, subscribe_relay_shutdown, ProviderAttemptEncoded,
+    ProviderAttemptError, ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision,
+    ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
+    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
+    SemanticOperationAttemptClass, SemanticProviderEgressFailure, SemanticReleaseConfirmation,
+    SemanticStageAbort,
 };
 use crate::state::AppState;
 
@@ -353,14 +353,14 @@ impl<'a> SemanticOneShotExecution<'a> {
     /// moves the permit by value into [`Self::sign_released`], which
     /// arbitrates the `Finalizing` latch and the synchronous signing.
     ///
-    /// R4 item 7: one classified release-confirmation transient may be
-    /// retried in place (plan §4.5) — only the confirmation itself is redone,
-    /// never scoring or packing, and only while nothing was signed and no
-    /// permit was received, which is exactly this failed-database-call path.
-    /// The ledger bounds the loop at two total attempts; an exhausted retry
-    /// projects the last typed failure through the frozen mapping, and a
-    /// fresh denial seen by the retry overrides the earlier transient (plan
-    /// §4.5 fixed priority).
+    /// R4 item 7 / F4 item 3 (fix plan §2.6): the bounded same-phase retry
+    /// runs inside the shared release-confirmation primitive both surfaces
+    /// use — only a classified transient that provably produced no permit
+    /// and no unknown side effect is redone, at most twice total under the
+    /// attempt ledger, and a fresh denial seen by the retry overrides the
+    /// earlier transient (plan §4.5 fixed priority). This surface keeps its
+    /// own exact-snapshot expectation (`expected_snapshot: Some`) and its
+    /// own frozen error mapping above the helper.
     pub(crate) async fn confirm_release(
         &self,
         snapshot: &SemanticGraphQueryTicket,
@@ -372,63 +372,32 @@ impl<'a> SemanticOneShotExecution<'a> {
         let routing_trust = self
             .routing_trust
             .ok_or(SemanticOneShotError::Unavailable)?;
-        let mut last_transient: Option<buzz_db::DbError> = None;
-        loop {
-            if let Err(_exhausted) = self.context.ledger().begin_release_confirmation() {
-                return Err(match last_transient.take() {
-                    Some(db_error) => {
-                        record_release_retry_decision(false);
-                        classify_database(db_error)
-                    }
-                    // Unreachable on a fresh request ledger; kept fail-closed.
-                    None => SemanticOneShotError::Busy,
-                });
-            }
-            let release = match self
-                .before_deadline(
-                    SemanticDeadlineWindow::SnapshotClose,
-                    self.state.db.confirm_semantic_graph_query_release(
-                        SemanticGraphQueryReleaseRequest {
-                            community_id: self.ticket.community_id,
-                            reader_pubkey: &self.reader_pubkey,
-                            expected_projection_pubkey: &self.relay_pubkey,
-                            expected_snapshot: Some(snapshot),
-                            routing_trust,
-                        },
-                    ),
-                )
-                .await
-            {
-                Ok(release) => release,
-                Err(_) => return Err(SemanticOneShotError::Timeout),
-            };
-            let release = match release {
-                Ok(confirmed) => confirmed,
-                Err(db_error) => {
-                    if release_confirmation_transient(&db_error) {
-                        record_release_retry_decision(true);
-                        last_transient = Some(db_error);
-                        continue;
-                    }
-                    record_release_retry_decision(false);
-                    return Err(classify_database(db_error));
-                }
-            };
-            return match release {
-                // The permit is linear: the caller must move it straight
-                // into `sign_released`, which arbitrates the `Finalizing`
-                // latch and consumes it with the synchronous signing.
-                SemanticGraphQueryReleaseConfirmation::Permitted(permit) => Ok(permit),
-                SemanticGraphQueryReleaseConfirmation::Denied => {
-                    Err(SemanticOneShotError::Restricted)
-                }
-                SemanticGraphQueryReleaseConfirmation::SnapshotChanged => {
-                    Err(SemanticOneShotError::Conflict)
-                }
-                SemanticGraphQueryReleaseConfirmation::FleetUnavailable => {
-                    Err(SemanticOneShotError::Unavailable)
-                }
-            };
+        let snapshot_close = SemanticDeadlineWindow::SnapshotClose;
+        match confirm_release_with_bounded_retry(&self.context, snapshot_close, || {
+            self.state
+                .db
+                .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
+                    community_id: self.ticket.community_id,
+                    reader_pubkey: &self.reader_pubkey,
+                    expected_projection_pubkey: &self.relay_pubkey,
+                    expected_snapshot: Some(snapshot),
+                    routing_trust,
+                })
+        })
+        .await
+        {
+            // The permit is linear: the caller must move it straight into
+            // `sign_released`, which arbitrates the `Finalizing` latch and
+            // consumes it with the synchronous signing.
+            SemanticReleaseConfirmation::Permitted(permit) => Ok(permit),
+            SemanticReleaseConfirmation::Denied => Err(SemanticOneShotError::Restricted),
+            SemanticReleaseConfirmation::SnapshotChanged => Err(SemanticOneShotError::Conflict),
+            SemanticReleaseConfirmation::FleetUnavailable => Err(SemanticOneShotError::Unavailable),
+            SemanticReleaseConfirmation::Database(db_error) => Err(classify_database(db_error)),
+            SemanticReleaseConfirmation::DeadlineExceeded => Err(SemanticOneShotError::Timeout),
+            // Unreachable on a fresh request ledger; kept fail-closed on the
+            // frozen busy error, exactly as the inline loop was.
+            SemanticReleaseConfirmation::Busy => Err(SemanticOneShotError::Busy),
         }
     }
 
@@ -508,28 +477,9 @@ pub(crate) fn read_snapshot_transient(error: &buzz_db::DbError) -> bool {
     )
 }
 
-/// R4 item 7: classify one release-confirmation database failure as a
-/// same-phase bounded-retry transient.
-fn release_confirmation_transient(error: &buzz_db::DbError) -> bool {
-    matches!(
-        error.semantic_failure_kind(buzz_db::SemanticDbEffectPhase::ReleaseConfirmation),
-        buzz_db::SemanticDbFailureKind::ReleaseConfirmationTransient { .. }
-    )
-}
-
-/// Record one closed release-retry decision (content-free; plan §7).
-fn record_release_retry_decision(retry: bool) {
-    metrics::counter!(
-        "buzz_semantic_release_retry_total",
-        "disposition" => if retry {
-            "retry_release_confirmation"
-        } else {
-            "terminal"
-        },
-    )
-    .increment(1);
-}
-
+// R4 item 7's classifier moved into the shared runtime primitive in F4
+// (fix plan §2.6): `release_confirmation_transient` now lives beside
+// `confirm_release_with_bounded_retry`, serving both surfaces.
 fn classify_database(error: buzz_db::DbError) -> SemanticOneShotError {
     match error {
         buzz_db::DbError::AccessDenied(_) => SemanticOneShotError::Restricted,
@@ -571,9 +521,8 @@ fn map_egress_failure(failure: SemanticProviderEgressFailure) -> SemanticOneShot
 #[cfg(test)]
 mod tests {
     use super::{
-        map_egress_failure, read_snapshot_transient, release_confirmation_transient,
-        SemanticOneShotEncodeFailure, SemanticOneShotError,
-        SemanticProviderEgressFailure as EgressFailure,
+        map_egress_failure, read_snapshot_transient, SemanticOneShotEncodeFailure,
+        SemanticOneShotError, SemanticProviderEgressFailure as EgressFailure,
     };
     use crate::semantic_query_runtime::{
         ProviderAttemptFailure, ProviderAttemptFailureKind, ProviderHandoffCertainty,
@@ -641,6 +590,9 @@ mod tests {
 
     #[test]
     fn release_confirmation_transient_accepts_only_the_classified_allowlist() {
+        // The classifier moved into the shared runtime primitive in F4 (fix
+        // plan §2.6); this pin keeps guarding the frozen allowlist.
+        use crate::semantic_query_runtime::release_confirmation_transient;
         assert!(release_confirmation_transient(&db_error_with_sqlstate(
             "55P03"
         )));

@@ -4,31 +4,43 @@
 //! Every test in this module encodes one frozen contract from the
 //! correctness fix plan (`docs/stage/semantic/unified-engine/fix/…`). The
 //! `rfx*` tests were the F0 red baseline; F1 turned rfx01 and the two rfx02
-//! tests green, F2 turned the three rfx03 tests green, and F3 turned rfx04
+//! tests green, F2 turned the three rfx03 tests green, F3 turned rfx04
 //! and rfx05 green — the circuit refusal now resolves through the fresh
-//! authorization recheck and the physical ledger counts real handoffs only.
-//! The `f1_*`/`rfx03_*`/`rfx04_*`/`rfx05_*` tests pin those deliveries.
+//! authorization recheck and the physical ledger counts real handoffs only —
+//! and F4 turned the two rfx06 tests green: the complete-path fresh plan
+//! pins its ordered input-bundle identity and both surfaces share one
+//! bounded release-confirmation retry. The `f1_*`/`rfx03_*`/`rfx04_*`/
+//! `rfx05_*`/`rfx06_*` tests pin those deliveries.
 //! Keeping the module outside `semantic_*` preserves the frozen
 //! characterization gates' historical `semantic_` filter scope while the
 //! full unit suite carries the remaining red baseline. Nothing here is
 //! ignored or feature-gated: each failure is the repeatable, content-free
 //! evidence the fix plan requires.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use buzz_core::CommunityId;
-use buzz_db::semantic_query::SemanticGraphQueryTicket;
+use buzz_db::semantic_query::{SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryTicket};
+use buzz_project_context::ProjectContextCoordinate;
+use buzz_project_view::ProjectViewObjectType;
 use buzz_semantic::SemanticEncoder;
+use buzz_semantic_query::{
+    build_query_encoder_inputs, ConditionedContextOverview, LifecycleFilter, SemanticGraphQuery,
+    SemanticGraphQueryBudget,
+};
 
+use crate::semantic_graph_query::RootAttemptInputIdentity;
 use crate::semantic_query_runtime::{
-    caller_disconnect_guard, execute_provider_attempt, subscribe_relay_shutdown,
-    ProviderAttemptError, ProviderAttemptFailure, ProviderAttemptOutcomeObservation,
-    ProviderCircuitAdmission, ProviderCircuitObservation, ProviderEgressObservation,
-    ProviderEgressPlan, ProviderHealthFailureClass, SemanticCancellationSource,
-    SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticExecutionContext,
-    SemanticLatchOutcome, SemanticLifecycleState, SemanticOperationAttemptClass,
-    SemanticProviderEgressFailure, SemanticReleaseSignAbort, SemanticStageAbort,
+    caller_disconnect_guard, confirm_release_with_bounded_retry, execute_provider_attempt,
+    subscribe_relay_shutdown, test_support::db_error_with_sqlstate, ProviderAttemptError,
+    ProviderAttemptFailure, ProviderAttemptOutcomeObservation, ProviderCircuitAdmission,
+    ProviderCircuitObservation, ProviderEgressObservation, ProviderEgressPlan,
+    ProviderHealthFailureClass, SemanticCancellationSource, SemanticDeadlineWindow,
+    SemanticDeadlineWindows, SemanticExecutionContext, SemanticLatchOutcome,
+    SemanticLifecycleState, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+    SemanticReleaseConfirmation, SemanticReleaseSignAbort, SemanticStageAbort,
     ONE_SHOT_RESERVE_DENOMINATOR, PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
 };
 use crate::AppState;
@@ -615,6 +627,192 @@ fn f1_caller_disconnect_guard_fires_on_request_drop() {
     assert_eq!(
         context.cancellation().cancelled(),
         Some(SemanticCancellationSource::CallerDisconnected)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RFX-06: retry and recovery boundaries are closed (fix plan §2.6/F4).
+// ---------------------------------------------------------------------------
+
+/// A complete-path Provider retry's fresh plan may continue inside the same
+/// root attempt only when the rebuilt ordered input bundle is exactly the one
+/// the attempt started with: same channel kinds (each conditioned context
+/// coordinate included), same exact input digests, same order, same
+/// contract-bearing generation. Anything else must go back to the outer
+/// coordinator as an operation restart — [`RootAttemptInputIdentity`] is the
+/// exact seam that decision reads, built here from real canonical encoder
+/// inputs. The coordinator's restart consumption itself is DB-dependent and
+/// stays with the env-gated suites (qualification §9); this module pins the
+/// pure boundary the coordinator consults.
+#[test]
+fn rfx06_retry_fresh_plan_pins_the_ordered_input_bundle_identity() {
+    let uuid =
+        |value: u128| uuid::Uuid::from_u128(0x123e_4567_e89b_42d3_a456_4266_0000_0000 | value);
+    let coordinate = |value: u128| ProjectContextCoordinate::ProjectViewObject {
+        object_type: ProjectViewObjectType::Work,
+        object_id: uuid(value),
+    };
+    let query = SemanticGraphQuery {
+        request_id: uuid(1),
+        project_id: uuid(2),
+        problem: " why? ".to_owned(),
+        initial_coordinates: Vec::new(),
+        context_coordinates: vec![coordinate(8), coordinate(4)],
+        lifecycle_filter: LifecycleFilter::AllCurrent,
+        budget: SemanticGraphQueryBudget::default(),
+    };
+    let inputs = |overview: &str, contexts: usize| {
+        let overviews: Vec<_> = query
+            .context_coordinates
+            .iter()
+            .take(contexts)
+            .map(|coordinate| ConditionedContextOverview {
+                coordinate: coordinate.clone(),
+                current_overview_semantic_text: overview.to_owned(),
+            })
+            .collect();
+        build_query_encoder_inputs(&query, &overviews)
+            .expect("canonical query inputs")
+            .inputs
+    };
+    let mut ticket = reliability_fix_ticket();
+    let identity = RootAttemptInputIdentity::of(&inputs("same", 2), &ticket);
+    // Q0 plus two Qi branches, in canonical Coordinate order.
+    assert_eq!(identity.channel_kinds.len(), 3);
+    // A byte-identical fresh-plan rebuild keeps the identity: only that
+    // retry may spend this root attempt's remaining Provider budget.
+    assert_eq!(
+        identity,
+        RootAttemptInputIdentity::of(&inputs("same", 2), &ticket)
+    );
+    // A moved current overview — the context observation changed — is a
+    // different bundle: back to the outer coordinator for a restart.
+    assert_ne!(
+        identity,
+        RootAttemptInputIdentity::of(&inputs("moved", 2), &ticket)
+    );
+    // A dropped context branch is a different bundle even though Q0 and the
+    // surviving Qi input bytes are unchanged.
+    assert_ne!(
+        identity,
+        RootAttemptInputIdentity::of(&inputs("same", 1), &ticket)
+    );
+    // Byte-identical inputs under a moved generation — the contract-bearing
+    // identity — are a different bundle.
+    ticket.generation.generation_id = uuid::Uuid::from_u128(0xdddd);
+    assert_ne!(
+        identity,
+        RootAttemptInputIdentity::of(&inputs("same", 2), &ticket)
+    );
+}
+
+/// Drive the shared bounded release confirmation through a sealed outcome
+/// sequence on a fresh request ledger, under the given window.
+async fn confirm_release_sequence(
+    class: SemanticOperationAttemptClass,
+    window: SemanticDeadlineWindow,
+    outcomes: VecDeque<Result<SemanticGraphQueryReleaseConfirmation, buzz_db::DbError>>,
+) -> (SemanticReleaseConfirmation, u32) {
+    let sequence = std::cell::RefCell::new(outcomes);
+    let confirmations = std::cell::Cell::new(0_u32);
+    let context = SemanticExecutionContext::new(class, future_windows());
+    let outcome = confirm_release_with_bounded_retry(&context, window, || {
+        confirmations.set(confirmations.get() + 1);
+        std::future::ready(
+            sequence
+                .borrow_mut()
+                .pop_front()
+                .expect("sealed outcome sequence covers every confirmation"),
+        )
+    })
+    .await;
+    (outcome, confirmations.get())
+}
+
+/// Both surfaces confirm their release through one shared bounded helper
+/// (fix plan §2.6/F4 item 3). A classified same-phase transient — one the
+/// database layer proved produced no permit and no unknown side effect — is
+/// redone exactly once, for a hard maximum of two confirmations; every
+/// closed outcome and every non-transient database failure returns after a
+/// single confirmation. The complete-path postflight previously confirmed
+/// once and mapped any database failure straight to its 503; it now rides
+/// this same helper under its own window with its own `expected_snapshot`
+/// parameter. A confirmed permit is not constructible outside `buzz-db`, so
+/// the `Permitted` return itself stays with the DB-gated suites
+/// (qualification §9).
+#[tokio::test]
+async fn rfx06_release_confirmation_retry_is_bounded_shared_and_fail_closed() {
+    // Two transients exhaust the budget: the freshest transient is returned
+    // and a third confirmation never happens.
+    let (outcome, confirmations) = confirm_release_sequence(
+        SemanticOperationAttemptClass::OneShot,
+        SemanticDeadlineWindow::SnapshotClose,
+        VecDeque::from([
+            Err(db_error_with_sqlstate("55P03")),
+            Err(db_error_with_sqlstate("57014")),
+            Err(db_error_with_sqlstate("55P03")),
+        ]),
+    )
+    .await;
+    assert!(
+        matches!(outcome, SemanticReleaseConfirmation::Database(_)),
+        "the exhausted budget returns the freshest transient, never a third call"
+    );
+    assert_eq!(
+        confirmations, 2,
+        "at most two release confirmations per request"
+    );
+
+    // The complete-path surface rides the same helper under its own window:
+    // one transient is retried and the closed outcome after it stands.
+    let (outcome, confirmations) = confirm_release_sequence(
+        SemanticOperationAttemptClass::CompletePath,
+        SemanticDeadlineWindow::Absolute,
+        VecDeque::from([
+            Err(db_error_with_sqlstate("55P03")),
+            Ok(SemanticGraphQueryReleaseConfirmation::Denied),
+        ]),
+    )
+    .await;
+    assert!(matches!(outcome, SemanticReleaseConfirmation::Denied));
+    assert_eq!(confirmations, 2);
+
+    // Closed outcomes and non-transient database failures are never retried.
+    let (outcome, confirmations) = confirm_release_sequence(
+        SemanticOperationAttemptClass::OneShot,
+        SemanticDeadlineWindow::SnapshotClose,
+        VecDeque::from([Ok(SemanticGraphQueryReleaseConfirmation::SnapshotChanged)]),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        SemanticReleaseConfirmation::SnapshotChanged
+    ));
+    assert_eq!(confirmations, 1, "a snapshot change is never re-confirmed");
+    let (outcome, confirmations) = confirm_release_sequence(
+        SemanticOperationAttemptClass::CompletePath,
+        SemanticDeadlineWindow::Absolute,
+        VecDeque::from([Ok(SemanticGraphQueryReleaseConfirmation::FleetUnavailable)]),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        SemanticReleaseConfirmation::FleetUnavailable
+    ));
+    assert_eq!(
+        confirmations, 1,
+        "a fleet assertion failure is never re-confirmed"
+    );
+    let (outcome, confirmations) = confirm_release_sequence(
+        SemanticOperationAttemptClass::OneShot,
+        SemanticDeadlineWindow::SnapshotClose,
+        VecDeque::from([Err(db_error_with_sqlstate("42501"))]),
+    )
+    .await;
+    assert!(matches!(outcome, SemanticReleaseConfirmation::Database(_)));
+    assert_eq!(
+        confirmations, 1,
+        "a non-transient database failure keeps its frozen terminal projection"
     );
 }
 

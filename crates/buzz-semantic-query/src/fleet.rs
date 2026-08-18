@@ -204,20 +204,20 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
 );
 
 /// Explicitly bumped closed descriptor for the compiled Phase 2 reliability
-/// runtime (unified-engine plan §12.2, corrected by the F1/F2/F3 correctness
-/// fixes).
+/// runtime (unified-engine plan §12.2, corrected by the F1/F2/F3/F4
+/// correctness fixes).
 ///
 /// The reliability route, deadline admission, one-shot reserves, lifecycle,
 /// cancellation, release-finalize ordering, retry categories, physical
-/// attempt caps, backoff, circuit, handoff, and vector-reuse contracts are
-/// hashed into the same compiled runtime digest as the wire contracts above,
-/// so an attested fleet cannot mix reliability behaviors any more than it
-/// can mix result shapes. The numeric values here mirror the compiled
-/// constants in `buzz-relay::semantic_query_runtime`; a binding test pins
-/// the two sides together, and any change to either must bump this dated
-/// descriptor.
+/// attempt caps, backoff, circuit, handoff, vector-reuse, and retry/recovery
+/// boundary contracts are hashed into the same compiled runtime digest as
+/// the wire contracts above, so an attested fleet cannot mix reliability
+/// behaviors any more than it can mix result shapes. The numeric values
+/// here mirror the compiled constants in `buzz-relay::semantic_query_runtime`;
+/// a binding test pins the two sides together, and any change to either must
+/// bump this dated descriptor.
 pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-reliability-20260818-phase2-f3-correctness-v1\n",
+    "runtime-contract=semantic-query-reliability-20260818-phase2-f4-correctness-v1\n",
     "route=server-owned-compiled-pin-per-request-no-fallback-no-dual-send-no-implementation-switch\n",
     "deadline-admission=target-window-scoped;earlier-spent-windows-are-legal-cutoffs-not-terminal\n",
     "one-shot-reserves=eighths-8;provider-start-4-eighths;work-2-eighths;snapshot-close-1-eighth;absolute-public-unchanged\n",
@@ -227,7 +227,7 @@ pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
     "attempt-caps=one-shot-physical-2;complete-path-physical-3;operation-attempt-2;release-confirmation-2;transport-retry-token-1-per-attempt\n",
     "attempt-ledger=non-counting-budget-reserved-before-circuit-gate;physical-counts-real-handoffs-only;pre-handoff-refusal-drops-token-with-delta-zero\n",
     "backoff=full-jitter-base-250ms;must-fully-fit-remaining-work-window\n",
-    "retry-fresh-plan=per-attempt-fresh-ticket-observation-inputs-reservation-egress-confirmation\n",
+    "retry-fresh-plan=per-attempt-fresh-ticket-observation-inputs-reservation-egress-confirmation;ordered-input-identity-kinds-digests-generation-pinned;mismatch-returns-typed-operation-restart-through-shared-attempt-ledger\n",
     "circuit=process-local-single-shared-failure-domain;closed-open-halfopen;epoch-fence-on-every-transition\n",
     "circuit-probe=half-open-single-exclusive-real-request-probe;probe-budget-reclaims-abandoned-lease\n",
     "circuit-gate=before-reservation;no-wait-epoch-revalidate-after-wait;refusal-caller-visible-only-after-fresh-authorization-recheck\n",
@@ -238,7 +238,7 @@ pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
     "circuit-scope=process-local-no-fleet-shared-epoch-or-lease;no-multi-pod-anti-storm-claim\n",
     "handoff=final-epoch-revalidate-and-budget-consume-in-one-synchronous-point;lazy-encode-constructed-only-after-handoff;single-outcome-observation-bound-to-handoff-permit\n",
     "vector-reuse=request-local;exact-ordered-input-digest-plus-generation-identity;fresh-ticket-fence-rebind;never-cross-generation-or-input;never-persisted\n",
-    "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline\n"
+    "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline;confirmation-bounded-2-shared-by-both-surfaces;transient-only-when-no-permit-and-no-unknown-side-effect;denied-snapshot-fleet-never-retried;one-shot-expected-snapshot-some-complete-path-none\n"
 );
 
 /// One instance asserted to be in the current HTTP load-balancer inventory.
@@ -487,7 +487,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "745ca5843c4bd8f22a33fc9fe9d6a9f7dff51fb8f137efe8b18df4dab2a36b47",
+            "8dc7f5e862f58627777c66abc50188b4d37266a9d11891267f0f589a98829cdc",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

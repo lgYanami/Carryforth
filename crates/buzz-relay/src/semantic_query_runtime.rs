@@ -79,6 +79,14 @@
 //! database, deadline, cancellation, or exhaustion — drops it with a
 //! physical delta of zero.
 //!
+//! Correctness fix F4 closes the retry-boundary deviations (fix plan §2.6):
+//! [`confirm_release_with_bounded_retry`] is the one release-confirmation
+//! primitive both surfaces share — one-shot with its exact-snapshot
+//! expectation, complete path with current authorization — retrying only a
+//! classified same-phase transient at most twice under the attempt ledger
+//! and never re-confirming a permit. The complete-path input-identity gate
+//! lives with its coordinator in `semantic_graph_query`.
+//!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
@@ -95,7 +103,8 @@ use std::time::{Duration, Instant};
 use buzz_db::semantic_query::{
     SemanticContextEgressExpectation, SemanticGraphQueryEgressConfirmation,
     SemanticGraphQueryEgressConfirmationRequest, SemanticGraphQueryEgressRequest,
-    SemanticGraphQueryEgressReservation, SemanticGraphQueryReleasePermit, SemanticGraphQueryTicket,
+    SemanticGraphQueryEgressReservation, SemanticGraphQueryReleaseConfirmation,
+    SemanticGraphQueryReleasePermit, SemanticGraphQueryTicket,
 };
 use buzz_semantic::SemanticError;
 use buzz_semantic_query::SemanticGraphQueryRoutingTrust;
@@ -2308,6 +2317,134 @@ where
     }
 }
 
+/// Neutral outcome of the shared bounded release confirmation (fix plan
+/// §2.6/F4 item 3).
+///
+/// The helper never chooses a public error: each surface projects this onto
+/// its own frozen mapping, with its own `expected_snapshot` parameter riding
+/// the confirmation closure.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SemanticReleaseConfirmation {
+    /// The confirmed permit — linear, the caller moves it by value straight
+    /// into its release signer.
+    #[error("semantic release confirmation permitted")]
+    Permitted(SemanticGraphQueryReleasePermit),
+    /// The principal or one of the current query/read prerequisites is no
+    /// longer authorized. Never retried.
+    #[error("semantic release confirmation denied")]
+    Denied,
+    /// The exact-snapshot expectation moved under the writer fence. Never
+    /// retried.
+    #[error("semantic release confirmation snapshot changed")]
+    SnapshotChanged,
+    /// The fleet assertion no longer authorizes this serving instance.
+    /// Never retried.
+    #[error("semantic release confirmation fleet unavailable")]
+    FleetUnavailable,
+    /// A database failure that is not a retryable same-phase transient, or
+    /// the last transient after the two-attempt budget ran out. The value is
+    /// the freshest failure: a denial-classified terminal overrides an
+    /// earlier transient (plan §4.5 fixed priority).
+    #[error("semantic release confirmation database failed")]
+    Database(#[source] buzz_db::DbError),
+    /// The release window aborted — deadline, cancellation, or a closed
+    /// latch. Never retried.
+    #[error("semantic release confirmation window aborted")]
+    DeadlineExceeded,
+    /// The confirmation ledger was exhausted before any attempt ran.
+    /// Unreachable on a fresh request ledger; kept fail-closed.
+    #[error("semantic release confirmation budget exhausted")]
+    Busy,
+}
+
+/// Classify one release-confirmation database failure as a same-phase
+/// bounded-retry transient (R4 item 7, shared by both surfaces since F4).
+///
+/// Only the closed SQLSTATE/phase allowlist qualifies — failures the database
+/// layer already proved produced no permit and no unknown commit outcome;
+/// every other database failure keeps its frozen terminal projection.
+pub(crate) fn release_confirmation_transient(error: &buzz_db::DbError) -> bool {
+    matches!(
+        error.semantic_failure_kind(buzz_db::SemanticDbEffectPhase::ReleaseConfirmation),
+        buzz_db::SemanticDbFailureKind::ReleaseConfirmationTransient { .. }
+    )
+}
+
+/// Record one closed release-retry decision (content-free; plan §7).
+pub(crate) fn record_release_retry_decision(retry: bool) {
+    metrics::counter!(
+        "buzz_semantic_release_retry_total",
+        "disposition" => if retry {
+            "retry_release_confirmation"
+        } else {
+            "terminal"
+        },
+    )
+    .increment(1);
+}
+
+/// Run the release confirmation with its bounded same-phase retry (fix plan
+/// §2.6/F4 item 3).
+///
+/// The retry is closed: only a classified
+/// [`release_confirmation_transient`] database failure — one that provably
+/// produced no permit and no unknown side effect — is redone, at most twice
+/// total under the attempt ledger. Denials, snapshot changes, fleet
+/// unavailability, window aborts, and every non-transient database failure
+/// return immediately; a permit is returned the moment one is issued and is
+/// never re-confirmed. The confirmation closure belongs to the closed
+/// surface: it carries that surface's own `expected_snapshot` parameter and
+/// its own frozen error mapping sits above this helper.
+pub(crate) async fn confirm_release_with_bounded_retry<Confirm, ConfirmFut>(
+    context: &SemanticExecutionContext,
+    window: SemanticDeadlineWindow,
+    confirm: Confirm,
+) -> SemanticReleaseConfirmation
+where
+    Confirm: Fn() -> ConfirmFut,
+    ConfirmFut: Future<Output = Result<SemanticGraphQueryReleaseConfirmation, buzz_db::DbError>>,
+{
+    let mut last_transient: Option<buzz_db::DbError> = None;
+    loop {
+        if context.ledger().begin_release_confirmation().is_err() {
+            return match last_transient.take() {
+                Some(db_error) => {
+                    record_release_retry_decision(false);
+                    SemanticReleaseConfirmation::Database(db_error)
+                }
+                None => SemanticReleaseConfirmation::Busy,
+            };
+        }
+        let release = match context.run_stage(window, confirm()).await {
+            Ok(release) => release,
+            Err(_abort) => return SemanticReleaseConfirmation::DeadlineExceeded,
+        };
+        match release {
+            Ok(SemanticGraphQueryReleaseConfirmation::Permitted(permit)) => {
+                return SemanticReleaseConfirmation::Permitted(permit);
+            }
+            Ok(SemanticGraphQueryReleaseConfirmation::Denied) => {
+                return SemanticReleaseConfirmation::Denied;
+            }
+            Ok(SemanticGraphQueryReleaseConfirmation::SnapshotChanged) => {
+                return SemanticReleaseConfirmation::SnapshotChanged;
+            }
+            Ok(SemanticGraphQueryReleaseConfirmation::FleetUnavailable) => {
+                return SemanticReleaseConfirmation::FleetUnavailable;
+            }
+            Err(db_error) => {
+                if release_confirmation_transient(&db_error) {
+                    record_release_retry_decision(true);
+                    last_transient = Some(db_error);
+                    continue;
+                }
+                record_release_retry_decision(false);
+                return SemanticReleaseConfirmation::Database(db_error);
+            }
+        }
+    }
+}
+
 /// Failure of one deadline-bounded single Provider invocation.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SemanticEncodeOnceFailure<E> {
@@ -3086,11 +3223,68 @@ fn record_circuit_recheck(current: bool) {
     .increment(1);
 }
 
+/// Test-only database failure fixtures shared by the semantic test modules
+/// (content-free: one fixed SQLSTATE each, never query content).
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Minimal `sqlx` database error carrying one fixed SQLSTATE.
+    pub(crate) struct StubSqlstateError(pub(crate) &'static str);
+
+    impl std::fmt::Debug for StubSqlstateError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("StubSqlstateError")
+        }
+    }
+
+    impl std::fmt::Display for StubSqlstateError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("stub semantic sqlstate")
+        }
+    }
+
+    impl std::error::Error for StubSqlstateError {}
+
+    impl sqlx::error::DatabaseError for StubSqlstateError {
+        fn message(&self) -> &str {
+            "stub semantic sqlstate"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// One database failure carrying exactly the given SQLSTATE.
+    pub(crate) fn db_error_with_sqlstate(code: &'static str) -> buzz_db::DbError {
+        buzz_db::DbError::Sqlx(sqlx::Error::Database(Box::new(StubSqlstateError(code))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Future windows for requests whose deadline behavior is not under
+    /// test.
+    fn future_windows() -> SemanticDeadlineWindows {
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(10);
+        SemanticDeadlineWindows::new(soon, soon, soon, soon).expect("future windows")
+    }
 
     #[test]
     fn deadline_windows_require_monotonic_order() {
@@ -4690,5 +4884,163 @@ mod tests {
             .await
             .expect("soak iteration must stay inside its budget");
         }
+    }
+
+    /// F4 (fix plan §2.6): the shared release confirmation retries exactly
+    /// one classified same-phase transient in place, bounds itself at two
+    /// total confirmations under the attempt ledger, and surfaces the
+    /// freshest failure once the budget is spent.
+    #[tokio::test]
+    async fn release_confirmation_retries_one_classified_transient_in_place() {
+        let context =
+            SemanticExecutionContext::new(SemanticOperationAttemptClass::OneShot, future_windows());
+        let transient = test_support::db_error_with_sqlstate("55P03");
+        let sequence = std::cell::RefCell::new(VecDeque::from(vec![
+            Err::<SemanticGraphQueryReleaseConfirmation, buzz_db::DbError>(transient),
+            Err(test_support::db_error_with_sqlstate("57014")),
+        ]));
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(
+                    sequence
+                        .borrow_mut()
+                        .pop_front()
+                        .expect("the bounded retry must stop at two confirmations"),
+                )
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 2, "the second transient must not be retried");
+        match outcome {
+            SemanticReleaseConfirmation::Database(error) => {
+                assert!(
+                    matches!(
+                        error.semantic_failure_kind(
+                            buzz_db::SemanticDbEffectPhase::ReleaseConfirmation
+                        ),
+                        buzz_db::SemanticDbFailureKind::ReleaseConfirmationTransient { .. }
+                    ),
+                    "the freshest transient must be the surfaced failure"
+                );
+            }
+            other => panic!("expected the bounded terminal database failure, got {other:?}"),
+        }
+    }
+
+    /// F4 (fix plan §2.6): a fresh closed outcome seen by the retry
+    /// overrides the earlier transient (plan §4.5 fixed priority), and
+    /// denials, snapshot changes, and fleet unavailability never retry.
+    #[tokio::test]
+    async fn release_confirmation_closed_outcomes_override_or_skip_the_retry() {
+        let context =
+            SemanticExecutionContext::new(SemanticOperationAttemptClass::OneShot, future_windows());
+        // A transient followed by a denial: the denial wins, no third call.
+        let transient = test_support::db_error_with_sqlstate("57014");
+        let sequence = std::cell::RefCell::new(VecDeque::from(vec![
+            Err::<SemanticGraphQueryReleaseConfirmation, buzz_db::DbError>(transient),
+            Ok(SemanticGraphQueryReleaseConfirmation::Denied),
+        ]));
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(sequence.borrow_mut().pop_front().expect("denial expected"))
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(outcome, SemanticReleaseConfirmation::Denied));
+
+        // Snapshot changes and fleet unavailability never retry at all.
+        // A fresh context each time: the attempt ledger's two-confirmation
+        // budget is per request.
+        let context =
+            SemanticExecutionContext::new(SemanticOperationAttemptClass::OneShot, future_windows());
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(SemanticGraphQueryReleaseConfirmation::SnapshotChanged))
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1, "closed outcomes return immediately");
+        assert!(matches!(
+            outcome,
+            SemanticReleaseConfirmation::SnapshotChanged
+        ));
+
+        let context =
+            SemanticExecutionContext::new(SemanticOperationAttemptClass::OneShot, future_windows());
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(SemanticGraphQueryReleaseConfirmation::FleetUnavailable))
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1, "closed outcomes return immediately");
+        assert!(matches!(
+            outcome,
+            SemanticReleaseConfirmation::FleetUnavailable
+        ));
+
+        // A non-transient database failure keeps its terminal projection.
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err(buzz_db::DbError::AccessDenied("denied".to_owned())))
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert!(
+            matches!(outcome, SemanticReleaseConfirmation::Database(_)),
+            "an unclassified database failure must not be retried"
+        );
+    }
+
+    /// F4 (fix plan §2.6): a window that closes while the confirmation is
+    /// in flight aborts it — the in-flight database call is dropped, never
+    /// observed as a confirmation outcome, and never retried.
+    #[tokio::test]
+    async fn release_confirmation_never_outlives_its_window() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let windows = SemanticDeadlineWindows::new(past, past, past, past).expect("past windows");
+        let context =
+            SemanticExecutionContext::new(SemanticOperationAttemptClass::OneShot, windows);
+        let calls = std::cell::Cell::new(0_u32);
+        let outcome = confirm_release_with_bounded_retry(
+            &context,
+            SemanticDeadlineWindow::SnapshotClose,
+            || {
+                calls.set(calls.get() + 1);
+                // A confirmation that never completes: only the window
+                // abort can end this stage.
+                std::future::pending::<
+                    Result<SemanticGraphQueryReleaseConfirmation, buzz_db::DbError>,
+                >()
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1, "exactly one confirmation starts");
+        assert!(matches!(
+            outcome,
+            SemanticReleaseConfirmation::DeadlineExceeded
+        ));
     }
 }

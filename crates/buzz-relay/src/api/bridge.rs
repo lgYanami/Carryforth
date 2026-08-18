@@ -22,9 +22,7 @@ use buzz_core::TenantContext;
 use buzz_db::project_document::{
     ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
 };
-use buzz_db::semantic_query::{
-    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleaseRequest,
-};
+use buzz_db::semantic_query::SemanticGraphQueryReleaseRequest;
 use buzz_sdk::project_view_v3::{
     PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG,
     PROJECT_VIEW_V3_ROLE_HISTORY_SCOPE,
@@ -1596,40 +1594,31 @@ async fn execute_semantic_graph_http_query_after_routing(
             "unavailable:semantic_graph_query:readiness",
         ));
     };
-    let release = context
-        .run_stage(
-            crate::semantic_query_runtime::SemanticDeadlineWindow::Absolute,
+    // F4 item 3 (fix plan §2.6): the release confirmation runs through the
+    // same bounded same-phase retry primitive the one-shot operations use —
+    // one classified transient may be redone, at most twice total under the
+    // attempt ledger — while this surface keeps its own current-authorization
+    // parameter (`expected_snapshot: None`) and its own frozen error mapping.
+    let relay_pubkey = state.relay_keypair.public_key();
+    let release = crate::semantic_query_runtime::confirm_release_with_bounded_retry(
+        &context,
+        crate::semantic_query_runtime::SemanticDeadlineWindow::Absolute,
+        || {
             state
                 .db
                 .confirm_semantic_graph_query_release(SemanticGraphQueryReleaseRequest {
                     community_id: tenant.community(),
                     reader_pubkey: &caller_bytes,
-                    expected_projection_pubkey: &state.relay_keypair.public_key(),
+                    expected_projection_pubkey: &relay_pubkey,
                     expected_snapshot: None,
                     routing_trust,
-                }),
-        )
-        .await
-        .map_err(|_| {
-            record_query_error(
-                SemanticGraphMetricStage::Postflight,
-                SemanticGraphQueryMetricError::DeadlineExceeded,
-            );
-            semantic_query_deadline_error()
-        })?
-        .map_err(|_| {
-            record_query_error(
-                SemanticGraphMetricStage::Postflight,
-                SemanticGraphQueryMetricError::PostflightUnavailable,
-            );
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable:semantic_graph_query:postflight",
-            )
-        })?;
+                })
+        },
+    )
+    .await;
     let release_permit = match release {
-        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => permit,
-        SemanticGraphQueryReleaseConfirmation::Denied => {
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::Permitted(permit) => permit,
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::Denied => {
             record_query_error(
                 SemanticGraphMetricStage::Postflight,
                 SemanticGraphQueryMetricError::PostflightDenied,
@@ -1639,13 +1628,13 @@ async fn execute_semantic_graph_http_query_after_routing(
                 "restricted:semantic_graph_query:authorization_changed",
             ));
         }
-        SemanticGraphQueryReleaseConfirmation::SnapshotChanged => {
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::SnapshotChanged => {
             return Err(api_error(
                 StatusCode::CONFLICT,
                 "conflict:semantic_graph_query:snapshot_changed",
             ));
         }
-        SemanticGraphQueryReleaseConfirmation::FleetUnavailable => {
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::FleetUnavailable => {
             record_query_error(
                 SemanticGraphMetricStage::Postflight,
                 SemanticGraphQueryMetricError::Readiness,
@@ -1653,6 +1642,35 @@ async fn execute_semantic_graph_http_query_after_routing(
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable:semantic_graph_query:readiness",
+            ));
+        }
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::Database(_) => {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::PostflightUnavailable,
+            );
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:semantic_graph_query:postflight",
+            ));
+        }
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::DeadlineExceeded => {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::DeadlineExceeded,
+            );
+            return Err(semantic_query_deadline_error());
+        }
+        // Unreachable on a fresh request ledger; kept fail-closed on this
+        // surface's frozen postflight unavailability.
+        crate::semantic_query_runtime::SemanticReleaseConfirmation::Busy => {
+            record_query_error(
+                SemanticGraphMetricStage::Postflight,
+                SemanticGraphQueryMetricError::PostflightUnavailable,
+            );
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable:semantic_graph_query:postflight",
             ));
         }
     };

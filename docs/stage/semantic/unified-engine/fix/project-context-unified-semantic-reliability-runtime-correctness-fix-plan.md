@@ -11,7 +11,15 @@
 > final revalidation 与 physical budget 消费合并为一个同步 handoff 线性点、lazy encode 仅在
 > handoff 之后构造、physical counter 只在真实 handoff 计数（预留在 circuit gate 前的
 > non-counting budget token + handoff 时消费），RFX-04/RFX-05 关闭；digest 轮换
-> `94b3912f… → 745ca584…`）；F4–F5 未开始。rfx04/rfx05 已转绿，剩余红色基线清零
+> `94b3912f… → 745ca584…`）；F4 已交付（complete-path fresh-plan 恒等 `RootAttemptInputIdentity`
+> 钉住有序 channel kinds + 精确 input digests + 顺序 + contract-bearing generation，恒等变化返回
+> typed `ReturnToOperationForInputRebuild` 交回 outer coordinator 消费 operation restart（同一
+> 共享 attempt ledger，无嵌套预算，预算耗尽浮出冻结 `ContextSourceChanged`）；release 确认抽出共享
+> `confirm_release_with_bounded_retry`（上限 2 次，仅 no-permit/no-unknown-side-effect transient
+> 原地重试，Denied/SnapshotChanged/FleetUnavailable/deadline/cancel 永不重试；one-shot 保持
+> `expected_snapshot=Some`+SnapshotClose 窗口与冻结映射，complete-path 保持 `None`+Absolute 窗口与
+> 冻结映射），RFX-06 关闭；digest 轮换 `745ca584… → 8dc7f5e8…`）。RFX-01..RFX-06 全部关闭；
+> F5（资格与文档收口）未开始
 >
 > 日期：2026-08-18
 >

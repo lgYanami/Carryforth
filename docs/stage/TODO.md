@@ -9,9 +9,11 @@
 > 交付：unsigned result 验证前移、permit 按值消费进单一同步 signer guard、complete-path 迁入
 > 同一形状，RFX-03 关闭；F3 已交付：统一 `execute_provider_attempt` 执行器、circuit 拒绝经
 > fresh-authorization 复核后调用方可见、最终 fence 与预算消费合并进单一同步 handoff 点、
-> non-counting 预算 token 只计真实 handoff，RFX-04/RFX-05 关闭、rfx 红色基线清零；runtime
-> digest 随日期化 descriptor 三轮轮换 `2c898e16…→36776253…→94b3912f…→745ca584…`；F4（RFX-06
-> test-first）与 F5 未开始）；第三阶段统一资源治理未启动
+> non-counting 预算 token 只计真实 handoff，RFX-04/RFX-05 关闭、rfx 红色基线清零；F4 已交付：
+> fresh-plan 有序输入恒等门 + typed operation restart、两 surface 共享 bounded release
+> confirmation（上限 2、closed outcome 永不重试），RFX-06 关闭；runtime digest 随日期化
+> descriptor 四轮轮换 `2c898e16…→36776253…→94b3912f…→745ca584…→8dc7f5e8…`；仅 F5
+> （资格收口）未开始）；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-18
 >
@@ -128,6 +130,21 @@
 > digest轮换`94b3912f…→745ca584…`（资格记录§5第五行/§12）。三个确定性门复跑绿色；
 > `buzz-relay --lib semantic_` 128绿、全量972绿（8个环境性DB失败）、`just test-unit` exit 0。
 > 剩余：F4（RFX-06，DB依赖路径test-first）、F5（资格收口）。
+>
+> **2026-08-18 F4 交付**：Retry与恢复边界修复落地（修复计划§3.5/§2.6）——complete-path每个
+> root attempt以`RootAttemptInputIdentity`钉住有序输入束恒等（channel kinds含conditioned
+> context坐标、精确input digests、顺序、contract-bearing generation），Provider retry的fresh
+> plan恒等变化即返回typed `ReturnToOperationForInputRebuild`交回outer coordinator消费
+> operation restart（同一共享attempt ledger无嵌套预算，预算耗尽浮出冻结`ContextSourceChanged`），
+> 旧ticket/reservation/circuit token/egress permit一律不复用；release确认抽出共享
+> `confirm_release_with_bounded_retry`（上限2，仅no-permit/no-unknown-side-effect transient
+> 原地重试，Denied/SnapshotChanged/FleetUnavailable/非transient DB/deadline/cancel立即返回），
+> one-shot保持`expected_snapshot=Some`+SnapshotClose窗口与冻结映射、complete-path保持`None`
+> +Absolute窗口与各自冻结映射，RFX-06关闭。rfx06两项入`reliability_fix_regressions`（16/16
+> 绿），DB依赖coordinator集成半按资格记录§9条件式保持env-gated。digest轮换
+> `745ca584…→8dc7f5e8…`（资格记录§5第六行/§13）。三个确定性门复跑绿色；`buzz-relay --lib
+> semantic_` 132绿、全量978绿（8个环境性DB失败）、`just test-unit` exit 0。剩余：F5（资格
+> 收口）。
 
 ### 背景
 

@@ -169,14 +169,31 @@ async fn begin_semantic_graph_root_query_inner(
                     _caller,
                 });
             }
-            Err(error @ SemanticGraphRootQueryError::SemanticGenerationChanged)
-            | Err(error @ SemanticGraphRootQueryError::ContextSourceChanged)
-                if attempt == 0 =>
-            {
+            Err(RootAttemptError::Failure(
+                error @ SemanticGraphRootQueryError::SemanticGenerationChanged,
+            ))
+            | Err(RootAttemptError::Failure(
+                error @ SemanticGraphRootQueryError::ContextSourceChanged,
+            )) if attempt == 0 => {
                 record_generation_retry();
                 last_churn = Some(error);
             }
-            Err(error) => return Err(error),
+            // F4 (fix plan §2.6): the Provider-retry fresh plan rebuilt a
+            // different ordered input bundle, so the old root attempt must
+            // not spend its retry budget against it. The outer coordinator
+            // consumes one operation restart — bounded by the same attempt
+            // ledger, so Provider retries and operation restarts can never
+            // multiply into nested budgets — and rebuilds the root attempt
+            // from a fresh observation. With the restart budget spent, the
+            // rebuild request surfaces through the frozen churn conflict.
+            Err(RootAttemptError::ReturnToOperationForInputRebuild) if attempt == 0 => {
+                record_generation_retry();
+                last_churn = Some(SemanticGraphRootQueryError::ContextSourceChanged);
+            }
+            Err(RootAttemptError::ReturnToOperationForInputRebuild) => {
+                return Err(SemanticGraphRootQueryError::ContextSourceChanged);
+            }
+            Err(RootAttemptError::Failure(error)) => return Err(error),
         }
     }
     Err(last_churn.unwrap_or(SemanticGraphRootQueryError::ContextSourceChanged))
@@ -196,7 +213,7 @@ struct RootQueryAttemptPlan<'a> {
 
 async fn root_query_attempt(
     plan: RootQueryAttemptPlan<'_>,
-) -> Result<StageCRootBuild, SemanticGraphRootQueryError> {
+) -> Result<StageCRootBuild, RootAttemptError> {
     let RootQueryAttemptPlan {
         state,
         provider,
@@ -216,15 +233,19 @@ async fn root_query_attempt(
         .map_err(|_| SemanticGraphRootQueryError::QueryProviderBusy)?;
     propagate_relay_shutdown(state, context);
     if let Err(abort) = context.admit_stage(SemanticDeadlineWindow::Work) {
-        return Err(match abort {
+        return Err(RootAttemptError::Failure(match abort {
             SemanticStageAbort::Deadline(_)
             | SemanticStageAbort::Cancelled(_)
             | SemanticStageAbort::LatchClosed(_) => {
                 SemanticGraphRootQueryError::QueryDeadlineExceeded
             }
-        });
+        }));
     }
     let mut prior_vectors = reusable.take();
+    // F4 (fix plan §2.6): the ordered input bundle identity this root
+    // attempt opened with. Set on the first fresh plan, compared on every
+    // Provider-retry fresh plan after it.
+    let mut attempt_input_identity: Option<RootAttemptInputIdentity> = None;
     loop {
         // Every physical Provider attempt assembles its own fresh plan
         // (plan §4.3): fresh authorized ticket, fresh context observation,
@@ -251,10 +272,28 @@ async fn root_query_attempt(
         .await?;
         if provider.source_contract() != &ticket.generation.model_contract {
             record_provider_failure(SemanticGraphProviderFailure::Unavailable);
-            return Err(SemanticGraphRootQueryError::QueryEncoderUnavailable);
+            return Err(RootAttemptError::Failure(
+                SemanticGraphRootQueryError::QueryEncoderUnavailable,
+            ));
         }
         let input_build =
             build_query_encoder_inputs(query, &conditioned_overviews(&stage_a_context))?;
+        // F4 (fix plan §2.6): a Provider-retry fresh plan may only spend
+        // this root attempt's retry budget on the exact bundle the attempt
+        // opened with — same channel kinds, same exact input digests, in the
+        // same order, under the same contract-bearing generation. A fresh
+        // plan that rebuilt anything else returns to the outer coordinator
+        // for an operation restart instead of retrying the old root attempt
+        // against a different bundle, so the old bundle is never re-sent and
+        // no retry budget is spent on a plan the restart will discard.
+        let fresh_identity = RootAttemptInputIdentity::of(&input_build.inputs, &ticket);
+        if let Some(attempt_identity) = &attempt_input_identity {
+            if *attempt_identity != fresh_identity {
+                return Err(RootAttemptError::ReturnToOperationForInputRebuild);
+            }
+        } else {
+            attempt_input_identity = Some(fresh_identity);
+        }
         let unsupported_conditioned = input_build
             .omitted_contexts
             .iter()
@@ -366,7 +405,7 @@ async fn root_query_attempt(
                 let encoded = match attempt {
                     Ok(ProviderAttemptEncoded { encoded, .. }) => encoded,
                     Err(ProviderAttemptError::Admission(failure)) => {
-                        return Err(match failure {
+                        return Err(RootAttemptError::Failure(match failure {
                             SemanticProviderEgressFailure::ProviderUnavailable => {
                                 classify_ticket_failure(
                                     state,
@@ -377,13 +416,15 @@ async fn root_query_attempt(
                                 .await
                             }
                             failure => map_provider_egress_failure(failure),
-                        });
+                        }));
                     }
                     Err(ProviderAttemptError::Encode(
                         SemanticEncodeOnceFailure::DeadlineExceeded,
                     ))
                     | Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::Cancelled(_))) => {
-                        return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+                        return Err(RootAttemptError::Failure(
+                            SemanticGraphRootQueryError::QueryDeadlineExceeded,
+                        ));
                     }
                     // R4 items 1-3: the closed runtime policy owns the retry
                     // decision (the circuit observation already ran inside
@@ -404,11 +445,13 @@ async fn root_query_attempt(
                         ProviderRetryDecision::Terminal => {
                             let TrackedProviderFailure { error, .. } = tracked;
                             record_provider_failure(provider_failure_class(&error));
-                            return Err(map_encoder_error(error));
+                            return Err(RootAttemptError::Failure(map_encoder_error(error)));
                         }
                         ProviderRetryDecision::Retry { backoff } => {
                             if provider_retry_backoff(context, backoff).await.is_err() {
-                                return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+                                return Err(RootAttemptError::Failure(
+                                    SemanticGraphRootQueryError::QueryDeadlineExceeded,
+                                ));
                             }
                             continue;
                         }
@@ -476,7 +519,78 @@ async fn root_query_attempt(
             &unsupported_conditioned,
             context,
         )
-        .await;
+        .await
+        .map_err(RootAttemptError::Failure);
+    }
+}
+
+/// Exact identity of one root attempt's ordered encoder input bundle (fix
+/// plan §2.6, F4 item 1).
+///
+/// The ordered channel kinds — each conditioned context coordinate included
+/// — and the ordered exact input digests, under the semantic generation the
+/// attempt opened with. The generation pins the model contract whose
+/// Provider compatibility is terminally checked at every fresh-plan
+/// admission, so identity equality means a Provider-retry fresh plan rebuilt
+/// the byte-identical bundle for the same contract: only then may the retry
+/// spend this root attempt's budget. Anything else — a channel kind, an
+/// input digest, the order, or the generation moving — returns to the outer
+/// coordinator for an operation restart. Content-free: kinds and digests
+/// only, never query text.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RootAttemptInputIdentity {
+    pub(crate) generation_id: uuid::Uuid,
+    pub(crate) channel_kinds: Vec<SemanticQueryChannelKind>,
+    pub(crate) input_digests: Vec<Digest32>,
+}
+
+impl RootAttemptInputIdentity {
+    pub(crate) fn of(
+        inputs: &[SemanticQueryEncoderInput],
+        ticket: &SemanticGraphQueryTicket,
+    ) -> Self {
+        Self {
+            generation_id: ticket.generation.generation_id,
+            channel_kinds: inputs
+                .iter()
+                .map(|input| input.channel_kind().clone())
+                .collect(),
+            input_digests: inputs.iter().map(|input| input.text_digest()).collect(),
+        }
+    }
+}
+
+/// One root attempt's failure: the typed operation-rebuild request of fix
+/// plan §2.6 or the surface's frozen failure.
+enum RootAttemptError {
+    /// The Provider-retry fresh plan rebuilt a different ordered input
+    /// bundle ([`RootAttemptInputIdentity`]). The old root attempt must not
+    /// retry against it: the outer coordinator consumes one operation
+    /// restart — bounded by the shared attempt ledger, so Provider retries
+    /// and operation restarts can never form nested budgets — and rebuilds
+    /// the root attempt from a fresh observation. This value never reaches
+    /// a public error mapping: the coordinator either restarts or surfaces
+    /// the frozen churn conflict once the restart budget is spent.
+    ReturnToOperationForInputRebuild,
+    /// The frozen surface failure.
+    Failure(SemanticGraphRootQueryError),
+}
+
+impl From<SemanticGraphRootQueryError> for RootAttemptError {
+    fn from(error: SemanticGraphRootQueryError) -> Self {
+        Self::Failure(error)
+    }
+}
+
+impl From<SemanticGraphQueryError> for RootAttemptError {
+    fn from(error: SemanticGraphQueryError) -> Self {
+        Self::Failure(SemanticGraphRootQueryError::Contract(error))
+    }
+}
+
+impl From<buzz_db::DbError> for RootAttemptError {
+    fn from(error: buzz_db::DbError) -> Self {
+        Self::Failure(SemanticGraphRootQueryError::Database(error))
     }
 }
 
@@ -2582,5 +2696,79 @@ mod tests {
             RESPONSE_TAIL_RESERVE_MS + SNAPSHOT_CLOSE_RESERVE_MS
         )
         .is_err());
+    }
+
+    /// F4 (fix plan §2.6): the root-attempt input identity is exact — same
+    /// channel kinds, same exact input digests, same order, same
+    /// contract-bearing generation — and any movement of one dimension
+    /// breaks it, sending the Provider retry back to the outer coordinator
+    /// for an operation restart instead of continuing the old root attempt.
+    #[test]
+    fn root_attempt_input_identity_tracks_kind_digest_order_and_generation() {
+        let generation = uuid::Uuid::from_u128(7);
+        let other_generation = uuid::Uuid::from_u128(8);
+        let problem = SemanticQueryChannelKind::Problem;
+        let identity = RootAttemptInputIdentity {
+            generation_id: generation,
+            channel_kinds: vec![problem.clone(), problem.clone()],
+            input_digests: vec![Digest32::from_bytes([1; 32]), Digest32::from_bytes([2; 32])],
+        };
+        // The exact same bundle rebuilds the same identity.
+        assert_eq!(
+            identity,
+            RootAttemptInputIdentity {
+                generation_id: generation,
+                channel_kinds: vec![problem.clone(), problem.clone()],
+                input_digests: vec![Digest32::from_bytes([1; 32]), Digest32::from_bytes([2; 32])],
+            }
+        );
+        // A reordered bundle is a different identity.
+        assert_ne!(
+            identity,
+            RootAttemptInputIdentity {
+                generation_id: generation,
+                channel_kinds: vec![problem.clone(), problem.clone()],
+                input_digests: vec![Digest32::from_bytes([2; 32]), Digest32::from_bytes([1; 32])],
+            }
+        );
+        // A changed input digest is a different identity.
+        assert_ne!(
+            identity,
+            RootAttemptInputIdentity {
+                generation_id: generation,
+                channel_kinds: vec![problem.clone(), problem.clone()],
+                input_digests: vec![Digest32::from_bytes([1; 32]), Digest32::from_bytes([3; 32])],
+            }
+        );
+        // A changed channel kind is a different identity.
+        let coordinate = ProjectContextCoordinate::Document {
+            document_id: uuid::Uuid::from_u128(9),
+        };
+        assert_ne!(
+            identity,
+            RootAttemptInputIdentity {
+                generation_id: generation,
+                channel_kinds: vec![
+                    problem,
+                    SemanticQueryChannelKind::ConditionedContext {
+                        context_coordinate: coordinate,
+                    },
+                ],
+                input_digests: vec![Digest32::from_bytes([1; 32]), Digest32::from_bytes([2; 32])],
+            }
+        );
+        // A moved generation — the contract-bearing identity — is a
+        // different identity even for byte-identical inputs.
+        assert_ne!(
+            identity,
+            RootAttemptInputIdentity {
+                generation_id: other_generation,
+                channel_kinds: vec![
+                    SemanticQueryChannelKind::Problem,
+                    SemanticQueryChannelKind::Problem
+                ],
+                input_digests: vec![Digest32::from_bytes([1; 32]), Digest32::from_bytes([2; 32])],
+            }
+        );
     }
 }
