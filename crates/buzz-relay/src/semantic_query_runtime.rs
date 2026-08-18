@@ -62,6 +62,23 @@
 //! simulated state, so the canary observes exactly what enforcement would
 //! have done.
 //!
+//! Correctness fix F3 closes the circuit/handoff/ledger deviations (fix plan
+//! §2.4/§2.5): the executor no longer hands coordinators an admission to
+//! hold across a gap — it runs the whole physical attempt
+//! (`execute_provider_attempt`), consulting the coordinator's
+//! fresh-authorization callback only when the caller would otherwise observe
+//! a circuit refusal, so a revoked or unprovable caller receives the
+//! authorization refusal first and only a still-authorized caller observes
+//! the circuit's Busy. The final circuit fence and the physical-attempt
+//! budget consumption linearize in one synchronous handoff authorization
+//! with no await before the coordinator's lazy encode closure, which is
+//! constructed only after that point; the handoff permit carries the single
+//! outcome observation. The physical counter counts only real handoffs: a
+//! non-counting budget token is reserved before the circuit gate and
+//! consumed at the handoff, and every pre-handoff refusal — circuit,
+//! database, deadline, cancellation, or exhaustion — drops it with a
+//! physical delta of zero.
+//!
 //! Every type here is content-free by construction: no query text, overview,
 //! Coordinate identity, vector, credential, or project content is stored,
 //! formatted, or logged.
@@ -699,14 +716,21 @@ pub(crate) enum SemanticAttemptExhausted {
 /// Counters never nest into new budgets and are never reset. The physical
 /// Provider attempt count is monotonic across operation restarts so nested
 /// retries cannot multiply past the compiled caps (one-shot 2, complete path
-/// 3). The single transport-retry token is shared across operation restarts;
-/// the fresh attempt of a restart does not consume it, which is exactly what
+/// 3), and — since F3 (fix plan §2.5) — it moves only when a reserved budget
+/// token is consumed at the real Provider handoff; a reservation held before
+/// the handoff, or dropped by any pre-handoff refusal, never counts. The
+/// single transport-retry token is shared across operation restarts; the
+/// fresh attempt of a restart does not consume it, which is exactly what
 /// allows "one safe Provider retry + one churn root restart" while forbidding
 /// a fourth physical call. These caps enter the compiled reliability runtime
 /// digest when the R2 route matrix lands.
 pub(crate) struct SemanticAttemptLedger {
     class: SemanticOperationAttemptClass,
     provider_attempts: AtomicU32,
+    /// Physical-attempt reservations held but not yet handed off (fix plan
+    /// §2.5). Counted against the class cap together with committed
+    /// attempts so concurrent reservations cannot overshoot it.
+    provider_attempt_reservations: AtomicU32,
     provider_attempts_in_operation: AtomicU32,
     provider_transport_retries: AtomicU32,
     operation_attempts: AtomicU32,
@@ -719,6 +743,7 @@ impl SemanticAttemptLedger {
         Self {
             class,
             provider_attempts: AtomicU32::new(0),
+            provider_attempt_reservations: AtomicU32::new(0),
             provider_attempts_in_operation: AtomicU32::new(0),
             provider_transport_retries: AtomicU32::new(0),
             operation_attempts: AtomicU32::new(0),
@@ -762,36 +787,74 @@ impl SemanticAttemptLedger {
         Ok(self.operation_attempts.load(Ordering::SeqCst))
     }
 
-    /// Begin one physical Provider attempt, returning its monotonic ordinal.
+    /// Reserve one physical Provider attempt without counting it (fix plan
+    /// §2.5).
     ///
-    /// Every attempt counts against the class physical cap. A second or
-    /// later attempt *within the same operation attempt* must consume the
-    /// single shared transport-retry token; the fresh attempt of a new
-    /// operation attempt does not. Deadline windows are checked by the
-    /// executor, not by this ledger.
-    pub(crate) fn begin_provider_attempt(&self) -> Result<u32, SemanticAttemptExhausted> {
-        if self.provider_attempts.load(Ordering::SeqCst)
-            >= self.class.physical_provider_attempt_cap()
-        {
+    /// The reservation holds a class-cap slot — counted together with the
+    /// committed attempts so nothing else can overshoot the cap — and, for a
+    /// second or later attempt *within the same operation attempt*, consumes
+    /// the single shared transport-retry token. The physical counter only
+    /// moves when the returned token is consumed at the real Provider
+    /// handoff ([`ProviderAttemptBudgetToken::consume_at_handoff`]); any
+    /// pre-handoff refusal drops the token, releases the slot, and refunds
+    /// the transport-retry token it consumed, so a refused egress leaves the
+    /// physical delta at zero.
+    pub(crate) fn reserve_provider_attempt_budget(
+        &self,
+    ) -> Result<ProviderAttemptBudgetToken<'_>, SemanticAttemptExhausted> {
+        let committed = self.provider_attempts.load(Ordering::SeqCst)
+            + self.provider_attempt_reservations.load(Ordering::SeqCst);
+        if committed >= self.class.physical_provider_attempt_cap() {
             return Err(SemanticAttemptExhausted::ProviderAttempts);
         }
-        if self.provider_attempts_in_operation.load(Ordering::SeqCst) > 0 {
-            let _ = self
-                .provider_transport_retries
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                    (used < 1).then_some(used + 1)
-                })
-                .map_err(|_| SemanticAttemptExhausted::ProviderTransportRetry)?;
+        let consumed_transport_retry =
+            if self.provider_attempts_in_operation.load(Ordering::SeqCst) > 0 {
+                let _ = self
+                    .provider_transport_retries
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                        (used < 1).then_some(used + 1)
+                    })
+                    .map_err(|_| SemanticAttemptExhausted::ProviderTransportRetry)?;
+                true
+            } else {
+                false
+            };
+        self.provider_attempt_reservations
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderAttemptBudgetToken {
+            ledger: Some(self),
+            consumed_transport_retry,
+        })
+    }
+
+    /// Release one pre-handoff reservation (fix plan §2.5).
+    ///
+    /// The slot returns to the class cap and a transport-retry token the
+    /// reservation had consumed is refunded: the retry it authorized never
+    /// made a physical call.
+    fn release_provider_attempt_reservation(&self, refund_transport_retry: bool) {
+        self.provider_attempt_reservations
+            .fetch_sub(1, Ordering::SeqCst);
+        if refund_transport_retry {
+            self.provider_transport_retries
+                .fetch_sub(1, Ordering::SeqCst);
         }
-        let ordinal = self
-            .provider_attempts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |begun| {
-                (begun < self.class.physical_provider_attempt_cap()).then_some(begun + 1)
-            })
-            .map_err(|_| SemanticAttemptExhausted::ProviderAttempts)?;
+    }
+
+    /// Commit one reservation into a real, counted physical attempt.
+    ///
+    /// Called only from [`ProviderAttemptBudgetToken::consume_at_handoff`] —
+    /// the moment the handoff permit accepted the attempt — so the counter
+    /// counts real Provider handoffs, not admissions. The cap was already
+    /// enforced at reservation under the same SeqCst order, and the
+    /// reservation slot this commits was counted against it, so the plain
+    /// increments cannot overshoot.
+    fn commit_provider_handoff(&self) {
+        self.provider_attempt_reservations
+            .fetch_sub(1, Ordering::SeqCst);
+        self.provider_attempts.fetch_add(1, Ordering::SeqCst);
         self.provider_attempts_in_operation
             .fetch_add(1, Ordering::SeqCst);
-        Ok(ordinal + 1)
     }
 
     /// Begin one release confirmation; the retry budget allows two total.
@@ -808,13 +871,14 @@ impl SemanticAttemptLedger {
     /// Whether one more physical Provider attempt fits the compiled caps.
     ///
     /// The decision core consults this before advising a retry so a retry is
-    /// never begun that the very next [`Self::begin_provider_attempt`] would
-    /// refuse (plan §9.1: an insufficient remaining budget never starts an
-    /// attempt).
+    /// never begun that the very next [`Self::reserve_provider_attempt_budget`]
+    /// would refuse (plan §9.1: an insufficient remaining budget never starts
+    /// an attempt). Committed attempts and live reservations count against
+    /// the cap together.
     pub(crate) fn can_begin_provider_attempt(&self) -> bool {
-        if self.provider_attempts.load(Ordering::SeqCst)
-            >= self.class.physical_provider_attempt_cap()
-        {
+        let committed = self.provider_attempts.load(Ordering::SeqCst)
+            + self.provider_attempt_reservations.load(Ordering::SeqCst);
+        if committed >= self.class.physical_provider_attempt_cap() {
             return false;
         }
         if self.provider_attempts_in_operation.load(Ordering::SeqCst) > 0
@@ -828,6 +892,47 @@ impl SemanticAttemptLedger {
     /// Whether one more operation or root attempt fits the compiled cap.
     pub(crate) fn can_begin_operation_attempt(&self) -> bool {
         self.operation_attempts.load(Ordering::SeqCst) < self.class.operation_attempt_cap()
+    }
+}
+
+/// Reserved-but-not-counted budget for exactly one physical Provider attempt
+/// (fix plan §2.5).
+///
+/// The token is linear: it is created only by
+/// [`SemanticAttemptLedger::reserve_provider_attempt_budget`], cannot be
+/// copied, and leaves the reservation in one of exactly two ways — consumed
+/// at the real handoff, or dropped by any pre-handoff refusal (circuit,
+/// database, deadline, cancellation, or budget exhaustion), which releases
+/// the slot, refunds the transport-retry token, and keeps the physical
+/// delta at zero.
+#[must_use = "a reserved physical-attempt budget must reach its handoff or be dropped"]
+pub(crate) struct ProviderAttemptBudgetToken<'a> {
+    ledger: Option<&'a SemanticAttemptLedger>,
+    consumed_transport_retry: bool,
+}
+
+impl ProviderAttemptBudgetToken<'_> {
+    /// Consume the reservation at the real Provider handoff.
+    ///
+    /// Called only from the handoff linearization point
+    /// ([`authorize_provider_handoff`]) once the circuit has accepted the
+    /// attempt: from this moment the physical counter counts it, the
+    /// transport-retry token it consumed stays consumed, and the attempt is
+    /// circuit-held — a later transition cannot retroactively revoke it.
+    pub(crate) fn consume_at_handoff(mut self) {
+        if let Some(ledger) = self.ledger.take() {
+            ledger.commit_provider_handoff();
+        }
+        // With the ledger taken, dropping the shell runs no release: the
+        // reservation has become a counted physical attempt.
+    }
+}
+
+impl Drop for ProviderAttemptBudgetToken<'_> {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.ledger.take() {
+            ledger.release_provider_attempt_reservation(self.consumed_transport_retry);
+        }
     }
 }
 
@@ -1697,7 +1802,7 @@ impl ProviderEgressObservation {
     }
 }
 
-/// Borrowed inputs for one shared Provider egress admission.
+/// Borrowed inputs for one shared Provider egress attempt (fix plan §2.4).
 ///
 /// `'state` outlives the per-attempt borrows so the returned routing trust
 /// can live in the caller's execution state after the plan's own borrows
@@ -1718,17 +1823,77 @@ pub(crate) struct ProviderEgressPlan<'state, 'plan> {
     pub(crate) observation: ProviderEgressObservation,
 }
 
-/// One completed shared Provider egress admission.
-pub(crate) struct ProviderEgressAdmission<'state> {
+/// One completed shared Provider attempt: the routing trust its release
+/// fence must later confirm against, plus the single encoded result.
+pub(crate) struct ProviderAttemptEncoded<'state, T> {
     /// Routing trust for the caller's later release fence.
     pub(crate) routing_trust: SemanticGraphQueryRoutingTrust<'state>,
-    /// Epoch-fenced circuit token for the admitted physical attempt.
+    /// The one lazy Provider invocation's result.
+    pub(crate) encoded: T,
+}
+
+/// Failure of one whole shared Provider attempt (fix plan §2.4).
+///
+/// `Admission` refused the attempt before the Provider handoff — the neutral
+/// egress vocabulary the owning surface maps onto its frozen public errors.
+/// `Encode` is the single sanctioned invocation failing inside the work
+/// window after the handoff was linearized.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProviderAttemptError<E> {
+    /// The attempt was refused before any Provider handoff.
+    #[error("semantic provider attempt admission failed")]
+    Admission(#[source] SemanticProviderEgressFailure),
+    /// The one Provider invocation failed after the handoff.
+    #[error("semantic provider attempt encode failed")]
+    Encode(#[source] SemanticEncodeOnceFailure<E>),
+}
+
+/// The closed typed-failure view the executor observes one completed handoff
+/// against its circuit through (fix plan §2.4).
+///
+/// Every sanctioned Provider encode future fails with one tracked failure
+/// carrying the closed [`ProviderAttemptFailure`] classification, whatever
+/// its operation-specific payload is; the executor needs only that
+/// classification to report the attempt's health.
+pub(crate) trait ProviderAttemptOutcomeObservation {
+    /// The closed attempt classification of this Provider failure.
+    fn attempt_failure(&self) -> &ProviderAttemptFailure;
+}
+
+impl<E> ProviderAttemptOutcomeObservation for crate::semantic_provider::TrackedProviderFailure<E> {
+    fn attempt_failure(&self) -> &ProviderAttemptFailure {
+        &self.failure
+    }
+}
+
+/// The one-time linear Provider-handoff authorization (fix plan §2.4).
+///
+/// Produced by [`authorize_provider_handoff`] — the final circuit epoch
+/// revalidation and the physical-attempt budget consumption in one
+/// synchronous critical section with no await between them and the lazy
+/// Provider closure — and consumed by the executor's single outcome
+/// observation. A permit holder's attempt is already accepted by its
+/// circuit: a later transition that opens the circuit does not retroactively
+/// revoke it. Deadline and cancellation outcomes drop the permit unobserved
+/// (plan §4.7).
+pub(crate) struct ProviderHandoffPermit<'state> {
+    provider: Option<&'state crate::semantic_provider::VolcengineSemanticProvider>,
+    circuit: Option<ProviderCircuitToken>,
+}
+
+impl ProviderHandoffPermit<'_> {
+    /// Observe the one completed handoff outcome against the same token that
+    /// authorized it.
     ///
-    /// `None` only when this process has no configured Provider (unreachable
-    /// behind the coordinators' own Provider resolution). The coordinator
-    /// reports the attempt's outcome through [`observe_provider_circuit`]
-    /// exactly once; a deadline or cancellation reports nothing.
-    pub(crate) circuit: Option<ProviderCircuitToken>,
+    /// This is the only sanctioned observation shape: exactly one report per
+    /// physical attempt, bound to the handoff that made the call. `None`
+    /// provider/token (no configured Provider) observes nothing, exactly as
+    /// the R5 coordinator reporting did.
+    pub(crate) fn observe_outcome(self, observation: ProviderCircuitObservation) {
+        if let (Some(provider), Some(token)) = (self.provider, self.circuit) {
+            provider.circuit().observe(token, observation);
+        }
+    }
 }
 
 /// Cancel `context` when the Relay process entered its controlled shutdown.
@@ -1813,7 +1978,10 @@ impl Drop for SemanticCallerGuard {
 }
 
 /// Map one refused or aborted bounded step onto the neutral egress failure.
-fn egress_stage_abort(abort: SemanticStageAbort) -> SemanticProviderEgressFailure {
+///
+/// Also used by the closed coordinators' fresh-authorization rechecks, which
+/// ride the executor's bounded-step vocabulary (fix plan §2.4 item 1).
+pub(crate) fn egress_stage_abort(abort: SemanticStageAbort) -> SemanticProviderEgressFailure {
     match abort {
         SemanticStageAbort::Deadline(_) => SemanticProviderEgressFailure::DeadlineExceeded,
         SemanticStageAbort::Cancelled(source) => SemanticProviderEgressFailure::Cancelled(source),
@@ -1839,28 +2007,104 @@ fn latest_start_at(work: Instant) -> Result<DateTime<Utc>, SemanticProviderEgres
     Ok(Utc::now() + duration)
 }
 
-/// Run the shared `circuit gate -> reservation -> wait -> routing trust ->
-/// egress confirmation` admission sequence for exactly one physical Provider
-/// attempt.
+/// Resolve one caller-visible circuit refusal through the fresh-authorization
+/// callback (fix plan §2.4 item 1).
 ///
-/// This is the R2 zero-policy primitive grown by R5's circuit fence: it adds
-/// no retry, backoff, or route fallback, and it never chooses a public
-/// error. Ticket admission, Stage A observation, and the Provider encode
-/// call stay with the closed operation. The returned routing trust belongs
-/// to the caller's later release fence.
+/// Only a caller the closed operation can still prove authorized — a fresh
+/// host-derived revalidation under the database writer fence, with no
+/// reservation and no encoding — observes the circuit's Busy. A refused or
+/// unprovable fresh check returns that failure instead: authorization always
+/// outranks the circuit. The runtime only orchestrates this priority; the
+/// check itself stays inside the operation's authorization boundary.
+async fn circuit_refusal_after_reauthorization<Reauth, ReauthFut>(
+    context: &SemanticExecutionContext,
+    reauthorize: Reauth,
+) -> SemanticProviderEgressFailure
+where
+    Reauth: FnOnce() -> ReauthFut,
+    ReauthFut: Future<Output = Result<(), SemanticProviderEgressFailure>>,
+{
+    match context
+        .run_stage(SemanticDeadlineWindow::Work, reauthorize())
+        .await
+    {
+        Ok(Ok(())) => SemanticProviderEgressFailure::AdmissionBusy,
+        Ok(Err(failure)) => failure,
+        Err(abort) => egress_stage_abort(abort),
+    }
+}
+
+/// The single linear Provider-handoff point (fix plan §2.4 item 2).
 ///
-/// The circuit gate is taken here — not in any coordinator — because this is
-/// the only Provider egress path: no operation can bypass an open circuit,
-/// and authorization always precedes it (the ticket was admitted and the
-/// principal capability-checked by the closed coordinator before this
-/// executor runs, so a caller without authorization never observes a circuit
-/// outcome). Every refusal rides the existing `AdmissionBusy` neutral
-/// failure, which each surface already projects onto its frozen Busy public
-/// error; the gate is fetched from the serving state itself so a coordinator
-/// cannot forget to pass it.
-pub(crate) async fn execute_provider_egress<'state>(
+/// In one synchronous critical section — the final database confirmation is
+/// already awaited, and nothing between this call and the lazy Provider
+/// closure awaits — this revalidates the attempt's circuit epoch one last
+/// time and consumes the reserved-not-yet-counted physical-attempt budget:
+///
+/// * a current epoch yields the one-time [`ProviderHandoffPermit`] and
+///   commits the physical attempt — the attempt is now circuit-held, and a
+///   later transition that opens the circuit cannot retroactively revoke it;
+/// * a stale epoch under enforcement drops the budget token (slot released,
+///   transport-retry token refunded) and refuses with Provider delta zero.
+///   The abandoned circuit token is never observed; a half-open probe lease
+///   it held is reclaimed by the circuit's existing probe-budget timeout,
+///   the same recovery R5 shipped for every unobserved token.
+fn authorize_provider_handoff<'state>(
+    provider: Option<&'state crate::semantic_provider::VolcengineSemanticProvider>,
+    circuit: Option<&SemanticProviderCircuit>,
+    circuit_token: Option<ProviderCircuitToken>,
+    budget: ProviderAttemptBudgetToken<'_>,
+) -> Result<ProviderHandoffPermit<'state>, SemanticProviderEgressFailure> {
+    if let (Some(circuit), Some(token)) = (circuit, circuit_token) {
+        if !circuit.revalidate(token) && circuit.enforce() {
+            // The budget token drops here: this refusal is pre-handoff, so
+            // the physical delta stays zero (fix plan §2.5).
+            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+        }
+    }
+    budget.consume_at_handoff();
+    Ok(ProviderHandoffPermit {
+        provider,
+        circuit: circuit_token,
+    })
+}
+
+/// Run the shared `budget reserve -> circuit gate -> reservation -> wait ->
+/// routing trust -> egress confirmation -> handoff -> lazy encode` sequence
+/// for exactly one physical Provider attempt (fix plan §2.4/§2.5).
+///
+/// This is the R2 zero-policy primitive grown by R5's circuit fence and
+/// closed by F3's linear handoff: it adds no retry, backoff, or route
+/// fallback, and it never chooses a public error. Ticket admission, Stage A
+/// observation, and the Provider encode body stay with the closed operation.
+///
+/// The two closed callbacks keep policy in the coordinators:
+/// `reauthorize_without_reservation` is consulted only when the caller would
+/// otherwise observe a circuit refusal — a fresh host-derived authorization
+/// recheck with no reservation, no encoding, and no query — so a revoked
+/// caller always receives the authorization refusal first and only a caller
+/// still provably authorized observes the circuit's Busy;
+/// `lazy_encode` is invoked only after the handoff linearized, so exactly
+/// one Provider future is ever constructed and polled per attempt, with no
+/// gap a coordinator could hold an admission across.
+///
+/// The returned routing trust belongs to the caller's later release fence.
+/// The physical attempt counts — and the handoff's single outcome
+/// observation reports — only against the real handoff; every pre-handoff
+/// refusal leaves the physical delta at zero.
+pub(crate) async fn execute_provider_attempt<'state, T, E, Reauth, ReauthFut, Encode, EncodeFut>(
     plan: ProviderEgressPlan<'state, '_>,
-) -> Result<ProviderEgressAdmission<'state>, SemanticProviderEgressFailure> {
+    reauthorize_without_reservation: Reauth,
+    lazy_encode: Encode,
+) -> Result<ProviderAttemptEncoded<'state, T>, ProviderAttemptError<E>>
+where
+    E: ProviderAttemptOutcomeObservation,
+    Reauth: FnOnce() -> ReauthFut,
+    ReauthFut: Future<Output = Result<(), SemanticProviderEgressFailure>>,
+    Encode: FnOnce() -> EncodeFut,
+    EncodeFut: Future<Output = Result<T, E>>,
+{
+    let refused = |failure: SemanticProviderEgressFailure| ProviderAttemptError::Admission(failure);
     let state = plan.state;
     let work = plan.context.windows().window(SemanticDeadlineWindow::Work);
     let relay_pubkey = state.relay_keypair.public_key();
@@ -1872,25 +2116,39 @@ pub(crate) async fn execute_provider_egress<'state>(
     // its windows freeze `provider_start == work`.
     plan.context
         .admit_stage(SemanticDeadlineWindow::ProviderStart)
-        .map_err(egress_stage_abort)?;
-    let latest_start_at = latest_start_at(work)?;
-    plan.context
+        .map_err(|abort| refused(egress_stage_abort(abort)))?;
+    let latest_start_at = latest_start_at(work).map_err(refused)?;
+    // F3 (fix plan §2.5): reserve the non-counting physical-attempt budget
+    // before any circuit lease is taken — an exhausted budget must never
+    // hold the exclusive half-open probe — and count it only at the real
+    // handoff below.
+    let budget = plan
+        .context
         .ledger()
-        .begin_provider_attempt()
-        .map_err(SemanticProviderEgressFailure::AttemptLedgerExhausted)?;
+        .reserve_provider_attempt_budget()
+        .map_err(SemanticProviderEgressFailure::AttemptLedgerExhausted)
+        .map_err(refused)?;
     // R5 fast gate: take the circuit admission (and, when the cooldown has
     // elapsed, the exclusive half-open probe lease) before any reservation
     // is taken (plan §4.7).
-    let circuit = state
-        .semantic_provider()
-        .ok()
-        .flatten()
-        .map(crate::semantic_provider::VolcengineSemanticProvider::circuit);
+    let provider = state.semantic_provider().ok().flatten();
+    let circuit = provider.map(crate::semantic_provider::VolcengineSemanticProvider::circuit);
     let circuit_token = match circuit {
         Some(circuit) => match circuit.admit() {
             ProviderCircuitAdmission::Admitted { token } => Some(token),
             ProviderCircuitAdmission::Refused { .. } => {
-                return Err(SemanticProviderEgressFailure::AdmissionBusy);
+                // F3 (fix plan §2.4 item 1): the fast gate refuses before
+                // any reservation exists, so the only caller-visible outcome
+                // of this branch is settled by the fresh authorization
+                // recheck — Busy only for a caller still provably
+                // authorized.
+                return Err(refused(
+                    circuit_refusal_after_reauthorization(
+                        plan.context,
+                        reauthorize_without_reservation,
+                    )
+                    .await,
+                ));
             }
         },
         None => None,
@@ -1912,24 +2170,26 @@ pub(crate) async fn execute_provider_egress<'state>(
                 }),
         )
         .await
-        .map_err(egress_stage_abort)?
-        .map_err(SemanticProviderEgressFailure::Database)?;
+        .map_err(|abort| refused(egress_stage_abort(abort)))?
+        .map_err(|error| refused(SemanticProviderEgressFailure::Database(error)))?;
     let reservation = match reservation {
         SemanticGraphQueryEgressReservation::Reserved(reservation) => reservation,
         SemanticGraphQueryEgressReservation::Busy => {
             plan.observation.provider_admission_busy();
-            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+            return Err(refused(SemanticProviderEgressFailure::AdmissionBusy));
         }
         SemanticGraphQueryEgressReservation::ContextChanged => {
-            return Err(SemanticProviderEgressFailure::ContextChanged);
+            return Err(refused(SemanticProviderEgressFailure::ContextChanged));
         }
         SemanticGraphQueryEgressReservation::Unavailable => {
-            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+            return Err(refused(SemanticProviderEgressFailure::ProviderUnavailable));
         }
     };
     let (wait, reserved_generation, reserved_context_digest) = reservation.into_parts();
     if reserved_generation != plan.ticket.generation.generation_id {
-        return Err(SemanticProviderEgressFailure::ReservationContractViolated);
+        return Err(refused(
+            SemanticProviderEgressFailure::ReservationContractViolated,
+        ));
     }
     let wait_started = Instant::now();
     let _wait_stage = plan.observation.provider_wait_stage();
@@ -1945,13 +2205,13 @@ pub(crate) async fn execute_provider_egress<'state>(
         Err(SemanticStageAbort::Deadline(_)) => {
             plan.observation
                 .provider_wait_deadline(wait_started.elapsed());
-            return Err(SemanticProviderEgressFailure::DeadlineExceeded);
+            return Err(refused(SemanticProviderEgressFailure::DeadlineExceeded));
         }
         Err(SemanticStageAbort::Cancelled(source)) => {
-            return Err(SemanticProviderEgressFailure::Cancelled(source));
+            return Err(refused(SemanticProviderEgressFailure::Cancelled(source)));
         }
         Err(SemanticStageAbort::LatchClosed(_)) => {
-            return Err(SemanticProviderEgressFailure::DeadlineExceeded);
+            return Err(refused(SemanticProviderEgressFailure::DeadlineExceeded));
         }
     }
 
@@ -1960,10 +2220,17 @@ pub(crate) async fn execute_provider_egress<'state>(
     // attempt may speak for. A refused revalidation abandons the already
     // consumed slot — the database contract already treats a reserved slot
     // as rate-limit capacity, not authorization — leaving Provider delta
-    // zero.
+    // zero. F3 (fix plan §2.4 item 1) routes the caller-visible outcome
+    // through the same fresh authorization recheck as the fast gate.
     if let (Some(circuit), Some(token)) = (circuit, circuit_token) {
         if !circuit.revalidate(token) && circuit.enforce() {
-            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+            return Err(refused(
+                circuit_refusal_after_reauthorization(
+                    plan.context,
+                    reauthorize_without_reservation,
+                )
+                .await,
+            ));
         }
     }
 
@@ -1971,7 +2238,7 @@ pub(crate) async fn execute_provider_egress<'state>(
     // The final confirmation revalidates principal, generation, graph, and
     // routing state under the shared Community writer fence.
     let routing_trust = crate::semantic_fleet::semantic_graph_query_routing_trust(state)
-        .map_err(|_| SemanticProviderEgressFailure::FleetUnavailable)?;
+        .map_err(|_| refused(SemanticProviderEgressFailure::FleetUnavailable))?;
     let confirmation = plan
         .context
         .run_stage(
@@ -1987,39 +2254,58 @@ pub(crate) async fn execute_provider_egress<'state>(
             ),
         )
         .await
-        .map_err(egress_stage_abort)?
-        .map_err(SemanticProviderEgressFailure::Database)?;
+        .map_err(|abort| refused(egress_stage_abort(abort)))?
+        .map_err(|error| refused(SemanticProviderEgressFailure::Database(error)))?;
     let permit = match confirmation {
         SemanticGraphQueryEgressConfirmation::Permitted(permit) => permit,
         SemanticGraphQueryEgressConfirmation::ContextChanged => {
-            return Err(SemanticProviderEgressFailure::ContextChanged);
+            return Err(refused(SemanticProviderEgressFailure::ContextChanged));
         }
         SemanticGraphQueryEgressConfirmation::FleetUnavailable => {
-            return Err(SemanticProviderEgressFailure::FleetUnavailable);
+            return Err(refused(SemanticProviderEgressFailure::FleetUnavailable));
         }
         SemanticGraphQueryEgressConfirmation::Unavailable => {
-            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+            return Err(refused(SemanticProviderEgressFailure::ProviderUnavailable));
         }
     };
     let (permitted_generation, permitted_context_digest) = permit.into_parts();
     if permitted_generation != reserved_generation
         || permitted_context_digest != reserved_context_digest
     {
-        return Err(SemanticProviderEgressFailure::PermitContractViolated);
+        return Err(refused(
+            SemanticProviderEgressFailure::PermitContractViolated,
+        ));
     }
-    // R5 final no-wait epoch revalidation, adjacent to the Provider call:
-    // this confirmation is the last await before the coordinator's
-    // `encode_once`, so a stale attempt is refused here with Provider delta
-    // zero rather than speaking for a circuit that already transitioned.
-    if let (Some(circuit), Some(token)) = (circuit, circuit_token) {
-        if !circuit.revalidate(token) && circuit.enforce() {
-            return Err(SemanticProviderEgressFailure::AdmissionBusy);
+    // F3 (fix plan §2.4 item 2): the final circuit fence and the
+    // physical-attempt budget consumption linearize here — the confirmation
+    // above is the last await, and the lazy Provider closure below is only
+    // constructed after this synchronous authorization succeeds, so a stale
+    // token refuses with Provider delta zero and no coordinator can hold an
+    // admission across a gap.
+    let handoff =
+        authorize_provider_handoff(provider, circuit, circuit_token, budget).map_err(refused)?;
+    // Exactly one Provider invocation, bounded by the work window, observed
+    // once against the same handoff that authorized it.
+    match encode_once(plan.context, plan.observation, lazy_encode()).await {
+        Ok(encoded) => {
+            handoff.observe_outcome(ProviderCircuitObservation::Success);
+            Ok(ProviderAttemptEncoded {
+                routing_trust,
+                encoded,
+            })
         }
+        Err(SemanticEncodeOnceFailure::Provider(error)) => {
+            handoff.observe_outcome(ProviderCircuitObservation::from_attempt_failure(
+                error.attempt_failure(),
+            ));
+            Err(ProviderAttemptError::Encode(
+                SemanticEncodeOnceFailure::Provider(error),
+            ))
+        }
+        // Deadline and cancellation outcomes observe nothing (plan §4.7):
+        // the permit drops unobserved.
+        Err(other) => Err(ProviderAttemptError::Encode(other)),
     }
-    Ok(ProviderEgressAdmission {
-        routing_trust,
-        circuit: circuit_token,
-    })
 }
 
 /// Failure of one deadline-bounded single Provider invocation.
@@ -2800,24 +3086,6 @@ fn record_circuit_recheck(current: bool) {
     .increment(1);
 }
 
-/// Report one completed physical Provider attempt to its circuit.
-///
-/// Reporting exactly once per physical attempt is the coordinator's duty:
-/// the one-shot envelope observes after each sanctioned `encode_once`, the
-/// complete path observes after its root-attempt encode, and the reuse path
-/// (no physical egress) observes nothing. Deadline and cancellation outcomes
-/// observe nothing — plan §4.7 excludes them from Provider health, and an
-/// abandoned half-open probe is reclaimed by its lease budget instead.
-pub(crate) fn observe_provider_circuit(
-    provider: &crate::semantic_provider::VolcengineSemanticProvider,
-    token: Option<ProviderCircuitToken>,
-    observation: ProviderCircuitObservation,
-) {
-    if let Some(token) = token {
-        provider.circuit().observe(token, observation);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2953,38 +3221,69 @@ mod tests {
         assert!(latch.state().forbids_new_semantic_work());
     }
 
+    /// Take one reservation through the real handoff, exactly as
+    /// `authorize_provider_handoff` consumes the executor's budget token.
+    fn spend_handoff(ledger: &SemanticAttemptLedger) -> Result<(), SemanticAttemptExhausted> {
+        let token = ledger.reserve_provider_attempt_budget()?;
+        token.consume_at_handoff();
+        Ok(())
+    }
+
     #[test]
     fn one_shot_ledger_caps_physical_attempts_at_two() {
         let ledger = SemanticAttemptLedger::new(SemanticOperationAttemptClass::OneShot);
         assert_eq!(ledger.begin_operation_attempt(), Ok(1));
-        assert_eq!(ledger.begin_provider_attempt(), Ok(1));
+        assert!(spend_handoff(&ledger).is_ok());
         // Second physical attempt consumes the single transport retry token.
-        assert_eq!(ledger.begin_provider_attempt(), Ok(2));
+        assert!(spend_handoff(&ledger).is_ok());
         // A third physical call breaches the class cap; the retry token is
         // exhausted at the same point, and the cap is the outer invariant.
-        assert_eq!(
-            ledger.begin_provider_attempt(),
+        assert!(matches!(
+            ledger.reserve_provider_attempt_budget(),
             Err(SemanticAttemptExhausted::ProviderAttempts)
-        );
+        ));
+        assert_eq!(ledger.provider_attempts(), 2);
         assert_eq!(ledger.provider_transport_retries(), 1);
+    }
+
+    #[test]
+    fn dropped_reservation_counts_no_physical_attempt_and_refunds_the_retry_token() {
+        let ledger = SemanticAttemptLedger::new(SemanticOperationAttemptClass::OneShot);
+        assert_eq!(ledger.begin_operation_attempt(), Ok(1));
+        assert!(spend_handoff(&ledger).is_ok());
+        // A second attempt is reserved — consuming the transport-retry
+        // token — but refused before the handoff: the token drops, the
+        // physical delta stays zero, and the transport token is refunded.
+        {
+            let token = ledger
+                .reserve_provider_attempt_budget()
+                .expect("second attempt reserves while the retry token is free");
+            assert_eq!(ledger.provider_transport_retries(), 1);
+            drop(token);
+        }
+        assert_eq!(ledger.provider_attempts(), 1);
+        assert_eq!(ledger.provider_transport_retries(), 0);
+        assert!(ledger.can_begin_provider_attempt());
+        assert!(spend_handoff(&ledger).is_ok());
+        assert_eq!(ledger.provider_attempts(), 2);
     }
 
     #[test]
     fn complete_path_ledger_allows_retry_plus_restart_without_fourth_call() {
         let ledger = SemanticAttemptLedger::new(SemanticOperationAttemptClass::CompletePath);
         assert_eq!(ledger.begin_operation_attempt(), Ok(1));
-        assert_eq!(ledger.begin_provider_attempt(), Ok(1));
+        assert!(spend_handoff(&ledger).is_ok());
         // One safe Provider transport retry within the first root attempt.
-        assert_eq!(ledger.begin_provider_attempt(), Ok(2));
+        assert!(spend_handoff(&ledger).is_ok());
         // One churn-driven root restart starts its own attempt without
         // consuming another transport-retry token...
         assert_eq!(ledger.begin_operation_attempt(), Ok(2));
-        assert_eq!(ledger.begin_provider_attempt(), Ok(3));
+        assert!(spend_handoff(&ledger).is_ok());
         // ...but a fourth physical call is impossible in either dimension.
-        assert_eq!(
-            ledger.begin_provider_attempt(),
+        assert!(matches!(
+            ledger.reserve_provider_attempt_budget(),
             Err(SemanticAttemptExhausted::ProviderAttempts)
-        );
+        ));
         assert_eq!(
             ledger.begin_operation_attempt(),
             Err(SemanticAttemptExhausted::OperationAttempts)
@@ -2997,16 +3296,16 @@ mod tests {
     fn one_shot_ledger_cannot_retry_after_operation_restart() {
         let ledger = SemanticAttemptLedger::new(SemanticOperationAttemptClass::OneShot);
         assert_eq!(ledger.begin_operation_attempt(), Ok(1));
-        assert_eq!(ledger.begin_provider_attempt(), Ok(1));
+        assert!(spend_handoff(&ledger).is_ok());
         // The one-shot snapshot restart consumes the operation budget...
         assert_eq!(ledger.begin_operation_attempt(), Ok(2));
         // ...and its fresh attempt is allowed...
-        assert_eq!(ledger.begin_provider_attempt(), Ok(2));
+        assert!(spend_handoff(&ledger).is_ok());
         // ...but a third physical call is denied by the class cap.
-        assert_eq!(
-            ledger.begin_provider_attempt(),
+        assert!(matches!(
+            ledger.reserve_provider_attempt_budget(),
             Err(SemanticAttemptExhausted::ProviderAttempts)
-        );
+        ));
     }
 
     #[test]
@@ -3610,13 +3909,13 @@ mod tests {
             Duration::from_secs(60),
         );
         let ledger = context.ledger();
-        assert!(ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(ledger).is_ok());
         // The single transport-retry token is still available.
         assert!(matches!(
             provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &context),
             ProviderRetryDecision::Retry { .. }
         ));
-        assert!(ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(ledger).is_ok());
         assert!(!ledger.can_begin_provider_attempt());
         assert!(matches!(
             provider_retry_decision(ProviderRetryRoute::R4, connect_not_started(), &context),
@@ -3625,7 +3924,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_probes_agree_with_the_begin_outcomes() {
+    fn ledger_probes_agree_with_the_handoff_outcomes() {
         // One-shot: the physical cap covers the initial send plus the single
         // transport retry.
         let one_shot = retry_context(
@@ -3634,11 +3933,11 @@ mod tests {
         );
         let one_shot_ledger = one_shot.ledger();
         assert!(one_shot_ledger.can_begin_provider_attempt());
-        assert!(one_shot_ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(one_shot_ledger).is_ok());
         assert!(one_shot_ledger.can_begin_provider_attempt());
-        assert!(one_shot_ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(one_shot_ledger).is_ok());
         assert!(!one_shot_ledger.can_begin_provider_attempt());
-        assert!(one_shot_ledger.begin_provider_attempt().is_err());
+        assert!(one_shot_ledger.reserve_provider_attempt_budget().is_err());
 
         // Complete path: three physical attempts across two root attempts —
         // two in the first attempt (initial plus the transport retry), then
@@ -3650,14 +3949,14 @@ mod tests {
         );
         let complete_ledger = complete.ledger();
         assert!(complete_ledger.begin_operation_attempt().is_ok());
-        assert!(complete_ledger.begin_provider_attempt().is_ok());
-        assert!(complete_ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(complete_ledger).is_ok());
+        assert!(spend_handoff(complete_ledger).is_ok());
         assert!(!complete_ledger.can_begin_provider_attempt());
         assert!(complete_ledger.begin_operation_attempt().is_ok());
         assert!(complete_ledger.can_begin_provider_attempt());
-        assert!(complete_ledger.begin_provider_attempt().is_ok());
+        assert!(spend_handoff(complete_ledger).is_ok());
         assert!(!complete_ledger.can_begin_provider_attempt());
-        assert!(complete_ledger.begin_provider_attempt().is_err());
+        assert!(complete_ledger.reserve_provider_attempt_budget().is_err());
 
         // Operation restart budget: the first attempt is free, exactly one
         // restart is allowed, and further restarts exhaust the ledger.
@@ -3836,6 +4135,20 @@ mod tests {
             String::from(
                 "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;",
             ),
+            // F3 (fix plan §2.4/§2.5): the physical ledger counts real
+            // handoffs only, a circuit refusal is caller-visible only after
+            // the fresh authorization recheck, and the final fence and the
+            // budget consumption linearize into one synchronous handoff
+            // point that constructs the lazy encode afterwards.
+            String::from(
+                "attempt-ledger=non-counting-budget-reserved-before-circuit-gate;physical-counts-real-handoffs-only;pre-handoff-refusal-drops-token-with-delta-zero",
+            ),
+            String::from(
+                "circuit-gate=before-reservation;no-wait-epoch-revalidate-after-wait;refusal-caller-visible-only-after-fresh-authorization-recheck",
+            ),
+            String::from(
+                "handoff=final-epoch-revalidate-and-budget-consume-in-one-synchronous-point;lazy-encode-constructed-only-after-handoff;single-outcome-observation-bound-to-handoff-permit",
+            ),
             format!(
                 "circuit-caps=health-threshold-{};open-cooldown-{}s;probe-budget-{}s;throttle-default-{}ms;throttle-max-{}s",
                 PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
@@ -3862,11 +4175,11 @@ mod tests {
         }
         assert!(contract.contains(&format!("release-confirmation-{release_budget}")));
         assert!(
-            ledger.begin_provider_attempt().is_ok(),
+            spend_handoff(&ledger).is_ok(),
             "first physical attempt must be admitted"
         );
         let mut transport_tokens = 0;
-        while ledger.begin_provider_attempt().is_ok() {
+        while spend_handoff(&ledger).is_ok() {
             transport_tokens += 1;
         }
         // One admitted retry within the attempt plus the exhausted token:
@@ -3874,6 +4187,26 @@ mod tests {
         // budget that stopped this loop.
         assert_eq!(transport_tokens, 1);
         assert!(contract.contains("transport-retry-token-1-per-attempt"));
+        // F3 (fix plan §2.5): the counted attempts are exactly the consumed
+        // handoffs — a reservation dropped before its handoff never counts.
+        let before = ledger.provider_attempts();
+        assert!(ledger.reserve_provider_attempt_budget().is_err());
+        {
+            let fresh = SemanticAttemptLedger::new(SemanticOperationAttemptClass::OneShot);
+            let _dropped = fresh
+                .reserve_provider_attempt_budget()
+                .expect("fresh ledger reserves");
+            assert_eq!(
+                fresh.provider_attempts(),
+                0,
+                "a held reservation alone must not count as a physical attempt"
+            );
+        }
+        assert_eq!(
+            ledger.provider_attempts(),
+            before,
+            "dropping a reservation leaves the committed count unchanged"
+        );
     }
 
     #[test]

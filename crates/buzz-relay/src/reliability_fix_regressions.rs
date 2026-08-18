@@ -4,8 +4,10 @@
 //! Every test in this module encodes one frozen contract from the
 //! correctness fix plan (`docs/stage/semantic/unified-engine/fix/…`). The
 //! `rfx*` tests were the F0 red baseline; F1 turned rfx01 and the two rfx02
-//! tests green and F2 turned the three rfx03 tests green, while rfx04/rfx05
-//! stay red until F3. The `f1_*`/`rfx03_*` tests pin those deliveries.
+//! tests green, F2 turned the three rfx03 tests green, and F3 turned rfx04
+//! and rfx05 green — the circuit refusal now resolves through the fresh
+//! authorization recheck and the physical ledger counts real handoffs only.
+//! The `f1_*`/`rfx03_*`/`rfx04_*`/`rfx05_*` tests pin those deliveries.
 //! Keeping the module outside `semantic_*` preserves the frozen
 //! characterization gates' historical `semantic_` filter scope while the
 //! full unit suite carries the remaining red baseline. Nothing here is
@@ -20,7 +22,8 @@ use buzz_db::semantic_query::SemanticGraphQueryTicket;
 use buzz_semantic::SemanticEncoder;
 
 use crate::semantic_query_runtime::{
-    caller_disconnect_guard, execute_provider_egress, subscribe_relay_shutdown,
+    caller_disconnect_guard, execute_provider_attempt, subscribe_relay_shutdown,
+    ProviderAttemptError, ProviderAttemptFailure, ProviderAttemptOutcomeObservation,
     ProviderCircuitAdmission, ProviderCircuitObservation, ProviderEgressObservation,
     ProviderEgressPlan, ProviderHealthFailureClass, SemanticCancellationSource,
     SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticExecutionContext,
@@ -317,27 +320,93 @@ fn rfx03_discard_during_synchronous_signing_drops_the_signed_result() {
 // ---------------------------------------------------------------------------
 
 /// When the caller would observe a circuit refusal, authorization must be
-/// freshly proven first. With authorization unprovable — the database is
-/// unreachable — the caller must see the authorization/unavailable
-/// failure, never the Provider circuit's Busy.
+/// freshly proven first. With authorization unprovable — the fresh recheck
+/// fails — the caller must see that authorization failure, never the
+/// Provider circuit's Busy; only a caller the fresh recheck still admits
+/// observes the circuit's Busy. The lazy Provider closure must never run on
+/// a refused admission.
+#[derive(Debug)]
+struct RefusedLazyEncode;
+
+impl ProviderAttemptOutcomeObservation for RefusedLazyEncode {
+    fn attempt_failure(&self) -> &ProviderAttemptFailure {
+        unreachable!("the lazy Provider closure never runs in this test")
+    }
+}
+
 #[tokio::test]
 async fn rfx04_circuit_refusal_requires_fresh_authorization_first() {
     let state = open_circuit_state().await;
     let context = active_one_shot_context();
     let ticket = reliability_fix_ticket();
-    let result = execute_provider_egress(ProviderEgressPlan {
-        state: &state,
-        context: &context,
-        ticket: &ticket,
-        reader_pubkey: &[0_u8; 32],
-        expected_contexts: &[],
-        observation: ProviderEgressObservation::Silent,
-    })
+    let mut encode_attempts = 0_u32;
+    let result = execute_provider_attempt(
+        ProviderEgressPlan {
+            state: &state,
+            context: &context,
+            ticket: &ticket,
+            reader_pubkey: &[0_u8; 32],
+            expected_contexts: &[],
+            observation: ProviderEgressObservation::Silent,
+        },
+        // The fresh authorization recheck cannot prove the caller (the
+        // database is unreachable in this shape): the refusal must surface
+        // as its own failure, never as the circuit's Busy.
+        || async {
+            Err::<(), SemanticProviderEgressFailure>(
+                SemanticProviderEgressFailure::ProviderUnavailable,
+            )
+        },
+        || async {
+            encode_attempts += 1;
+            Err::<(), _>(RefusedLazyEncode)
+        },
+    )
     .await;
     assert!(
-        !matches!(result, Err(SemanticProviderEgressFailure::AdmissionBusy)),
+        matches!(
+            result,
+            Err(ProviderAttemptError::Admission(
+                SemanticProviderEgressFailure::ProviderUnavailable
+            ))
+        ),
         "a caller whose authorization cannot be freshly proven must not \
          observe the Provider circuit state through a Busy refusal"
+    );
+    assert_eq!(
+        encode_attempts, 0,
+        "the lazy Provider closure must not run for a refused admission"
+    );
+
+    // Only a caller the fresh recheck still admits observes the Busy.
+    let result = execute_provider_attempt(
+        ProviderEgressPlan {
+            state: &state,
+            context: &context,
+            ticket: &ticket,
+            reader_pubkey: &[0_u8; 32],
+            expected_contexts: &[],
+            observation: ProviderEgressObservation::Silent,
+        },
+        || async { Ok::<(), SemanticProviderEgressFailure>(()) },
+        || async {
+            encode_attempts += 1;
+            Err::<(), _>(RefusedLazyEncode)
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(ProviderAttemptError::Admission(
+                SemanticProviderEgressFailure::AdmissionBusy
+            ))
+        ),
+        "a freshly re-authorized caller observes the circuit's Busy"
+    );
+    assert_eq!(
+        encode_attempts, 0,
+        "the lazy Provider closure must not run for a refused admission"
     );
 }
 
@@ -354,21 +423,40 @@ async fn rfx05_refused_egress_counts_no_physical_attempt() {
     let state = open_circuit_state().await;
     let context = active_one_shot_context();
     let ticket = reliability_fix_ticket();
-    let result = execute_provider_egress(ProviderEgressPlan {
-        state: &state,
-        context: &context,
-        ticket: &ticket,
-        reader_pubkey: &[0_u8; 32],
-        expected_contexts: &[],
-        observation: ProviderEgressObservation::Silent,
-    })
+    let mut encode_attempts = 0_u32;
+    let result = execute_provider_attempt(
+        ProviderEgressPlan {
+            state: &state,
+            context: &context,
+            ticket: &ticket,
+            reader_pubkey: &[0_u8; 32],
+            expected_contexts: &[],
+            observation: ProviderEgressObservation::Silent,
+        },
+        || async {
+            Err::<(), SemanticProviderEgressFailure>(
+                SemanticProviderEgressFailure::ProviderUnavailable,
+            )
+        },
+        || async {
+            encode_attempts += 1;
+            Err::<(), _>(RefusedLazyEncode)
+        },
+    )
     .await;
     assert!(result.is_err(), "the open circuit must refuse the egress");
+    assert_eq!(encode_attempts, 0, "no Provider call may happen");
     assert_eq!(
         context.ledger().provider_attempts(),
         0,
         "a refused egress with zero Provider calls must not consume \
          physical-attempt budget"
+    );
+    assert_eq!(
+        context.ledger().provider_transport_retries(),
+        0,
+        "a dropped pre-handoff reservation must refund its transport-retry \
+         token"
     );
 }
 

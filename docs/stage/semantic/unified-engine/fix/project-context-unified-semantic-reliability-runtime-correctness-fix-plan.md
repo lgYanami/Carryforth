@@ -6,8 +6,12 @@
 > RFX-01/RFX-02 关闭；runtime digest 随日期化 descriptor 轮换
 > `2c898e16… → 36776253…`）；F2 已交付（unsigned result 验证前移到 release 确认之前、
 > permit 按值消费进单一同步 signer guard、complete-path 迁入同一 helper 形状，RFX-03 关闭；
-> digest 轮换 `36776253… → 94b3912f…`）；F3–F5 未开始。`just test-unit` 中 rfx04/rfx05 的
-> 红色是本计划的预期基线状态（等待 F3）
+> digest 轮换 `36776253… → 94b3912f…`）；F3 已交付（`execute_provider_attempt` 统一物理
+> attempt：circuit 拒绝先经 coordinator 的 fresh authorization recheck 才对 caller 可见、
+> final revalidation 与 physical budget 消费合并为一个同步 handoff 线性点、lazy encode 仅在
+> handoff 之后构造、physical counter 只在真实 handoff 计数（预留在 circuit gate 前的
+> non-counting budget token + handoff 时消费），RFX-04/RFX-05 关闭；digest 轮换
+> `94b3912f… → 745ca584…`）；F4–F5 未开始。rfx04/rfx05 已转绿，剩余红色基线清零
 >
 > 日期：2026-08-18
 >

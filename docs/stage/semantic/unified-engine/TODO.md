@@ -4,10 +4,12 @@
 > 运行时主体（R0–R6）已落地，但代码审计确认 RFX-01..RFX-07 七项与冻结合同的偏差——**主体已
 > 实现、correctness 修复中**（F0 红色基线已建立；F1 已交付：RFX-01/RFX-02 关闭；F2 已交付：
 > RFX-03 关闭，unsigned result 验证前移、permit 按值消费进单一同步 signer、complete-path 迁入
-> 同一形状；剩余红色 rfx04/rfx05→F3；见
+> 同一形状；F3 已交付：RFX-04/RFX-05 关闭，统一 `execute_provider_attempt` 执行器、circuit
+> 拒绝经 fresh-authorization 复核后可见、单一同步 handoff 点、non-counting 预算 token 只计
+> 真实 handoff——rfx 红色基线清零；F4（RFX-06）待 test-first、F5 资格收口未开始；见
 > [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)
 > 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)
-> §10/§11 F1/F2 交付记录）
+> §10–§12 F1/F2/F3 交付记录）
 >
 > 日期：2026-08-18
 
@@ -118,6 +120,21 @@ unsigned result构造、canonical验证与Event builder（含response cap）全�
 complete-path bridge尾段删除手写四段finalize逻辑迁入同一helper；两类release policy（exact-snapshot
 与current-authorization）保持。RFX-03三测转绿；digest轮换`36776253…→94b3912f…`（资格记录
 §5第四行/§11）。三个确定性门复跑绿色；剩余红色rfx04/rfx05（F3）。
+
+**2026-08-18 F3 交付**：Circuit、handoff与physical ledger修复完成（修复计划§3.4/§2.4、§2.5）
+——统一执行器`execute_provider_attempt`落地并迁移one-shot与complete-path两个surface：
+circuit拒绝（fast-gate与wait-stale两处）先经调用方fresh-authorization复核闭包（closed
+coordinator重读writer-fence ticket，无reservation/编码/查询）才对调用方可见Busy，复核自身
+失败按既有冻结映射出栈（RFX-04 TOCTOU#1关闭）；最终circuit fence与physical预算消费合并进
+单一同步handoff点`authorize_provider_handoff`（其间无await），lazy encode仅在handoff之后构造，
+outcome观测与handoff permit一一绑定（TOCTOU#2关闭）；`ProviderAttemptBudgetToken`在circuit
+gate之前以non-counting方式保留、只在真实handoff消费、pre-handoff任何拒绝Drop退还（physical
+delta零、transport-retry token退还），caps不变（one-shot 2/complete-path 3）（RFX-05关闭）。
+rfx04/rfx05转绿，**F0红色基线清零**；half-open probe lease归还仍由既有R5 probe-budget
+timeout兜底（`ProviderCircuitToken`为Copy、无Drop路径，不变量成立但如实记录）。digest轮换
+`94b3912f…→745ca584…`（资格记录§5第五行/§12）。三个确定性门复跑绿色；`buzz-relay --lib
+semantic_` 128绿、全量972绿（8个环境性DB失败）、`just test-unit` exit 0；剩余修复：F4
+（RFX-06，DB依赖路径test-first）、F5（资格收口）。
 相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

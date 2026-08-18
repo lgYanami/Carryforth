@@ -1623,11 +1623,15 @@ mod tests {
         let ProviderCircuitAdmission::Admitted { token } = provider.circuit().admit() else {
             panic!("real Provider canary: a healthy domain must admit");
         };
-        let ordinal = context
+        // The canary models the real handoff shape (fix plan §2.5): the
+        // reserved budget is consumed exactly when the single Provider call
+        // is about to happen, so the physical counter counts this call.
+        context
             .ledger()
-            .begin_provider_attempt()
-            .expect("first physical attempt");
-        assert_eq!(ordinal, 1);
+            .reserve_provider_attempt_budget()
+            .expect("first physical attempt budget")
+            .consume_at_handoff();
+        assert_eq!(context.ledger().provider_attempts(), 1);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(60),

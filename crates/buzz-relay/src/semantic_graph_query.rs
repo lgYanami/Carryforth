@@ -57,12 +57,12 @@ use crate::semantic_graph_observability::{
 };
 use crate::semantic_provider::TrackedProviderFailure;
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, observe_provider_circuit, propagate_relay_shutdown,
-    provider_retry_backoff, provider_retry_decision, record_vector_reuse,
-    ProviderCircuitObservation, ProviderEgressObservation, ProviderEgressPlan,
-    ProviderRetryDecision, ProviderRetryRoute, SemanticDeadlineWindow, SemanticDeadlineWindows,
-    SemanticEncodeOnceFailure, SemanticExecutionContext, SemanticOperationAttemptClass,
-    SemanticProviderEgressFailure, SemanticStageAbort, SemanticVectorReuseOutcome,
+    egress_stage_abort, execute_provider_attempt, propagate_relay_shutdown, provider_retry_backoff,
+    provider_retry_decision, record_vector_reuse, ProviderAttemptEncoded, ProviderAttemptError,
+    ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision, ProviderRetryRoute,
+    SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticEncodeOnceFailure,
+    SemanticExecutionContext, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
+    SemanticStageAbort, SemanticVectorReuseOutcome,
 };
 use crate::AppState;
 
@@ -301,25 +301,71 @@ async fn root_query_attempt(
         let query_vectors = match reused_vectors {
             Some(vectors) => vectors,
             None => {
-                // Shared R2 Provider egress executor: circuit gate,
-                // reservation, deadline-aware wait, routing trust, and final
-                // no-wait confirmation in one zero-policy sequence. Its
-                // neutral outcome maps back onto this surface's frozen
-                // public errors; `ProviderUnavailable` keeps its pre-R2
-                // ticket re-read. The R5 admission's circuit token is
-                // reported back after the encode below.
-                let circuit_token = match execute_provider_egress(ProviderEgressPlan {
-                    state,
-                    context,
-                    ticket: &ticket,
-                    reader_pubkey,
-                    expected_contexts: &context_expectations,
-                    observation: ProviderEgressObservation::CompletePathQuery,
-                })
-                .await
-                {
-                    Ok(admission) => admission.circuit,
-                    Err(failure) => {
+                // Shared Provider egress executor (fix plan §2.4): budget
+                // reservation, circuit gate, database reservation,
+                // deadline-aware wait, routing trust, final no-wait
+                // confirmation, the linear handoff, and the single lazy
+                // encode — constructed only after the handoff — with its
+                // outcome observed against the same handoff inside the
+                // executor. The neutral admission outcome maps back onto
+                // this surface's frozen public errors; `ProviderUnavailable`
+                // keeps its pre-R2 ticket re-read. The fresh-authorization
+                // recheck below is consulted only when the caller would
+                // otherwise observe a circuit refusal, so a revoked caller
+                // receives the authorization failure first.
+                let attempt = execute_provider_attempt(
+                    ProviderEgressPlan {
+                        state,
+                        context,
+                        ticket: &ticket,
+                        reader_pubkey,
+                        expected_contexts: &context_expectations,
+                        observation: ProviderEgressObservation::CompletePathQuery,
+                    },
+                    || async {
+                        let fresh = context
+                            .run_stage(
+                                SemanticDeadlineWindow::Work,
+                                state.db.semantic_graph_query_ticket(
+                                    community_id,
+                                    reader_pubkey,
+                                    &state.relay_keypair.public_key(),
+                                ),
+                            )
+                            .await
+                            .map_err(egress_stage_abort)?
+                            .map_err(SemanticProviderEgressFailure::Database)?;
+                        if fresh.generation.generation_id != ticket.generation.generation_id {
+                            return Err(SemanticProviderEgressFailure::ContextChanged);
+                        }
+                        if provider.source_contract() != &fresh.generation.model_contract {
+                            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+                        }
+                        Ok(())
+                    },
+                    || async {
+                        metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes")
+                            .record(
+                                common_inputs
+                                    .inputs()
+                                    .iter()
+                                    .map(|input| input.exact_utf8_text().len() as f64)
+                                    .sum::<f64>(),
+                            );
+                        let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
+                        encode_complete_path_inputs(
+                            provider,
+                            SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
+                            &input_build.inputs,
+                            &common_inputs,
+                        )
+                        .await
+                    },
+                )
+                .await;
+                let encoded = match attempt {
+                    Ok(ProviderAttemptEncoded { encoded, .. }) => encoded,
+                    Err(ProviderAttemptError::Admission(failure)) => {
                         return Err(match failure {
                             SemanticProviderEgressFailure::ProviderUnavailable => {
                                 classify_ticket_failure(
@@ -333,76 +379,41 @@ async fn root_query_attempt(
                             failure => map_provider_egress_failure(failure),
                         });
                     }
-                };
-
-                metrics::histogram!("buzz_semantic_graph_query_provider_input_bytes").record(
-                    common_inputs
-                        .inputs()
-                        .iter()
-                        .map(|input| input.exact_utf8_text().len() as f64)
-                        .sum::<f64>(),
-                );
-                let _provider_timer = stage_timer(SemanticGraphMetricStage::Provider);
-                // R4 items 1-3: the closed runtime policy owns the retry
-                // decision. A sanctioned retry backoffs inside the work
-                // window and restarts this loop — which re-reads the ticket,
-                // re-observes the context, and takes a fresh reservation —
-                // so no stale plan fragment survives. A declined or
-                // exhausted retry returns the last typed failure through
-                // the frozen single-attempt projection.
-                let encoded = match encode_once(
-                    context,
-                    ProviderEgressObservation::CompletePathQuery,
-                    encode_complete_path_inputs(
-                        provider,
-                        SEMANTIC_COMPUTATION_ROUTES.bounded_complete_path,
-                        &input_build.inputs,
-                        &common_inputs,
-                    ),
-                )
-                .await
-                {
-                    Ok(encoded) => {
-                        // R5: report the one completed physical attempt to
-                        // the shared circuit (plan §4.7); deadline and
-                        // cancellation outcomes report nothing.
-                        observe_provider_circuit(
-                            provider,
-                            circuit_token,
-                            ProviderCircuitObservation::Success,
-                        );
-                        encoded
-                    }
-                    Err(SemanticEncodeOnceFailure::DeadlineExceeded)
-                    | Err(SemanticEncodeOnceFailure::Cancelled(_)) => {
+                    Err(ProviderAttemptError::Encode(
+                        SemanticEncodeOnceFailure::DeadlineExceeded,
+                    ))
+                    | Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::Cancelled(_))) => {
                         return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
                     }
-                    Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
-                        observe_provider_circuit(
-                            provider,
-                            circuit_token,
-                            ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
-                        );
-                        match provider_retry_decision(
-                            ProviderRetryRoute::R4,
-                            tracked.failure,
-                            context,
-                        ) {
-                            ProviderRetryDecision::Terminal => {
-                                let TrackedProviderFailure { error, .. } = tracked;
-                                record_provider_failure(provider_failure_class(&error));
-                                return Err(map_encoder_error(error));
-                            }
-                            ProviderRetryDecision::Retry { backoff } => {
-                                if provider_retry_backoff(context, backoff).await.is_err() {
-                                    return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
-                                }
-                                continue;
-                            }
+                    // R4 items 1-3: the closed runtime policy owns the retry
+                    // decision (the circuit observation already ran inside
+                    // the executor against the same handoff). A sanctioned
+                    // retry backoffs inside the work window and restarts
+                    // this loop — which re-reads the ticket, re-observes the
+                    // context, and takes a fresh reservation — so no stale
+                    // plan fragment survives. A declined or exhausted retry
+                    // returns the last typed failure through the frozen
+                    // single-attempt projection.
+                    Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::Provider(
+                        tracked,
+                    ))) => match provider_retry_decision(
+                        ProviderRetryRoute::R4,
+                        tracked.failure,
+                        context,
+                    ) {
+                        ProviderRetryDecision::Terminal => {
+                            let TrackedProviderFailure { error, .. } = tracked;
+                            record_provider_failure(provider_failure_class(&error));
+                            return Err(map_encoder_error(error));
                         }
-                    }
+                        ProviderRetryDecision::Retry { backoff } => {
+                            if provider_retry_backoff(context, backoff).await.is_err() {
+                                return Err(SemanticGraphRootQueryError::QueryDeadlineExceeded);
+                            }
+                            continue;
+                        }
+                    },
                 };
-                drop(_provider_timer);
                 let (query_vectors, stash) = match encoded {
                     CompletePathEncodedInputs::Compatibility(encoded) => {
                         let values = encoded

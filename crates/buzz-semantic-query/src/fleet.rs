@@ -204,19 +204,20 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
 );
 
 /// Explicitly bumped closed descriptor for the compiled Phase 2 reliability
-/// runtime (unified-engine plan §12.2, corrected by the F1/F2 correctness
+/// runtime (unified-engine plan §12.2, corrected by the F1/F2/F3 correctness
 /// fixes).
 ///
 /// The reliability route, deadline admission, one-shot reserves, lifecycle,
 /// cancellation, release-finalize ordering, retry categories, physical
-/// attempt caps, backoff, circuit, and vector-reuse contracts are hashed
-/// into the same compiled runtime digest as the wire contracts above, so an
-/// attested fleet cannot mix reliability behaviors any more than it can mix
-/// result shapes. The numeric values here mirror the compiled constants in
-/// `buzz-relay::semantic_query_runtime`; a binding test pins the two sides
-/// together, and any change to either must bump this dated descriptor.
+/// attempt caps, backoff, circuit, handoff, and vector-reuse contracts are
+/// hashed into the same compiled runtime digest as the wire contracts above,
+/// so an attested fleet cannot mix reliability behaviors any more than it
+/// can mix result shapes. The numeric values here mirror the compiled
+/// constants in `buzz-relay::semantic_query_runtime`; a binding test pins
+/// the two sides together, and any change to either must bump this dated
+/// descriptor.
 pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-reliability-20260818-phase2-f2-correctness-v1\n",
+    "runtime-contract=semantic-query-reliability-20260818-phase2-f3-correctness-v1\n",
     "route=server-owned-compiled-pin-per-request-no-fallback-no-dual-send-no-implementation-switch\n",
     "deadline-admission=target-window-scoped;earlier-spent-windows-are-legal-cutoffs-not-terminal\n",
     "one-shot-reserves=eighths-8;provider-start-4-eighths;work-2-eighths;snapshot-close-1-eighth;absolute-public-unchanged\n",
@@ -224,16 +225,18 @@ pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
     "cancellation=subscribable-shutdown-signal;caller-disconnect-guard-on-request-drop\n",
     "retry-matrix=connect-not-started-pre-handoff;rate-limited-valid-retry-after-full-fit;retryable-definitive-5xx\n",
     "attempt-caps=one-shot-physical-2;complete-path-physical-3;operation-attempt-2;release-confirmation-2;transport-retry-token-1-per-attempt\n",
+    "attempt-ledger=non-counting-budget-reserved-before-circuit-gate;physical-counts-real-handoffs-only;pre-handoff-refusal-drops-token-with-delta-zero\n",
     "backoff=full-jitter-base-250ms;must-fully-fit-remaining-work-window\n",
     "retry-fresh-plan=per-attempt-fresh-ticket-observation-inputs-reservation-egress-confirmation\n",
     "circuit=process-local-single-shared-failure-domain;closed-open-halfopen;epoch-fence-on-every-transition\n",
     "circuit-probe=half-open-single-exclusive-real-request-probe;probe-budget-reclaims-abandoned-lease\n",
-    "circuit-gate=before-reservation;no-wait-epoch-revalidate-after-wait-and-after-final-egress-confirm-adjacent-to-provider-call\n",
+    "circuit-gate=before-reservation;no-wait-epoch-revalidate-after-wait;refusal-caller-visible-only-after-fresh-authorization-recheck\n",
     "circuit-health=connect;definitive-5xx;transport-unknown;protocol-invalid-response\n",
     "circuit-throttle=429-retry-after-independent-window;never-counts-as-health\n",
     "circuit-caps=health-threshold-5;open-cooldown-15s;probe-budget-15s;throttle-default-1000ms;throttle-max-60s\n",
     "circuit-enforcement=shadow-spectator-default;single-relay-canary-flag;refusal-maps-existing-busy-only;auth-precedes-circuit-outcome\n",
     "circuit-scope=process-local-no-fleet-shared-epoch-or-lease;no-multi-pod-anti-storm-claim\n",
+    "handoff=final-epoch-revalidate-and-budget-consume-in-one-synchronous-point;lazy-encode-constructed-only-after-handoff;single-outcome-observation-bound-to-handoff-permit\n",
     "vector-reuse=request-local;exact-ordered-input-digest-plus-generation-identity;fresh-ticket-fence-rebind;never-cross-generation-or-input;never-persisted\n",
     "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline\n"
 );
@@ -484,7 +487,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "94b3912fe39bdff87335b105067e28667ec1fa19b173bac7bbd97395e0385ace",
+            "745ca5843c4bd8f22a33fc9fe9d6a9f7dff51fb8f137efe8b18df4dab2a36b47",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

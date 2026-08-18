@@ -3,11 +3,11 @@
 > 状态：R0–R6 主体已交付；**correctness 修复中**——代码审计确认七项与冻结合同的偏差
 > （RFX-01..RFX-07，见
 > [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)），
-> F0 红色基线已建立（§9），F1（§10）与 F2（§11）已交付，RFX-01..RFX-03 关闭，F3–F5 修复
-> 未开始。修复关闭前不能声明统一可靠性运行已按实现计划完整交付，也不能声明 production
-> qualification 完成
+> F0 红色基线已建立（§9），F1（§10）、F2（§11）与 F3（§12）已交付，RFX-01..RFX-05 关闭，
+> rfx 红色基线清零，F4–F5 修复未开始。修复关闭前不能声明统一可靠性运行已按实现计划完整
+> 交付，也不能声明 production qualification 完成
 >
-> 日期：2026-08-17（R6 收口）；2026-08-18（correctness 修复 F0 基线、F1/F2 交付）
+> 日期：2026-08-17（R6 收口）；2026-08-18（correctness 修复 F0 基线、F1/F2/F3 交付）
 >
 > 结论边界：可声明“统一可靠性原语与 Provider 执行层的主体实现已落地”。不能声明 Phase 2
 > 按实现计划完整交付；不能声明统一资源治理（bounded queue、fairness、capacity）完成，不能
@@ -39,14 +39,15 @@ operation（whole-graph Coordinate、两个 one-hop variant、bounded complete p
 
 | 门 | 状态 | 说明 |
 | --- | --- | --- |
-| `bash scripts/check-semantic-retrieval-compatibility-baseline.sh all`（`just semantic-retrieval-compatibility-baseline`） | 通过（2026-08-18 F2 复跑） | 兼容基线 manifest、sha256、freeze diff 与确定性测试 |
-| `bash scripts/check-semantic-retrieval-computation.sh all`（`just semantic-retrieval-computation`） | 通过（2026-08-18 F2 复跑） | Phase 1 计算合同门；R6 未重跑，F0–F2 复跑确认未被 Phase 2 破坏 |
-| `bash scripts/check-semantic-retrieval-reliability.sh all`（`just semantic-retrieval-reliability`） | 通过（2026-08-18 F2 复跑） | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check`。rfx 红色基线（§9）在过滤器之外，不影响本门。F1/F2 起本门 digest golden 已随日期化 descriptor 显式重钉（§5） |
-| `cargo test -p buzz-relay --lib semantic_` | 通过（2026-08-18 F2 复跑） | 127 通过、2 个 gated 真实 Provider canary 显式 `#[ignore]` |
-| `cargo test -p buzz-semantic-query --lib` | 通过（2026-08-18 F2 复跑） | 53 通过；`runtime_digest_is_stable_and_nonzero` 随 F1/F2 descriptor 轮换重钉到新 digest |
-| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过（2026-08-18 F2 复跑） | F0 起随各修复阶段复跑 |
+| `bash scripts/check-semantic-retrieval-compatibility-baseline.sh all`（`just semantic-retrieval-compatibility-baseline`） | 通过（2026-08-18 F3 复跑） | 兼容基线 manifest、sha256、freeze diff 与确定性测试 |
+| `bash scripts/check-semantic-retrieval-computation.sh all`（`just semantic-retrieval-computation`） | 通过（2026-08-18 F3 复跑） | Phase 1 计算合同门；R6 未重跑，F0–F3 复跑确认未被 Phase 2 破坏 |
+| `bash scripts/check-semantic-retrieval-reliability.sh all`（`just semantic-retrieval-reliability`） | 通过（2026-08-18 F3 复跑） | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check`。rfx 红色基线（§9）在过滤器之外，不影响本门。F1–F3 起本门 digest golden 已随日期化 descriptor 显式重钉（§5） |
+| `cargo test -p buzz-relay --lib semantic_` | 通过（2026-08-18 F3 复跑） | 128 通过、2 个 gated 真实 Provider canary 显式 `#[ignore]` |
+| `cargo test -p buzz-semantic-query --lib` | 通过（2026-08-18 F3 复跑） | 53 通过；`runtime_digest_is_stable_and_nonzero` 随 F1–F3 descriptor 轮换重钉到新 digest |
+| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过（2026-08-18 F3 复跑） | F0 起随各修复阶段复跑 |
 | `cargo fmt -p buzz-semantic-query -p buzz-relay` | 通过 | 每次提交 hooks 执行 |
-| `just test-unit`（`cargo test -p buzz-relay --lib` 全量） | **红色（预期收窄）** | F2 后 `reliability_fix_regressions` 仅 rfx04/rfx05（F3）按计划保持红；969 通过。另有 8 个环境性失败（`api::media`×7、`api::admin::feedback_attachment`×1）：这些测试需真实 Postgres（`ensure_configured_community`），本沙箱 5432 端口无服务，与修复无关——有服务环境下复跑 |
+| `cargo test -p buzz-relay --lib`（全量） | 通过（代码）/ 8 环境性失败 | F3 后 972 通过；`reliability_fix_regressions` 14/14 绿（rfx 红色基线清零）。8 个失败（`api::media`×7、`api::admin::feedback_attachment`×1）需真实 Postgres（`ensure_configured_community`），本沙箱 5432 端口无服务，与修复无关——有服务环境下复跑 |
+| `just test-unit` | 通过（2026-08-18 F3 复跑，exit 0） | 无服务 unit 门：buzz-core/auth/db/conformance、Project View/Document/Context、buzz-acp `--lib`、buzz-relay `meeting` 过滤器（该门不含 buzz-relay 全量 `--lib`，全量见上行），28 组全绿、耗时 73s |
 | `just ci` | **未运行** | 本环境无法完成完整本地 PR gate。复跑：`just ci` |
 | `just semantic-test`（= pgvector + migration） | **未运行** | 见下两行 |
 | `just semantic-pgvector-test` | **未运行** | 本环境无 disposable Postgres。复跑：`just semantic-pgvector-test`（`scripts/test-semantic-pgvector.sh`，设置 `BUZZ_TEST_SEMANTIC_DATABASE_URL`）。单元绿色不替代本门 |
@@ -92,12 +93,16 @@ operation（whole-graph Coordinate、两个 one-hop variant、bounded complete p
 | `d9878ff2…`（上 row target） | `2c898e16398d8c65d10c37052f08f07178586632e8e647ad5484d0bbff8bd4ae`（R6 `semantic-query-reliability-20260817-phase2-r6-v1`） | 2026-08-17 | R6 交付（本 change） | freeze base `db6c8c1d5` 起的可部署前一 binary | 仓库内编译期切换 + characterization golden/sha256 同步重钉；未经真实 fleet |
 | `2c898e16…`（上 row target） | `3677625395e79b386fcc4445a52ccbe10224b1e1669c1b8c04b0a0732bf28993`（F1 `semantic-query-reliability-20260818-phase2-f1-correctness-v1`） | 2026-08-18 | correctness F1 交付 | R6 binary（`1d8be4643` 后未部署，freeze base 内） | 仓库内编译期切换 + characterization golden/sha256、inline 稳定性测试、binding test 三处同步重钉；未经真实 fleet |
 | `36776253…`（上 row target） | `94b3912fe39bdff87335b105067e28667ec1fa19b173bac7bbd97395e0385ace`（F2 `semantic-query-reliability-20260818-phase2-f2-correctness-v1`） | 2026-08-18 | correctness F2 交付 | 同上（F1/F2 均未部署，freeze base 内） | 仓库内编译期切换 + characterization golden/sha256、inline 稳定性测试、binding test 三处同步重钉；未经真实 fleet |
+| `94b3912f…`（上 row target） | `745ca5843c4bd8f22a33fc9fe9d6a9f7dff51fb8f137efe8b18df4dab2a36b47`（F3 `semantic-query-reliability-20260818-phase2-f3-correctness-v1`） | 2026-08-18 | correctness F3 交付 | 同上（F1–F3 均未部署，freeze base 内） | 仓库内编译期切换 + characterization golden/sha256、inline 稳定性测试、binding test 三处同步重钉；未经真实 fleet |
 
-- 当前编译目标 digest：`94b3912f…`（F1 起 deadline-admission、one-shot eighths reserve、
+- 当前编译目标 digest：`745ca584…`（F1 起 deadline-admission、one-shot eighths reserve、
   lifecycle 与 cancellation 四行，F2 起 release 行补入
-  `unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer`
-  进入 reliability contract digest；characterization golden、inline 稳定性测试与 binding test
-  三处钉住）。历史行保持原值，不静默改史。
+  `unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer`，
+  F3 起 attempt-ledger/circuit-gate/handoff 三行——预算在 circuit gate 之前以 non-counting
+  token 保留、physical 只计真实 handoff、circuit 拒绝仅在 fresh authorization 复核后对调用方
+  可见、最终 fence 与预算消费合并进单一同步 handoff 点——进入 reliability contract digest；
+  characterization golden、inline 稳定性测试与 binding test 三处钉住）。历史行保持原值，不
+  静默改史。
 - 真实 fleet 行（source、时间、owner、rollback binary、gate/drain/redeploy/re-attest 演练结果）
   在每次实际切流时追加；本交付环境未执行任何真实 fleet 切流，**不存在用第一个编译窗口覆盖
   后续变化的情况**。
@@ -236,3 +241,54 @@ F2（fix plan §3.3「Release-finalize 线性化」/§2.3）关闭 RFX-03（三�
 F2 退出门核对：每个成功 Event 的 signer 均按值消费一个 release permit（类型与测试双向证明）；
 rfx03×3 绿；rfx04/rfx05（F3）保持预期红；`buzz-relay --lib semantic_` 127 绿；三个确定性门
 复跑绿（§2）；clippy/fmt 绿。
+
+## 12. Correctness 修复 F3 交付记录（2026-08-18）
+
+F3（fix plan §3.4「Circuit、handoff 与 physical ledger」/§2.4、§2.5）关闭 RFX-04 与
+RFX-05（rfx04/rfx05 转绿，**F0 红色基线清零**；RFX-06 按 §9 保持条件式，待 F4 test-first）。
+生产路径变更（`semantic_query_runtime.rs` 统一执行器，one-shot 与 complete-path 两个 surface
+迁入）：
+
+- **统一物理 attempt 执行器 `execute_provider_attempt`**：ProviderStart 窗口准入 →
+  `latest_start` → 预算保留 → circuit fast gate →（过闸后）数据库 reservation → wait →
+  wait-stale circuit 复核 → routing trust → final confirmation → **`authorize_provider_handoff`**
+  （最终 epoch revalidate + 预算消费合并为单一同步点，其间无 await）→ lazy encode 闭包仅在
+  handoff 之后构造执行 → Success/`from_attempt_failure` 对同一 handoff permit 观测一次。
+  Deadline/Cancelled 在 encode 段不观测 circuit（permit 无观测丢弃），保持 R5 既有语义。
+- **circuit 拒绝的 fresh authorization 复核（RFX-04 TOCTOU #1）**：fast-gate 与 wait-stale 两处
+  拒绝都不立即对调用方可见——先回调调用方提供的 `reauthorize_without_reservation` 闭包
+  （closed coordinator：重读 DB writer-fence ticket、不做 reservation/编码/查询），复核
+  `Ok` ⇒ 拒绝以冻结 `AdmissionBusy` 出栈；复核自身失败 ⇒ 该失败（数据库不可达 ⇒
+  `Database`，保住 `AccessDenied→Restricted` 冻结映射；合同漂移 ⇒ `ProviderUnavailable`；
+  generation 漂移 ⇒ `ContextChanged`）原样出栈；stage abort ⇒ `egress_stage_abort`。
+  授权不可证时调用方永远看不到 Busy。
+- **handoff 线性化（RFX-04 TOCTOU #2）**：最终 circuit fence 与 physical 预算消费合并进
+  `authorize_provider_handoff` 的同一同步段——拒绝则预算 token 走 Drop（physical 增量
+  零、transport-retry token 退还），通过则同步消费 token 并交出 `ProviderHandoffPermit`；
+  coordinator 不再跨 gap 持有 admission，encode 闭包只在 permit 之后就绪，观测
+  （`observe_outcome`）与 permit 一一绑定。
+- **non-counting 预算 token（RFX-05）**：`reserve_provider_attempt_budget` 在 circuit gate
+  **之前**返回 `ProviderAttemptBudgetToken`（`#[must_use]`，`consume_at_handoff` 按值取走并
+  commit；Drop 即释放保留并退还 transport-retry token）。physical ledger 只计真实 handoff；
+  pre-handoff 任何拒绝（circuit/DB/deadline/cancel/exhaustion）physical delta 为零。caps 不变：
+  one-shot 2、complete-path 3；`can_begin_provider_attempt` 同时计数 committed+reserved。
+- **错误映射逐面保持**：one-shot 首轮 admission 失败经 `map_egress_failure` 投影与旧
+  prepare 路径一致（同走 `map_one_shot`）；complete-path `ProviderUnavailable` 仍由
+  `classify_ticket_failure` 重分类，其余经 `map_provider_egress_failure`。one-shot 重试前
+  `refresh_ticket_for_retry` 采纳 fresh generation（与旧行为一致）。
+- **已知偏差（如实记录）**：half-open probe lease 的归还依赖既有 R5 probe-budget timeout
+  （descriptor 行 `probe-budget-reclaims-abandoned-lease` 不变）而非 Drop——`ProviderCircuitToken`
+  为 `Copy`，pre-handoff 被弃的 lease 不会被本阶段新增的 Drop 路径回收，但「绝不永久占用」
+  不变量仍由既有 timeout 兜底成立。
+- **descriptor 轮换**：token `20260818-phase2-f3-correctness-v1`；合同新增/改写
+  attempt-ledger、circuit-gate、handoff 三行（§5 引文）；digest
+  `94b3912f… → 745ca584…`（§5 第五行），三处 golden 显式重钉。
+- **公开合同不变**：Busy/Unavailable/Restricted/Conflict 冻结映射、HTTP status、retryable、
+  45s absolute 均未变；`observe_provider_circuit` 与 `begin_provider_attempt` 旧入口删除，
+  全部调用方（one-shot、complete-path、canary 测试）迁入新执行器。
+
+F3 退出门核对：rfx04（两子案：复核失败不出 Busy 且零编码、复核通过才出 Busy）、rfx05
+（拒绝零 handoff、零 physical、transport-retry 退还）绿；`reliability_fix_regressions` 14/14
+绿——F0 基线红测清零；`buzz-relay --lib semantic_` 128 绿；`buzz-relay --lib` 全量 972 绿
+（8 个环境性失败见 §2）；`buzz-semantic-query --lib` 53 绿；三个确定性门复跑绿（§2）；
+clippy/fmt 绿；`just test-unit` exit 0。

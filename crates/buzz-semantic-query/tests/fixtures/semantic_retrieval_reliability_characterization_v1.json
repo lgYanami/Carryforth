@@ -3,7 +3,7 @@
   "compiled_profile": {
     "canonical_route_profile": "edge-member-coordinate=migrated\ncoordinate-incident-edge=migrated\nwhole-graph-coordinate-discovery=migrated\nbounded-complete-path=migrated\n",
     "http_runtime_contract_id": "runtime-contract=semantic-query-http-runtime-20260816-coordinate-filter-v2",
-    "http_runtime_digest": "94b3912fe39bdff87335b105067e28667ec1fa19b173bac7bbd97395e0385ace",
+    "http_runtime_digest": "745ca5843c4bd8f22a33fc9fe9d6a9f7dff51fb8f137efe8b18df4dab2a36b47",
     "routes": {
       "bounded_complete_path": "migrated",
       "coordinate_incident_edge": "migrated",

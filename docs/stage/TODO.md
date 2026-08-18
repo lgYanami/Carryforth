@@ -7,8 +7,11 @@
 > 基线已建立；F1 已交付：target-window admission、`TimedOut` 真实 latch、`Finalizing` stage
 > 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，RFX-01/RFX-02 关闭；F2 已
 > 交付：unsigned result 验证前移、permit 按值消费进单一同步 signer guard、complete-path 迁入
-> 同一形状，RFX-03 关闭；runtime digest 随日期化 descriptor 两轮轮换
-> `2c898e16…→36776253…→94b3912f…`；F3–F5 未开始）；第三阶段统一资源治理未启动
+> 同一形状，RFX-03 关闭；F3 已交付：统一 `execute_provider_attempt` 执行器、circuit 拒绝经
+> fresh-authorization 复核后调用方可见、最终 fence 与预算消费合并进单一同步 handoff 点、
+> non-counting 预算 token 只计真实 handoff，RFX-04/RFX-05 关闭、rfx 红色基线清零；runtime
+> digest 随日期化 descriptor 三轮轮换 `2c898e16…→36776253…→94b3912f…→745ca584…`；F4（RFX-06
+> test-first）与 F5 未开始）；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-18
 >
@@ -111,6 +114,20 @@
 > `sign_released`单一同步signer guard按值消费permit（拒绝路径不进签名闭包，签名中取消由
 > post-check丢弃已签名结果）；complete-path bridge尾段迁入同一helper形状；两类release policy
 > 保持；digest轮换`36776253…→94b3912f…`（资格记录§5第四行/§11）。剩余红色：rfx04/rfx05（F3）。
+>
+> **2026-08-18 F3 交付**：Circuit、handoff与physical ledger修复落地（修复计划§3.4/§2.4、§2.5）
+> ——统一执行器`execute_provider_attempt`承接one-shot与complete-path两surface的Provider
+> attempt（RFX-04关闭：circuit拒绝——fast-gate与wait-stale两处——先经调用方fresh-authorization
+> 复核闭包（closed coordinator重读writer-fence ticket）才以Busy对调用方可见，复核自身失败按
+> 既有冻结映射出栈；最终circuit fence与physical预算消费合并进单一同步handoff点，无await间隔，
+> lazy encode仅在handoff之后构造，outcome观测绑定handoff permit）；non-counting
+> `ProviderAttemptBudgetToken`在circuit gate之前保留、只在真实handoff消费、pre-handoff任何
+> 拒绝Drop退还（physical delta零、transport-retry token退还），caps不变（RFX-05关闭）。
+> rfx04/rfx05转绿，**F0红色基线清零**（`reliability_fix_regressions` 14/14绿）；half-open
+> probe lease归还仍由既有R5 probe-budget timeout兜底（Copy token无Drop路径，如实记录）。
+> digest轮换`94b3912f…→745ca584…`（资格记录§5第五行/§12）。三个确定性门复跑绿色；
+> `buzz-relay --lib semantic_` 128绿、全量972绿（8个环境性DB失败）、`just test-unit` exit 0。
+> 剩余：F4（RFX-06，DB依赖路径test-first）、F5（资格收口）。
 
 ### 背景
 

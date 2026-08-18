@@ -1,9 +1,11 @@
 //! Shared safety envelope for one-shot semantic HTTP operations.
 //!
 //! This module owns only the common process admission, authorized ticket,
-//! physical Provider reservation, final egress confirmation, deadline, and
-//! result-release fence. Query text, Provider encoding shape, database
-//! ranking, and public result contracts remain owned by each closed surface.
+//! deadline, and result-release fence; each physical Provider attempt — its
+//! reservation, egress confirmation, circuit handoff, and outcome
+//! observation — runs inside the shared executor (fix plan §2.4). Query
+//! text, Provider encoding shape, database ranking, and public result
+//! contracts remain owned by each closed surface.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -19,13 +21,13 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::{TrackedProviderFailure, VolcengineSemanticProvider};
 use crate::semantic_query_runtime::{
-    caller_disconnect_guard, encode_once, execute_provider_egress, observe_provider_circuit,
+    caller_disconnect_guard, egress_stage_abort, execute_provider_attempt,
     propagate_relay_shutdown, provider_retry_backoff, provider_retry_decision,
-    subscribe_relay_shutdown, ProviderCircuitObservation, ProviderCircuitToken,
-    ProviderEgressAdmission, ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision,
-    ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
-    SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
-    SemanticOperationAttemptClass, SemanticProviderEgressFailure, SemanticStageAbort,
+    subscribe_relay_shutdown, ProviderAttemptEncoded, ProviderAttemptError,
+    ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision, ProviderRetryRoute,
+    SemanticCancellationSource, SemanticDeadlineWindow, SemanticDeadlineWindows,
+    SemanticEncodeOnceFailure, SemanticExecutionContext, SemanticOperationAttemptClass,
+    SemanticProviderEgressFailure, SemanticStageAbort,
 };
 use crate::state::AppState;
 
@@ -48,17 +50,19 @@ pub(crate) enum SemanticOneShotError {
     Database(#[source] buzz_db::DbError),
 }
 
-/// Authorized, single-use execution state immediately before Provider egress.
+/// Authorized, single-use execution state around its physical Provider
+/// attempts (fix plan §2.4: the executor owns each attempt end to end, so
+/// the envelope holds no admission or circuit token across any gap).
 pub(crate) struct SemanticOneShotExecution<'a> {
     state: &'a AppState,
     ticket: SemanticGraphQueryTicket,
     reader_pubkey: Vec<u8>,
     relay_pubkey: PublicKey,
-    routing_trust: SemanticGraphQueryRoutingTrust<'a>,
+    /// Routing trust confirmed by the latest completed physical attempt; the
+    /// release fence validates against the same attempt. `None` until the
+    /// first attempt succeeds — there is nothing to release before that.
+    routing_trust: Option<SemanticGraphQueryRoutingTrust<'a>>,
     provider: &'a VolcengineSemanticProvider,
-    /// R5 circuit token of the current physical attempt; refreshed together
-    /// with the ticket by every retry's fresh egress admission.
-    circuit_token: Option<ProviderCircuitToken>,
     context: SemanticExecutionContext,
     _process_permit: OwnedSemaphorePermit,
     /// F1 item 6: cancel this request the moment controlled shutdown begins
@@ -86,7 +90,9 @@ pub(crate) enum SemanticOneShotEncodeFailure {
 }
 
 impl<'a> SemanticOneShotExecution<'a> {
-    /// Prepare one request through the shared no-wait Provider egress fence.
+    /// Prepare one request: process admission, authorized ticket, and the
+    /// execution context — but no egress admission, which the first physical
+    /// attempt takes inside the shared executor (fix plan §2.4).
     pub(crate) async fn prepare(
         state: &'a AppState,
         community_id: CommunityId,
@@ -141,29 +147,19 @@ impl<'a> SemanticOneShotExecution<'a> {
             .ledger()
             .begin_operation_attempt()
             .map_err(|_| SemanticOneShotError::Busy)?;
-        let admission = execute_provider_egress(ProviderEgressPlan {
-            state,
-            context: &context,
-            ticket: &ticket,
-            reader_pubkey,
-            expected_contexts: &[],
-            observation: ProviderEgressObservation::Silent,
-        })
-        .await
-        .map_err(map_egress_failure)?;
-        let ProviderEgressAdmission {
-            routing_trust,
-            circuit,
-        } = admission;
 
+        // F3 (fix plan §2.4): prepare only takes the process admission and
+        // the authorized ticket — every physical attempt, from its circuit
+        // gate through its handoff and outcome observation, runs inside
+        // `encode_with_retry`'s shared-executor call, so this envelope never
+        // holds an egress admission across a gap.
         Ok(Self {
             state,
             ticket,
             reader_pubkey: reader_pubkey.to_vec(),
             relay_pubkey,
-            routing_trust,
+            routing_trust: None,
             provider,
-            circuit_token: circuit,
             context,
             _process_permit: process_permit,
             _shutdown,
@@ -173,12 +169,19 @@ impl<'a> SemanticOneShotExecution<'a> {
 
     /// Run the bounded Provider encode with the R4 retry policy applied.
     ///
-    /// Each attempt is one sanctioned `encode_once` handoff inside the work
-    /// window. When the closed policy advises a retry, this envelope sleeps
-    /// the bounded backoff and assembles the fresh plan itself — a fresh
-    /// authorized ticket plus a fresh reservation/confirmation through the
-    /// shared executor (plan §4.3) — because only the envelope owns that
-    /// state. The fresh attempt re-enters through the same admission, so the
+    /// Each iteration is one whole physical attempt through the shared
+    /// executor (fix plan §2.4): budget reservation, circuit gate, database
+    /// reservation and confirmation, the linear handoff, and the single
+    /// deadline-bounded encode — constructed only after the handoff — with
+    /// its outcome observed against the same handoff inside the executor.
+    /// This envelope supplies the two closed callbacks: the fresh-authorization
+    /// recheck the executor consults only when the caller would otherwise
+    /// observe a circuit refusal, and the lazy encode closure itself.
+    ///
+    /// When the closed policy advises a retry, this envelope sleeps the
+    /// bounded backoff and assembles the fresh plan itself — a fresh
+    /// authorized ticket (plan §4.3) — because only the envelope owns that
+    /// state. The fresh attempt re-enters through the same executor, so the
     /// attempt ledger caps and the cancellation latch stay binding, and an
     /// exhausted or declined retry returns the last typed failure for the
     /// surface's frozen projection.
@@ -191,71 +194,110 @@ impl<'a> SemanticOneShotExecution<'a> {
         Fut: Future<Output = Result<T, TrackedProviderFailure<SemanticGraphQueryError>>>,
     {
         loop {
-            let tracked = match encode_once(
-                &self.context,
-                ProviderEgressObservation::Silent,
-                encode(self.provider),
+            match execute_provider_attempt(
+                ProviderEgressPlan {
+                    state: self.state,
+                    context: &self.context,
+                    ticket: &self.ticket,
+                    reader_pubkey: &self.reader_pubkey,
+                    expected_contexts: &[],
+                    observation: ProviderEgressObservation::Silent,
+                },
+                || self.reauthorize_without_reservation(),
+                || encode(self.provider),
             )
             .await
             {
-                Ok(encoded) => {
-                    // R5: report the one completed physical attempt to the
-                    // shared circuit. Deadline and cancellation outcomes
-                    // report nothing (plan §4.7).
-                    observe_provider_circuit(
-                        self.provider,
-                        self.circuit_token,
-                        ProviderCircuitObservation::Success,
-                    );
+                Ok(ProviderAttemptEncoded {
+                    routing_trust,
+                    encoded,
+                }) => {
+                    // The release fence validates against the attempt that
+                    // just succeeded.
+                    self.routing_trust = Some(routing_trust);
                     return Ok(encoded);
                 }
-                Err(SemanticEncodeOnceFailure::DeadlineExceeded) => {
+                Err(ProviderAttemptError::Admission(failure)) => {
+                    return Err(SemanticOneShotEncodeFailure::FreshPlan(map_egress_failure(
+                        failure,
+                    )));
+                }
+                Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::DeadlineExceeded)) => {
                     return Err(SemanticOneShotEncodeFailure::DeadlineExceeded);
                 }
-                Err(SemanticEncodeOnceFailure::Cancelled(source)) => {
+                Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::Cancelled(source))) => {
                     return Err(SemanticOneShotEncodeFailure::Cancelled(source));
                 }
-                Err(SemanticEncodeOnceFailure::Provider(tracked)) => {
-                    observe_provider_circuit(
-                        self.provider,
-                        self.circuit_token,
-                        ProviderCircuitObservation::from_attempt_failure(&tracked.failure),
-                    );
-                    tracked
-                }
-            };
-            match provider_retry_decision(route, tracked.failure, &self.context) {
-                ProviderRetryDecision::Terminal => {
-                    return Err(SemanticOneShotEncodeFailure::Provider(tracked));
-                }
-                ProviderRetryDecision::Retry { backoff } => {
-                    if let Err(abort) = provider_retry_backoff(&self.context, backoff).await {
-                        return Err(match abort {
-                            SemanticStageAbort::Deadline(_)
-                            | SemanticStageAbort::LatchClosed(_) => {
-                                SemanticOneShotEncodeFailure::DeadlineExceeded
+                Err(ProviderAttemptError::Encode(SemanticEncodeOnceFailure::Provider(tracked))) => {
+                    match provider_retry_decision(route, tracked.failure, &self.context) {
+                        ProviderRetryDecision::Terminal => {
+                            return Err(SemanticOneShotEncodeFailure::Provider(tracked));
+                        }
+                        ProviderRetryDecision::Retry { backoff } => {
+                            if let Err(abort) = provider_retry_backoff(&self.context, backoff).await
+                            {
+                                return Err(match abort {
+                                    SemanticStageAbort::Deadline(_)
+                                    | SemanticStageAbort::LatchClosed(_) => {
+                                        SemanticOneShotEncodeFailure::DeadlineExceeded
+                                    }
+                                    SemanticStageAbort::Cancelled(source) => {
+                                        SemanticOneShotEncodeFailure::Cancelled(source)
+                                    }
+                                });
                             }
-                            SemanticStageAbort::Cancelled(source) => {
-                                SemanticOneShotEncodeFailure::Cancelled(source)
-                            }
-                        });
+                            self.refresh_ticket_for_retry()
+                                .await
+                                .map_err(SemanticOneShotEncodeFailure::FreshPlan)?;
+                        }
                     }
-                    self.refresh_plan_for_retry()
-                        .await
-                        .map_err(SemanticOneShotEncodeFailure::FreshPlan)?;
                 }
             }
         }
     }
 
-    /// Assemble the fresh plan one Provider retry needs (plan §4.3).
+    /// Fresh host-derived authorization recheck with no reservation, no
+    /// encoding, and no query (fix plan §2.4 item 1).
+    ///
+    /// The shared executor consults this only when the caller would
+    /// otherwise observe a circuit refusal: a re-read ticket under the
+    /// database writer fence must still admit this principal into this
+    /// community's active generation with the same Provider contract and the
+    /// same generation the current attempt is encoding against. Only then is
+    /// the circuit's Busy caller-visible; a denial, drift, or transport
+    /// failure surfaces as its own frozen failure instead.
+    async fn reauthorize_without_reservation(&self) -> Result<(), SemanticProviderEgressFailure> {
+        let fresh = self
+            .context
+            .run_stage(
+                SemanticDeadlineWindow::Work,
+                self.state.db.semantic_graph_query_ticket(
+                    self.ticket.community_id,
+                    &self.reader_pubkey,
+                    &self.relay_pubkey,
+                ),
+            )
+            .await
+            .map_err(egress_stage_abort)?
+            .map_err(SemanticProviderEgressFailure::Database)?;
+        if self.provider.source_contract() != &fresh.generation.model_contract {
+            return Err(SemanticProviderEgressFailure::ProviderUnavailable);
+        }
+        if fresh.generation.generation_id != self.ticket.generation.generation_id {
+            return Err(SemanticProviderEgressFailure::ContextChanged);
+        }
+        Ok(())
+    }
+
+    /// Re-read the authorized ticket one Provider retry needs (plan §4.3).
     ///
     /// Fresh authorization first: the ticket is re-read and the Provider
-    /// contract re-checked before any reservation, then the shared executor
-    /// runs its full reservation/confirmation admission for the new physical
-    /// attempt. The updated ticket and routing trust stay bound into this
+    /// contract re-checked before the fresh attempt re-enters the shared
+    /// executor. Unlike the reauthorization recheck, a retry adopts the
+    /// fresh ticket whatever generation it carries — the fresh attempt
+    /// encodes against it — and the updated ticket stays bound into this
     /// execution so the release fence validates against the same attempt.
-    async fn refresh_plan_for_retry(&mut self) -> Result<(), SemanticOneShotError> {
+    async fn refresh_ticket_for_retry(&mut self) -> Result<(), SemanticOneShotError> {
         let fresh = self
             .context
             .run_stage(
@@ -272,22 +314,6 @@ impl<'a> SemanticOneShotExecution<'a> {
         if self.provider.source_contract() != &fresh.generation.model_contract {
             return Err(SemanticOneShotError::Unavailable);
         }
-        let admission = execute_provider_egress(ProviderEgressPlan {
-            state: self.state,
-            context: &self.context,
-            ticket: &fresh,
-            reader_pubkey: &self.reader_pubkey,
-            expected_contexts: &[],
-            observation: ProviderEgressObservation::Silent,
-        })
-        .await
-        .map_err(map_egress_failure)?;
-        let ProviderEgressAdmission {
-            routing_trust,
-            circuit,
-        } = admission;
-        self.routing_trust = routing_trust;
-        self.circuit_token = circuit;
         self.ticket = fresh;
         Ok(())
     }
@@ -339,6 +365,13 @@ impl<'a> SemanticOneShotExecution<'a> {
         &self,
         snapshot: &SemanticGraphQueryTicket,
     ) -> Result<SemanticGraphQueryReleasePermit, SemanticOneShotError> {
+        // The release fence validates against the routing trust the latest
+        // completed physical attempt confirmed (fix plan §2.4). There is no
+        // release without a completed attempt — the surfaces encode before
+        // they release — so the missing case stays fail-closed.
+        let routing_trust = self
+            .routing_trust
+            .ok_or(SemanticOneShotError::Unavailable)?;
         let mut last_transient: Option<buzz_db::DbError> = None;
         loop {
             if let Err(_exhausted) = self.context.ledger().begin_release_confirmation() {
@@ -360,7 +393,7 @@ impl<'a> SemanticOneShotExecution<'a> {
                             reader_pubkey: &self.reader_pubkey,
                             expected_projection_pubkey: &self.relay_pubkey,
                             expected_snapshot: Some(snapshot),
-                            routing_trust: self.routing_trust,
+                            routing_trust,
                         },
                     ),
                 )
