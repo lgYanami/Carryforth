@@ -1,10 +1,12 @@
 # Project Context 统一语义检索引擎 TODO
 
-> 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性运行时
-> 已按计划交付R0–R6并关闭（资格记录见
-> [统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）
+> 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性
+> 运行时主体（R0–R6）已落地，但代码审计确认 RFX-01..RFX-07 七项与冻结合同的偏差——**主体已
+> 实现、correctness 修复中**（F0 红色基线已建立，F1–F5 未开始；见
+> [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)
+> 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）
 >
-> 日期：2026-08-17
+> 日期：2026-08-18
 
 ## Coordinate 起点检索的目标意图与上下文信号
 
@@ -89,6 +91,15 @@ query/vector/body），binding test把digest descriptor与编译常量互相绑�
 未运行的disposable DB/真实Provider/真实fleet门逐项列明原因与复跑配方。可声明
 “统一可靠性原语与Provider执行层已交付”；统一资源治理（bounded
 queue/fairness/capacity、fleet-shared circuit）与production SLO属第三阶段。
+
+**2026-08-18 修正**：上述R6收口声明被代码审计推翻——七项偏差（RFX-01..RFX-07）确认与冻结
+合同不一致，其中RFX-01（complete-path合法partial被全局deadline门转为hard timeout）构成直接
+功能错误。当前准确状态为“主体已实现、correctness 修复中”：F0已交付失败回归基线
+（`reliability_fix_regressions` 7个rfx测试在当前代码上失败，`just test-unit` 因此保持红色直至
+F1–F4逐项修复；三个确定性characterization门不受影响），修复设计、分阶段交付（F0–F5）与退出门
+见[正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)；
+资格记录（§2门清单、§9红色基线）同步改写。correctness修复关闭前，不得声明Phase 2按实现计划
+完整交付或具备部署资格。
 相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

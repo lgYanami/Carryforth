@@ -94,6 +94,7 @@ unexpected_paths="$(
       crates/buzz-db/src/semantic_query/* | \
       crates/buzz-db/src/semantic_coordinate_search.rs | \
       crates/buzz-relay/src/lib.rs | \
+      crates/buzz-relay/src/reliability_fix_regressions.rs | \
       crates/buzz-relay/src/state.rs | \
       crates/buzz-relay/src/config.rs | \
       crates/buzz-relay/src/api/bridge.rs | \

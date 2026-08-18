@@ -1357,6 +1357,51 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// Build a service-free [`AppState`] for the semantic reliability
+/// correctness-fix regression tests.
+///
+/// The Postgres pool is created lazily and Redis points at an unreachable
+/// address, so callers must either refuse before the first database or
+/// Redis acquire (for example at the Provider circuit fast gate), or expect
+/// those calls to fail closed. The semantic Provider is initialized from
+/// the caller-supplied `config.semantic_worker`.
+#[cfg(test)]
+pub(crate) async fn app_state_for_reliability_fix_tests(
+    config: crate::config::Config,
+) -> Arc<AppState> {
+    let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+    let db = buzz_db::Db::from_pool(pool.clone());
+    let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .expect("redis pool");
+    let pubsub = Arc::new(
+        buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+            .await
+            .expect("pubsub manager"),
+    );
+    let audit = buzz_audit::AuditService::new(pool.clone());
+    let auth = buzz_auth::AuthService::new(config.auth.clone());
+    let search = buzz_search::SearchService::new(pool.clone());
+    let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+        db.clone(),
+        buzz_workflow::WorkflowConfig::default(),
+    ));
+    let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+    let (state, _audit_shutdown) = AppState::new(
+        config,
+        db,
+        redis_pool,
+        audit,
+        pubsub,
+        auth,
+        search,
+        workflow_engine,
+        nostr::Keys::generate(),
+        media_storage,
+    );
+    Arc::new(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,37 +1449,7 @@ mod tests {
     }
 
     async fn test_state_with_config(config: crate::config::Config) -> Arc<AppState> {
-        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
-        let db = buzz_db::Db::from_pool(pool.clone());
-        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("redis pool");
-        let pubsub = Arc::new(
-            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
-                .await
-                .expect("pubsub manager"),
-        );
-        let audit = buzz_audit::AuditService::new(pool.clone());
-        let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(pool.clone());
-        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
-            db.clone(),
-            buzz_workflow::WorkflowConfig::default(),
-        ));
-        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
-        let (state, _audit_shutdown) = AppState::new(
-            config,
-            db,
-            redis_pool,
-            audit,
-            pubsub,
-            auth,
-            search,
-            workflow_engine,
-            nostr::Keys::generate(),
-            media_storage,
-        );
-        Arc::new(state)
+        app_state_for_reliability_fix_tests(config).await
     }
 
     #[test]

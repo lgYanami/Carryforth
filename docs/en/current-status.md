@@ -148,10 +148,14 @@ Implemented:
 - NIP-98 request binding, Relay-signed semantic results, and canonical read descriptors;
 - the retained bounded complete-path `semantic-query` as a supplementary product;
 - controlled real-request paths on a local single Relay;
-- a unified reliability runtime shared by all four semantic operations: typed failures, deadline
-  and cancellation arbitration, a bounded safe retry policy with full-jitter backoff,
-  request-local vector reuse, and a process-local Provider circuit that ships shadow-by-default
-  behind an isolated single-Relay canary flag and never introduces new public error codes.
+- the main body of a unified reliability runtime shared by all four semantic operations: typed
+  failures, deadline and cancellation arbitration, a bounded safe retry policy with full-jitter
+  backoff, request-local vector reuse, and a process-local Provider circuit that ships
+  shadow-by-default behind an isolated single-Relay canary flag and never introduces new public
+  error codes. A code audit found seven correctness deviations from the frozen runtime contract
+  (including complete-path partial results being converted into hard timeouts); a correctness
+  fix with a failing regression baseline is in progress, so the runtime is not yet claimed as
+  fully delivered against its implementation plan.
 
 Still outside the current production-ready claim:
 

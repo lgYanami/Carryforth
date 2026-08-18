@@ -34,6 +34,12 @@ pub mod metrics;
 pub mod nip11;
 /// NIP-01 client/relay message parsing.
 pub mod protocol;
+/// Failing regression baseline for the semantic reliability correctness fix
+/// (fix plan F0, RFX-01..RFX-07). These tests are intentionally red until
+/// fix stages F1–F4 land; they are kept outside the `semantic_*` modules so
+/// the frozen characterization gates keep their historical filter scope.
+#[cfg(test)]
+mod reliability_fix_regressions;
 /// Axum router construction.
 pub mod router;
 /// Trusted managed-runtime recovery scheduler.

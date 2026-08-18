@@ -1,15 +1,20 @@
 # Project Context 统一可靠性运行时资格记录
 
-> 状态：R0–R6 已交付并通过本记录所列的确定性资格门；真实数据库资格、真实 Provider canary 与
-> 真实 fleet 切流未在交付环境运行，逐项列明原因与复跑配方
+> 状态：R0–R6 主体已交付；**correctness 修复中**——代码审计确认七项与冻结合同的偏差
+> （RFX-01..RFX-07，见
+> [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)），
+> F0 红色基线已建立（§9），F1–F5 修复未开始。修复关闭前不能声明统一可靠性运行已按实现计划
+> 完整交付，也不能声明 production qualification 完成
 >
-> 日期：2026-08-17
+> 日期：2026-08-17（R6 收口）；2026-08-18（correctness 修复 F0 基线）
 >
-> 结论边界：可以声明**统一可靠性原语与 Provider 执行层已交付**。不能声明统一资源治理
-> （bounded queue、fairness、capacity）完成，不能声明 production SLO 或多 Pod 部署资格完成。
+> 结论边界：可声明“统一可靠性原语与 Provider 执行层的主体实现已落地”。不能声明 Phase 2
+> 按实现计划完整交付；不能声明统一资源治理（bounded queue、fairness、capacity）完成，不能
+> 声明 production SLO 或多 Pod 部署资格完成。
 >
 > 关联文档：
 > [统一可靠性运行时实现计划](project-context-unified-semantic-reliability-runtime-implementation-plan.md)、
+> [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)、
 > [统一语义检索引擎规范](project-context-unified-semantic-retrieval-engine-spec.md)、
 > [统一语义计算资格记录](project-context-unified-semantic-computation-qualification.md)、
 > [Stage TODO](../../TODO.md)
@@ -28,22 +33,25 @@ operation（whole-graph Coordinate、两个 one-hop variant、bounded complete p
 
 ## 2. 资格门运行记录
 
-在交付分支 `feat/semantic-engine`（freeze base `db6c8c1d5`）上运行：
+在交付分支 `feat/semantic-engine`（freeze base `db6c8c1d5`）上运行。correctness 修复（F0 起）之后的
+状态逐项更新；未运行的门不得由其他门的绿色替代声明：
 
 | 门 | 状态 | 说明 |
 | --- | --- | --- |
-| `bash scripts/check-semantic-retrieval-reliability.sh all` | 通过 | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check` |
+| `bash scripts/check-semantic-retrieval-compatibility-baseline.sh all`（`just semantic-retrieval-compatibility-baseline`） | 通过（2026-08-18 F0 复跑） | 兼容基线 manifest、sha256、freeze diff 与确定性测试 |
+| `bash scripts/check-semantic-retrieval-computation.sh all`（`just semantic-retrieval-computation`） | 通过（2026-08-18 F0 复跑） | Phase 1 计算合同门；R6 未重跑，F0 复跑确认未被 Phase 2 破坏 |
+| `bash scripts/check-semantic-retrieval-reliability.sh all`（`just semantic-retrieval-reliability`） | 通过（2026-08-18 F0 复跑） | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check`。rfx 红色基线（§9）在过滤器之外，不影响本门 |
 | `cargo test -p buzz-relay --lib semantic_` | 通过 | 127 通过、2 个 gated 真实 Provider canary 显式 `#[ignore]` |
-| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过 | 无告警 |
-| `cargo fmt -p buzz-semantic-query -p buzz-relay` | 通过 | 已格式化 |
-| `just test-unit` | 通过 | 全仓库单元套件（无需服务） |
+| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过（R6） | F0 起随各修复阶段复跑 |
+| `cargo fmt -p buzz-semantic-query -p buzz-relay` | 通过 | 每次提交 hooks 执行 |
+| `just test-unit` | **红色（F0 预期状态）** | `reliability_fix_regressions` 7 个 rfx 测试按修复计划 F0 故意失败，F1–F4 逐项转绿；这是修复基线，不是回归 |
+| `just ci` | **未运行** | 本环境无法完成完整本地 PR gate。复跑：`just ci` |
+| `just semantic-test`（= pgvector + migration） | **未运行** | 见下两行 |
 | `just semantic-pgvector-test` | **未运行** | 本环境无 disposable Postgres。复跑：`just semantic-pgvector-test`（`scripts/test-semantic-pgvector.sh`，设置 `BUZZ_TEST_SEMANTIC_DATABASE_URL`）。单元绿色不替代本门 |
 | `just semantic-migration-test` | **未运行** | 同上。复跑：`just semantic-migration-test` |
 | `just test`（完整 integration） | **未运行** | 本环境无 Postgres/Redis。已知与本阶段无关的既有基线：`api::media`/`api::admin` 8 个 DB 用例失败。复跑：`just test` |
-| 真实 Provider canary（`real_provider_semantic_input_canary`、`real_provider_reliability_canary_is_bounded_and_content_free`） | **未运行** | 无受支持的真实 embedding Provider 配置。复跑：设置完整 `LLM_*` 三元组后 `cargo test -p buzz-relay --lib -- --ignored real_provider` |
+| 真实 Provider canary（`cargo test -p buzz-relay --lib -- --ignored real_provider`） | **未运行** | 无受支持的真实 embedding Provider 配置。复跑：设置完整 `LLM_*` 三元组后执行 |
 | 真实 fleet old→new digest 切流 | **未运行** | 本环境没有真实多 Relay fleet。切流行模板见 §5 |
-
-未运行的门不得由其他门的绿色替代声明；上表即计划要求的诚实记录。
 
 ## 3. R6 交付项与证据映射
 
@@ -126,3 +134,32 @@ R6 的更新即 §5 记录的第二次编译期切换，非静默改史。
   Busy/Unavailable 冻结映射出栈。
 - 日志与 metrics 维持 content-free：circuit key、failure-domain key、observation/gate/transition
   标签均为 closed 低基数枚举或 digest。
+
+## 9. Correctness 修复 F0 红色基线（2026-08-18）
+
+代码审计（fix plan §1）确认 RFX-01..RFX-07 与冻结合同的偏差后，F0 建立失败回归基线：
+`crates/buzz-relay/src/reliability_fix_regressions.rs`（7 个 `rfx*` 测试，全部在当前代码上失败，
+构成修复计划 F0 退出门要求的可重复、内容无关证据）：
+
+| 测试 | RFX | 当前失败事实 |
+| --- | --- | --- |
+| `rfx01_partial_tail_must_survive_earlier_window_cutoff` | RFX-01 | work 窗口已耗尽、SnapshotClose/Absolute 仍开放时，指向 Absolute 的 tail stage 被 `Deadline(ProviderStart)` 拒绝——合法 partial 无法发布 |
+| `rfx02_deadline_expiry_writes_timed_out_latch_state` | RFX-02 | `deadline_expired()` 后 latch 实际状态是 `Cancelling`，`TimedOut` 无写入路径 |
+| `rfx02_finalizing_forbids_new_work_stages` | RFX-02 | `Finalizing` 被视为允许新工作，generic stage admission 通过 |
+| `rfx03_unsigned_result_validation_precedes_release_finalize` | RFX-03 | 模拟当前 one-shot 顺序（release/finalize 先于结果验证失败）后 latch 停在 `Finalizing`，而合同要求仍是 `Active` |
+| `rfx04_circuit_refusal_requires_fresh_authorization_first` | RFX-04 | 授权无法证明（数据库不可达）时，调用方仍观察到 circuit 的 `AdmissionBusy` |
+| `rfx05_refused_egress_counts_no_physical_attempt` | RFX-05 | circuit fast-gate 拒绝的零外发请求把 physical attempt 计为 1 |
+| `rfx07_qualification_record_carries_the_gate_inventory` | RFX-07 | 本记录 §2 的机械门清单断言（每个 §5 门具名 + 状态显式 + 未运行不得缺失） |
+
+- **RFX-06 的红色证据按修复计划记录为条件式**：其两处偏差（complete-path fresh-plan 输入
+  identity 比较缺失、complete-path release transient 未接入有界重验）都位于数据库依赖的
+  coordinator 路径之后，无服务环境不可执行；其失败测试在 F4 开工时以 test-first 交付（修复
+  计划 §4.5 清单），本记录不以其缺位冒充已验证。
+- 基线测试放在独立模块 `reliability_fix_regressions`（lib.rs 仅 `#[cfg(test)]` 声明），测试名
+  刻意避开 `semantic_` 子串：三个确定性 characterization 门的过滤器保持历史范围与绿色，
+  `just test-unit` 全量红色即修复基线本身。
+- 测试通过 `state.rs` 新增的 `#[cfg(test)] app_state_for_reliability_fix_tests` 构造无服务
+  AppState（lazy PgPool + 不可达 Redis + 手工 Provider config），rfx04/rfx05 在 circuit fast
+  gate 拒绝路径上执行真实 `execute_provider_egress`，数据库从未被触及。
+- 当前 runtime digest（`2c898e16…`）、characterization manifest/sha256 与 binary（`1d8be4643`）
+  保持为诊断/rollback 基线；F0 未修改任何生产路径、公开合同或 digest。

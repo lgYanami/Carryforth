@@ -2,9 +2,11 @@
 
 ## 独立架构事项：统一 Project Context 语义检索引擎
 
-> 状态：兼容基线、第一阶段统一语义计算与第二阶段统一可靠性运行时（R0–R6）均已交付；第三阶段统一资源治理未启动
+> 状态：兼容基线、第一阶段统一语义计算已交付；第二阶段统一可靠性运行时主体（R0–R6）已落地，
+> 但 RFX-01..RFX-07 七项 correctness 偏差确认——**主体已实现、correctness 修复中**（F0 红色
+> 基线已建立，F1–F5 未开始）；第三阶段统一资源治理未启动
 >
-> 更新日期：2026-08-17
+> 更新日期：2026-08-18
 >
 > 概念规范：
 > [Project Context 统一语义检索引擎规范](semantic/unified-engine/project-context-unified-semantic-retrieval-engine-spec.md)
@@ -81,6 +83,16 @@
 > 未运行的disposable DB/真实Provider/真实fleet门逐项列明原因与复跑配方。
 > 可声明"统一可靠性原语与Provider执行层已交付"；统一资源治理（bounded
 > queue/fairness/capacity、fleet-shared circuit状态）与production SLO属第三阶段。
+>
+> **2026-08-18 修正**：R6收口时的上述声明被代码审计推翻：七项偏差（RFX-01..RFX-07）与冻结
+> 合同不一致，其中RFX-01（complete-path合法partial被全局deadline admission门转为hard
+> timeout，`WallTimeExhausted`部分结果在生产路径不可达）构成直接功能错误；RFX-02..RFX-06涉及
+> lifecycle状态、release permit顺序、circuit/授权优先级、physical attempt计数与complete-path
+> retry边界，RFX-07为资格证据缺口。当前准确状态为"主体已实现、correctness 修复中"：F0已交付
+> 失败回归基线（`reliability_fix_regressions` 7个rfx测试故意红色，`just test-unit` 因此红色直至
+> F1–F4；三个确定性characterization门保持绿色），修复设计与退出门见
+> [正确性修复计划](semantic/unified-engine/fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)，
+> 资格记录§2/§9同步改写。correctness修复关闭前不得声明Phase 2完整交付或具备部署资格。
 
 ### 背景
 
