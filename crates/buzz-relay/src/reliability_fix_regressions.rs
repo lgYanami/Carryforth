@@ -823,16 +823,23 @@ async fn rfx06_release_confirmation_retry_is_bounded_shared_and_fail_closed() {
 /// The qualification record is the executable status assertion for every
 /// gate the fix plan §5 requires: each gate must be listed with an explicit
 /// run status (passed, not-run, or conditional), and the record must carry
-/// the correctness-fix status marker F0 introduced — no undocumented gate,
-/// no blank completion claim.
+/// the tiered completion statement F5 closed on — correctness implementation
+/// delivered, deployment qualification explicitly not — so no blank
+/// completion claim can reappear while the real-fleet gates stay unrun.
 #[test]
 fn rfx07_qualification_record_carries_the_gate_inventory() {
     let record = include_str!(
         "../../../docs/stage/semantic/unified-engine/project-context-unified-semantic-reliability-runtime-qualification.md"
     );
     assert!(
-        record.contains("correctness 修复中"),
-        "the qualification record must state the correctness-fix status"
+        record.contains("Phase 2 correctness implementation 已交付"),
+        "the qualification record must state the delivered correctness tier"
+    );
+    assert!(
+        record.contains("deployment qualification 未完成"),
+        "the qualification record must keep the undelivered deployment tier \
+         explicit — a blank completion claim is forbidden while the \
+         real-fleet gates are unrun"
     );
     for gate in [
         "check-semantic-retrieval-compatibility-baseline",

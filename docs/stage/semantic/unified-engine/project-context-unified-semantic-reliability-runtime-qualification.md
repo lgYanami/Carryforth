@@ -1,13 +1,13 @@
 # Project Context 统一可靠性运行时资格记录
 
-> 状态：R0–R6 主体已交付；**correctness 修复中**——代码审计确认七项与冻结合同的偏差
-> （RFX-01..RFX-07，见
-> [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)），
-> F0 红色基线已建立（§9），F1（§10）、F2（§11）、F3（§12）与 F4（§13）已交付，
-> RFX-01..RFX-06 关闭，rfx 红色基线保持清零，仅剩 F5（资格与文档收口）。修复关闭前不能
-> 声明统一可靠性运行已按实现计划完整交付，也不能声明 production qualification 完成
+> 状态：R0–R6 主体已交付；correctness 修复 **F0–F5 全部交付（§9–§14）**——RFX-01..RFX-06
+> 关闭、rfx 基线保持清零、deterministic/disposable DB/migration/unit/integration/真实 Provider
+> canary 门绿色（§2；`just ci` 唯一失败为与语义运行时无关的 main 既有 release-asset pin）。
+> 分层结论：**Phase 2 correctness implementation 已交付；deployment qualification 未完成**——
+> 真实 fleet old/new digest 切流、gate/drain/re-attest 与 binary rollback 演练未执行（无真实
+> fleet），修复计划 §7.2 未关闭，不得声明 "Phase 2 已完整交付" 或 production-ready
 >
-> 日期：2026-08-17（R6 收口）；2026-08-18（correctness 修复 F0 基线、F1/F2/F3/F4 交付）
+> 日期：2026-08-17（R6 收口）；2026-08-18（correctness 修复 F0 基线、F1/F2/F3/F4/F5 交付）
 >
 > 结论边界：可声明“统一可靠性原语与 Provider 执行层的主体实现已落地”。不能声明 Phase 2
 > 按实现计划完整交付；不能声明统一资源治理（bounded queue、fairness、capacity）完成，不能
@@ -39,21 +39,21 @@ operation（whole-graph Coordinate、两个 one-hop variant、bounded complete p
 
 | 门 | 状态 | 说明 |
 | --- | --- | --- |
-| `bash scripts/check-semantic-retrieval-compatibility-baseline.sh all`（`just semantic-retrieval-compatibility-baseline`） | 通过（2026-08-18 F4 复跑） | 兼容基线 manifest、sha256、freeze diff 与确定性测试 |
-| `bash scripts/check-semantic-retrieval-computation.sh all`（`just semantic-retrieval-computation`） | 通过（2026-08-18 F4 复跑） | Phase 1 计算合同门；R6 未重跑，F0–F4 复跑确认未被 Phase 2 破坏 |
-| `bash scripts/check-semantic-retrieval-reliability.sh all`（`just semantic-retrieval-reliability`） | 通过（2026-08-18 F4 复跑） | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check`。rfx 红色基线（§9）在过滤器之外，不影响本门。F1–F4 起本门 digest golden 已随日期化 descriptor 显式重钉（§5） |
-| `cargo test -p buzz-relay --lib semantic_` | 通过（2026-08-18 F4 复跑） | 132 通过（F4 新增 3 个 release-confirmation runtime 测试与 1 个 root-attempt identity 钉住测试）、2 个 gated 真实 Provider canary 显式 `#[ignore]` |
-| `cargo test -p buzz-semantic-query --lib` | 通过（2026-08-18 F4 复跑） | 53 通过；`runtime_digest_is_stable_and_nonzero` 随 F1–F4 descriptor 轮换重钉到新 digest |
-| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过（2026-08-18 F4 复跑） | F0 起随各修复阶段复跑 |
+| `bash scripts/check-semantic-retrieval-compatibility-baseline.sh all`（`just semantic-retrieval-compatibility-baseline`） | 通过（2026-08-18 F5 复跑） | 兼容基线 manifest、sha256、freeze diff 与确定性测试 |
+| `bash scripts/check-semantic-retrieval-computation.sh all`（`just semantic-retrieval-computation`） | 通过（2026-08-18 F5 复跑） | Phase 1 计算合同门；R6 未重跑，F0–F5 复跑确认未被 Phase 2 破坏 |
+| `bash scripts/check-semantic-retrieval-reliability.sh all`（`just semantic-retrieval-reliability`） | 通过（2026-08-18 F5 复跑） | manifest 结构门、sha256、characterization golden、freeze diff、`buzz-semantic-query --lib`、`buzz-relay --lib semantic_`、三 crate `cargo check`。rfx 基线在过滤器之外；F1–F4 起本门 digest golden 已随日期化 descriptor 显式重钉（§5） |
+| `cargo test -p buzz-relay --lib semantic_` | 通过（2026-08-18 F5 复跑） | 132 通过（F4 新增 3 个 release-confirmation runtime 测试与 1 个 root-attempt identity 钉住测试）、2 个 gated 真实 Provider canary 显式 `#[ignore]`（该 canary 于 F5 实际运行，见下行） |
+| `cargo test -p buzz-semantic-query --lib` | 通过（2026-08-18 F5 复跑） | 53 通过；`runtime_digest_is_stable_and_nonzero` 随 F1–F4 descriptor 轮换重钉到新 digest |
+| `cargo clippy -p buzz-semantic-query -p buzz-relay --all-targets -- -D warnings` | 通过（2026-08-18 F4 复跑；F5 `just clippy` 全 workspace 亦绿） | F0 起随各修复阶段复跑 |
 | `cargo fmt -p buzz-semantic-query -p buzz-relay` | 通过 | 每次提交 hooks 执行 |
-| `cargo test -p buzz-relay --lib`（全量） | 通过（代码）/ 8 环境性失败 | F4 后 978 通过；`reliability_fix_regressions` 16/16 绿（含 F4 新增 rfx06 两项，rfx 红色基线保持清零）。8 个失败（`api::media`×7、`api::admin::feedback_attachment`×1）需真实 Postgres（`ensure_configured_community`），本沙箱 5432 端口无服务，与修复无关——有服务环境下复跑 |
-| `just test-unit` | 通过（2026-08-18 F4 复跑，exit 0） | 无服务 unit 门：buzz-core/auth/db/conformance、Project View/Document/Context、buzz-acp `--lib`、buzz-relay `meeting` 过滤器（该门不含 buzz-relay 全量 `--lib`，全量见上行），28 组全绿、耗时 73s |
-| `just ci` | **未运行** | 本环境无法完成完整本地 PR gate。复跑：`just ci` |
-| `just semantic-test`（= pgvector + migration） | **未运行** | 见下两行 |
-| `just semantic-pgvector-test` | **未运行** | 本环境无 disposable Postgres。复跑：`just semantic-pgvector-test`（`scripts/test-semantic-pgvector.sh`，设置 `BUZZ_TEST_SEMANTIC_DATABASE_URL`）。单元绿色不替代本门 |
-| `just semantic-migration-test` | **未运行** | 同上。复跑：`just semantic-migration-test` |
-| `just test`（完整 integration） | **未运行** | 本环境无 Postgres/Redis。已知与本阶段无关的既有基线：`api::media`/`api::admin` 8 个 DB 用例失败。复跑：`just test` |
-| 真实 Provider canary（`cargo test -p buzz-relay --lib -- --ignored real_provider`） | **未运行** | 无受支持的真实 embedding Provider 配置。复跑：设置完整 `LLM_*` 三元组后执行 |
+| `cargo test -p buzz-relay --lib`（全量） | 通过（2026-08-18 F5，986 通过/0 失败/31 ignored） | 无服务环境曾为 978 通过/8 环境性失败（`api::media`×7、`api::admin::feedback_attachment`×1，`ensure_configured_community` 需真实 Postgres）；F5 起 compose Postgres/Redis 在位，全量转绿：986 通过、0 失败，`reliability_fix_regressions` 16/16 绿（rfx 基线保持清零） |
+| `just test-unit` | 通过（2026-08-18 F4 复跑，exit 0） | 无服务 unit 门：buzz-core/auth/db/conformance、Project View/Document/Context、buzz-acp `--lib`、buzz-relay `meeting` 过滤器（该门不含 buzz-relay 全量 `--lib`，全量见上行），28 组全绿、耗时 73s。F5 经 `just test`/`just ci` 组合复跑同为绿色 |
+| `just ci` | 部分通过（2026-08-18 F5） | `check` 链唯一失败为 `ci-source-contracts` → release-asset-inventory 对 `desktop/src-tauri/icons/**` 的既有 tree_sha256 pin（`fe7cf9d1…` vs 实际 `51403134…`）——该 pin 与 icons 均先于本分支（main 上即失败，分支对二者零改动），与本修复无关；修复建议：独立 change 重新核对并显式重钉 `release/packaged-assets.json`。其余组件逐项全绿：fmt-check、clippy（全 workspace）、web-check、desktop-check、desktop-tauri-fmt-check、desktop-tauri-clippy、test-unit、desktop-test、desktop-build、desktop-tauri-check、desktop-tauri-test、web-build |
+| `just semantic-test`（= pgvector + migration） | 通过（2026-08-18 F5） | 两门均以脚本自管 disposable Docker Postgres 运行，见下两行 |
+| `just semantic-pgvector-test` | 通过（2026-08-18 F5） | 脚本自起 disposable pgvector 容器（pgvector 0.8.5 / Postgres 17.10）：2048 维 vector/halfvec roundtrip、halfvec HNSW 索引、sqlx roundtrip、`buzz-admin semantic preflight` `ready: true` |
+| `just semantic-migration-test` | 通过（2026-08-18 F5） | disposable 容器上 semantic 迁移、desired-schema 与 ledger-less fresh-schema 门全绿（含 real-pgvector scoped search 与 fleet policy matrix 用例） |
+| `just test`（完整 integration） | 通过（2026-08-18 F5，31 组全绿，112s） | compose Postgres/Redis 在位运行；此前的 `api::media`/`api::admin` 8 个 DB 用例失败随服务在位全部转绿 |
+| 真实 Provider canary（`cargo test -p buzz-relay --lib -- --ignored real_provider`） | 通过（2026-08-18 F5，2/2） | 本机 `.env` 提供完整 `LLM_*` 三元组，端点可达；`real_provider_semantic_input_canary` 与 `real_provider_reliability_canary_is_bounded_and_content_free` 通过——仅断言 content-free 不变量（bounded attempts、closed failure taxonomy），不保存 query/vector/body |
 | 真实 fleet old→new digest 切流 | **未运行** | 本环境没有真实多 Relay fleet。切流行模板见 §5 |
 
 ## 3. R6 交付项与证据映射
@@ -350,3 +350,58 @@ F4 退出门核对：rfx06 两项绿；`reliability_fix_regressions` 16/16 绿�
 semantic_` 132 绿；`buzz-relay --lib` 全量 978 绿（8 个环境性失败见 §2）；
 `buzz-semantic-query --lib` 53 绿；三个确定性门复跑绿（§2）；clippy/fmt 绿；
 `just test-unit` exit 0。RFX-06 关闭；剩余 F5（资格与文档收口）。
+
+## 14. Correctness 修复 F5 资格收口记录（2026-08-18）
+
+修复计划 §3.6/F5（资格与文档收口，RFX-07 的机械证据闭环）已交付。本阶段在具备 Docker 与
+真实 `LLM_*` 配置的环境补齐了此前全部 "未运行" 的资格门，并按修复计划 §7 完成分层收口：
+
+- **disposable DB 门（此前未运行）**：`just semantic-pgvector-test` 通过（脚本自管 pgvector
+  0.8.5 / Postgres 17.10 容器；2048 维 vector/halfvec roundtrip、halfvec HNSW、sqlx
+  roundtrip、`buzz-admin semantic preflight` `ready: true`）；`just semantic-migration-test`
+  通过（semantic 迁移、desired-schema、ledger-less fresh-schema，含 real-pgvector scoped
+  search 与 fleet policy matrix 用例）。
+- **完整 integration 门（此前未运行）**：compose Postgres/Redis 在位后 `just test` 31 组全绿
+  （112s）；此前 8 个环境性失败（`api::media`×7、`api::admin::feedback_attachment`×1）全部
+  转绿，`cargo test -p buzz-relay --lib` 全量 986 通过/0 失败/31 ignored。
+- **真实 Provider canary（此前未运行）**：`cargo test -p buzz-relay --lib -- --ignored
+  real_provider` 2/2 通过——`real_provider_semantic_input_canary` 与
+  `real_provider_reliability_canary_is_bounded_and_content_free` 对真实端点执行，仅断言
+  content-free 不变量；不保存 query/vector/body。
+- **`just ci`（此前未运行）**：`check` 链唯一失败为 `ci-source-contracts` 内
+  release-asset-inventory 对 `desktop/src-tauri/icons/**` 的既有 tree_sha256 pin 不匹配
+  （`fe7cf9d1…` vs `51403134…`）。证据表明与本修复无关：manifest（`590ce9b8b`）与 icons
+  （`ca6f5ba5d`）最后一次改动均在 main 且先于本分叉，分支对二者零改动（`git diff
+  main...HEAD` 为空），失败在 main 上同样成立。修复建议以独立 change 显式重钉
+  `release/packaged-assets.json`，不并入本修复。其余 CI 组件逐项复跑全绿：fmt-check、
+  clippy（全 workspace）、web-check、desktop-check、desktop-tauri-fmt-check、
+  desktop-tauri-clippy、test-unit、desktop-test、desktop-build、desktop-tauri-check、
+  desktop-tauri-test、web-build。
+- **retry/recovery 故障门与最终组合 profile**：每行 closed 故障门由
+  `failure_dispositions_follow_the_closed_matrix`、
+  `retry_matrix_enables_exactly_the_compiled_route_rows` 与 rfx01–rfx06 回归逐行钉住并复跑
+  绿；最终组合 profile 由三个确定性 characterization 门 + 全量 unit/integration + 真实
+  Provider canary 共同验证，无 attempt 放大、late sign、授权/circuit 优先级倒置、snapshot
+  或公开结果差异。
+- **digest/manifest 轮换记录**：F1–F4 四轮日期化 descriptor 轮换与三处 golden 重钉完整记于
+  §5（当前 `8dc7f5e8…`）；本阶段无代码变化，不轮换。
+- **真实 fleet 切流（§7.2 项 2–3）**：无真实多 Relay fleet，old/new digest 切流、
+  gate/drain/re-attest 与 binary rollback 演练未执行，切流行模板见 §5；此项保持未运行，
+  不得由编译期切换或 canary 绿色替代声明。
+
+### 分层完成结论（修复计划 §7）
+
+- **§7.1 Correctness implementation：关闭。** 目标窗口 admission 与 partial tail 可达、
+  lifecycle 状态真实、取消/关停/deadline 全 stage 可中断、Finalizing 单一同步 signer、
+  unsigned 验证前移、permit 按值单次消费、circuit 前置 fresh auth 与单一 handoff 线性点、
+  physical 只计真实调用、fresh-plan 恒等门与无嵌套 restart、两类 release policy 与有界
+  transient retry、四 operation 差分合同（Phase 1 门复跑）全部成立；deterministic、
+  semantic DB、migration、unit、integration 与真实 Provider canary 门绿色。可声明
+  **"Phase 2 correctness implementation 已交付"**。`just ci` 的唯一红色为上述与语义运行时
+  无关的 main 既有 release-asset pin（附证据与独立修复建议），不构成本计划的 correctness
+  缺口。
+- **§7.2 Deployment qualification：未关闭。** 真实 fleet 同质 digest 切流与 rollback 演练、
+  rollback 窗口 owner/起止/保留结论均未执行/记录。状态保持 **"correctness implementation
+  已交付、deployment qualification 未完成"**，不得使用无修饰的 "Phase 2 已完整交付 /
+  具备部署资格 / production-ready" 表述。
+- 第三阶段统一资源治理（bounded queue、fairness、capacity、fleet-shared circuit）保持未交付。

@@ -1,6 +1,7 @@
 # Project Context 统一可靠性运行时正确性修复计划
 
-> 状态：修复中——F0 已交付（状态修正 + 7 个 rfx 红色基线 + 机械门清单断言，RFX-06 红色证据
+> 状态：F0–F5 全部交付，correctness implementation 关闭（分层结论见段末；deployment
+> qualification 未完成）——F0 已交付（状态修正 + 7 个 rfx 红色基线 + 机械门清单断言，RFX-06 红色证据
 > 按计划记录为 F4 test-first 条件式）；F1 已交付（target-window admission、`TimedOut` 真实
 > latch、`Finalizing` stage 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，
 > RFX-01/RFX-02 关闭；runtime digest 随日期化 descriptor 轮换
@@ -18,8 +19,13 @@
 > `confirm_release_with_bounded_retry`（上限 2 次，仅 no-permit/no-unknown-side-effect transient
 > 原地重试，Denied/SnapshotChanged/FleetUnavailable/deadline/cancel 永不重试；one-shot 保持
 > `expected_snapshot=Some`+SnapshotClose 窗口与冻结映射，complete-path 保持 `None`+Absolute 窗口与
-> 冻结映射），RFX-06 关闭；digest 轮换 `745ca584… → 8dc7f5e8…`）。RFX-01..RFX-06 全部关闭；
-> F5（资格与文档收口）未开始
+> 冻结映射），RFX-06 关闭；digest 轮换 `745ca584… → 8dc7f5e8…`）；F5 已交付（资格收口：
+> disposable pgvector/migration 门、完整 integration（31 组）、全量 `--lib` 986 绿（此前 8 个
+> 环境性失败随服务在位转绿）、真实 Provider canary 2/2 通过；`just ci` 唯一失败为与语义运行时
+> 无关的 main 既有 release-asset icons pin，其余组件逐项绿——证据与独立修复建议见资格记录 §14）。
+> **分层结论（§7）：Phase 2 correctness implementation 已交付（§7.1 关闭，RFX-01..RFX-07 全部
+> 关闭）；deployment qualification 未完成（§7.2 未关闭——真实 fleet digest 切流与 rollback
+> 演练未执行），不得声明 "Phase 2 已完整交付" 或 production-ready**
 >
 > 日期：2026-08-18
 >

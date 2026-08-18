@@ -11,9 +11,13 @@
 > fresh-authorization 复核后调用方可见、最终 fence 与预算消费合并进单一同步 handoff 点、
 > non-counting 预算 token 只计真实 handoff，RFX-04/RFX-05 关闭、rfx 红色基线清零；F4 已交付：
 > fresh-plan 有序输入恒等门 + typed operation restart、两 surface 共享 bounded release
-> confirmation（上限 2、closed outcome 永不重试），RFX-06 关闭；runtime digest 随日期化
-> descriptor 四轮轮换 `2c898e16…→36776253…→94b3912f…→745ca584…→8dc7f5e8…`；仅 F5
-> （资格收口）未开始）；第三阶段统一资源治理未启动
+> confirmation（上限 2、closed outcome 永不重试），RFX-06 关闭；F5 已交付：disposable
+> pgvector/migration、完整 integration、全量 `--lib` 986 绿与真实 Provider canary 2/2 补齐
+> （`just ci` 唯一失败为与语义运行时无关的 main 既有 release-asset icons pin，见资格记录
+> §14）——**分层结论：Phase 2 correctness implementation 已交付（RFX-01..RFX-07 关闭）；
+> deployment qualification 未完成（真实 fleet 切流未执行），不得声明 "Phase 2 已完整交付"**；
+> runtime digest 随日期化
+> descriptor 四轮轮换 `2c898e16…→36776253…→94b3912f…→745ca584…→8dc7f5e8…`）；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-18
 >
@@ -145,6 +149,21 @@
 > `745ca584…→8dc7f5e8…`（资格记录§5第六行/§13）。三个确定性门复跑绿色；`buzz-relay --lib
 > semantic_` 132绿、全量978绿（8个环境性DB失败）、`just test-unit` exit 0。剩余：F5（资格
 > 收口）。
+>
+> **2026-08-18 F5 交付（资格收口，correctness 修复关闭）**：具备 Docker 与真实 `LLM_*` 配置
+> 的环境补齐全部此前未运行的资格门——`just semantic-pgvector-test`（disposable pgvector
+> 0.8.5/PG17：2048 维 vector/halfvec roundtrip、halfvec HNSW、preflight ready）与
+> `just semantic-migration-test`（迁移/desired-schema/ledger-less fresh-schema）通过；compose
+> Postgres/Redis 在位后 `just test` 31 组全绿（112s）、`buzz-relay --lib` 全量 986 绿/0 失败
+> （此前 8 个环境性失败全部转绿）；真实 Provider canary 2/2 通过（content-free 不变量，不保存
+> query/vector/body）；`just ci` 唯一失败为 `ci-source-contracts` 内与语义运行时无关的 main
+> 既有 release-asset icons pin（manifest `590ce9b8b` 与 icons `ca6f5ba5d` 均先于本分叉、分支
+> 零改动、main 同样失败；建议独立 change 显式重钉 `release/packaged-assets.json`），其余 CI
+> 组件逐项绿。**分层结论（修复计划 §7）：Phase 2 correctness implementation 已交付（§7.1
+> 关闭，RFX-01..RFX-07 全部关闭）；deployment qualification 未完成（§7.2 未关闭：真实 fleet
+> old/new digest 切流、gate/drain/re-attest 与 binary rollback 演练未执行）——保持
+> "correctness implementation 已交付、deployment qualification 未完成"表述，不得声明
+> "Phase 2 已完整交付"或 production-ready**。第三阶段统一资源治理保持未交付。
 
 ### 背景
 
