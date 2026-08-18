@@ -1573,9 +1573,15 @@ async fn execute_semantic_graph_http_query_after_routing(
     let postflight_timer = stage_timer(SemanticGraphMetricStage::Postflight);
     // The postflight, release, and signing phases arbitrate the same context
     // the root and traversal phases used: once cancellation or a deadline won
-    // its latch, no new release or signing stage may start here.
+    // its latch, no new release or signing stage may start here. Admission
+    // targets the tail's own `Absolute` window (fix plan F1 item 1): a spent
+    // work window is the legal `wall_time_exhausted` cutoff that produced
+    // this partial, not a terminal refusal for the packing/release/sign tail.
     crate::semantic_query_runtime::propagate_relay_shutdown(state, &context);
-    if context.admit_stage().is_err() {
+    if context
+        .admit_stage(crate::semantic_query_runtime::SemanticDeadlineWindow::Absolute)
+        .is_err()
+    {
         record_query_error(
             SemanticGraphMetricStage::Postflight,
             SemanticGraphQueryMetricError::DeadlineExceeded,

@@ -22,7 +22,7 @@ use crate::semantic_one_shot::{
     SemanticOneShotExecution,
 };
 use crate::semantic_query_runtime::{
-    record_vector_reuse, ProviderRetryRoute, SemanticOperationAttemptClass,
+    record_vector_reuse, ProviderRetryRoute, SemanticDeadlineWindow, SemanticOperationAttemptClass,
     SemanticVectorReuseOutcome,
 };
 use crate::state::AppState;
@@ -284,12 +284,15 @@ async fn coordinate_short_snapshot(
     query: &ProjectContextCoordinateSearchQuery,
 ) -> ShortSnapshotOutcome {
     let mut read = match execution
-        .before_deadline(state.db.begin_semantic_graph_read(
-            execution.ticket(),
-            reader_pubkey,
-            execution.relay_pubkey(),
-            SemanticGraphReadTimeouts::default(),
-        ))
+        .before_deadline(
+            SemanticDeadlineWindow::SnapshotClose,
+            state.db.begin_semantic_graph_read(
+                execution.ticket(),
+                reader_pubkey,
+                execution.relay_pubkey(),
+                SemanticGraphReadTimeouts::default(),
+            ),
+        )
         .await
     {
         Ok(Ok(read)) => read,
@@ -314,7 +317,10 @@ async fn coordinate_short_snapshot(
             }
         }
     };
-    let batch = match execution.before_deadline(search).await {
+    let batch = match execution
+        .before_deadline(SemanticDeadlineWindow::SnapshotClose, search)
+        .await
+    {
         Ok(Ok(batch)) => batch,
         Ok(Err(db_error)) => {
             // The failed read transaction is dropped before control returns.
@@ -328,7 +334,10 @@ async fn coordinate_short_snapshot(
         Err(_) => return ShortSnapshotOutcome::Failed(CoordinateSearchExecutionError::Timeout),
     };
     let snapshot_ticket = read.ticket().clone();
-    match execution.before_deadline(read.commit()).await {
+    match execution
+        .before_deadline(SemanticDeadlineWindow::SnapshotClose, read.commit())
+        .await
+    {
         Ok(Ok(())) => ShortSnapshotOutcome::Ranked(Box::new((batch, snapshot_ticket))),
         Ok(Err(db_error)) => {
             if read_snapshot_transient(&db_error) {

@@ -605,6 +605,11 @@ pub struct AppState {
     pub audio_rooms: Arc<AudioRoomManager>,
     /// Set to `true` on SIGTERM — readiness probe returns 503.
     pub shutting_down: Arc<AtomicBool>,
+    /// Subscribable companion of `shutting_down`, flipped at the same
+    /// moment. In-flight semantic requests subscribe so controlled shutdown
+    /// interrupts their parked awaits instead of waiting for the next stage
+    /// entry poll (reliability fix plan F1 item 6).
+    pub shutdown_signal: tokio::sync::watch::Sender<bool>,
     /// Process start time — used by `/_status` endpoint.
     pub started_at: Instant,
     /// Shared, community-scoped NIP-98 replay prevention.
@@ -817,6 +822,7 @@ impl AppState {
             git_pack_cache,
             audio_rooms: Arc::new(AudioRoomManager::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_signal: tokio::sync::watch::channel(false).0,
             started_at: Instant::now(),
             nip98_replay,
             admission_rate_limiter,

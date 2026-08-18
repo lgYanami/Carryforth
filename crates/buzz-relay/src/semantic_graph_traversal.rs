@@ -63,6 +63,10 @@ pub(crate) struct SemanticGraphTraversalOutcome {
     /// release/sign fence. A cancellation that stopped traversal has already
     /// won the latch, so that fence refuses to sign the partial forest.
     pub(crate) context: SemanticExecutionContext,
+    /// F1 item 6: request guards moved from the root session; they stay
+    /// armed until the response tail consumes this outcome.
+    pub(crate) _shutdown: crate::semantic_query_runtime::SemanticShutdownSubscription,
+    pub(crate) _caller: crate::semantic_query_runtime::SemanticCallerGuard,
 }
 
 impl std::fmt::Debug for SemanticGraphTraversalOutcome {
@@ -98,6 +102,8 @@ async fn complete_semantic_graph_traversal_inner(
     let mut coverage = session.outcome.coverage.clone();
     let mut exhausted_dimensions = session.outcome.exhausted_dimensions.clone();
     let context = session.context;
+    let _shutdown = session._shutdown;
+    let _caller = session._caller;
     let shutdown = session.shutdown;
     let search = {
         let mut backend = DbTraversalBackend {
@@ -120,9 +126,23 @@ async fn complete_semantic_graph_traversal_inner(
     // Committing against the later deadline preserves a valid
     // `wall_time_exhausted` partial result instead of converting the expected
     // stop into a hard 504 merely because the traversal deadline elapsed.
-    run_db_before(session.snapshot_close_deadline, session.read.commit())
-        .await?
-        .ok_or(SemanticGraphRootQueryError::QueryDeadlineExceeded)?;
+    // F1 item 6: the commit also races the aggregated cancellation now, so a
+    // disconnected or shutting-down request drops the read transaction into
+    // its mandatory cleanup instead of committing beside a won cancellation.
+    context
+        .run_stage(
+            crate::semantic_query_runtime::SemanticDeadlineWindow::SnapshotClose,
+            session.read.commit(),
+        )
+        .await
+        .map_err(|abort| match abort {
+            crate::semantic_query_runtime::SemanticStageAbort::Deadline(_)
+            | crate::semantic_query_runtime::SemanticStageAbort::Cancelled(_)
+            | crate::semantic_query_runtime::SemanticStageAbort::LatchClosed(_) => {
+                SemanticGraphRootQueryError::QueryDeadlineExceeded
+            }
+        })?
+        .map_err(SemanticGraphRootQueryError::Database)?;
     record_snapshot_transaction(session.snapshot_started_at.elapsed());
     apply_search_coverage(&mut coverage, &search);
     exhausted_dimensions.extend(search.exhausted_dimensions.iter().copied());
@@ -150,6 +170,8 @@ async fn complete_semantic_graph_traversal_inner(
         exhausted_dimensions,
         absolute_deadline: session.absolute_deadline,
         context,
+        _shutdown,
+        _caller,
     })
 }
 

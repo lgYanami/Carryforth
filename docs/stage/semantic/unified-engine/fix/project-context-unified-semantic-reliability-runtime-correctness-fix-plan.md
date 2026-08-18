@@ -1,8 +1,11 @@
 # Project Context 统一可靠性运行时正确性修复计划
 
 > 状态：修复中——F0 已交付（状态修正 + 7 个 rfx 红色基线 + 机械门清单断言，RFX-06 红色证据
-> 按计划记录为 F4 test-first 条件式）；F1–F5 未开始。`just test-unit` 的 rfx 红色是本计划的
-> 预期基线状态
+> 按计划记录为 F4 test-first 条件式）；F1 已交付（target-window admission、`TimedOut` 真实
+> latch、`Finalizing` stage 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，
+> RFX-01/RFX-02 关闭；runtime digest 随日期化 descriptor 轮换
+> `2c898e16… → 36776253…`）；F2–F5 未开始。`just test-unit` 中 rfx03/rfx04/rfx05 的红色是
+> 本计划的预期基线状态（分别等待 F2/F3）
 >
 > 日期：2026-08-18
 >

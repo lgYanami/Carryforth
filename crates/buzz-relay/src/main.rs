@@ -1326,9 +1326,15 @@ async fn serve(
     let shutdown_flag = Arc::clone(&state.shutting_down);
     let drain_conn_manager = Arc::clone(&state.conn_manager);
     let tx = shutdown_tx.clone();
+    let semantic_shutdown = Arc::clone(&state);
     tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_flag.store(true, Ordering::Relaxed);
+        // Flip the subscribable companion in the same moment: in-flight
+        // semantic requests parked on a Provider wait, backoff, or database
+        // await observe it immediately instead of at their next stage entry
+        // (reliability fix plan F1 item 6).
+        semantic_shutdown.shutdown_signal.send_replace(true);
         info!("Shutdown signal received — readiness now returns 503");
         // 5s grace: let K8s stop routing new traffic before we close listeners.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;

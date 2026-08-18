@@ -96,6 +96,7 @@ unexpected_paths="$(
       crates/buzz-relay/src/lib.rs | \
       crates/buzz-relay/src/reliability_fix_regressions.rs | \
       crates/buzz-relay/src/state.rs | \
+      crates/buzz-relay/src/main.rs | \
       crates/buzz-relay/src/config.rs | \
       crates/buzz-relay/src/api/bridge.rs | \
       crates/buzz-relay/src/semantic_provider.rs | \

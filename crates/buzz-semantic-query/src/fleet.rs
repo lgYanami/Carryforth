@@ -204,18 +204,23 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
 );
 
 /// Explicitly bumped closed descriptor for the compiled Phase 2 reliability
-/// runtime (unified-engine plan §12.2).
+/// runtime (unified-engine plan §12.2, corrected by the F1 correctness fix).
 ///
-/// The reliability route, retry categories, physical attempt caps, backoff,
-/// circuit, and vector-reuse contracts are hashed into the same compiled
-/// runtime digest as the wire contracts above, so an attested fleet cannot
-/// mix reliability behaviors any more than it can mix result shapes. The
-/// numeric values here mirror the compiled constants in
+/// The reliability route, deadline admission, one-shot reserves, lifecycle,
+/// cancellation, retry categories, physical attempt caps, backoff, circuit,
+/// and vector-reuse contracts are hashed into the same compiled runtime
+/// digest as the wire contracts above, so an attested fleet cannot mix
+/// reliability behaviors any more than it can mix result shapes. The numeric
+/// values here mirror the compiled constants in
 /// `buzz-relay::semantic_query_runtime`; a binding test pins the two sides
 /// together, and any change to either must bump this dated descriptor.
 pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-reliability-20260817-phase2-r6-v1\n",
+    "runtime-contract=semantic-query-reliability-20260818-phase2-f1-correctness-v1\n",
     "route=server-owned-compiled-pin-per-request-no-fallback-no-dual-send-no-implementation-switch\n",
+    "deadline-admission=target-window-scoped;earlier-spent-windows-are-legal-cutoffs-not-terminal\n",
+    "one-shot-reserves=eighths-8;provider-start-4-eighths;work-2-eighths;snapshot-close-1-eighth;absolute-public-unchanged\n",
+    "lifecycle=timeout-writes-real-timed-out-state;finalizing-refuses-generic-stages;finalize-owner-admission\n",
+    "cancellation=subscribable-shutdown-signal;caller-disconnect-guard-on-request-drop\n",
     "retry-matrix=connect-not-started-pre-handoff;rate-limited-valid-retry-after-full-fit;retryable-definitive-5xx\n",
     "attempt-caps=one-shot-physical-2;complete-path-physical-3;operation-attempt-2;release-confirmation-2;transport-retry-token-1-per-attempt\n",
     "backoff=full-jitter-base-250ms;must-fully-fit-remaining-work-window\n",
@@ -478,7 +483,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "2c898e16398d8c65d10c37052f08f07178586632e8e647ad5484d0bbff8bd4ae",
+            "3677625395e79b386fcc4445a52ccbe10224b1e1669c1b8c04b0a0732bf28993",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

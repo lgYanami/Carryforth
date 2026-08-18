@@ -4,7 +4,9 @@
 
 > 状态：兼容基线、第一阶段统一语义计算已交付；第二阶段统一可靠性运行时主体（R0–R6）已落地，
 > 但 RFX-01..RFX-07 七项 correctness 偏差确认——**主体已实现、correctness 修复中**（F0 红色
-> 基线已建立，F1–F5 未开始）；第三阶段统一资源治理未启动
+> 基线已建立；F1 已交付：target-window admission、`TimedOut` 真实 latch、`Finalizing` stage
+> 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，RFX-01/RFX-02 关闭，runtime
+> digest 随日期化 descriptor 轮换；F2–F5 未开始）；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-18
 >
@@ -93,6 +95,13 @@
 > F1–F4；三个确定性characterization门保持绿色），修复设计与退出门见
 > [正确性修复计划](semantic/unified-engine/fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)，
 > 资格记录§2/§9同步改写。correctness修复关闭前不得声明Phase 2完整交付或具备部署资格。
+>
+> **2026-08-18 F1 交付**：Deadline与lifecycle修复落地——target-window admission（RFX-01关闭，
+> 合法partial tail可达）、`timeout()`真实CAS写入`TimedOut`（RFX-02关闭）、`Finalizing`
+> stage所有权（generic仅从`Active`准入）、one-shot内部窗口eighths冻结reserve（公开45s合同
+> 不变）、relay shutdown订阅与caller disconnect guard接入生产取消、runtime digest随日期化
+> descriptor轮换（`2c898e16…→36776253…`，资格记录§5第三行，三处golden显式重钉）。剩余红色：
+> rfx03（F2）、rfx04/rfx05（F3）。
 
 ### 背景
 

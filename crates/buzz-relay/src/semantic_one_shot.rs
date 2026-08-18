@@ -19,10 +19,11 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::semantic_provider::{TrackedProviderFailure, VolcengineSemanticProvider};
 use crate::semantic_query_runtime::{
-    encode_once, execute_provider_egress, observe_provider_circuit, propagate_relay_shutdown,
-    provider_retry_backoff, provider_retry_decision, ProviderCircuitObservation,
-    ProviderCircuitToken, ProviderEgressAdmission, ProviderEgressObservation, ProviderEgressPlan,
-    ProviderRetryDecision, ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
+    caller_disconnect_guard, encode_once, execute_provider_egress, observe_provider_circuit,
+    propagate_relay_shutdown, provider_retry_backoff, provider_retry_decision,
+    subscribe_relay_shutdown, ProviderCircuitObservation, ProviderCircuitToken,
+    ProviderEgressAdmission, ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision,
+    ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
     SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
     SemanticLatchOutcome, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
     SemanticStageAbort,
@@ -61,6 +62,10 @@ pub(crate) struct SemanticOneShotExecution<'a> {
     circuit_token: Option<ProviderCircuitToken>,
     context: SemanticExecutionContext,
     _process_permit: OwnedSemaphorePermit,
+    /// F1 item 6: cancel this request the moment controlled shutdown begins
+    /// or the request future is dropped with the caller gone.
+    _shutdown: crate::semantic_query_runtime::SemanticShutdownSubscription,
+    _caller: crate::semantic_query_runtime::SemanticCallerGuard,
 }
 
 /// Failure of the R4 bounded Provider encode after its retry policy ran.
@@ -93,12 +98,19 @@ impl<'a> SemanticOneShotExecution<'a> {
         if !deployment_master {
             return Err(SemanticOneShotError::Unavailable);
         }
-        let deadline = Instant::now() + Duration::from_millis(u64::from(maximum_wall_time_ms));
+        let started = Instant::now();
+        let total = Duration::from_millis(u64::from(maximum_wall_time_ms));
         let context = SemanticExecutionContext::new(
             SemanticOperationAttemptClass::OneShot,
-            SemanticDeadlineWindows::for_one_shot_hard_deadline(deadline),
+            // F1 item 3: the caller-visible absolute deadline is preserved;
+            // the internal windows reserve closed tail fractions so the
+            // short repeatable read, release, and synchronous finalize can
+            // always finish inside the public budget.
+            SemanticDeadlineWindows::for_one_shot_reserved_budget(started, total),
         );
         propagate_relay_shutdown(state, &context);
+        let _shutdown = subscribe_relay_shutdown(state, &context);
+        let _caller = caller_disconnect_guard(&context);
         let process_permit = state
             .semantic_graph_query_semaphore
             .clone()
@@ -112,7 +124,7 @@ impl<'a> SemanticOneShotExecution<'a> {
         let relay_pubkey = state.relay_keypair.public_key();
         let ticket = context
             .run_stage(
-                SemanticDeadlineWindow::Absolute,
+                SemanticDeadlineWindow::Work,
                 state
                     .db
                     .semantic_graph_query_ticket(community_id, reader_pubkey, &relay_pubkey),
@@ -155,6 +167,8 @@ impl<'a> SemanticOneShotExecution<'a> {
             circuit_token: circuit,
             context,
             _process_permit: process_permit,
+            _shutdown,
+            _caller,
         })
     }
 
@@ -218,7 +232,8 @@ impl<'a> SemanticOneShotExecution<'a> {
                 ProviderRetryDecision::Retry { backoff } => {
                     if let Err(abort) = provider_retry_backoff(&self.context, backoff).await {
                         return Err(match abort {
-                            SemanticStageAbort::Deadline(_) => {
+                            SemanticStageAbort::Deadline(_)
+                            | SemanticStageAbort::LatchClosed(_) => {
                                 SemanticOneShotEncodeFailure::DeadlineExceeded
                             }
                             SemanticStageAbort::Cancelled(source) => {
@@ -245,7 +260,7 @@ impl<'a> SemanticOneShotExecution<'a> {
         let fresh = self
             .context
             .run_stage(
-                SemanticDeadlineWindow::Absolute,
+                SemanticDeadlineWindow::Work,
                 self.state.db.semantic_graph_query_ticket(
                     self.ticket.community_id,
                     &self.reader_pubkey,
@@ -283,13 +298,22 @@ impl<'a> SemanticOneShotExecution<'a> {
         &self.ticket
     }
 
-    /// Run one operation inside the request's absolute work deadline.
-    pub(crate) async fn before_deadline<T, F>(&self, future: F) -> Result<T, SemanticOneShotError>
+    /// Run one operation inside one of the request's closed windows.
+    ///
+    /// F1 item 2: the short repeatable read and the release confirmation
+    /// target `SnapshotClose` — after the work window yields, the closed
+    /// reserve still finishes them — while the synchronous finalization tail
+    /// targets the public `Absolute` deadline.
+    pub(crate) async fn before_deadline<T, F>(
+        &self,
+        window: SemanticDeadlineWindow,
+        future: F,
+    ) -> Result<T, SemanticOneShotError>
     where
         F: Future<Output = T>,
     {
         self.context
-            .run_stage(SemanticDeadlineWindow::Absolute, future)
+            .run_stage(window, future)
             .await
             .map_err(|_| SemanticOneShotError::Timeout)
     }
@@ -329,15 +353,18 @@ impl<'a> SemanticOneShotExecution<'a> {
                 });
             }
             let release = match self
-                .before_deadline(self.state.db.confirm_semantic_graph_query_release(
-                    SemanticGraphQueryReleaseRequest {
-                        community_id: self.ticket.community_id,
-                        reader_pubkey: &self.reader_pubkey,
-                        expected_projection_pubkey: &self.relay_pubkey,
-                        expected_snapshot: Some(snapshot),
-                        routing_trust: self.routing_trust,
-                    },
-                ))
+                .before_deadline(
+                    SemanticDeadlineWindow::SnapshotClose,
+                    self.state.db.confirm_semantic_graph_query_release(
+                        SemanticGraphQueryReleaseRequest {
+                            community_id: self.ticket.community_id,
+                            reader_pubkey: &self.reader_pubkey,
+                            expected_projection_pubkey: &self.relay_pubkey,
+                            expected_snapshot: Some(snapshot),
+                            routing_trust: self.routing_trust,
+                        },
+                    ),
+                )
                 .await
             {
                 Ok(release) => release,
@@ -393,11 +420,15 @@ impl<'a> SemanticOneShotExecution<'a> {
         &self,
         permit: SemanticGraphQueryReleasePermit,
     ) -> Result<(), SemanticOneShotError> {
-        if self
-            .context
-            .windows()
-            .expired_window(Instant::now())
-            .is_some()
+        // F1 item 2: only the public `Absolute` deadline refuses the
+        // synchronous finalize. The internal work and snapshot-close windows
+        // are legal spent cutoffs by the time the finalizer runs, so an
+        // earliest-expired check here would reject every reserved one-shot.
+        if Instant::now()
+            >= self
+                .context
+                .windows()
+                .window(SemanticDeadlineWindow::Absolute)
         {
             let _ = self.context.deadline_expired();
         }
@@ -437,7 +468,13 @@ impl<'a> SemanticOneShotExecution<'a> {
             .ledger()
             .begin_operation_attempt()
             .map_err(|_| SemanticOneShotError::Busy)?;
-        if self.context.admit_stage().is_err() {
+        // The restarted short read belongs to the snapshot-close reserve,
+        // not the already-yielded work window (fix plan F1 item 2).
+        if self
+            .context
+            .admit_stage(SemanticDeadlineWindow::SnapshotClose)
+            .is_err()
+        {
             return Err(SemanticOneShotError::Timeout);
         }
         Ok(())

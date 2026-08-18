@@ -114,6 +114,11 @@ async fn begin_semantic_graph_root_query_inner(
         )
         .map_err(|_| invalid_state("query deadline windows cannot be frozen"))?,
     );
+    // F1 item 6: the subscribable shutdown watcher and the caller-disconnect
+    // guard ride the context from creation until the response tail, so every
+    // parked await in between observes either signal the moment it fires.
+    let _shutdown = crate::semantic_query_runtime::subscribe_relay_shutdown(state, &context);
+    let _caller = crate::semantic_query_runtime::caller_disconnect_guard(&context);
     let process_permit = state
         .semantic_graph_query_semaphore
         .clone()
@@ -154,13 +159,14 @@ async fn begin_semantic_graph_root_query_inner(
                     outcome: stage.outcome,
                     query_vectors: stage.query_vectors,
                     channels: stage.channels,
-                    snapshot_close_deadline: deadlines.snapshot_close,
                     absolute_deadline: deadlines.absolute,
                     snapshot_started_at: stage.snapshot_started_at,
                     context,
                     shutdown: Arc::clone(&state.shutting_down),
                     _process_permit: process_permit,
                     _traversal_permit: stage.traversal_permit,
+                    _shutdown,
+                    _caller,
                 });
             }
             Err(error @ SemanticGraphRootQueryError::SemanticGenerationChanged)
@@ -209,9 +215,11 @@ async fn root_query_attempt(
         .begin_operation_attempt()
         .map_err(|_| SemanticGraphRootQueryError::QueryProviderBusy)?;
     propagate_relay_shutdown(state, context);
-    if let Err(abort) = context.admit_stage() {
+    if let Err(abort) = context.admit_stage(SemanticDeadlineWindow::Work) {
         return Err(match abort {
-            SemanticStageAbort::Deadline(_) | SemanticStageAbort::Cancelled(_) => {
+            SemanticStageAbort::Deadline(_)
+            | SemanticStageAbort::Cancelled(_)
+            | SemanticStageAbort::LatchClosed(_) => {
                 SemanticGraphRootQueryError::QueryDeadlineExceeded
             }
         });
@@ -616,8 +624,9 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) outcome: SemanticGraphRootQueryOutcome,
     pub(crate) query_vectors: SemanticGraphQueryVectorBundle,
     pub(crate) channels: Vec<QueryChannelBinding>,
-    /// Later deadline reserved exclusively for closing the read-only snapshot.
-    pub(crate) snapshot_close_deadline: Instant,
+    /// Later deadline reserved exclusively for closing the read-only
+    /// snapshot; carried inside the context's `SnapshotClose` window and
+    /// arbitrated by its admission (fix plan F1 item 6).
     pub(crate) absolute_deadline: Instant,
     pub(crate) snapshot_started_at: std::time::Instant,
     /// Reliability context of the logical request, carried into traversal
@@ -628,6 +637,12 @@ pub(crate) struct SemanticGraphRootQuerySession {
     pub(crate) shutdown: Arc<std::sync::atomic::AtomicBool>,
     _process_permit: OwnedSemaphorePermit,
     _traversal_permit: SemanticGraphTraversalPermit,
+    /// F1 item 6: subscribable shutdown watcher and caller-disconnect guard,
+    /// riding the request from creation until the release/sign tail. The
+    /// traversal moves them into its outcome so they stay armed through the
+    /// response tail instead of firing when the root session is consumed.
+    pub(crate) _shutdown: crate::semantic_query_runtime::SemanticShutdownSubscription,
+    pub(crate) _caller: crate::semantic_query_runtime::SemanticCallerGuard,
 }
 
 struct SemanticGraphTraversalPermit {
@@ -2218,7 +2233,9 @@ where
         .run_stage(SemanticDeadlineWindow::Work, future)
         .await
         .map_err(|abort| match abort {
-            SemanticStageAbort::Deadline(_) | SemanticStageAbort::Cancelled(_) => {
+            SemanticStageAbort::Deadline(_)
+            | SemanticStageAbort::Cancelled(_)
+            | SemanticStageAbort::LatchClosed(_) => {
                 SemanticGraphRootQueryError::QueryDeadlineExceeded
             }
         })

@@ -2,9 +2,11 @@
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性
 > 运行时主体（R0–R6）已落地，但代码审计确认 RFX-01..RFX-07 七项与冻结合同的偏差——**主体已
-> 实现、correctness 修复中**（F0 红色基线已建立，F1–F5 未开始；见
+> 实现、correctness 修复中**（F0 红色基线已建立；F1 已交付：RFX-01/RFX-02 关闭，剩余红色
+> rfx03→F2、rfx04/rfx05→F3；见
 > [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)
-> 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)）
+> 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)
+> §10 F1 交付记录）
 >
 > 日期：2026-08-18
 
@@ -100,6 +102,13 @@ F1–F4逐项修复；三个确定性characterization门不受影响），修复
 见[正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)；
 资格记录（§2门清单、§9红色基线）同步改写。correctness修复关闭前，不得声明Phase 2按实现计划
 完整交付或具备部署资格。
+
+**2026-08-18 F1 交付**：Deadline与lifecycle修复完成（修复计划§3.2）——target-window
+admission（RFX-01关闭，complete-path合法partial tail可达）、`timeout()`真实CAS写入
+`TimedOut`（RFX-02关闭）、`Finalizing`仅接受finalize stage的ownership规则、one-shot内部
+eighths冻结reserve（公开45s合同不变）、relay shutdown订阅与caller disconnect guard进入
+生产取消路径、runtime digest随日期化descriptor轮换（`2c898e16…→36776253…`，三处golden
+显式重钉，资格记录§5/§10）。三个确定性门复跑绿色；剩余红色rfx03（F2）、rfx04/rfx05（F3）。
 相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。

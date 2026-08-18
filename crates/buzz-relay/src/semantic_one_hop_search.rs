@@ -25,7 +25,7 @@ use crate::semantic_one_shot::{
     SemanticOneShotExecution,
 };
 use crate::semantic_query_runtime::{
-    record_vector_reuse, ProviderRetryRoute, SemanticOperationAttemptClass,
+    record_vector_reuse, ProviderRetryRoute, SemanticDeadlineWindow, SemanticOperationAttemptClass,
     SemanticVectorReuseOutcome,
 };
 use crate::state::AppState;
@@ -305,12 +305,15 @@ async fn one_hop_short_snapshot(
     query: &ProjectContextOneHopSemanticQuery,
 ) -> OneHopSnapshotOutcome {
     let mut read = match execution
-        .before_deadline(state.db.begin_semantic_graph_read(
-            execution.ticket(),
-            reader_pubkey,
-            execution.relay_pubkey(),
-            SemanticGraphReadTimeouts::default(),
-        ))
+        .before_deadline(
+            SemanticDeadlineWindow::SnapshotClose,
+            state.db.begin_semantic_graph_read(
+                execution.ticket(),
+                reader_pubkey,
+                execution.relay_pubkey(),
+                SemanticGraphReadTimeouts::default(),
+            ),
+        )
         .await
     {
         Ok(Ok(read)) => read,
@@ -332,11 +335,10 @@ async fn one_hop_short_snapshot(
     let batch = match &query.scope {
         OneHopSemanticScope::IncidentEdges { coordinate } => {
             match execution
-                .before_deadline(read.search_incident_edges_one_hop(
-                    coordinate,
-                    query_vector,
-                    query.limit,
-                ))
+                .before_deadline(
+                    SemanticDeadlineWindow::SnapshotClose,
+                    read.search_incident_edges_one_hop(coordinate, query_vector, query.limit),
+                )
                 .await
             {
                 Ok(Ok(outcome)) => match outcome {
@@ -372,7 +374,7 @@ async fn one_hop_short_snapshot(
             coordinate_types,
         } => {
             match execution
-                .before_deadline(async {
+                .before_deadline(SemanticDeadlineWindow::SnapshotClose, async {
                     match coordinate_types.as_ref() {
                         Some(coordinate_types) => {
                             read.search_edge_coordinates_one_hop_filtered(
@@ -430,7 +432,10 @@ async fn one_hop_short_snapshot(
         }
     };
     let snapshot_ticket = read.ticket().clone();
-    match execution.before_deadline(read.commit()).await {
+    match execution
+        .before_deadline(SemanticDeadlineWindow::SnapshotClose, read.commit())
+        .await
+    {
         Ok(Ok(())) => OneHopSnapshotOutcome::Ranked(Box::new((batch, snapshot_ticket))),
         Ok(Err(db_error)) => {
             if read_snapshot_transient(&db_error) {
