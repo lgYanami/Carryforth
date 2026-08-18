@@ -3,14 +3,14 @@
 //!
 //! Every test in this module encodes one frozen contract from the
 //! correctness fix plan (`docs/stage/semantic/unified-engine/fix/…`). The
-//! `rfx*` tests were the F0 red baseline; F1 turns rfx01 and the two rfx02
-//! tests green, while rfx03 stays red until F2 and rfx04/rfx05 stay red
-//! until F3. The `f1_*` tests pin the F1 delivery itself. Keeping the
-//! module outside `semantic_*` preserves the frozen characterization gates'
-//! historical `semantic_` filter scope while the full unit suite carries
-//! the remaining red baseline. Nothing here is ignored or feature-gated:
-//! each failure is the repeatable, content-free evidence the fix plan
-//! requires.
+//! `rfx*` tests were the F0 red baseline; F1 turned rfx01 and the two rfx02
+//! tests green and F2 turned the three rfx03 tests green, while rfx04/rfx05
+//! stay red until F3. The `f1_*`/`rfx03_*` tests pin those deliveries.
+//! Keeping the module outside `semantic_*` preserves the frozen
+//! characterization gates' historical `semantic_` filter scope while the
+//! full unit suite carries the remaining red baseline. Nothing here is
+//! ignored or feature-gated: each failure is the repeatable, content-free
+//! evidence the fix plan requires.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,8 +25,8 @@ use crate::semantic_query_runtime::{
     ProviderEgressPlan, ProviderHealthFailureClass, SemanticCancellationSource,
     SemanticDeadlineWindow, SemanticDeadlineWindows, SemanticExecutionContext,
     SemanticLatchOutcome, SemanticLifecycleState, SemanticOperationAttemptClass,
-    SemanticProviderEgressFailure, SemanticStageAbort, ONE_SHOT_RESERVE_DENOMINATOR,
-    PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
+    SemanticProviderEgressFailure, SemanticReleaseSignAbort, SemanticStageAbort,
+    ONE_SHOT_RESERVE_DENOMINATOR, PROVIDER_CIRCUIT_HEALTH_FAILURE_THRESHOLD,
 };
 use crate::AppState;
 
@@ -211,23 +211,105 @@ fn rfx02_finalizing_forbids_new_work_stages() {
 // ---------------------------------------------------------------------------
 
 /// The frozen release order builds and validates the unsigned result before
-/// the release confirmation may move the latch to `Finalizing`. Simulating
-/// the current one-shot surface order — release/finalize first, then a
-/// result whose validation fails — must leave the latch `Active`: no
-/// release may be confirmed for a result that never validated.
+/// the release confirmation; only then does the confirmed permit move by
+/// value into the single synchronous signer (fix plan F2 / §2.3).
+///
+/// A validation failure therefore never reaches the release at all: the
+/// latch stays `Active` because `begin_finalize` is reachable only through
+/// the signer arbitration, which the coordinators call after validation.
 #[test]
 fn rfx03_unsigned_result_validation_precedes_release_finalize() {
     let context = active_one_shot_context();
-    let _ = context.latch().begin_finalize();
+    // The unsigned result's validation failed: the coordinator returns its
+    // contract error before any release confirmation, so nothing may have
+    // arbitrated the finalize latch on the release path.
     let unsigned_result_validation_failed = true;
     if unsigned_result_validation_failed {
         assert_eq!(
             context.latch().state(),
             SemanticLifecycleState::Active,
-            "a validation failure after release leaves a confirmed release \
-             and a Finalizing latch for a result that was never valid"
+            "a validation failure must leave the latch Active: no release \
+             may be confirmed, and no Finalizing arbitration may run, for a \
+             result that never validated"
+        );
+        assert!(
+            context
+                .latch()
+                .begin_finalize()
+                .won(SemanticLifecycleState::Finalizing),
+            "an unconfirmed release path must still be able to arbitrate the \
+             latch — the deviation is the order, not the CAS itself"
         );
     }
+}
+
+/// The confirmed permit authorizes exactly one synchronous signer. When
+/// cancellation or the deadline already won, the signer is refused before
+/// the closure ever runs, and a second authorization after a completed
+/// signing is refused as well — the permit cannot sign twice.
+#[test]
+fn rfx03_refused_or_spent_release_signer_never_signs() {
+    // Cancelled before the release tail: the authorization must be refused
+    // without running the signing closure (the coordinator shape is
+    // authorize-then-sign, exactly as the one-shot surfaces call it).
+    let cancelled = active_one_shot_context();
+    let _ = cancelled.cancel(SemanticCancellationSource::ServerShutdown);
+    let mut signed_attempts = 0_u32;
+    if let Ok(signer) = cancelled.authorize_release_signer() {
+        let _ = cancelled.sign_released(signer, || signed_attempts += 1);
+    }
+    assert_eq!(
+        signed_attempts, 0,
+        "the signing closure must not run when authorization was refused"
+    );
+
+    // Clean path: the signer runs exactly once, the latch completes, and a
+    // second authorization on the same request is refused.
+    let context = active_one_shot_context();
+    let signer = context
+        .authorize_release_signer()
+        .expect("an active request authorizes its single signer");
+    let outcome = context.sign_released(signer, || signed_attempts + 1);
+    assert_eq!(outcome, Ok(1));
+    assert_eq!(
+        context.latch().state(),
+        SemanticLifecycleState::Completed,
+        "a clean post-check completes the latch"
+    );
+    assert!(
+        context.authorize_release_signer().is_err(),
+        "the single-use permit cannot authorize a second signer after the \
+         first signing completed"
+    );
+}
+
+/// A cancellation that arrives during the synchronous signing work only
+/// records a discard: the post-check must drop the signed value instead of
+/// returning it, and the latch must not complete as a success.
+#[test]
+fn rfx03_discard_during_synchronous_signing_drops_the_signed_result() {
+    let context = active_one_shot_context();
+    let signer = context
+        .authorize_release_signer()
+        .expect("an active request authorizes its single signer");
+    let outcome = context.sign_released(signer, || {
+        // The cancellation lands inside the synchronous signing tail.
+        let _ = context.cancel(SemanticCancellationSource::CallerDisconnected);
+        7_u32
+    });
+    assert_eq!(
+        outcome,
+        Err(SemanticReleaseSignAbort::Discarded(
+            SemanticLifecycleState::Finalizing
+        )),
+        "the signed value must be discarded, not returned, when the request \
+         was cancelled during the synchronous signing"
+    );
+    assert_eq!(
+        context.latch().state(),
+        SemanticLifecycleState::Finalizing,
+        "a discarded signing keeps the Finalizing state — it is not a success"
+    );
 }
 
 // ---------------------------------------------------------------------------

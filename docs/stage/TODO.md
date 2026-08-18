@@ -5,8 +5,10 @@
 > 状态：兼容基线、第一阶段统一语义计算已交付；第二阶段统一可靠性运行时主体（R0–R6）已落地，
 > 但 RFX-01..RFX-07 七项 correctness 偏差确认——**主体已实现、correctness 修复中**（F0 红色
 > 基线已建立；F1 已交付：target-window admission、`TimedOut` 真实 latch、`Finalizing` stage
-> 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，RFX-01/RFX-02 关闭，runtime
-> digest 随日期化 descriptor 轮换；F2–F5 未开始）；第三阶段统一资源治理未启动
+> 所有权、one-shot eighths reserve、shutdown 订阅与 caller guard，RFX-01/RFX-02 关闭；F2 已
+> 交付：unsigned result 验证前移、permit 按值消费进单一同步 signer guard、complete-path 迁入
+> 同一形状，RFX-03 关闭；runtime digest 随日期化 descriptor 两轮轮换
+> `2c898e16…→36776253…→94b3912f…`；F3–F5 未开始）；第三阶段统一资源治理未启动
 >
 > 更新日期：2026-08-18
 >
@@ -102,6 +104,13 @@
 > 不变）、relay shutdown订阅与caller disconnect guard接入生产取消、runtime digest随日期化
 > descriptor轮换（`2c898e16…→36776253…`，资格记录§5第三行，三处golden显式重钉）。剩余红色：
 > rfx03（F2）、rfx04/rfx05（F3）。
+>
+> **2026-08-18 F2 交付**：Release-finalize线性化落地（修复计划§3.3/§2.3）——one-shot两surface的
+> request binding、结果构造、canonical验证与unsigned Event builder全部前移到release确认之前
+> （RFX-03关闭：contract/size失败不再消耗permit或锁上`Finalizing`）；`begin_release_signer`/
+> `sign_released`单一同步signer guard按值消费permit（拒绝路径不进签名闭包，签名中取消由
+> post-check丢弃已签名结果）；complete-path bridge尾段迁入同一helper形状；两类release policy
+> 保持；digest轮换`36776253…→94b3912f…`（资格记录§5第四行/§11）。剩余红色：rfx04/rfx05（F3）。
 
 ### 背景
 

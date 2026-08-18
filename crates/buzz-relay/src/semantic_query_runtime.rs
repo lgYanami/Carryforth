@@ -27,6 +27,16 @@
 //! during it only records a discard that the finalizer's post-check must
 //! honor by never sending the signed result.
 //!
+//! Correctness fix F2 linearizes that tail (fix plan §2.3): the unsigned
+//! result, request binding, response cap, and canonical validation all
+//! finish before the release is confirmed, and the confirmed permit moves
+//! by value into the single synchronous signer through
+//! `begin_release_signer` / `sign_released`. The permit is consumed whether
+//! the signer succeeds or fails; a cancel or deadline that wins before the
+//! signer runs consumes the permit without ever calling it; and one that
+//! arrives during the synchronous work only makes the post-check discard
+//! the signed result.
+//!
 //! Phase 2 R4 adds the closed retry policy core: the per-item Provider retry
 //! route, the disposition-and-budget decision, and the deadline-raced
 //! backoff. The policy is owned here in one place; the closed coordinators
@@ -68,7 +78,7 @@ use std::time::{Duration, Instant};
 use buzz_db::semantic_query::{
     SemanticContextEgressExpectation, SemanticGraphQueryEgressConfirmation,
     SemanticGraphQueryEgressConfirmationRequest, SemanticGraphQueryEgressRequest,
-    SemanticGraphQueryEgressReservation, SemanticGraphQueryTicket,
+    SemanticGraphQueryEgressReservation, SemanticGraphQueryReleasePermit, SemanticGraphQueryTicket,
 };
 use buzz_semantic::SemanticError;
 use buzz_semantic_query::SemanticGraphQueryRoutingTrust;
@@ -1443,6 +1453,112 @@ impl SemanticExecutionContext {
             },
         }
     }
+
+    /// Consume the confirmed release permit into the single synchronous
+    /// signer (fix plan §2.3 / F2 item 2).
+    ///
+    /// The unsigned result, request binding, response cap, and canonical
+    /// validation have already finished before the release was confirmed.
+    /// This is the only constructor of [`SemanticReleaseSigner`]: the permit
+    /// moves in by value and is consumed here — whether arbitration succeeds
+    /// or refuses — so it can never be re-issued, duplicated, or handed to a
+    /// second signer.
+    pub(crate) fn begin_release_signer(
+        &self,
+        permit: SemanticGraphQueryReleasePermit,
+    ) -> Result<SemanticReleaseSigner, SemanticReleaseSignAbort> {
+        let signer = self.authorize_release_signer()?;
+        // The linear permit is consumed by the move into this call: whether
+        // authorization succeeds or refuses, it is never re-exposed, and the
+        // returned signer is the only capability that may reach the signing
+        // closure.
+        let _ = permit;
+        Ok(signer)
+    }
+
+    /// Latch arbitration for the one synchronous release signer.
+    ///
+    /// Cancellation is checked first, then the public `Absolute` deadline —
+    /// the internal work and snapshot-close reserves are legal spent cutoffs
+    /// by the time the finalizer runs (F1 item 2) — and finally the one-time
+    /// `Finalizing` CAS. A refusal consumed the caller's permit without ever
+    /// reaching the signer.
+    pub(crate) fn authorize_release_signer(
+        &self,
+    ) -> Result<SemanticReleaseSigner, SemanticReleaseSignAbort> {
+        if let Some(source) = self.cancellation.cancelled() {
+            let _ = self.cancel(source);
+            return Err(SemanticReleaseSignAbort::Refused(self.latch.state()));
+        }
+        if Instant::now() >= self.windows.window(SemanticDeadlineWindow::Absolute) {
+            let _ = self.deadline_expired();
+            return Err(SemanticReleaseSignAbort::Refused(self.latch.state()));
+        }
+        if !self
+            .latch()
+            .begin_finalize()
+            .won(SemanticLifecycleState::Finalizing)
+        {
+            return Err(SemanticReleaseSignAbort::Refused(self.latch.state()));
+        }
+        Ok(SemanticReleaseSigner { _authorized: () })
+    }
+
+    /// Sign through the single synchronous signer and run the §4.1
+    /// post-check (fix plan §2.3 / F2 item 2).
+    ///
+    /// The closure runs with no intervening await after the permit was
+    /// consumed; its signed-or-failed value consumes the signer either way.
+    /// A cancellation or deadline that arrived during that synchronous work
+    /// discards the signed result instead of sending it; only a clean
+    /// post-check completes the latch.
+    pub(crate) fn sign_released<T>(
+        &self,
+        signer: SemanticReleaseSigner,
+        sign: impl FnOnce() -> T,
+    ) -> Result<T, SemanticReleaseSignAbort> {
+        let signed = sign();
+        // The signer capability was consumed with the signed-or-failed value.
+        let _ = signer;
+        if Instant::now() >= self.windows.window(SemanticDeadlineWindow::Absolute) {
+            // A deadline that elapsed during the synchronous tail keeps the
+            // `Finalizing` state and records the discard of the signed value.
+            let _ = self.deadline_expired();
+        }
+        if self.latch.discard_requested() {
+            return Err(SemanticReleaseSignAbort::Discarded(self.latch.state()));
+        }
+        self.latch.complete();
+        Ok(signed)
+    }
+}
+
+/// The single linear capability authorizing one synchronous release signing
+/// (fix plan §2.3 / F2 item 2).
+///
+/// Constructed only by [`SemanticExecutionContext::begin_release_signer`],
+/// which consumes the database-issued release permit by value while winning
+/// the latch's `Finalizing` arbitration, and consumed by value by
+/// [`SemanticExecutionContext::sign_released`]. Deliberately not `Clone`
+/// and content-free.
+#[must_use = "a release signer authorizes exactly one synchronous signing"]
+pub(crate) struct SemanticReleaseSigner {
+    /// Content-free authorization marker; the real permit was already
+    /// consumed at authorization time.
+    _authorized: (),
+}
+
+/// Why the synchronous release-signing tail produced no signed result
+/// (fix plan §2.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SemanticReleaseSignAbort {
+    /// The signer was never authorized: cancellation, the public `Absolute`
+    /// deadline, or a latch that does not own a fresh release won first, and
+    /// the permit was consumed without signing.
+    Refused(SemanticLifecycleState),
+    /// The §4.1 post-check discarded the signed result: a cancellation or
+    /// deadline arrived during the synchronous signing work.
+    Discarded(SemanticLifecycleState),
 }
 
 /// Which side of the lifecycle latch owns one admitted stage.
@@ -3713,6 +3829,12 @@ mod tests {
             format!(
                 "one-shot-reserves=eighths-{};provider-start-4-eighths;work-2-eighths;snapshot-close-1-eighth;absolute-public-unchanged",
                 ONE_SHOT_RESERVE_DENOMINATOR,
+            ),
+            // F2 (fix plan §2.3): the release tail validates the unsigned
+            // result before the confirmation and moves the permit by value
+            // into the single synchronous signer.
+            String::from(
+                "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;",
             ),
             format!(
                 "circuit-caps=health-threshold-{};open-cooldown-{}s;probe-budget-{}s;throttle-default-{}ms;throttle-max-{}s",

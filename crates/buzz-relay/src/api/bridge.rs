@@ -23,8 +23,7 @@ use buzz_db::project_document::{
     ProjectDocumentActiveHeadsPageRequest, ProjectDocumentHistoryPageRequest,
 };
 use buzz_db::semantic_query::{
-    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleasePermit,
-    SemanticGraphQueryReleaseRequest,
+    SemanticGraphQueryReleaseConfirmation, SemanticGraphQueryReleaseRequest,
 };
 use buzz_sdk::project_view_v3::{
     PROJECT_VIEW_V3_CURRENT_ENTITIES_SCOPE, PROJECT_VIEW_V3_ENTITY_TAG,
@@ -47,9 +46,8 @@ use crate::semantic_graph_observability::{
 use crate::semantic_graph_query::SemanticGraphRootQueryError;
 use crate::semantic_graph_response::{
     pack_semantic_graph_response, sign_packed_semantic_graph_response,
-    validate_completed_semantic_graph_forest, PackedSemanticGraphResponse,
-    SemanticGraphResponsePackingError, SemanticGraphResponsePackingInput,
-    SignedSemanticGraphResponse,
+    validate_completed_semantic_graph_forest, SemanticGraphResponsePackingError,
+    SemanticGraphResponsePackingInput,
 };
 use crate::state::AppState;
 
@@ -1630,21 +1628,7 @@ async fn execute_semantic_graph_http_query_after_routing(
             )
         })?;
     let release_permit = match release {
-        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => {
-            match context.latch().begin_finalize() {
-                crate::semantic_query_runtime::SemanticLatchOutcome::Won(_) => permit,
-                // Cancellation or a deadline won while the confirmation was in
-                // flight: the issued permit is consumed here, nothing is signed.
-                crate::semantic_query_runtime::SemanticLatchOutcome::LostTerminal(_)
-                | crate::semantic_query_runtime::SemanticLatchOutcome::LostToFinalizing(_) => {
-                    record_query_error(
-                        SemanticGraphMetricStage::Postflight,
-                        SemanticGraphQueryMetricError::DeadlineExceeded,
-                    );
-                    return Err(semantic_query_deadline_error());
-                }
-            }
-        }
+        SemanticGraphQueryReleaseConfirmation::Permitted(permit) => permit,
         SemanticGraphQueryReleaseConfirmation::Denied => {
             record_query_error(
                 SemanticGraphMetricStage::Postflight,
@@ -1676,24 +1660,31 @@ async fn execute_semantic_graph_http_query_after_routing(
     require_semantic_absolute_deadline(absolute_deadline)?;
 
     // This is the first and only point at which a verifiable result Event is
-    // created. The single-use Stage D permit is consumed synchronously with no
-    // intervening await, and the Event remains response-local.
-    let signed =
-        sign_released_semantic_graph_response(release_permit, packed, &state.relay_keypair)
-            .map_err(map_semantic_response_packing_error)?;
-    require_semantic_absolute_deadline(absolute_deadline)?;
-    // §4.1 post-check: a cancel or deadline that arrived during the
-    // synchronous signing requested a discard — the response-local signed
-    // Event is dropped instead of sent, and the latch completes either way.
-    if context.latch().discard_requested() {
-        drop(signed);
+    // created. The confirmed permit moves by value into the single
+    // synchronous signer (fix plan F2 item 3, the same helper shape the
+    // one-shot operations use): the closure runs with no intervening await,
+    // consumes the permit whether it signs or fails, and the §4.1 post-check
+    // discards the response-local signed Event instead of sending it when
+    // cancellation or the deadline arrived during that work.
+    let signer = context.begin_release_signer(release_permit).map_err(|_| {
         record_query_error(
-            SemanticGraphMetricStage::Signing,
+            SemanticGraphMetricStage::Postflight,
             SemanticGraphQueryMetricError::DeadlineExceeded,
         );
-        return Err(semantic_query_deadline_error());
-    }
-    context.latch().complete();
+        semantic_query_deadline_error()
+    })?;
+    let signed = context
+        .sign_released(signer, || {
+            sign_packed_semantic_graph_response(packed, &state.relay_keypair)
+        })
+        .map_err(|_| {
+            record_query_error(
+                SemanticGraphMetricStage::Signing,
+                SemanticGraphQueryMetricError::DeadlineExceeded,
+            );
+            semantic_query_deadline_error()
+        })?
+        .map_err(map_semantic_response_packing_error)?;
     let response = serde_json::from_slice(&signed.event_array_bytes).map_err(|_| {
         record_query_error(
             SemanticGraphMetricStage::Signing,
@@ -1703,14 +1694,6 @@ async fn execute_semantic_graph_http_query_after_routing(
     })?;
     result_metrics.record_success(signed.event_array_bytes.len());
     Ok(Json(response))
-}
-
-fn sign_released_semantic_graph_response(
-    _release_permit: SemanticGraphQueryReleasePermit,
-    packed: PackedSemanticGraphResponse,
-    relay_keys: &nostr::Keys,
-) -> Result<SignedSemanticGraphResponse, SemanticGraphResponsePackingError> {
-    sign_packed_semantic_graph_response(packed, relay_keys)
 }
 
 fn semantic_graph_query_observations(

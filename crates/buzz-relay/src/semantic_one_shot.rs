@@ -25,8 +25,7 @@ use crate::semantic_query_runtime::{
     ProviderEgressAdmission, ProviderEgressObservation, ProviderEgressPlan, ProviderRetryDecision,
     ProviderRetryRoute, SemanticCancellationSource, SemanticDeadlineWindow,
     SemanticDeadlineWindows, SemanticEncodeOnceFailure, SemanticExecutionContext,
-    SemanticLatchOutcome, SemanticOperationAttemptClass, SemanticProviderEgressFailure,
-    SemanticStageAbort,
+    SemanticOperationAttemptClass, SemanticProviderEgressFailure, SemanticStageAbort,
 };
 use crate::state::AppState;
 
@@ -322,11 +321,11 @@ impl<'a> SemanticOneShotExecution<'a> {
     /// snapshot closes and before a signed result can be released.
     ///
     /// When the release is permitted, the single-use permit is handed to the
-    /// caller and the latch moves to `Finalizing`: the immediately following
-    /// synchronous signing is authorized, and [`Self::finalize_completed`]
-    /// must run before the signed result may be sent. If cancellation or a
-    /// deadline won while the confirmation was in flight, the permit is
-    /// discarded here instead.
+    /// caller — the unsigned result was already constructed and validated
+    /// before this call (fix plan F2 item 1), so a contract failure can
+    /// never consume a permit or latch `Finalizing`. The caller immediately
+    /// moves the permit by value into [`Self::sign_released`], which
+    /// arbitrates the `Finalizing` latch and the synchronous signing.
     ///
     /// R4 item 7: one classified release-confirmation transient may be
     /// retried in place (plan §4.5) — only the confirmation itself is redone,
@@ -383,17 +382,10 @@ impl<'a> SemanticOneShotExecution<'a> {
                 }
             };
             return match release {
-                SemanticGraphQueryReleaseConfirmation::Permitted(permit) => {
-                    match self.context.latch().begin_finalize() {
-                        SemanticLatchOutcome::Won(_) => Ok(permit),
-                        // Cancellation or a deadline already won the latch: the
-                        // won permit is consumed here and nothing is signed.
-                        SemanticLatchOutcome::LostTerminal(_)
-                        | SemanticLatchOutcome::LostToFinalizing(_) => {
-                            Err(SemanticOneShotError::Timeout)
-                        }
-                    }
-                }
+                // The permit is linear: the caller must move it straight
+                // into `sign_released`, which arbitrates the `Finalizing`
+                // latch and consumes it with the synchronous signing.
+                SemanticGraphQueryReleaseConfirmation::Permitted(permit) => Ok(permit),
                 SemanticGraphQueryReleaseConfirmation::Denied => {
                     Err(SemanticOneShotError::Restricted)
                 }
@@ -407,40 +399,30 @@ impl<'a> SemanticOneShotExecution<'a> {
         }
     }
 
-    /// Post-check the synchronous finalization and consume the release permit
-    /// with the accepted Event signature.
+    /// Consume the confirmed release into the single synchronous signer and
+    /// the §4.1 post-check (fix plan §2.3 / F2 item 2).
     ///
-    /// Runs after the closed surface finished building and signing its
-    /// result — with no intervening await since the permit was issued. A
-    /// cancellation or deadline that arrived during that synchronous work
-    /// requested a discard: the signed result must be dropped, the permit is
-    /// consumed anyway, and the caller observes the deadline error. Only a
-    /// clean post-check completes the latch.
-    pub(crate) fn finalize_completed(
+    /// The unsigned result was already validated before the release was
+    /// confirmed. This arbitrates the `Finalizing` latch — a cancellation or
+    /// the public `Absolute` deadline that won while the confirmation was in
+    /// flight consumes the permit here without ever calling the signer —
+    /// then runs the closed surface's synchronous signing closure with no
+    /// intervening await. The permit is consumed whether the signer succeeds
+    /// or fails; a cancellation or deadline that arrived during that work
+    /// discards the signed Event instead of sending it, and only a clean
+    /// post-check completes the latch.
+    pub(crate) fn sign_released<T>(
         &self,
         permit: SemanticGraphQueryReleasePermit,
-    ) -> Result<(), SemanticOneShotError> {
-        // F1 item 2: only the public `Absolute` deadline refuses the
-        // synchronous finalize. The internal work and snapshot-close windows
-        // are legal spent cutoffs by the time the finalizer runs, so an
-        // earliest-expired check here would reject every reserved one-shot.
-        if Instant::now()
-            >= self
-                .context
-                .windows()
-                .window(SemanticDeadlineWindow::Absolute)
-        {
-            let _ = self.context.deadline_expired();
-        }
-        if self.context.latch().discard_requested() {
-            // The single-use permit is consumed with the discarded result.
-            let _ = permit;
-            return Err(SemanticOneShotError::Timeout);
-        }
-        self.context.latch().complete();
-        // The single-use permit is consumed with the accepted Event signature.
-        let _ = permit;
-        Ok(())
+        sign: impl FnOnce() -> T,
+    ) -> Result<T, SemanticOneShotError> {
+        let signer = self
+            .context
+            .begin_release_signer(permit)
+            .map_err(|_| SemanticOneShotError::Timeout)?;
+        self.context
+            .sign_released(signer, sign)
+            .map_err(|_| SemanticOneShotError::Timeout)
     }
 
     /// Relay projection signer bound into the request/result transcript.

@@ -204,18 +204,19 @@ pub const SEMANTIC_GRAPH_HTTP_RUNTIME_CONTRACT: &str = concat!(
 );
 
 /// Explicitly bumped closed descriptor for the compiled Phase 2 reliability
-/// runtime (unified-engine plan §12.2, corrected by the F1 correctness fix).
+/// runtime (unified-engine plan §12.2, corrected by the F1/F2 correctness
+/// fixes).
 ///
 /// The reliability route, deadline admission, one-shot reserves, lifecycle,
-/// cancellation, retry categories, physical attempt caps, backoff, circuit,
-/// and vector-reuse contracts are hashed into the same compiled runtime
-/// digest as the wire contracts above, so an attested fleet cannot mix
-/// reliability behaviors any more than it can mix result shapes. The numeric
-/// values here mirror the compiled constants in
+/// cancellation, release-finalize ordering, retry categories, physical
+/// attempt caps, backoff, circuit, and vector-reuse contracts are hashed
+/// into the same compiled runtime digest as the wire contracts above, so an
+/// attested fleet cannot mix reliability behaviors any more than it can mix
+/// result shapes. The numeric values here mirror the compiled constants in
 /// `buzz-relay::semantic_query_runtime`; a binding test pins the two sides
 /// together, and any change to either must bump this dated descriptor.
 pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
-    "runtime-contract=semantic-query-reliability-20260818-phase2-f1-correctness-v1\n",
+    "runtime-contract=semantic-query-reliability-20260818-phase2-f2-correctness-v1\n",
     "route=server-owned-compiled-pin-per-request-no-fallback-no-dual-send-no-implementation-switch\n",
     "deadline-admission=target-window-scoped;earlier-spent-windows-are-legal-cutoffs-not-terminal\n",
     "one-shot-reserves=eighths-8;provider-start-4-eighths;work-2-eighths;snapshot-close-1-eighth;absolute-public-unchanged\n",
@@ -234,7 +235,7 @@ pub const SEMANTIC_RELIABILITY_RUNTIME_CONTRACT: &str = concat!(
     "circuit-enforcement=shadow-spectator-default;single-relay-canary-flag;refusal-maps-existing-busy-only;auth-precedes-circuit-outcome\n",
     "circuit-scope=process-local-no-fleet-shared-epoch-or-lease;no-multi-pod-anti-storm-claim\n",
     "vector-reuse=request-local;exact-ordered-input-digest-plus-generation-identity;fresh-ticket-fence-rebind;never-cross-generation-or-input;never-persisted\n",
-    "release=permit-linear-move-consume;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline\n"
+    "release=unsigned-result-validated-before-confirmation;permit-linear-move-consume-into-single-signer;finalizing-wins-latch;post-check-discards-signed-result-on-cancel-or-deadline\n"
 );
 
 /// One instance asserted to be in the current HTTP load-balancer inventory.
@@ -483,7 +484,7 @@ mod tests {
         assert_ne!(digest.as_bytes(), &[0; 32]);
         assert_eq!(
             digest.to_hex(),
-            "3677625395e79b386fcc4445a52ccbe10224b1e1669c1b8c04b0a0732bf28993",
+            "94b3912fe39bdff87335b105067e28667ec1fa19b173bac7bbd97395e0385ace",
             "incompatible HTTP runtime changes require an explicit contract bump"
         );
         assert_eq!(

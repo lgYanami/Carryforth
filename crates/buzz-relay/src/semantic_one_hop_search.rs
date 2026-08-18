@@ -198,11 +198,10 @@ async fn execute_one_hop_semantic_search(
             OneHopSnapshotOutcome::Failed(error) => return Err(error),
         }
     };
-    let release_permit = execution
-        .confirm_release(&snapshot_ticket)
-        .await
-        .map_err(map_one_shot)?;
-
+    // F2 item 1: the unsigned result, its request binding, its response cap,
+    // and its canonical validation all finish before the release is
+    // confirmed, so a contract or size failure can never consume a release
+    // permit or latch `Finalizing` for a result that was never valid.
     let request_binding_digest = if filtered {
         derive_one_hop_semantic_v2_http_request_binding(
             query.project_id,
@@ -268,16 +267,21 @@ async fn execute_one_hop_semantic_search(
         }
         _ => verification_failed("result_event_builder"),
     })?;
-    // The single-use release permit is consumed synchronously with the Event
-    // signature: the whole build/sign block above ran without an intervening
-    // await, and the post-check discards the signed result instead of sending
-    // it when cancellation or the deadline arrived during that work.
-    let signed = builder
-        .sign_with_keys(&state.relay_keypair)
-        .map_err(|_| OneHopSemanticExecutionError::Signing)?;
-    execution
-        .finalize_completed(release_permit)
+    let release_permit = execution
+        .confirm_release(&snapshot_ticket)
+        .await
         .map_err(map_one_shot)?;
+    // The confirmed permit moves by value into the single synchronous
+    // signer: the closure runs with no intervening await, consumes the
+    // permit whether it signs or fails, and the §4.1 post-check discards the
+    // signed Event instead of sending it when cancellation or the deadline
+    // arrived during that work.
+    let signed = execution
+        .sign_released(release_permit, || {
+            builder.sign_with_keys(&state.relay_keypair)
+        })
+        .map_err(map_one_shot)?
+        .map_err(|_| OneHopSemanticExecutionError::Signing)?;
     Ok(signed)
 }
 

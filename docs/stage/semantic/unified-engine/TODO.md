@@ -2,11 +2,12 @@
 
 > 状态：Skill修正与Coordinate类型过滤实现已完成；真实Agent验收待执行；第二阶段统一可靠性
 > 运行时主体（R0–R6）已落地，但代码审计确认 RFX-01..RFX-07 七项与冻结合同的偏差——**主体已
-> 实现、correctness 修复中**（F0 红色基线已建立；F1 已交付：RFX-01/RFX-02 关闭，剩余红色
-> rfx03→F2、rfx04/rfx05→F3；见
+> 实现、correctness 修复中**（F0 红色基线已建立；F1 已交付：RFX-01/RFX-02 关闭；F2 已交付：
+> RFX-03 关闭，unsigned result 验证前移、permit 按值消费进单一同步 signer、complete-path 迁入
+> 同一形状；剩余红色 rfx04/rfx05→F3；见
 > [正确性修复计划](fix/project-context-unified-semantic-reliability-runtime-correctness-fix-plan.md)
 > 与[统一可靠性运行时资格记录](project-context-unified-semantic-reliability-runtime-qualification.md)
-> §10 F1 交付记录）
+> §10/§11 F1/F2 交付记录）
 >
 > 日期：2026-08-18
 
@@ -109,6 +110,14 @@ admission（RFX-01关闭，complete-path合法partial tail可达）、`timeout()
 eighths冻结reserve（公开45s合同不变）、relay shutdown订阅与caller disconnect guard进入
 生产取消路径、runtime digest随日期化descriptor轮换（`2c898e16…→36776253…`，三处golden
 显式重钉，资格记录§5/§10）。三个确定性门复跑绿色；剩余红色rfx03（F2）、rfx04/rfx05（F3）。
+
+**2026-08-18 F2 交付**：Release-finalize线性化完成（修复计划§3.3/§2.3）——one-shot两surface的
+unsigned result构造、canonical验证与Event builder（含response cap）全部前移到release确认之前；
+`begin_release_signer`/`sign_released` guard按值消费permit（唯一构造点、无Clone、`#[must_use]`，
+拒绝路径消费permit且绝不调用签名闭包，签名中cancel/deadline由§4.1 post-check丢弃已签名结果）；
+complete-path bridge尾段删除手写四段finalize逻辑迁入同一helper；两类release policy（exact-snapshot
+与current-authorization）保持。RFX-03三测转绿；digest轮换`36776253…→94b3912f…`（资格记录
+§5第四行/§11）。三个确定性门复跑绿色；剩余红色rfx04/rfx05（F3）。
 相关性验收结果只影响
 Coordinate检索的排名合同，不阻塞可靠性阶段的零行为迁移步骤；若验收要求改变公开surface，必须按独立
 版本化设计处理，不得混入可靠性迁移。
