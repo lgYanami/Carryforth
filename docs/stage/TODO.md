@@ -159,7 +159,9 @@
 > query/vector/body）；`just ci` 唯一失败为 `ci-source-contracts` 内与语义运行时无关的 main
 > 既有 release-asset icons pin（manifest `590ce9b8b` 与 icons `ca6f5ba5d` 均先于本分叉、分支
 > 零改动、main 同样失败；建议独立 change 显式重钉 `release/packaged-assets.json`），其余 CI
-> 组件逐项绿。**分层结论（修复计划 §7）：Phase 2 correctness implementation 已交付（§7.1
+> 组件逐项绿。（2026-08-22 附记：独立 change 核对后重钉 icons 与 sounds 两处 pin——两处旧
+> pin 均从未匹配任何已提交内容——图标/音频字节零改动，`just ci` 全链复跑绿，见资格记录 §14
+> 附记。）**分层结论（修复计划 §7）：Phase 2 correctness implementation 已交付（§7.1
 > 关闭，RFX-01..RFX-07 全部关闭）；deployment qualification 未完成（§7.2 未关闭：真实 fleet
 > old/new digest 切流、gate/drain/re-attest 与 binary rollback 演练未执行）——保持
 > "correctness implementation 已交付、deployment qualification 未完成"表述，不得声明

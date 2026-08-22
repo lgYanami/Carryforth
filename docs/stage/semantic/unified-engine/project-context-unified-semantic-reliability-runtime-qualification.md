@@ -2,7 +2,8 @@
 
 > 状态：R0–R6 主体已交付；correctness 修复 **F0–F5 全部交付（§9–§14）**——RFX-01..RFX-06
 > 关闭、rfx 基线保持清零、deterministic/disposable DB/migration/unit/integration/真实 Provider
-> canary 门绿色（§2；`just ci` 唯一失败为与语义运行时无关的 main 既有 release-asset pin）。
+> canary 门绿色（§2；`just ci` 曾唯一失败于与语义运行时无关的 main 既有 release-asset pin，
+> 2026-08-22 独立重钉后全链绿，见 §14 附记）。
 > 分层结论：**Phase 2 correctness implementation 已交付；deployment qualification 未完成**——
 > 真实 fleet old/new digest 切流、gate/drain/re-attest 与 binary rollback 演练未执行（无真实
 > fleet），修复计划 §7.2 未关闭，不得声明 "Phase 2 已完整交付" 或 production-ready
@@ -48,7 +49,7 @@ operation（whole-graph Coordinate、两个 one-hop variant、bounded complete p
 | `cargo fmt -p buzz-semantic-query -p buzz-relay` | 通过 | 每次提交 hooks 执行 |
 | `cargo test -p buzz-relay --lib`（全量） | 通过（2026-08-18 F5，986 通过/0 失败/31 ignored） | 无服务环境曾为 978 通过/8 环境性失败（`api::media`×7、`api::admin::feedback_attachment`×1，`ensure_configured_community` 需真实 Postgres）；F5 起 compose Postgres/Redis 在位，全量转绿：986 通过、0 失败，`reliability_fix_regressions` 16/16 绿（rfx 基线保持清零） |
 | `just test-unit` | 通过（2026-08-18 F4 复跑，exit 0） | 无服务 unit 门：buzz-core/auth/db/conformance、Project View/Document/Context、buzz-acp `--lib`、buzz-relay `meeting` 过滤器（该门不含 buzz-relay 全量 `--lib`，全量见上行），28 组全绿、耗时 73s。F5 经 `just test`/`just ci` 组合复跑同为绿色 |
-| `just ci` | 部分通过（2026-08-18 F5） | `check` 链唯一失败为 `ci-source-contracts` → release-asset-inventory 对 `desktop/src-tauri/icons/**` 的既有 tree_sha256 pin（`fe7cf9d1…` vs 实际 `51403134…`）——该 pin 与 icons 均先于本分支（main 上即失败，分支对二者零改动），与本修复无关；修复建议：独立 change 重新核对并显式重钉 `release/packaged-assets.json`。其余组件逐项全绿：fmt-check、clippy（全 workspace）、web-check、desktop-check、desktop-tauri-fmt-check、desktop-tauri-clippy、test-unit、desktop-test、desktop-build、desktop-tauri-check、desktop-tauri-test、web-build |
+| `just ci` | 通过（2026-08-22 独立重钉后复跑全绿） | 2026-08-18 F5 时为部分通过：`check` 链唯一失败为 `ci-source-contracts` → release-asset-inventory 对 `desktop/src-tauri/icons/**` 的既有 tree_sha256 pin（`fe7cf9d1…` vs 实际 `51403134…`）——该 pin 与 icons 均先于本分支（main 上即失败，分支对二者零改动），与本修复无关。2026-08-22 独立 change 核对后显式重钉 `release/packaged-assets.json` 的 icons 与 sounds 两处 pin（证据见 §14 附记），`ci-source-contracts` 与全链复跑通过 |
 | `just semantic-test`（= pgvector + migration） | 通过（2026-08-18 F5） | 两门均以脚本自管 disposable Docker Postgres 运行，见下两行 |
 | `just semantic-pgvector-test` | 通过（2026-08-18 F5） | 脚本自起 disposable pgvector 容器（pgvector 0.8.5 / Postgres 17.10）：2048 维 vector/halfvec roundtrip、halfvec HNSW 索引、sqlx roundtrip、`buzz-admin semantic preflight` `ready: true` |
 | `just semantic-migration-test` | 通过（2026-08-18 F5） | disposable 容器上 semantic 迁移、desired-schema 与 ledger-less fresh-schema 门全绿（含 real-pgvector scoped search 与 fleet policy matrix 用例） |
@@ -377,6 +378,16 @@ semantic_` 132 绿；`buzz-relay --lib` 全量 978 绿（8 个环境性失败见
   clippy（全 workspace）、web-check、desktop-check、desktop-tauri-fmt-check、
   desktop-tauri-clippy、test-unit、desktop-test、desktop-build、desktop-tauri-check、
   desktop-tauri-test、web-build。
+- **§14 附记（2026-08-22 独立重钉）**：按上述建议执行核对后发现不止 icons 一处——
+  `carryforth-generated-platform-icons`（`fe7cf9d1…`）与
+  `notification-sounds-and-waveforms`（`d456f65f…`）两个 pin 均从未匹配任何已提交内容
+  （icons 53 文件自 rebrand `ca6f5ba5d` 起、sounds 24 文件自 `684e2e024` 起恒为
+  `51403134…`/`d953506f…`，含 manifest 自身提交 `590ce9b8b` 时点；二者最后改动均先于
+  manifest 两次写入，无任何已提交树hash 等于旧 pin）。sounds 侧另有
+  `generate-notification-sounds.mjs --check` 逐字节验证 12 个 WAV 为预期生成内容，
+  证明重钉对象是既定产物而非损坏。独立 change 将两处 pin 显式重钉到已提交内容并在
+  provenance 记录旧值与证据，图标/音频字节零改动；`ci-source-contracts` 与全链 `just ci`
+  复跑通过（§2 行已更新）。该修复与语义运行时无关，不改变本记录任何分层结论。
 - **retry/recovery 故障门与最终组合 profile**：每行 closed 故障门由
   `failure_dispositions_follow_the_closed_matrix`、
   `retry_matrix_enables_exactly_the_compiled_route_rows` 与 rfx01–rfx06 回归逐行钉住并复跑
